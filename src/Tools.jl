@@ -5,8 +5,10 @@ import Luna: Modes, PhysData, Capillary, RectModes
 function τfw_to_τ0(τfw, shape)
     if shape == :sech
         τ0 = τfw/(2*log(1+sqrt(2)))
+    elseif shape == :gauss
+        τ0 = τfw/(2*sqrt(log(2)))
     else
-        error("shape must be one of: :sech")
+        error("shape must be one of: :sech, :gauss")
     end
     τ0
 end
