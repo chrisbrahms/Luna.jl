@@ -114,7 +114,7 @@ function make_init(grid, inputs, energyfun, FT)
 end
 
 function scaled_input(grid, input, energyfun, FT)
-    Et = input.func(grid.t)
+    Et = input.func(grid)
     energy = energyfun(grid.t, Et)
     Et_sc = sqrt(input.energy)/sqrt(energy) .* Et
     return FT * Et_sc
