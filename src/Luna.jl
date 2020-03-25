@@ -37,6 +37,7 @@ include("LinearOps.jl")
 include("Stats.jl")
 include("Polarisation.jl")
 include("Tools.jl")
+include("Plotting.jl")
 
 function setup(grid::Grid.RealGrid, energyfun, densityfun, normfun, responses, inputs)
     Utils.loadFFTwisdom()
@@ -122,6 +123,62 @@ function setup(grid::Grid.EnvGrid, energyfun, densityfun, normfun, responses, in
     Eω, transform, FT
 end
 
+function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
+               energyfun, densityfun, normfun, responses, inputs)
+    xt = zeros(Float64, length(grid.t), length(q.r))
+    FT = FFTW.plan_rfft(xt, 1, flags=FFTW.MEASURE)
+    Eω = zeros(ComplexF64, length(grid.ω), length(q.k))
+    for input in inputs
+        Eω .+= scaled_input(grid, input, energyfun, FT)
+    end
+    Eωk = q * Eω
+    xo = Array{Float64}(undef, length(grid.to), length(q.r))
+    FTo = FFTW.plan_rfft(xo, 1, flags=FFTW.MEASURE)
+    transform = NonlinearRHS.TransRadial(grid, q, FTo, responses, densityfun, normfun)
+    Eωk, transform, FT
+end
+
+function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
+               energyfun, densityfun, normfun, responses, inputs)
+    xt = zeros(ComplexF64, length(grid.t), length(q.r))
+    FT = FFTW.plan_fft(xt, 1, flags=FFTW.MEASURE)
+    Eω = zeros(ComplexF64, length(grid.ω), length(q.k))
+    for input in inputs
+        Eω .+= scaled_input(grid, input, energyfun, FT)
+    end
+    Eωk = q * Eω
+    xo = Array{ComplexF64}(undef, length(grid.to), length(q.r))
+    FTo = FFTW.plan_fft(xo, 1, flags=FFTW.MEASURE)
+    transform = NonlinearRHS.TransRadial(grid, q, FTo, responses, densityfun, normfun)
+    Eωk, transform, FT
+end
+
+function setup(grid::Grid.RealGrid, FT, x, y,
+               energyfun, densityfun, normfun, responses, inputs)
+    Eωk = zeros(ComplexF64, length(grid.ω), length(y), length(x))
+    for input in inputs
+        Eωk .+= scaled_input(grid, input, energyfun, FT)
+    end
+    xo = Array{Float64}(undef, length(grid.to), length(y), length(x))
+    FTo = FFTW.plan_rfft(xo, (1, 2, 3), flags=FFTW.MEASURE)
+    transform = NonlinearRHS.TransFree(grid, FTo, length(y), length(x),
+                                       responses, densityfun, normfun)
+    Eωk, transform, FTo
+end
+
+function setup(grid::Grid.EnvGrid, FT, x, y,
+               energyfun, densityfun, normfun, responses, inputs)
+    Eωk = zeros(ComplexF64, length(grid.ω), length(y), length(x))
+    for input in inputs
+        Eωk .+= scaled_input(grid, input, energyfun, FT)
+    end
+    xo = Array{ComplexF64}(undef, length(grid.to), length(y), length(x))
+    FTo = FFTW.plan_fft(xo, (1, 2, 3), flags=FFTW.MEASURE)
+    transform = NonlinearRHS.TransFree(grid, FTo, length(y), length(x),
+                                       responses, densityfun, normfun)
+    Eωk, transform, FTo
+end
+
 function make_init(grid, inputs, energyfun, FT)
     out = fill(0.0 + 0.0im, length(grid.ω))
     for input in inputs
@@ -184,14 +241,13 @@ end
 
 function run(Eω, grid,
              linop, transform, FT, output;
-             min_dz=0, max_dz=Inf,
+             min_dz=0, max_dz=Inf, init_dz=1e-4,
              rtol=1e-6, atol=1e-10, safety=0.9, norm=RK45.weaknorm)
 
 
     Et = FT \ Eω
 
     z = 0
-    dz = 1e-3
 
     window! = let window=grid.ωwin, twindow=grid.twin, FT=FT, Et=Et
         function window!(Eω)
@@ -210,7 +266,7 @@ function run(Eω, grid,
     output(Grid.to_dict(grid), group="grid")
 
     RK45.solve_precon(
-        transform, linop, Eω, z, dz, grid.zmax, stepfun=stepfun,
+        transform, linop, Eω, z, init_dz, grid.zmax, stepfun=stepfun,
         max_dt=max_dz, min_dt=min_dz,
         rtol=rtol, atol=atol, safety=safety, norm=norm)
 end
