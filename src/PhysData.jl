@@ -47,7 +47,7 @@ const gas_str = Dict(
     :Xe => "Xenon",
     :Air => "Air"
 )
-const glass = (:SiO2, :BK7, :KBr, :CaF2, :BaF2, :Si)
+const glass = (:SiO2, :BK7, :KBr, :CaF2, :BaF2, :Si, :MgF2)
 const metal = (:Ag,)
 
 "Change from ω to λ and vice versa"
@@ -173,6 +173,13 @@ function sellmeier_glass(material::Symbol)
              + 0.0030434748/(1-(1.13475115/μm)^2)
              + 1.54133408/(1-(1104/μm)^2)
              ))
+    elseif material == :MgF2
+        return μm -> @. sqrt(complex(1
+            + 0.27620
+            + 0.60967/(1-(0.08636/μm)^2)
+            + 0.0080/(1-(18.0/μm)^2)
+            + 2.14973/(1-(25.0/μm)^2)
+            ))
     else
         throw(DomainError(material, "Unknown glass $material"))
     end
