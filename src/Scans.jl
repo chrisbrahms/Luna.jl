@@ -122,6 +122,7 @@ function Scan(name, args)
         mode = :condor
         batch = (0, args["condor"])
     elseif haskey(args, "remote")
+        mode = :remote
         batch = (0, args["remote"])
     else
         error("One of batch, range, local or cirrus options must be given!")
@@ -351,17 +352,17 @@ end
 function remote_setup(name, script, batches)
     scriptfile = basename(script)
     folder = Dates.format(Dates.now(), "yyyymmdd_HHMMSS") * "_$name"
-    @info "Making directory ~/luna_sims/$folder"
+    @info "Making directory \$HOME/luna_sims/$folder"
     read(`ssh HWLX0003-EPS "mkdir -p ~/luna_sims/$folder"`)
     @info "Transferring file..."
-    run(`scp $script HWLX0003-EPS:\~/luna_sims/$folder`)
+    read(`scp $script HWLX0003-EPS:\$HOME/luna_sims/$folder`)
     @info "Making job script..."
     subfile = read(
-        `ssh HWLX0003-EPS julia ~/luna_sims/$folder/$scriptfile --condor 16`,
+        `ssh HWLX0003-EPS julia \$HOME/luna_sims/$folder/$scriptfile --condor 16`,
         String)
     @info "Submitting job..."
-    out = read(`ssh HWLX0003-EPS condor_submit $subfile`)
-    @info "Condor submit\n" * out
+    out = read(`ssh HWLX0003-EPS condor_submit $subfile`, String)
+    @info "condor_submit output:\n" * out
 end
 
 
