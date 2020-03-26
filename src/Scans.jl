@@ -2,6 +2,8 @@ module Scans
 import ArgParse: ArgParseSettings, parse_args, parse_item, @add_arg_table!
 import Base.Threads: @threads
 import Base: length
+import Dates
+import Logging: @info
 
 """
     @scaninit(name="scan")
@@ -35,6 +37,9 @@ function parse_scan_cmdline()
             arg_type = Int
         "--condor"
             help = "Make job submission script for HTCondor. Do not run any simulations."
+            arg_type = Int
+        "--remote", "-r"
+            help = "Run script remotely using HTCondor on HWLX0003-EPS"
             arg_type = Int
         "--local"
             help = "Simply run the scan locally"
@@ -116,6 +121,9 @@ function Scan(name, args)
     elseif haskey(args, "condor")
         mode = :condor
         batch = (0, args["condor"])
+    elseif haskey(args, "remote")
+        mode = :remote
+        batch = (0, args["remote"])
     else
         error("One of batch, range, local or cirrus options must be given!")
     end
@@ -296,6 +304,8 @@ macro scan(ex)
             cirrus_setup($(esc(:__SCAN__)).name, script, $(esc(:__SCAN__)).batch[2])
         elseif $(esc(:__SCAN__)).mode == :condor
             condor_setup($(esc(:__SCAN__)).name, script, $(esc(:__SCAN__)).batch[2])
+        elseif $(esc(:__SCAN__)).mode == :remote
+            remote_setup($(esc(:__SCAN__)).name, script, $(esc(:__SCAN__)).batch[2])
         else
             if $(esc(:__SCAN__)).parallel
                 @threads for $(esc(:__SCANIDX__)) in $(esc(:__SCAN__)).idcs
@@ -325,6 +335,7 @@ function condor_setup(name, script, batches)
         "log = $name.log.\$(Process)",
         "output = $name.out.\$(Process)",
         "error = $name.err.\$(Process)",
+        "initialdir = $(dirname(script))",
         "request_cpus = 1",
         "queue $batches"
     ]
@@ -337,6 +348,23 @@ function condor_setup(name, script, batches)
         end
     end
 end
+
+function remote_setup(name, script, batches)
+    scriptfile = basename(script)
+    folder = Dates.format(Dates.now(), "yyyymmdd_HHMMSS") * "_$name"
+    @info "Making directory \$HOME/luna_sims/$folder"
+    read(`ssh HWLX0003-EPS "mkdir -p ~/luna_sims/$folder"`)
+    @info "Transferring file..."
+    read(`scp $script HWLX0003-EPS:\$HOME/luna_sims/$folder`)
+    @info "Making job script..."
+    subfile = read(
+        `ssh HWLX0003-EPS julia \$HOME/luna_sims/$folder/$scriptfile --condor 16`,
+        String)
+    @info "Submitting job..."
+    out = read(`ssh HWLX0003-EPS condor_submit $subfile`, String)
+    @info "condor_submit output:\n" * out
+end
+
 
 """
     cirrus_setup(name, script, batches)
