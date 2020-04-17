@@ -1,7 +1,9 @@
 import Luna
-import Luna: Grid, Maths, PhysData, Nonlinear, Ionisation, NonlinearRHS, Output, Stats, LinearOps, Hankel, Plotting
+import Luna: Grid, Maths, PhysData, Nonlinear, Ionisation, NonlinearRHS, Output, Stats, LinearOps, Plotting
+import Luna.PhysData: wlfreq
 import Logging
 import FFTW
+import Hankel
 import NumericalIntegration: integrate, SimpsonEven
 Logging.disable_logging(Logging.BelowMinLevel)
 
@@ -14,7 +16,7 @@ pres = 1.2
 λ0 = 800e-9
 
 w0 = 40e-6
-energy = 2e-3
+energy = 2e-9
 L = 0.6
 
 R = 4e-3
@@ -23,7 +25,7 @@ N = 1024
 grid = Grid.RealGrid(L, 800e-9, (400e-9, 2000e-9), 0.2e-12)
 q = Hankel.QDHT(R, N, dim=2)
 
-energyfun = NonlinearRHS.energy_radial(q)
+energyfun, energyfun_ω = NonlinearRHS.energy_radial(grid, q)
 
 function prop(E, z)
     Eω = FFTW.rfft(E, 1)
@@ -44,8 +46,9 @@ function gausspulse(t)
     return prop(Et, -0.3)
 end
 
-dens0 = PhysData.density(gas, pres)
-densityfun(z) = dens0
+densityfun = let dens0=PhysData.density(gas, pres)
+    z -> dens0
+end
 
 ionpot = PhysData.ionisation_potential(gas)
 ionrate = Ionisation.ionrate_fun!_PPTcached(gas, λ0)
@@ -55,7 +58,7 @@ responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),
 
 linop = LinearOps.make_const_linop(grid, q, PhysData.ref_index_fun(gas, pres))
 
-normfun = NonlinearRHS.norm_radial(grid.ω, q, PhysData.ref_index_fun(gas, pres))
+normfun = NonlinearRHS.const_norm_radial(grid, q, PhysData.ref_index_fun(gas, pres))
 
 in1 = (func=gausspulse, energy=energy)
 inputs = (in1, )
@@ -64,7 +67,6 @@ Eω, transform, FT = Luna.setup(grid, q, energyfun, densityfun, normfun, respons
 
 # statsfun = Stats.collect_stats((Stats.ω0(grid), ))
 output = Output.MemoryOutput(0, grid.zmax, 201, (length(grid.ω), length(q.r)))
-
 Luna.run(Eω, grid, linop, transform, FT, output)
 
 ω = grid.ω
