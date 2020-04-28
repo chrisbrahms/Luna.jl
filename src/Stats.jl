@@ -1,5 +1,5 @@
 module Stats
-import Luna: Maths, Grid, Modes, Utils
+import Luna: Maths, Grid, Modes, Utils, settings
 import Luna.PhysData: wlfreq, c, ε_0
 import FFTW
 import LinearAlgebra: mul!
@@ -28,9 +28,9 @@ Create stats function to calculate the total energy.
 function energy(grid, energyfun_ω)
     function addstat!(d, Eω, Et, z, dz)
         if ndims(Eω) > 1
-            d["energy"] = [energyfun_ω(grid.ω, Eω[:, i]) for i=1:size(Eω, 2)]
+            d["energy"] = [energyfun_ω(Eω[:, i]) for i=1:size(Eω, 2)]
         else
-            d["energy"] = energyfun_ω(grid.ω, Eω)
+            d["energy"] = energyfun_ω(Eω)
         end
     end
     return addstat!
@@ -63,9 +63,9 @@ function energy_window(grid, energyfun_ω, window; label)
     key = "energy_$label"
     function addstat!(d, Eω, Et, z, dz)
         if ndims(Eω) > 1
-            d[key] = [energyfun_ω(grid.ω, Eω[:, i].*window) for i=1:size(Eω, 2)]
+            d[key] = [energyfun_ω(Eω[:, i].*window) for i=1:size(Eω, 2)]
         else
-            d[key] = energyfun_ω(grid.ω, Eω.*window)
+            d[key] = energyfun_ω(Eω.*window)
         end
     end
     return addstat!
@@ -252,7 +252,7 @@ Returns both a buffer for the analytic field and a closure to do the transform.
 function plan_analytic(grid::Grid.EnvGrid, Eω)
     Eta = similar(Eω)
     Utils.loadFFTwisdom()
-    iFT = FFTW.plan_ifft(Eω, 1, flags=FFTW.PATIENT)
+    iFT = FFTW.plan_ifft(copy(Eω), 1, flags=settings["fftw_flag"])
     Utils.saveFFTwisdom()
     function analytic!(Eta, Eω)
         mul!(Eta, iFT, Eω) # for envelope fields, we only need to do the inverse transform
@@ -267,7 +267,7 @@ function plan_analytic(grid::Grid.RealGrid, Eω)
     Eωa = zero(Eta)
     idxhi = CartesianIndices(size(Eω)[2:end]) # index over all other dimensions
     Utils.loadFFTwisdom()
-    iFT = FFTW.plan_ifft(Eωa, 1, flags=FFTW.PATIENT)
+    iFT = FFTW.plan_ifft(Eωa, 1, flags=settings["fftw_flag"])
     Utils.saveFFTwisdom()
     function analytic!(Eta, Eω)
         copyto_fft!(Eωa, Eω, idxhi) # copy across to FFT-sampled buffer

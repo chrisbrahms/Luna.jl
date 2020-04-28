@@ -72,6 +72,11 @@ end
     include(joinpath(testdir, "test_gradient.jl"))
 end
 
+@testset "Tapers" begin
+    @info("================= test_tapers.jl")
+    include(joinpath(testdir, "test_tapers.jl"))
+end
+
 @testset "Scans" begin
     @info("================= test_scans.jl")
     include(joinpath(testdir, "test_scans.jl"))
@@ -110,6 +115,11 @@ end
 @testset "Antiresonant modes" begin
     @info("================= test_antiresonant.jl")
     include(joinpath(testdir, "test_antiresonant.jl"))
+end
+
+@testset "Fields" begin
+    @info("================= test_fields.jl")
+    include(joinpath(testdir, "test_fields.jl"))
 end
 
 end
