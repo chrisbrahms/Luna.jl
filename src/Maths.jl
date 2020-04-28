@@ -10,6 +10,10 @@ import Luna.Utils: saveFFTwisdom, loadFFTwisdom
 import Roots: fzero
 import Dierckx
 
+#= Pre-created finite difference methods for speed.
+    Above order=7, this would create overflow errors in central_fwm() =#
+FDMs = [FiniteDifferences.central_fdm(order+6, order) for order=1:7]
+
 "Calculate derivative of function f(x) at value x using finite differences"
 function derivative(f, x, order::Integer)
     if order == 0
@@ -17,7 +21,7 @@ function derivative(f, x, order::Integer)
     else
         # use 5th order central finite differences with 4 adaptive steps
         scale = abs(x) > 0 ? x : 1.0
-        FiniteDifferences.fdm(FiniteDifferences.central_fdm(order+6, order), y->f(y*scale), x/scale, adapt=2)/scale^order
+        FiniteDifferences.fdm(FDMs[order], y->f(y*scale), x/scale, adapt=2)/scale^order
     end
 end
 
@@ -278,10 +282,14 @@ function errfun_window(x, xmin, xmax, width_left, width_right)
 end
 
 """
-Planck taper window as defined in the paper (https://arxiv.org/pdf/1003.2939.pdf eq(7)):
-    xmin: lower limit (window is 0 here)
-    xmax: upper limit (window is 0 here)
-    ε: fraction of window width over which to increase from 0 to 1
+    planck_taper(x, xmin, xmax, ε)
+
+Planck taper window as defined in the paper (https://arxiv.org/pdf/1003.2939.pdf eq(7)).
+
+#Arguments
+-`xmin` : lower limit (window is 0 here)
+-`xmax` : upper limit (window is 0 here)
+-`ε` : fraction of window width over which to increase from 0 to 1
 """
 function planck_taper(x::AbstractArray, xmin, xmax, ε)
     x0 = (xmax + xmin) / 2
@@ -295,9 +303,11 @@ function planck_taper(x::AbstractArray, xmin, xmax, ε)
 end
 
 """
+    planck_taper(x, left0, left1, right1, right0)
+
 Planck taper window, but finding the taper width by defining 4 points:
-The window increases from 0 to 1 between left0 and left1, and then drops again
-to 0 between right1 and right0
+The window increases from 0 to 1 between `left0` and `left1`, and then drops again
+to 0 between `right1` and `right0`.
 """
 function planck_taper(x::AbstractArray, left0, left1, right1, right0)
     x0 = (right0 + left0) / 2
@@ -336,6 +346,23 @@ function hypergauss_window(x, xmin, xmax, power = 10)
     x0 = (xmax + xmin) / 2
     return gauss(x, x0 = x0, fwhm = fw, power = power)
 end
+
+"""
+    gabor(t, A, ts, fw)
+
+Compute the Gabor transform (aka spectrogram or time-gated Fourier transform) of the vector
+`A`, sampled on axis `t`, with windows centred at `ts` and a window FWHM of `fw`.
+"""
+function gabor(t::Vector, A::Vector, ts, fw)
+    tmp = Array{eltype(A), 2}(undef, (length(t), length(ts)));
+    for (ii, ti) in enumerate(ts)
+        tmp[:, ii] = A .* Maths.gauss.(t; x0=ti, fwhm=fw)
+    end
+    _gaborFT(tmp)
+end
+
+_gaborFT(x::Array{T, 2}) where T <: Real = FFTW.rfft(x, 1)
+_gaborFT(x::Array{T, 2}) where T <: Complex = FFTW.fft(x, 1)
 
 """
     hilbert(x; dim=1)
@@ -628,6 +655,16 @@ function fftfreq(x)
     N = length(x)
     n = collect(range(0, length=N))
     (n .- N/2) .* 2π/(N*Dx)
+end
+
+"Calculate frequency vector k from samples x for rFFT"
+function rfftfreq(x)
+    Dx = abs(x[2] - x[1])
+    all(diff(x) .≈ Dx) || error("x must be spaced uniformly")
+    Nx = length(x)
+    Nf = length(x)÷2 + 1
+    n = collect(range(0, length=Nf))
+    n .* 2π/(Nx*Dx)
 end
 
 """
