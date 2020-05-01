@@ -1,5 +1,4 @@
 module Fields
-import Luna
 import Luna: Grid, Maths, PhysData
 import NumericalIntegration: integrate, SimpsonEven
 import Random: AbstractRNG, GLOBAL_RNG
