@@ -4,12 +4,12 @@ import Logging
 import Base: getindex, show
 import Printf: @sprintf
 import Luna: Scans, Utils, @hlock
+import Pidfile: mkpidlock
 
 
 "Output handler for writing only to memory"
-mutable struct MemoryOutput{sT, N, S}
+mutable struct MemoryOutput{sT, S}
     save_cond::sT
-    ydims::NTuple{N, Int64}  # Dimensions of one array to be saved
     yname::AbstractString  # Name for solution (e.g. "Eω")
     tname::AbstractString  # Name for propagation direction (e.g. "z")
     saved::Integer  # How many points have been saved so far
@@ -17,17 +17,14 @@ mutable struct MemoryOutput{sT, N, S}
     statsfun::S  # Callable, returns dictionary of statistics
 end
 
-function MemoryOutput(tmin, tmax, saveN::Integer, ydims, statsfun=nostats;
+function MemoryOutput(tmin, tmax, saveN::Integer, statsfun=nostats;
                       yname="Eω", tname="z", script=nothing)
     save_cond = GridCondition(tmin, tmax, saveN)
-    MemoryOutput(save_cond, ydims, yname, tname, statsfun, script)
+    MemoryOutput(save_cond, yname, tname, statsfun, script)
 end
 
-function MemoryOutput(save_cond, ydims, yname, tname, statsfun=nostats, script=nothing)
-    dims = init_dims(ydims, save_cond)
+function MemoryOutput(save_cond, yname, tname, statsfun=nostats, script=nothing)
     data = Dict{String, Any}()
-    data[yname] = Array{ComplexF64}(undef, dims)
-    data[tname] = Array{Float64}(undef, (dims[end],))
     data["stats"] = Dict{String, Any}()
     data["meta"] = Dict{String, Any}()
     data["meta"]["sourcecode"] = Utils.sourcecode()
@@ -35,7 +32,13 @@ function MemoryOutput(save_cond, ydims, yname, tname, statsfun=nostats, script=n
     if !isnothing(script)
         data["meta"]["script_code"] = script
     end
-    MemoryOutput(save_cond, ydims, yname, tname, 0, data, statsfun)
+    MemoryOutput(save_cond, yname, tname, 0, data, statsfun)
+end
+
+function initialise(o::MemoryOutput, y)
+    dims = init_dims(size(y), o.save_cond)
+    o.data[o.yname] = Array{ComplexF64}(undef, dims)
+    o.data[o.tname] = Array{Float64}(undef, (dims[end],))
 end
 
 "getindex works interchangeably so when switching from one Output to
@@ -55,13 +58,14 @@ show(io::IO, o::MemoryOutput) = print(io, "MemoryOutput$(collect(keys(o.data)))"
 function (o::MemoryOutput)(y, t, dt, yfun)
     save, ts = o.save_cond(y, t, dt, o.saved)
     append_stats!(o, o.statsfun(y, t, dt))
+    !haskey(o.data, o.yname) && initialise(o, y)
     while save
         s = size(o.data[o.yname])
         if s[end] < o.saved+1
             o.data[o.yname] = fastcat(o.data[o.yname], yfun(ts))
             push!(o.data[o.tname], ts)
         else
-            idcs = fill(:, length(o.ydims))
+            idcs = fill(:, ndims(y))
             o.data[o.yname][idcs..., o.saved+1] = yfun(ts)
             o.data[o.tname][o.saved+1] = ts
         end
@@ -132,34 +136,26 @@ function fastcat(A, v)
 end
 
 "Output handler for writing to an HDF5 file"
-mutable struct HDF5Output{sT, N, S}
+mutable struct HDF5Output{sT, S}
     fpath::AbstractString  # Path to output file
     save_cond::sT  # callable, determines when data is saved and where it is interpolated
-    ydims::NTuple{N, Int64}  # Dimensions of one array to be saved
     yname::AbstractString  # Name for solution (e.g. "Eω")
     tname::AbstractString  # Name for propagation direction (e.g. "z")
     saved::Integer  # How many points have been saved so far
     statsfun::S  # Callable, returns dictionary of statistics
     stats_tmp::Vector{Dict{String, Any}}  # Temporary storage for statistics between saves
+    compression::Bool # whether to use compression
 end
 
 "Simple constructor"
-function HDF5Output(fpath, tmin, tmax, saveN::Integer, ydims, statsfun=nostats;
+function HDF5Output(fpath, tmin, tmax, saveN::Integer, statsfun=nostats;
                     yname="Eω", tname="z", compression=false, script=nothing)
     save_cond = GridCondition(tmin, tmax, saveN)
-    HDF5Output(fpath, save_cond, ydims, yname, tname, statsfun, compression, script)
+    HDF5Output(fpath, save_cond, yname, tname, statsfun, compression, script)
 end
 
-"Internal constructor - creates datasets in the file"
-function HDF5Output(fpath, save_cond, ydims, yname, tname, statsfun, compression, script=nothing)
-    idims = init_dims(ydims, save_cond)
-    cdims = collect(idims)
-    # cdims[1] *= 2 # Allow for interleaving of real, imag, real, imag...
-    dims = Tuple(cdims)
-    chdims = (dims[1:end-1]..., 1) # Chunk size is that of one z-point
-    mdims = copy(cdims)
-    mdims[end] = -1
-    maxdims = Tuple(mdims)
+"Internal constructor - creates the file"
+function HDF5Output(fpath, save_cond, yname, tname, statsfun, compression, script=nothing)
     if isfile(fpath)
         Logging.@warn("Output file $(fpath) already exists and will be overwritten!")
         rm(fpath)
@@ -167,15 +163,6 @@ function HDF5Output(fpath, save_cond, ydims, yname, tname, statsfun, compression
     fdir, fname = splitdir(fpath)
     isdir(fdir) || mkpath(fdir)
     @hlock HDF5.h5open(fpath, "cw") do file
-        if compression
-            HDF5.d_create(file, yname, HDF5.datatype(ComplexF64), (dims, maxdims),
-                          "chunk", chdims, "blosc", 3)
-        else
-            HDF5.d_create(file, yname, HDF5.datatype(ComplexF64), (dims, maxdims),
-                          "chunk", chdims)
-        end
-        HDF5.d_create(file, tname, HDF5.datatype(Float64), ((dims[end],), (-1,)),
-                      "chunk", (1,))
         HDF5.g_create(file, "stats")
         HDF5.g_create(file, "meta")
         file["meta"]["sourcecode"] = Utils.sourcecode()
@@ -185,7 +172,29 @@ function HDF5Output(fpath, save_cond, ydims, yname, tname, statsfun, compression
         end
     end
     stats0 = Vector{Dict{String, Any}}()
-    HDF5Output(fpath, save_cond, ydims, yname, tname, 0, statsfun, stats0)
+    HDF5Output(fpath, save_cond, yname, tname, 0, statsfun, stats0, compression)
+end
+
+function initialise(o::HDF5Output, y)
+    ydims = size(y)
+    idims = init_dims(ydims, o.save_cond)
+    cdims = collect(idims)
+    dims = Tuple(cdims)
+    chdims = (dims[1:end-1]..., 1) # Chunk size is that of one z-point
+    mdims = copy(cdims)
+    mdims[end] = -1
+    maxdims = Tuple(mdims)
+    @hlock HDF5.h5open(o.fpath, "r+") do file
+        if o.compression
+            HDF5.d_create(file, o.yname, HDF5.datatype(ComplexF64), (dims, maxdims),
+                          "chunk", chdims, "blosc", 3)
+        else
+            HDF5.d_create(file, o.yname, HDF5.datatype(ComplexF64), (dims, maxdims),
+                          "chunk", chdims)
+        end
+        HDF5.d_create(file, o.tname, HDF5.datatype(Float64), ((dims[end],), (-1,)),
+                      "chunk", (1,))
+    end
 end
 
 "Here, getindex also opens and closes the file.
@@ -219,9 +228,10 @@ function (o::HDF5Output)(y, t, dt, yfun)
     push!(o.stats_tmp, o.statsfun(y, t, dt))
     if save
         @hlock HDF5.h5open(o.fpath, "r+") do file
+            !HDF5.exists(file, o.yname) && initialise(o, y)
             while save
-                idcs = fill(:, length(o.ydims))
                 s = collect(size(file[o.yname]))
+                idcs = fill(:, length(s)-1)
                 if s[end] < o.saved+1
                     s[end] += 1
                     HDF5.set_dims!(file[o.yname], Tuple(s))
@@ -318,7 +328,7 @@ function (o::HDF5Output)(key::AbstractString, val; force=false, meta=false, grou
                 error("File $(o.fpath) already has dataset $(key)")
             end
         end
-        isa(val, BitArray) && (v = Array{Bool, 1}(val))
+        isa(val, BitArray) && (val = Array{Bool, 1}(val))
         if !isnothing(group)
             if !HDF5.exists(parent, group)
                 HDF5.g_create(parent, group)
@@ -383,7 +393,6 @@ macro ScanHDF5Output(args...)
     code = ""
     try
         script = string(__source__.file)
-        isdir(Utils.cachedir()) || mkpath(Utils.cachedir())
         code = open(script, "r") do file
             read(file, String)
         end
@@ -425,7 +434,6 @@ for op in (:MemoryOutput, :HDF5Output)
                 script_code = ""
                 try
                     script = string(__source__.file)
-                    isdir(Utils.cachedir()) || mkpath(Utils.cachedir())
                     code = open(script, "r") do file
                         read(file, String)
                     end
@@ -447,5 +455,135 @@ for op in (:MemoryOutput, :HDF5Output)
         end
     )
 end
-            
+
+"""
+    scansave(scan, scanidx, Eω, stats; kwargs...)
+
+Save the field `Eω` and statistics dictionary `stats` in the "collected" scan output file, 
+placing it into the scan-grid as indicated by `scanidx` and the arrays of `scan`. Additional
+keyword arguments are also saved in this manner, in a field given by the keyword.
+
+E.g. if scanning over 2 arrays with length 16 and 10, shape of the `"Eω"` dataset in the 
+file will be `(size(Eω)..., 16, 10)`. Stats and additional keyword arguments are also saved
+in this manner.
+"""
+function scansave(scan, scanidx, Eω, stats=nothing; script=nothing, kwargs...)
+    fpath = "$(scan.name)_collected.h5"
+    lockpath = joinpath(Utils.cachedir(), "scanlock")
+    isdir(Utils.cachedir()) || mkpath(Utils.cachedir())
+    pidlock = mkpidlock(lockpath)
+    if !isfile(fpath)
+        # First save - set up file structure
+        @hlock HDF5.h5open(fpath, "cw") do file
+            group = HDF5.g_create(file, "scanvariables")
+            order = String[]
+            shape = Int[] # scan shape
+            # create grid of scan points
+            for (k, var) in pairs(scan.vars)
+                # scan.vars is an OrderedDict so this iteration is deterministic
+                group[string(k)] = var
+                push!(order, string(k))
+                push!(shape, length(var))
+            end
+            file["scanorder"] = order
+            # dimensions of the field saved
+            dims = (size(Eω)..., shape...)
+            # chunk size is dimension of one field slice
+            chdims = (size(Eω)..., fill(1, length(shape))...)
+            HDF5.d_create(file, "Eω", HDF5.datatype(ComplexF64), (dims, dims),
+                          "chunk", chdims)
+            if !isnothing(stats)
+                group = HDF5.g_create(file, "stats")
+                for (k, v) in pairs(stats)
+                    dims = (size(v)..., shape...)
+                    mdims = (fill(-1, ndims(v))..., shape...)
+                    chdims = (fill(1, ndims(v))..., shape...)
+                    HDF5.d_create(group, k, HDF5.datatype(eltype(v)), (dims, mdims),
+                                  "chunk", chdims)
+                end
+                group["valid_length"] = zeros(Int, shape...)
+            end
+            if !isnothing(script)
+                script_code = ""
+                try
+                    code = open(script, "r") do file
+                        read(file, String)
+                    end
+                    script_code = script*"\n"*code
+                catch
+                end
+                file["script"] = script_code
+            end
+            # deal with other keyword arguments (additional quantities to be saved)
+            for (k, v) in kwargs
+                # dimensions of the array
+                dims = (size(v)..., shape...)
+                # chunk size is dimension of one array
+                chdims = (size(v)..., fill(1, length(shape))...)
+                HDF5.d_create(file, string(k), HDF5.datatype(eltype(v)), (dims, dims),
+                              "chunk", chdims)
+            end
+        end
+    end
+    @hlock HDF5.h5open(fpath, "r+") do file
+        scanshape = Tuple([length(ai) for ai in scan.arrays])
+        cidcs = CartesianIndices(scanshape)
+        scanidcs = Tuple(cidcs[scanidx])
+        Eωidcs = fill(:, ndims(Eω))
+        file["Eω"][Eωidcs..., scanidcs...] = Eω
+        for (k, v) in pairs(stats)
+            if size(v)[end] > size(file["stats"][k])[ndims(v)]
+                #= new point has more stats points than before - extend dataset
+                    stats arrays are of shape (N1, N2,... Ns) where N1 etc are fixed and
+                    Ns depends on the number of steps
+                    stats *datasets" have shape (N1, N2,... Ns, Nx, Ny,...) where Nx, Ny...
+                    are the lengths of the scan arrays (see scanshape above)=#
+                oldlength = size(file["stats"][k])[ndims(v)] # current Ns
+                newlength = size(v)[end] # new Ns
+                newdims = (size(v)..., scanshape...) # (N1, N2,..., new Ns, Nx, Ny,...)
+                HDF5.set_dims!(file["stats"][k], newdims) # set new dimensions
+                # For existing shorter arrays, fill everything above their length with NaN
+                nanidcs = (fill(:, (ndims(v)-1))..., oldlength+1:newlength)
+                allscan = fill(:, length(scanshape)) # = (1:Nx, 1:Ny,...)
+                file["stats"][k][nanidcs..., allscan...] = NaN
+            end
+            # Stats array has shape (N1, N2,... Ns) - fill everything up to Ns with data
+            sidcs = (fill(:, (ndims(v)-1))..., 1:size(v)[end])
+            file["stats"][k][sidcs..., scanidcs...] = v
+            # save number of valid points we just saved
+            file["stats"]["valid_length"][scanidcs...] = size(v)[end]
+            # fill everything after Ns with NaN
+            nanidcs = (fill(:, (ndims(v)-1))..., size(v)[end]+1:size(file["stats"][k])[ndims(v)])
+            file["stats"][k][nanidcs..., scanidcs...] = NaN
+        end
+        for (k, v) in pairs(kwargs)
+            sidcs = fill(:, ndims(v))
+            file[string(k)][sidcs..., scanidcs...] = v
+        end 
+    end
+    close(pidlock)
+end
+
+"""
+    @scansave(Eω, stats; kwargs...)
+
+Like [`scansave`](@ref) but automatically grabs the scan index and scan instance from the
+surrounding scope and also saves the script being run.
+"""
+macro scansave(Eω, stats, kwargs...)
+    global script = string(__source__.file)
+    ex = :(scansave($(esc(:__SCAN__)), $(esc(:__SCANIDX__)),
+                    $(esc(Eω)), $(esc(stats)),
+                    script=script))
+    for arg in kwargs
+        if isa(arg, Expr) && arg.head == :(=)
+            arg.head = :kw
+            push!(ex.args, esc(arg))
+        else
+            # To a macro, arguments and keyword arguments look the same, so check manually
+            error("third and higher argument to `@scansave` must be keyword arguments")
+        end
+    end
+    ex
+end
 end

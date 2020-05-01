@@ -5,7 +5,7 @@ import Logging
 import LibGit2
 import Pidfile: mkpidlock
 import HDF5
-import Luna: @hlock
+import Luna: @hlock, settings
 
 function git_commit()
     try
@@ -60,25 +60,31 @@ function sourcecode()
     return out
 end
 
+function FFTWthreads()
+    if Threads.nthreads() == 1
+        1
+    else
+        settings["fftw_threads"] == 0 ? 4*Threads.nthreads() : settings["fftw_threads"]
+    end
+end
+
 function loadFFTwisdom()
-    fpath = joinpath(cachedir(), "FFTWcache")
+    FFTW.set_num_threads(FFTWthreads())
+    fpath = joinpath(cachedir(), "FFTWcache_$(FFTWthreads())threads")
     lockpath = joinpath(cachedir(), "FFTWlock")
+    isdir(cachedir()) || mkpath(cachedir())
     if isfile(fpath)
         Logging.@info("Found FFTW wisdom at $fpath")
         pidlock = mkpidlock(lockpath)
         ret = FFTW.import_wisdom(fpath)
         close(pidlock)
-        success = (ret != 0)
-        Logging.@info(success ? "FFTW wisdom loaded" : "Loading FFTW wisdom failed")
-        return success
     else
         Logging.@info("No FFTW wisdom found")
-        return false
     end
 end
 
 function saveFFTwisdom()
-    fpath = joinpath(cachedir(), "FFTWcache")
+    fpath = joinpath(cachedir(), "FFTWcache_$(FFTWthreads())threads")
     lockpath = joinpath(cachedir(), "FFTWlock")
     pidlock = mkpidlock(lockpath)
     isfile(fpath) && rm(fpath)
@@ -88,20 +94,20 @@ function saveFFTwisdom()
     Logging.@info("FFTW wisdom saved to $fpath")
 end
 
-function save_dict_h5(fpath, d, force=false, rmold=false)
-    if isfile(fpath) & rmold
+function save_dict_h5(fpath, d; force=false, rmold=false)
+    if isfile(fpath) && rmold
         rm(fpath)
     end
 
     function dict2h5(k::AbstractString, v, parent)
-        if HDF5.exists(parent, k) & !force
+        if HDF5.exists(parent, k) && !force
             error("Dataset $k exists in $fpath. Set force=true to overwrite.")
         end
         parent[k] = v
     end
 
     function dict2h5(k::AbstractString, v::Nothing, parent)
-        if HDF5.exists(parent, k) & !force
+        if HDF5.exists(parent, k) && !force
             error("Dataset $k exists in $fpath. Set force=true to overwrite.")
         end
         parent[k] = Float64[]

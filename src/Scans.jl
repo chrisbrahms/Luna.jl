@@ -4,16 +4,21 @@ import Base.Threads: @threads
 import Base: length
 import Dates
 import Logging: @info
+import DataStructures: OrderedDict
 
 """
     @scaninit(name="scan")
 
-Initialise a scan for this file by parsing command line arguments and creating a Scan object.
-The scan name (added to file names via @ScanHDF5Output) can also be given.
+Initialise a scan for this file by parsing command line arguments and creating a `Scan` object
+in the variable `__SCAN__`. The scan name (added to file names via `@ScanHDF5Output`)
+can also be given.
 
 # Examples
 ```julia
-@scaninit "energy_scan_5bar"
+julia> push!(ARGS, "--local")
+julia> @scaninit "scantest"
+julia> __SCAN__
+Luna.Scans.Scan("scantest", :local, (0, 0), nothing, Dict{Symbol,Any}(), Any[], IdDict{Any,Any}(), false)
 ```
 """
 macro scaninit(name="scan")
@@ -58,8 +63,14 @@ function parse_scan_cmdline()
     if haskey(args, "range") && args["local"]
         error("Option --local and range cannot both be given")
     end
+    if haskey(args, "batch") && args["local"]
+        error("Option --local and batch cannot both be given")
+    end
     if args["local"] && haskey(args, "cirrus")
         error("Local and cirrus-setup options cannot both be given.")
+    end
+    if args["local"] && haskey(args, "condor")
+        error("Local and condor-setup options cannot both be given.")
     end
     return args
 end
@@ -96,7 +107,7 @@ mutable struct Scan
     mode::Symbol # :cirrus, :condor, :local, :batch or :range
     batch::Tuple{Int, Int} # batch index and number of batches
     idcs # Array or iterator of indices to be run on this execution
-    vars::Dict{Symbol, Any} # maps from variable names to arrays
+    vars::OrderedDict{Symbol, Any} # maps from variable names to arrays
     arrays # Array of arrays, each element is one of the arrays to be scanned over
     values::IdDict # maps from each scan array to the expanded array of values
     parallel::Bool # true if scan is being run multi-threaded
@@ -127,10 +138,15 @@ function Scan(name, args)
     else
         error("One of batch, range, local or cirrus options must be given!")
     end
-    Scan(name, mode, batch, idcs, Dict{Symbol, Any}(), Array{Any, 1}(), IdDict(), args["parallel"])
+    Scan(name, mode, batch, idcs, OrderedDict{Symbol, Any}(), Array{Any, 1}(), IdDict(), args["parallel"])
 end
 
-# The length of a scan is the product of the lengths of the arrays to be scanned over
+"""
+    length(s::Scan)
+
+Compute the total number of simulations in a scan, which is is the product
+of the lengths of the arrays to be scanned over.
+"""
 length(s::Scan) = (length(s.arrays) > 0) ? prod([length(ai) for ai in s.arrays]) : 0
 
 """
@@ -141,8 +157,9 @@ cartesian product.
 
 This function is used internally by `@scanvar`
 """
-function addvar!(s::Scan, var::Symbol, arr::AbstractArray)
+function addvar!(s::Scan, var::AbstractString, arr::AbstractArray)
     push!(s.arrays, arr)
+    var = Symbol(var)
     s.vars[var] = arr
     makearray!(s)
 end
@@ -226,7 +243,6 @@ Create an array first and add it to the scan later:
 ```
 """
 macro scanvar(expr)
-    global ex = expr
     if isa(expr, Symbol)
         # existing array being added
         q = quote
@@ -239,7 +255,7 @@ macro scanvar(expr)
     isa(lhs, Symbol) || error("@scanvar expressions must assign to a variable")
     quote
         $(esc(expr)) # First, simply execute the assignment
-        addvar!($(esc(:__SCAN__)), lhs, $(esc(:($lhs)))) # now add the resulting array to the Scan
+        addvar!($(esc(:__SCAN__)), $(string(lhs)), $(esc(:($lhs)))) # now add the resulting array to the Scan
     end
 end
 
@@ -251,10 +267,10 @@ Recursively interpolate scan variables into a scan expression.
 # Examples
 ```jldoctest
 julia> for i in eachindex(ARGS)
-    pop!(ARGS)
-end
+           pop!(ARGS) # remove existing command line args
+       end
 julia> push!(ARGS, "--local")
-julia> __SCANIDX__ = 1
+julia> __SCANIDX__ = 1 # pretend we're in a @scan block
 julia> @scaninit
 julia> @scanvar energy = range(0.1e-6, 1.5e-6, length=16);
 julia> ex = Expr(:\$, :energy)
@@ -290,11 +306,11 @@ end
 Run the enclosed expression as a scan.
 
 Depending on `__SCAN__.mode`, different things happen:
-* :batch, :range, :local -> run enclosed expression as many times as required, using values
+* `:batch`, `:range`, `:local` -> run enclosed expression as many times as required, using values
     from the cartesian product `__SCAN__.values`. If `__SCAN__.parallel` is true, these runs
     are done on different threads.
-* :cirrus -> make PBS job script for batched run on cirrus
-* :condor -> make HTCondor job script for batched run on HWLX0003
+* `:cirrus` -> make PBS job script for batched run on cirrus
+* `:condor` -> make HTCondor job script for batched run on HWLX0003
 """
 macro scan(ex)
     body = interpolate!(ex)
