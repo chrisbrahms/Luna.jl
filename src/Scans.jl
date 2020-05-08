@@ -327,7 +327,9 @@ macro scan(ex)
                 @threads for $(esc(:__SCANIDX__)) in $(esc(:__SCAN__)).idcs
                     try
                         $(esc(body))
-                    catch
+                    catch e
+                        bt = catch_backtrace()
+                        @warn sprint(showerror, e, bt)
                     end
                 end
             else

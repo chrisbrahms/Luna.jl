@@ -301,9 +301,14 @@ end
 
 function make_linop(grid::Grid.RealGrid, mode::Modes.AbstractMode, λ0)
     function linop!(out, z)
-        out[2:end] .= -im.*grid.ω[2:end]./PhysData.c.*conj.(
-            Modes.neff.(mode, grid.ω[2:end], z=z))
-        out .-= -im.*grid.ω.*Modes.dispersion(mode, 1, wlfreq(λ0), z=z)
+        β1 = Modes.dispersion(mode, 1, wlfreq(λ0), z=z)::Float64
+        for iω = 2:length(grid.ω)
+            n = Modes.neff(mode, grid.ω[iω], z=z)
+            # make sure neff is within safe limits and also take complex conjugate
+            nc = (clamp(real(n), 1e-3, Inf)
+                    - im*clamp(imag(n), 0, 3000*PhysData.c/grid.ω[iω]))
+            out[iω] = -im*(grid.ω[iω]/PhysData.c*nc - grid.ω[iω]*β1)
+        end
         out[1] = 0
     end
     function βfun!(out, ω, z)
@@ -314,16 +319,22 @@ function make_linop(grid::Grid.RealGrid, mode::Modes.AbstractMode, λ0)
 end
 
 function make_linop(grid::Grid.EnvGrid, mode::Modes.AbstractMode, λ0; thg=false)
+    sidcs = (1:length(grid.ω))[grid.sidx]
     function linop!(out, z)
         fill!(out, 0.0)
-        out[grid.sidx] .= -im.*(
-            grid.ω[grid.sidx]./PhysData.c.*conj.(Modes.neff.(mode, grid.ω[grid.sidx], z=z))
-            )
-        out[grid.sidx] .-= -im.*(
-            (grid.ω[grid.sidx] .- grid.ω0).*Modes.dispersion(mode, 1, wlfreq(λ0), z=z)
-            )
+        β1 = Modes.dispersion(mode, 1, wlfreq(λ0), z=z)::Float64
         if !thg
-            out[grid.sidx] .-= -im.*Modes.β(mode, wlfreq(λ0))
+            βref = Modes.β(mode, wlfreq(λ0), z=z)
+        end
+        for iω in sidcs
+            n = Modes.neff(mode, grid.ω[iω], z=z)
+            # make sure neff is within safe limits and also take complex conjugate
+            nc = (clamp(real(n), 1e-3, Inf)
+                    - im*clamp(imag(n), 0, 3000*PhysData.c/grid.ω[iω]))
+            out[iω] = -im*(grid.ω[iω]/PhysData.c*nc - (grid.ω[iω] - grid.ω0)*β1)
+            if !thg
+                out[iω] -= -im*βref
+            end
         end
     end
     function βfun!(out, ω, z)
@@ -381,7 +392,8 @@ function make_linop(grid::Grid.RealGrid, modes, λ0; ref_mode=1)
             for iω = 2:length(grid.ω)
                 n = Modes.neff(modes[i], grid.ω[iω], z=z)
                 # make sure neff is within safe limits and also take complex conjugate
-                nc = clamp(real(n), 1e-3, Inf) - im*clamp(imag(n), 0, 3000*PhysData.c/grid.ω[iω])
+                nc = (clamp(real(n), 1e-3, Inf)
+                        - im*clamp(imag(n), 0, 3000*PhysData.c/grid.ω[iω]))
                 out[iω, i] = -im*(grid.ω[iω]/PhysData.c*nc - grid.ω[iω]*β1)
             end
         end
@@ -389,18 +401,23 @@ function make_linop(grid::Grid.RealGrid, modes, λ0; ref_mode=1)
 end
 
 function make_linop(grid::Grid.EnvGrid, modes, λ0; ref_mode=1, thg=false)
+    sidcs = (1:length(grid.ω))[grid.sidx]
     function linop!(out, z)
-        β1 = Modes.dispersion(modes[ref_mode], 1, wlfreq(λ0), z=z)
-        nmodes = length(modes)
+        β1 = Modes.dispersion(modes[ref_mode], 1, wlfreq(λ0), z=z)::Float64
         fill!(out, 0.0)
-        for i = 1:nmodes
-            out[grid.sidx, i] .= -im.*(
-                grid.ω[grid.sidx]./PhysData.c.*conj.(
-                    Modes.neff.(modes[i], grid.ω[grid.sidx], z=z))
-                .- (grid.ω[grid.sidx] .- grid.ω0) .* β1
-                )
-            if !thg
-                out[grid.sidx, i] .-= -im.*Modes.β(modes[ref_mode], wlfreq(λ0), z=z)
+        if !thg
+            βref = Modes.β(modes[ref_mode], wlfreq(λ0), z=z)
+        end
+        for i in eachindex(modes)
+            for iω in sidcs
+                n = Modes.neff(modes[i], grid.ω[iω], z=z)
+                # make sure neff is within safe limits and also take complex conjugate
+                nc = (clamp(real(n), 1e-3, Inf)
+                        - im*clamp(imag(n), 0, 3000*PhysData.c/grid.ω[iω]))
+                out[iω, i] = -im*(grid.ω[iω]/PhysData.c*nc - (grid.ω[iω] - grid.ω0)*β1)
+                if !thg
+                    out[iω, i] -= -im*βref
+                end
             end
         end
     end
