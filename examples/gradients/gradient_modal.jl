@@ -2,7 +2,7 @@ using Luna
 
 a = 13e-6
 gas = :Ar
-pres = 5
+pres = 7.5
 
 τfwhm = 30e-15
 λ0 = 800e-9
@@ -10,7 +10,7 @@ energy = 1e-6
 
 L = 15e-2
 
-coren, densityfun = Capillary.gradient(gas, L, pres, pres);
+coren, densityfun = Capillary.gradient(gas, L, pres, 0);
 
 modes = (
     Capillary.MarcatilliMode(a, coren, n=1, m=1, kind=:HE, ϕ=0.0, loss=false),
@@ -20,7 +20,6 @@ modes = (
 grid = Grid.RealGrid(L, λ0, (160e-9, 3000e-9), 1e-12)
 
 energyfun, energyfunω = Fields.energyfuncs(grid)
-normfun = NonlinearRHS.norm_modal(grid.ω)
 
 ionpot = PhysData.ionisation_potential(gas)
 ionrate = Ionisation.ionrate_fun!_ADK(ionpot)
@@ -30,8 +29,8 @@ responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
 
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy)
 
-Eω, transform, FT = Luna.setup(grid, densityfun, normfun, responses, inputs,
-                              modes, :y; full=false)
+Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs,
+                               modes, :y; full=false)
 
 statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
 output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)

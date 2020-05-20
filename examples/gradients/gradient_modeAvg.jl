@@ -12,9 +12,11 @@ L = 15e-2
 
 grid = Grid.RealGrid(L, λ0, (160e-9, 3000e-9), 1e-12)
 
-coren, densityfun = Capillary.gradient(gas, L, pres, pres);
+coren, densityfun = Capillary.gradient(gas, L, pres, 0);
 m = Capillary.MarcatilliMode(a, coren, loss=false, model=:full);
-aeff(z) = Modes.Aeff(m, z=z)
+aeff = let m = m
+    aeff(z) = Modes.Aeff(m, z=z)
+end
 
 energyfun, energyfunω = Fields.energyfuncs(grid)
 
@@ -24,13 +26,11 @@ ionrate = Ionisation.ionrate_fun!_ADK(ionpot)
 responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),
              Nonlinear.PlasmaCumtrapz(grid.to, grid.to, ionrate, ionpot))
 
-linop, βfun = LinearOps.make_linop(grid, m, λ0);
-
-normfun = NonlinearRHS.norm_mode_average(grid.ω, βfun, aeff)
+linop!, βfun! = LinearOps.make_linop(grid, m, λ0)
 
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy)
 
-Eω, transform, FT = Luna.setup(grid, energyfun, densityfun, normfun, responses, inputs, aeff)
+Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 
 statsfun = Stats.collect_stats(grid, Eω,
                                Stats.ω0(grid),
@@ -44,7 +44,7 @@ statsfun = Stats.collect_stats(grid, Eω,
                                Stats.pressure(densityfun, gas))
 output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop!, transform, FT, output)
 
 ##
 Plotting.pygui(true)
