@@ -8,7 +8,7 @@ using Reexport
 import Luna: Maths, Grid
 import Luna.PhysData: c, ε_0, μ_0, ref_index_fun, roomtemp, densityspline, sellmeier_gas
 import Luna.Modes: AbstractMode, dimlimits, neff, field, Aeff, N
-import Luna.LinearOps: make_linop, conj_clamp
+import Luna.LinearOps: make_linop, conj_clamp, neff_grid, neff_β_grid
 import Luna.PhysData: wlfreq
 import Luna.Utils: subscript
 import Base: show
@@ -191,10 +191,9 @@ end
 
 function neff(m::MarcatilliMode{Ta, Tco, Tcl, Val{true}}, εco, nwg) where {Ta, Tcl, Tco}
     if m.model == :full
-        n = sqrt(complex(εco - nwg))
-        return (real(n) < 1e-3) ? (1e-3 + im*clamp(imag(n), 0, Inf)) : n
+        return sqrt(complex(εco - nwg))
     elseif m.model == :reduced
-        return ((1 + (εco - 1)/2 - nwg))
+        return complex((1 + (εco - 1)/2 - nwg))
     else
         error("model must be :full or :reduced")
     end 
@@ -202,8 +201,7 @@ end
 
 function neff(m::MarcatilliMode{Ta, Tco, Tcl, Val{false}}, εco, nwg) where {Ta, Tcl, Tco}
     if m.model == :full
-        n = real(sqrt(complex(εco - nwg)))
-        return (real(n) < 1e-3) ? (1e-3 + im*clamp(imag(n), 0, Inf)) : n
+        return real(sqrt(complex(εco - nwg)))
     elseif m.model == :reduced
         return real((1 + (εco - 1)/2 - nwg))
     else
@@ -304,114 +302,44 @@ function gradient(gas, Z, P)
     return coren, dens
 end
 
-function make_linop(grid::Grid.RealGrid,
-                    mode::MarcatilliMode{<:Number, Tco, Tcl, LT} where {Tco, Tcl, LT},
-                    λ0)
+#= Avoid repeated calculation of the waveguide part of the effective index for modes with
+    constant core radius.
+    This is used by LinearOps.make_linop =# 
+function neff_β_grid(grid,
+                   mode::MarcatilliMode{<:Number, Tco, Tcl, LT} where {Tco, Tcl, LT},
+                   λ0)
     nwg = complex(zero(grid.ω))
-    nwg[2:end] = neff_wg.(mode, grid.ω[2:end]; z=0)
-    function linop!(out, z)
-        β1 = Modes.dispersion(mode, 1, wlfreq(λ0), z=z)::Float64
-        for iω = 2:length(grid.ω)
-            εco = mode.coren(grid.ω[iω], z=z)^2
-            nc = conj_clamp(neff(mode, εco, nwg[iω]), grid.ω[iω])
-            out[iω] = -im*(grid.ω[iω]/c*nc - grid.ω[iω]*β1)
-        end
-        out[1] = 0
-    end
-    function βfun!(out, z)
-        for iω = 2:length(grid.ω)
-            εco = mode.coren(grid.ω[iω], z=z)^2
-            n = neff(mode, εco, nwg[iω])
-            out[iω] = grid.ω[iω]/c*real(n)
-        end
-        out[1] = 1.0
-    end
-    return linop!, βfun!
-end
-
-function make_linop(grid::Grid.EnvGrid,
-                    mode::MarcatilliMode{<:Number, Tco, Tcl, LT} where {Tco, Tcl, LT},
-                    λ0; thg=false)
     sidcs = (1:length(grid.ω))[grid.sidx]
-    nwg = complex(zero(grid.ω))
-    nwg[grid.sidx] = neff_wg.(mode, grid.ω[grid.sidx]; z=0)
-    function linop!(out, z)
-        fill!(out, 0.0)
-        β1 = Modes.dispersion(mode, 1, wlfreq(λ0), z=z)::Float64
-        if !thg
-            βref = Modes.β(mode, wlfreq(λ0), z=z)
-        end
-        for iω in sidcs
-            εco = mode.coren(grid.ω[iω], z=z)^2
-            nc = conj_clamp(neff(mode, εco, nwg[iω]), grid.ω[iω])
-            out[iω] = -im*(grid.ω[iω]/c*nc - (grid.ω[iω] - grid.ω0)*β1)
-            if !thg
-                out[iω] -= -im*βref
-            end
-        end
+    for iω in sidcs
+        nwg[iω] = neff_wg(mode, grid.ω[iω]; z=0)
     end
-    function βfun!(out, z)
-        fill!(out, 1.0)
-        for iω in sidcs
-            εco = mode.coren(grid.ω[iω], z=z)^2
-            n = neff(mode, εco, nwg[iω])
-            out[iω] = grid.ω[iω]/c*real(n)
-        end
+    _neff = let nwg=nwg, ω=grid.ω, mode=mode
+        _neff(iω; z) = neff(mode, mode.coren(ω[iω], z=z)^2, nwg[iω])
     end
-    return linop!, βfun!
+    _β = let nwg=nwg, ω=grid.ω, _neff=_neff
+        _β(iω; z) = ω[iω]/c*real(_neff(iω; z=z))
+    end
+    _neff, _β
 end
 
+# Collection of modes with fixed core radius
 FixedCoreCollection = Union{
     Tuple{Vararg{MarcatilliMode{<:Number, Tco, Tcl, LT}} where {Tco, Tcl, LT}},
     AbstractArray{MarcatilliMode{<:Number, Tco, Tcl, LT} where {Tco, Tcl, LT}}
     }
 
-function make_linop(grid::Grid.RealGrid, modes::FixedCoreCollection, λ0; ref_mode=1)
+function neff_grid(grid, modes::FixedCoreCollection, λ0; ref_mode=1)
     nwg = Array{ComplexF64, 2}(undef, (length(grid.ω), length(modes)))
-    for (i, mi) in enumerate(modes)
-        nwg[2:end, i] = neff_wg.(mi, grid.ω[2:end]; z=0)
-    end
-    εco = complex(zero(grid.ω))
-    function linop!(out, z)
-        β1 = Modes.dispersion(modes[ref_mode], 1, wlfreq(λ0), z=z)::Float64
-        fill!(out, 0.0)
-        # NOTE here we assume that all modes have the same gas fill
-        εco[2:end] .= modes[ref_mode].coren.(grid.ω[2:end], z=z).^2
-        for i in eachindex(modes)
-            for iω = 2:length(grid.ω)
-                nc = conj_clamp(neff(modes[i], εco[iω], nwg[iω, i]), grid.ω[iω])
-                out[iω, i] = -im*(grid.ω[iω]/c*nc - grid.ω[iω]*β1)
-            end
-        end
-    end
-end
-
-function make_linop(grid::Grid.EnvGrid, modes::FixedCoreCollection, λ0;
-                    ref_mode=1, thg=false)
     sidcs = (1:length(grid.ω))[grid.sidx]
-    nwg = Array{ComplexF64, 2}(undef, (length(grid.ω), length(modes)))
     for (i, mi) in enumerate(modes)
-        nwg[grid.sidx, i] = neff_wg.(mi, grid.ω[grid.sidx]; z=0)
-    end
-    εco = complex(zero(grid.ω))
-    function linop!(out, z)
-        β1 = Modes.dispersion(modes[ref_mode], 1, wlfreq(λ0), z=z)::Float64
-        fill!(out, 0.0)
-        if !thg
-            βref = Modes.β(modes[ref_mode], wlfreq(λ0), z=z)
-        end
-        # NOTE here we assume that all modes have the same gas fill
-        εco[grid.sidx] .= modes[ref_mode].coren.(grid.ω[grid.sidx], z=z).^2
-        for i in eachindex(modes)
-            for iω in sidcs
-                nc = conj_clamp(neff(modes[i], εco[iω], nwg[iω, i]), grid.ω[iω])
-                out[iω, i] = -im*(grid.ω[iω]/c*nc - (grid.ω[iω] - grid.ω0)*β1)
-                if !thg
-                    out[iω, i] -= -im*βref
-                end
-            end
+        for iω in sidcs
+            nwg[iω, i] = neff_wg(mi, grid.ω[iω]; z=0)
         end
     end
+    _neff = let nwg=nwg, ω=grid.ω, modes=modes
+        _neff(iω, iim; z) = neff(modes[iim], modes[iim].coren(ω[iω], z=z)^2, nwg[iω, iim])
+    end
+    _neff
 end
 
 end
