@@ -18,8 +18,9 @@ grid = Grid.RealGrid(flength, λ0, (160e-9, 3000e-9), 1e-12)
 
 energyfun, energyfunω = Fields.energyfuncs(grid)
 
-dens0 = PhysData.density(gas, pres)
-densityfun(z) = dens0
+densityfun = let dens0=PhysData.density(gas, pres)
+    z -> dens0
+end
 
 ionpot = PhysData.ionisation_potential(gas)
 ionrate = Ionisation.ionrate_fun!_PPTcached(gas, λ0)
@@ -29,8 +30,7 @@ responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),
 
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy)
 
-Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs,
-                              modes, :y; full=false)
+Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, modes, :y; full=false)
                               
 linop = LinearOps.make_const_linop(grid, modes, λ0)
 
