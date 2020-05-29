@@ -101,6 +101,40 @@ function coherence(Eω, prodidcs, restidcs)
     @. abs(num/sqrt(den1*den2))
 end
 
+
+"""
+    coherence(Eω; ndim=1)
+
+Calculate the first-order coherence function g₁₂ of the set of fields `Eω`. The ensemble
+average is taken over the last `ndim` dimensions of `Eω`, other dimensions are preserved.
+
+See J. M. Dudley and S. Coen, Optics Letters 27, 1180 (2002).
+"""
+function coherence(Eω; ndim=1)
+    dimsize = size(Eω)[end-ndim+1:end]
+    outsize = size(Eω)[1:end-ndim]
+    prodidcs = CartesianIndices(dimsize)
+    restidcs = CartesianIndices(outsize)
+    coherence(Eω, prodidcs, restidcs)
+end
+
+# function barrier for speedup
+function coherence(Eω, prodidcs, restidcs)
+    num = zeros(ComplexF64, size(restidcs))
+    den1 = zeros(ComplexF64, size(restidcs))
+    den2 = zeros(ComplexF64, size(restidcs))
+    it = Iterators.product(prodidcs, prodidcs)
+    for (idx1, idx2) in it
+        Eω1 = Eω[restidcs, idx1]
+        Eω2 = Eω[restidcs, idx2]
+        @. num += conj(Eω1)*Eω2
+        @. den1 += abs2(Eω1)
+        @. den2 += abs2(Eω2)
+    end
+    @. abs(num/sqrt(den1*den2))
+end
+
+
 """
     arrivaltime(grid, Eω; bandpass=nothing, method=:moment, oversampling=1)
 
@@ -495,12 +529,14 @@ getEt(output::AbstractOutput, args...; kwargs...) = getEt(
     makegrid(output), output, args...; kwargs...)
 
 """
-    getEt(grid, Eω; trange=nothing, oversampling=4, bandpass=nothing)
+    getEt(grid, Eω; trange=nothing, oversampling=4, bandpass=nothing, FTL=false)
 
 Get the envelope time-domain electric field (including the carrier wave) from the frequency-
 domain field `Eω`. The field can be cropped in time using `trange`, it is oversampled by
-a factor of `oversampling` (default 4) and can be bandpassed using a pre-defined window,
-or wavelength limits with `bandpass` (see [`window_maybe`](@ref)).
+a factor of `oversampling` (default 4) and can be bandpassed with `bandpass`
+(see [`window_maybe`](@ref)). If `FTL` is `true`, return the Fourier-transform limited pulse,
+i.e. remove any spectral phase.
+
 If `zslice` is given, returs only the slices of `Eω` closest to the given distances. `zslice`
 can be a single number or an array.
 """
@@ -526,10 +562,14 @@ end
 getEt(grid::AbstractGrid, output::AbstractOutput; kwargs...) = getEt(grid, output["Eω"]; kwargs...)
 
 function getEt(grid::AbstractGrid, output::AbstractOutput, zslice;
-               trange=nothing, oversampling=4, bandpass=nothing)
+               trange=nothing, oversampling=4, bandpass=nothing, FTL=false)
     t = grid.t
     zidx = nearest_z(output, zslice)
     Eω = window_maybe(grid.ω, output["Eω", .., zidx], bandpass)
+    if FTL
+        τ = length(grid.t) * (grid.t[2] - grid.t[1])/2
+        Eω .= abs.(Eω) .* exp.(-1im .* grid.ω .* τ)
+    end
     Etout = envelope(grid, Eω)
     if isnothing(trange)
         idcs = 1:length(t)
@@ -540,14 +580,24 @@ function getEt(grid::AbstractGrid, output::AbstractOutput, zslice;
     return to, Eto, output["z"][zidx]
 end
 
-struct PeakWindow
+"""
+    PeakWindow(width, λmin, λmax; relative=false)
+
+Window function generator which automatically tracks the peak in the spectral region given
+by `λmin` and `λmax` and applies a window of a specific `width` around the peak. If 
+`relative` is `true`, `width` is relative bandwidth instead of the wavelength width.
+
+A `PeakWindow` automatically stores the limits of the windows it applies in the field `lims`.
+"""
+mutable struct PeakWindow
     width::Float64
     λmin::Float64
     λmax::Float64
     relative::Bool
+    lims
 end
 
-PeakWindow(width, λmin, λmax; relative=false) = PeakWindow(width, λmin, λmax, relative)
+PeakWindow(width, λmin, λmax; relative=false) = PeakWindow(width, λmin, λmax, relative, nothing)
 
 function (pw::PeakWindow)(ω, Eω)
     cidcs = CartesianIndices(size(Eω)[3:end]) # dims are ω, modes, rest...
@@ -555,14 +605,17 @@ function (pw::PeakWindow)(ω, Eω)
     cropidcs = (ω .> wlfreq(pw.λmax)) .& (ω .< wlfreq(pw.λmin))
     cropω = ω[cropidcs]
     Iω = abs2.(Eω)
+    limsA = zeros((2, size(Eω)[3:end]...))
     for cidx in cidcs
         λpeak = wlfreq(cropω[argmax(Iω[cropidcs, 1, cidx])])
         lims = pw.relative ? λpeak.*(1 .+ (-0.5, 0.5).*pw.width) : λpeak .+ (-0.5, 0.5).*pw.width
         window = ωwindow_λ(ω, lims)
+        limsA[:, cidx] .= lims
         for midx in 1:size(Eω, 2)
             out[:, midx, cidx] .= Eω[:, midx, cidx] .* window
         end
     end
+    pw.lims = limsA
     out
 end
 

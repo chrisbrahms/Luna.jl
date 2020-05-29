@@ -51,7 +51,7 @@ const gas_str = Dict(
     :N2 => "Nitrogen",
     :H2 => "Hydrogen"
 )
-const glass = (:SiO2, :BK7, :KBr, :CaF2, :BaF2, :Si)
+const glass = (:SiO2, :BK7, :KBr, :CaF2, :BaF2, :Si, :MgF2)
 const metal = (:Ag,:Al)
 
 "Change from ω to λ and vice versa"
