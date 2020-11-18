@@ -35,7 +35,9 @@ inputs = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy)
 
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 
-statsfun = Stats.default(grid, Eω, m, linop, transform; gas=gas, windows=((150e-9, 300e-9),))
+ppwin = Stats.peakpower(grid, Eω, (150e-9, 300e-9)) # peak power of dispersive wave
+statsfun = Stats.default(grid, Eω, m, linop, transform;
+                         gas=gas, windows=((150e-9, 300e-9),), userfuns=(ppwin,))
 output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
 
 Luna.run(Eω, grid, linop, transform, FT, output)
