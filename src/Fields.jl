@@ -12,6 +12,7 @@ import Optim
 import CSV
 import HCubature: hquadrature
 import DSP: unwrap
+import Logging: @warn
 
 abstract type AbstractField end
 abstract type TimeField <: AbstractField end
@@ -24,26 +25,24 @@ Represents a temporal pulse with shape defined by `Itshape`.
 # Fields
 - `λ0::Float64`: the central field wavelength
 - `energy::Float64`: the pulse energy
-- `ϕ::Float64`: the CEO phase
-- `τ0::Float64`: the temproal shift from grid time 0
+- `ϕ::Vector{Float64}`: spectral phases (CEP, group delay, GDD, TOD, ...)
 - `Itshape`: a callable `f(t)` to get the shape of the intensity/power in the time domain
 """
 struct PulseField{iT} <: TimeField
     λ0::Float64
     energy::Float64
-    ϕ::Float64
-    τ0::Float64
+    ϕ::Vector{Float64}
     Itshape::iT
 end
 
 """
-    GaussField(;λ0, τfwhm, energy, ϕ=0.0, τ0=0.0, m=1)
+    GaussField(;λ0, τfwhm, energy, ϕ, m=1)
 
 Construct a (super)Gaussian shaped pulse with intensity/power FWHM `τfwhm`, either
 `energy` or peak `power` specified, superGaussian parameter `m=1` and other parameters
 as defined for [`PulseField`](@ref).
 """
-function GaussField(;λ0, τfwhm, energy=nothing, power=nothing, ϕ=0.0, τ0=0.0, m=1)
+function GaussField(;λ0, τfwhm, energy=nothing, power=nothing, ϕ=Float64[], m=1)
     if !isnothing(power)
         if !isnothing(energy)
             error("only one of `energy` or `power` can be specified")
@@ -53,7 +52,7 @@ function GaussField(;λ0, τfwhm, energy=nothing, power=nothing, ϕ=0.0, τ0=0.0
     elseif isnothing(energy)
         error("one of `energy` or `power` must be specified")
     end
-    PulseField(λ0, energy, ϕ, τ0, t -> Maths.gauss(t, fwhm=τfwhm, power=2*m))
+    PulseField(λ0, energy, ϕ, t -> Maths.gauss(t, fwhm=τfwhm, power=2*m))
 end
 
 """
@@ -65,7 +64,7 @@ natural width `τw`, or the intensity/power FWHM `τfwhm`, and either
 Other parameters are as defined for [`PulseField`](@ref).
 """
 function SechField(;λ0, energy=nothing, power=nothing, τw=nothing, τfwhm=nothing,
-                    ϕ=0.0, τ0=0.0)
+                    ϕ=Float64[])
     if !isnothing(τfwhm)
         if !isnothing(τw)
             error("only one of `τw` or `τfwhm` can be specified")
@@ -84,7 +83,7 @@ function SechField(;λ0, energy=nothing, power=nothing, τw=nothing, τfwhm=noth
     elseif isnothing(energy)
         error("one of `energy` or `power` must be specified")
     end
-    PulseField(λ0, energy, ϕ, τ0, t -> sech(t/τw)^2)
+    PulseField(λ0, energy, ϕ, t -> sech(t/τw)^2)
 end
 
 """
@@ -94,15 +93,15 @@ Create electric field for `PulseField`, either the field (for `RealGrid`) or
 the envelope (for `EnvGrid`)
 """
 function make_Et(p::PulseField, grid::Grid.RealGrid)
-    t = grid.t .- p.τ0
+    t = grid.t
     ω0 = PhysData.wlfreq(p.λ0)
-    @. sqrt(p.Itshape(t))*cos(ω0*t + p.ϕ)
+    @. sqrt(p.Itshape(t))*cos(ω0*t)
 end
 
 function make_Et(p::PulseField, grid::Grid.EnvGrid)
-    t = grid.t .- p.τ0
+    t = grid.t
     Δω = PhysData.wlfreq(p.λ0) - grid.ω0
-    @. sqrt(p.Itshape(t))*exp(im*(p.ϕ + Δω*t))
+    @. sqrt(p.Itshape(t))*exp(im*(Δω*t))
 end
 
 """
@@ -113,7 +112,9 @@ Add the field to `Eω` for the provided `grid`, `energy_t` function and Fourier 
 function (p::PulseField)(grid, FT)
     Et = make_Et(p, grid)
     energy_t = Fields.energyfuncs(grid)[1]
-    FT * (sqrt(p.energy)/sqrt(energy_t(Et)) .* Et)
+    Eω = FT * (sqrt(p.energy)/sqrt(energy_t(Et)) .* Et)
+    (length(p.ϕ) >= 1) && prop_taylor!(Eω, grid, p.ϕ, p.λ0)
+    Eω
 end
 
 """
@@ -169,29 +170,34 @@ function (c::CWField)(grid::Grid.EnvGrid, FT)
     Eω
 end
 
-"""
-    DataField(ω, Iω, ϕω, energy)
-
-Represents a field with spectral power density `Iω` and spectral phase `ϕω`, sampled on
-radial frequency axis `ω`.
-"""
 struct DataField <: TimeField
     ω::Vector{Float64}
     Iω::Vector{Float64}
     ϕω::Vector{Float64}
     energy::Float64
+    ϕ::Vector{Float64}
+    λ0::Float64
 end
 
 """
-    DataField(ω, Eω, energy)
+    DataField(ω, Iω, ϕω; energy, ϕ=Float64[], λ0=NaN)
+
+Represents a field with spectral power density `Iω` and spectral phase `ϕω`, sampled on
+radial frequency axis `ω`.
+"""
+DataField(ω, Iω, ϕω; energy, ϕ=Float64[], λ0=NaN) = DataField(ω, Iω, ϕω, energy, ϕ, λ0)
+
+"""
+    DataField(ω, Eω; energy, ϕ=Float64[], λ0=NaN)
 
 Create a `DataField` from the complex frequency-domain field `Eω` sampled on radial
 frequency grid `ω`.
 """
-DataField(ω, Eω, energy) = DataField(ω, abs2.(Eω), unwrap(angle.(Eω)), energy)
+DataField(ω, Eω; energy, ϕ=Float64[], λ0=NaN) = DataField(ω, abs2.(Eω), unwrap(angle.(Eω)),
+                                                          energy, ϕ, λ0)
 
 """
-    DataField(fpath, energy)
+    DataField(fpath; energy, ϕ=Float64[], λ0=NaN)
 
 Create a `DataField` by loading `ω`, `Iω`, and `ϕω` from the file at `fpath`. The file must
 contain 3 columns:
@@ -200,9 +206,9 @@ contain 3 columns:
 - spectral power density (arbitrary units)
 - unwrapped spectral phase
 """
-function DataField(fpath, energy)
+function DataField(fpath; energy, ϕ=Float64[], λ0=NaN)
     dat = CSV.read(fpath)
-    DataField(dat[:, 1]*2π, dat[:, 2], dat[:, 3], energy)
+    DataField(dat[:, 1]*2π, dat[:, 2], dat[:, 3]; energy, ϕ)
 end
 
 """
@@ -211,6 +217,9 @@ end
 Interpolate the `DataField` onto the provided `grid` (note the argument `FT` is unused).
 """
 function (d::DataField)(grid::Grid.AbstractGrid, FT)
+    if maximum(grid.ω) < maximum(d.ω)
+        @warn("Interpolating onto a coarser grid may clip the input spectrum.")
+    end
     energy_ω = Fields.energyfuncs(grid)[2]
     ϕg = Maths.BSpline(d.ω, d.ϕω).(grid.ω)
     Ig = Maths.BSpline(d.ω, d.Iω).(grid.ω)
@@ -221,6 +230,11 @@ function (d::DataField)(grid::Grid.AbstractGrid, FT)
     Eω .*= sqrt(d.energy/energy_ω(Eω))
     τ = length(grid.t) * (grid.t[2] - grid.t[1])/2
     Eω .*= exp.(-1im .* grid.ω .* τ)
+    if length(d.ϕ) >= 1
+        λ0 = isnan(d.λ0) ? wlfreq(Maths.moment(d.ω, d.Iω)) : d.λ0
+        prop_taylor!(Eω, grid, d.ϕ, λ0)
+    end
+    Eω
 end
 
 """
@@ -553,9 +567,11 @@ prop_mirror!(Eω, grid::Grid.AbstractGrid, args...) = prop_mirror!(Eω, grid.ω,
 prop_mirror(Eω, args...) = prop_mirror!(copy(Eω), args...)
 
 """
-    prop_mirror!(Eω, ω, mirror, reflections)
+    prop_mode!(Eω, ω, mode, distance, λ0=nothing)
 
-Propagate the field `Eω` linearly by adding a number of `reflections` from the `mirror` type.
+Propagate the field `Eω` linearly by a certain `distance` in the given `mode`. If the
+central wavelength `λ0` is given, remove the group delay at this wavelength. Propagation
+includes both dispersion and loss.
 """
 function prop_mode!(Eω, ω, mode, distance, λ0=nothing)
     β(z) = ω./PhysData.c .* Modes.neff.(mode, ω; z=z)
@@ -581,21 +597,29 @@ prop_mode(Eω, args...) = prop_mode!(copy(Eω), args...)
 Maximise the peak power of the field `Eω` by adding Taylor-expanded spectral phases up to
 order `order`. 
 """
-function optcomp_taylor(Eω::AbstractVecOrMat, grid, λ0; order=2)
+function optcomp_taylor(Eω::AbstractVecOrMat, grid, λ0; order=2, boundfac=8)
     τ = length(grid.t) * (grid.t[2] - grid.t[1])/2
     EωFTL = abs.(Eω) .* exp.(-1im .* grid.ω .* τ)
     ItFTL = _It(iFT(EωFTL, grid), grid)
-    target = 1e12/maximum(ItFTL)
+    target = 1/maximum(ItFTL)
+
+    Eωnorm = Eω ./ sqrt(maximum(ItFTL))
 
     function f(disp)
         # disp here is just the dispersion terms (2nd order and higher)
         ϕs = [0, 0, disp...]
-        Eωp = prop_taylor(Eω, grid, ϕs, λ0)
+        Eωp = prop_taylor(Eωnorm, grid, ϕs, λ0)
         Itp = _It(iFT(Eωp, grid), grid)
-        1e12/maximum(Itp)
+        1/maximum(Itp)
     end
 
-    bounds = (100e-15 .^(1:order))[2:end]
+    τ0FTL = Maths.fwhm(grid.t, ItFTL)/(2*sqrt(log(2)))
+    τ0 = Maths.fwhm(grid.t, _It(iFT(Eω, grid), grid))/(2*sqrt(log(2)))
+
+    ϕ2_0 = τ0FTL*sqrt(τ0^2 - τ0FTL^2) # GDD to stretch Gaussian from FTL to actual duration
+
+    # for Gaussian with pure GDD, sqrt(ϕ2_0) is the FTL duration, so use that as guide
+    bounds = boundfac*(sqrt(ϕ2_0) .^(2:order))
     srange = [(-bi, bi) for bi in bounds]
     res = BlackBoxOptim.bboptimize(f; SearchRange=srange,
                                    TraceMode=:silent, TargetFitness=target)
@@ -629,16 +653,18 @@ function optcomp_material(Eω::AbstractVecOrMat, grid, material, λ0,
     τ = length(grid.t) * (grid.t[2] - grid.t[1])/2
     EωFTL = abs.(Eω) .* exp.(-1im .* grid.ω .* τ)
     ItFTL = _It(iFT(EωFTL, grid), grid)
-    target = 1e12/maximum(ItFTL)
+    target = 1/maximum(ItFTL)
+
+    Eωnorm = Eω ./ sqrt(maximum(ItFTL))
 
     prop! = propagator_material(material; kwargs...)
 
     function f(d)
         # d is the material insertion
-        Eωp = copy(Eω)
+        Eωp = copy(Eωnorm)
         prop!(Eωp, grid.ω, d, λ0)
         Itp = _It(iFT(Eωp, grid), grid)
-        1e12/maximum(Itp)
+        1/maximum(Itp)
     end
 
     # res = BlackBoxOptim.bboptimize(f; SearchRange=[srange],
