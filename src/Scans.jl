@@ -385,7 +385,7 @@ function remote_setup(name, script, batches)
     read(`scp $script HWLX0003-EPS:\$HOME/luna_sims/$folder`)
     @info "Making job script..."
     subfile = read(
-        `ssh HWLX0003-EPS /opt/julia-1.4.1/bin/julia \$HOME/luna_sims/$folder/$scriptfile --condor $batches`,
+        `ssh HWLX0003-EPS /opt/julia-1.5.1/bin/julia \$HOME/luna_sims/$folder/$scriptfile --condor $batches`,
         String)
     @info "Submitting job..."
     out = read(`ssh HWLX0003-EPS condor_submit $subfile`, String)
