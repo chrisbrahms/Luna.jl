@@ -728,8 +728,10 @@ function lookup_mirror(type)
         p[2:end] = 0 # polynomials use 0-based indexing - only use constant and linear term
         ϕ .-= p.(ωfs .- ωfs0) # subtract linear part
         ϕspl = Maths.BSpline(λGDD*1e-9, ϕ)
-        return λ -> rspl(λ) * exp(-1im*ϕspl(λ)) * Maths.planck_taper(
-            λ, 400e-9, 450e-9, 1200e-9, 1300e-9)
+        λlims = extrema(λGDD) .* 1e-9
+        ϕfun(λ) = (λlims[1] <= λ <= λlims[2]) ? ϕspl(λ) : 0
+        return λ -> rspl(λ) * exp(-1im*ϕfun(λ)) * Maths.planck_taper(
+            λ, 400e-9, 450e-9, 2450e-9, 2500e-9)
     elseif type == :ThorlabsUMC
         # λ (nm), R(p) (%), R(s) (%)
         Rdat = CSV.File(joinpath(Utils.datadir(), "UCxx-15FS_R.csv"))
