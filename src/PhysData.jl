@@ -64,6 +64,7 @@ wlfreq(ωλ) = 2π*c/ωλ
 ΔλΔω(Δλ, λ) = (2π*c)*Δλ/λ^2
 
 eV_to_m(eV) = wlfreq(electron*eV/ħ)
+m_to_eV(m) = wlfreq(m)*ħ/electron
 
 "Linear coefficients"
 
@@ -149,6 +150,9 @@ function sellmeier_gas(material::Symbol)
         B2 = 4903.7e-6
         C2 = 92.0
         return γ_Peck(B1, C1, B2, C2, density(material, atm/bar, 273.15))
+    elseif material == :ArP
+        ρ = density(material, atm/bar, 273.15)
+        return μm -> ((1 + 6.786711e-5 + 3.0182943e-2/(144-1/μm^2))^2 - 1)/ρ
     else
         throw(DomainError(material, "Unknown gas $material"))
     end

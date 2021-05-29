@@ -136,6 +136,7 @@ function save_dict_h5(fpath, d; force=false, rmold=false)
         end
     end
     
+    isdir(dirname(fpath)) || mkpath(dirname(fpath))
     @hlock HDF5.h5open(fpath, "cw") do file
         for (k, v) in pairs(d)
             dict2h5(k, v, file)

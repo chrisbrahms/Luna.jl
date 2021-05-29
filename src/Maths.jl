@@ -136,6 +136,7 @@ point of y.
 function level_xings(x::AbstractVector, y::AbstractVector;
                      method=:linear, baseline=false, minmax=:min, level=0.5)
     minmax in (:min, :max) || error("minmax has to be :min or :max")
+    length(x) == length(y) || error("x and y must be the same length")
     if baseline
         val = minimum(y) + level*(maximum(y) - minimum(y))
     else

@@ -97,6 +97,7 @@ include("Tools.jl")
 include("Plotting.jl")
 include("Raman.jl")
 include("Interface.jl")
+include("SFA.jl")
 
 prop_capillary = Interface.prop_capillary
 
