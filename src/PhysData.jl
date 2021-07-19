@@ -337,8 +337,8 @@ end
     pressure in bar
     temperature in Kelvin
 Gases only."
-function χ1_fun(gas::Symbol; Lorentz=false)
-    γ = Lorentz ? Lorentzian(gas) : sellmeier_gas(gas)
+function χ1_fun(gas::Symbol; lorentz=false)
+    γ = lorentz ? Lorentzian(gas) : sellmeier_gas(gas)
     f = let γ=γ, gas=gas
         function χ1(λ, P, T)
             γ(λ*1e6)*density(gas, P, T)
@@ -347,28 +347,28 @@ function χ1_fun(gas::Symbol; Lorentz=false)
     return f
 end
 
-function χ1_fun(gas::Symbol, P, T; Lorentz=false)
-    γ = Lorentz ? Lorentzian(gas) : sellmeier_gas(gas)
+function χ1_fun(gas::Symbol, P, T; lorentz=false)
+    γ = lorentz ? Lorentzian(gas) : sellmeier_gas(gas)
     dens = density(gas, P, T)
     return λ -> γ(λ*1e6)*dens
 end
 
 "Get χ1 at wavelength λ in SI units, pressure P in bar and temperature T in Kelvin.
 Gases only."
-function χ1(gas::Symbol, λ, P=1.0, T=roomtemp; Lorentz=false)
-    return χ1_fun(gas; Lorentz)(λ, P, T)
+function χ1(gas::Symbol, λ, P=1.0, T=roomtemp; lorentz=false)
+    return χ1_fun(gas; lorentz)(λ, P, T)
 end
 
 
 "Get refractive index for any material at wavelength given in SI units"
-function ref_index(material, λ, P=1.0, T=roomtemp; lookup=nothing)
-    return ref_index_fun(material, P, T; lookup=lookup)(λ)
+function ref_index(material, λ, P=1.0, T=roomtemp; lookup=nothing, lorentz=false)
+    return ref_index_fun(material, P, T; lookup, lorentz)(λ)
 end
 
 "Get function which returns refractive index."
-function ref_index_fun(material::Symbol, P=1.0, T=roomtemp; lookup=nothing, Lorentz=false)
+function ref_index_fun(material::Symbol, P=1.0, T=roomtemp; lookup=nothing, lorentz=false)
     if material in gas
-        χ1 = χ1_fun(material, P, T; Lorentz)
+        χ1 = χ1_fun(material, P, T; lorentz)
         return λ -> sqrt(1 + χ1(λ))
     elseif material in glass
         if isnothing(lookup)
