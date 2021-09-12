@@ -1,5 +1,5 @@
 module Capillary
-import FunctionZeros: besselj_zero
+import FastGaussQuadrature: approx_besselroots
 import SpecialFunctions: besselj
 import StaticArrays: SVector
 import Cubature: hquadrature
@@ -246,9 +246,9 @@ function get_unm(n, m, kind)
         if (n != 0)
             error("n=0 for TE or TM modes")
         end
-        besselj_zero(1, m)
+        approx_besselroots(1, m)[end]
     elseif kind == :HE
-        besselj_zero(n-1, m)
+        approx_besselroots(n-1, m)[end]
     else
         error("kind must be :TE, :TM or :HE")
     end

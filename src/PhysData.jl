@@ -1,6 +1,6 @@
 module PhysData
 
-import CoolProp
+import Clapeyron
 import PhysicalConstants: CODATA2014
 import Unitful: ustrip
 import CSV
@@ -43,17 +43,16 @@ const N_A = ustrip(CODATA2014.N_A)
 const amg = atm/(k_B*273.15)
 
 const gas = (:Air, :He, :HeJ, :Ne, :Ar, :Kr, :Xe, :N2, :H2, :O2)
-const gas_str = Dict(
-    :He => "He",
-    :HeJ => "He",
-    :Ar => "Ar",
-    :Ne => "Neon",
-    :Kr => "Krypton",
-    :Xe => "Xenon",
-    :Air => "Air",
-    :N2 => "Nitrogen",
-    :H2 => "Hydrogen",
-    :O2 => "Oxygen"
+const gas_models = Dict(
+    :He => Clapeyron.SAFTVRQMie(["Helium"]),
+    :HeJ => Clapeyron.SAFTVRQMie(["Helium"]),
+    :Ne => Clapeyron.SAFTVRQMie(["Neon"]),
+    :Ar => Clapeyron.sPCSAFT(["Argon"]),
+    :Kr => Clapeyron.sPCSAFT(["Krypton"]),
+    :Xe => Clapeyron.sPCSAFT(["Xenon"]),
+    :N2 => Clapeyron.sPCSAFT(["Nitrogen"]),
+    :H2 => Clapeyron.sPCSAFT(["Hydrogen"]),
+    :O2 => Clapeyron.sPCSAFT(["Oxygen"]),
 )
 const glass = (:SiO2, :BK7, :KBr, :CaF2, :BaF2, :Si, :MgF2, :ADPo, :ADPe, :KDPo, :KDPe)
 const metal = (:Ag,:Al)
@@ -593,7 +592,8 @@ end
 Number density of `gas` [m^-3] at pressure `P` [bar] and temperature `T` [K].
 """
 function density(gas::Symbol, P, T=roomtemp)
-    P == 0 ? zero(P) : CoolProp.PropsSI("DMOLAR", "T", T, "P", bar*P, gas_str[gas])*N_A
+    
+    P == 0 ? zero(P) : N_A/Clapeyron.volume(gas_models[gas], bar*P, T)
 end
 
 """
@@ -603,7 +603,7 @@ Calculate the pressure in bar of the `gas` at number density `density` and tempe
 """
 function pressure(gas, density, T=roomtemp)
     density == 0 ? zero(density) :
-                   CoolProp.PropsSI("P", "T", T, "DMOLAR", density/N_A, gas_str[gas])/bar
+                   Clapeyron.pressure(gas_models[gas], N_A/density, T)/bar
 end
 
 """
