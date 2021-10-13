@@ -7,7 +7,7 @@ using Reexport
 @reexport using Luna.Modes
 import Luna: Maths, Grid
 import Luna.PhysData: c, ε_0, μ_0, ref_index_fun, roomtemp, densityspline, sellmeier_gas
-import Luna.Modes: AbstractMode, dimlimits, neff, field, Aeff, N
+import Luna.Modes: AbstractMode, dimlimits, neff, field, Aeff, N, geomfac
 import Luna.LinearOps: make_linop, conj_clamp, neff_grid, neff_β_grid
 import Luna.PhysData: wlfreq
 import Luna.Utils: subscript
@@ -257,19 +257,22 @@ end
 radius(m::MarcatiliMode{<:Number, Tco, Tcl, LT}, z) where {Tcl, Tco, LT} = m.a
 radius(m::MarcatiliMode, z) = m.a(z)
 
-dimlimits(m::MarcatiliMode; z=0) = (:polar, (0.0, 0.0), (radius(m, z), 2π))
+dimlimits(m::MarcatiliMode; z=0) = (:polar, (0.0, 0.0), (radius(m, z), π))
+
+geomfac(m::MarcatiliMode) = 2
 
 # we use polar coords, so xs = (r, θ)
 function field(m::MarcatiliMode, xs; z=0)
+    r, θ = xs
     if m.kind == :HE
-        return (besselj(m.n-1, xs[1]*m.unm/radius(m, z)) .* SVector(
-            cos(xs[2])*sin(m.n*(xs[2] + m.ϕ)) - sin(xs[2])*cos(m.n*(xs[2] + m.ϕ)),
-            sin(xs[2])*sin(m.n*(xs[2] + m.ϕ)) + cos(xs[2])*cos(m.n*(xs[2] + m.ϕ))
+        return (besselj(m.n-1, r*m.unm/radius(m, z)) .* SVector(
+            cos(θ)*sin(m.n*(θ + m.ϕ)) - sin(θ)*cos(m.n*(θ + m.ϕ)),
+            sin(θ)*sin(m.n*(θ + m.ϕ)) + cos(θ)*cos(m.n*(θ + m.ϕ))
             ))
     elseif m.kind == :TE
-        return besselj(1, xs[1]*m.unm/radius(m, z)) .* SVector(-sin(xs[2]), cos(xs[2]))
+        return besselj(1, r*m.unm/radius(m, z)) .* SVector(-sin(θ), cos(θ))
     elseif m.kind == :TM
-        return besselj(1, xs[1]*m.unm/radius(m, z)) .* SVector(cos(xs[2]), sin(xs[2]))
+        return besselj(1, r*m.unm/radius(m, z)) .* SVector(cos(θ), sin(θ))
     end
 end
 
