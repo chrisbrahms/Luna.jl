@@ -239,16 +239,16 @@ function pointcalc!(fval, xs, t::TransModal)
             fval[:, i] .= 0.0
             continue
         end
-        if size(xs, 1) > 1
+        if size(xs, 1) > 1 # full 2-D mode integral
             x2 = xs[2, i]
             if t.dimlimits[1] == :polar
-                pre = x1
+                pre = Modes.geomfac(t.ts.ms[1])*x1
             else
                 if x2 <= t.dimlimits[2][2] || x1 >= t.dimlimits[3][2]
                     fval[:, i] .= 0.0
                     continue
                 end
-                pre = 1.0
+                pre = Modes.geomfac(t.ts.ms[1])*1.0
             end
         else
             if t.dimlimits[1] == :polar
@@ -277,8 +277,8 @@ end
 
 function (t::TransModal)(nl, Eω, z)
     reset!(t, Eω, z)
+    coords, ll, ul = t.dimlimits
     if t.full
-        coords, ll, ul = t.dimlimits
         if coords == :polar
             ul = (ul[1], ul[2]/Modes.geomfac(t.ts.ms[1]))
         end
@@ -295,7 +295,6 @@ function (t::TransModal)(nl, Eω, z)
             reltol=t.rtol, abstol=t.atol, maxevals=t.mfcn, error_norm=Cubature.L2)
     end
     nl .= reshape(reinterpret(ComplexF64, val), size(nl))
-    nl .*= Modes.geomfac(t.ts.ms[1])
 end
 
 """
