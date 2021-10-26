@@ -592,8 +592,16 @@ end
 Number density of `gas` [m^-3] at pressure `P` [bar] and temperature `T` [K].
 """
 function density(gas::Symbol, P, T=roomtemp)
-    
-    P == 0 ? zero(P) : N_A/Clapeyron.volume(gas_models[gas], bar*P, T)
+    if P == 0
+        return zero(P)
+    else
+        v = Clapeyron.volume(gas_models[gas], bar*P, T)
+        if isnan(v) # at very low pressure, equations of state don't give good results
+            return bar*P/(k_B*T)
+        else
+            return N_A/v
+        end
+    end
 end
 
 """
@@ -602,8 +610,16 @@ end
 Calculate the pressure in bar of the `gas` at number density `density` and temperature `T`.
 """
 function pressure(gas, density, T=roomtemp)
-    density == 0 ? zero(density) :
-                   Clapeyron.pressure(gas_models[gas], N_A/density, T)/bar
+    if density == 0
+        return zero(density)
+    else
+        P = Clapeyron.pressure(gas_models[gas], N_A/density, T)/bar
+        if isnan(P)
+            return k_B*T*density/bar
+        else
+            return P
+        end
+    end       
 end
 
 """
