@@ -189,34 +189,47 @@ function (c::CWField)(grid::Grid.EnvGrid, FT)
     Eω
 end
 
-struct DataField <: TimeField
+struct DataField{eT, pT} <: TimeField
     ω::Vector{Float64}
     Iω::Vector{Float64}
     ϕω::Vector{Float64}
-    energy::Float64
+    energy::eT
+    power::pT
     ϕ::Vector{Float64}
     λ0::Float64
 end
 
+function DataField(ω, Iω, ϕω, energy, power, ϕ, λ0)
+    if isnothing(energy) && isnothing(power)
+        error("one of power or energy must be given to DataField")
+    elseif ~isnothing(energy) && ~isnothing(energy)
+        error("only one of power or energy can be given to DataField")
+    end
+    DataField(ω, Iω, ϕω, energy, power, ϕ, λ0)
+end
+
 """
-    DataField(ω, Iω, ϕω; energy, ϕ=Float64[], λ0=NaN)
+    DataField(ω, Iω, ϕω; energy=nothing, power=nothing ϕ=Float64[], λ0=NaN)
 
 Represents a field with spectral power density `Iω` and spectral phase `ϕω`, sampled on
 radial frequency axis `ω`.
 """
-DataField(ω, Iω, ϕω; energy, ϕ=Float64[], λ0=NaN) = DataField(ω, Iω, ϕω, energy, ϕ, λ0)
+DataField(ω, Iω, ϕω; energy=nothing, power=nothing, ϕ=Float64[], λ0=NaN) = DataField(
+    ω, Iω, ϕω, energy, power, ϕ, λ0
+)
 
 """
-    DataField(ω, Eω; energy, ϕ=Float64[], λ0=NaN)
+    DataField(ω, Eω; energy=nothing, power=nothing, ϕ=Float64[], λ0=NaN)
 
 Create a `DataField` from the complex frequency-domain field `Eω` sampled on radial
 frequency grid `ω`.
 """
-DataField(ω, Eω; energy, ϕ=Float64[], λ0=NaN) = DataField(ω, abs2.(Eω), unwrap(angle.(Eω)),
-                                                          energy, ϕ, λ0)
+DataField(ω, Eω; kwargs...) = DataField(
+    ω, abs2.(Eω), unwrap(angle.(Eω)); kwargs...
+)
 
 """
-    DataField(fpath; energy, ϕ=Float64[], λ0=NaN)
+    DataField(fpath; energy=nothing, power=nothing, ϕ=Float64[], λ0=NaN)
 
 Create a `DataField` by loading `ω`, `Iω`, and `ϕω` from the file at `fpath`. The file must
 contain 3 columns:
@@ -225,15 +238,15 @@ contain 3 columns:
 - spectral power density (arbitrary units)
 - unwrapped spectral phase
 """
-function DataField(fpath; energy, ϕ=Float64[], λ0=NaN)
+function DataField(fpath; kwargs...)
     dat = readdlm(fpath, ' ')
-    DataField(dat[:, 1]*2π, dat[:, 2], dat[:, 3]; energy, ϕ)
+    DataField(dat[:, 1]*2π, dat[:, 2], dat[:, 3]; kwargs...)
 end
 
 """
     (d::DataField)(grid, FT)
 
-Interpolate the `DataField` onto the provided `grid` (note the argument `FT` is unused).
+Interpolate the `DataField` onto the provided `grid`.
 """
 function (d::DataField)(grid::Grid.AbstractGrid, FT)
     if maximum(grid.ω) < maximum(d.ω)
@@ -246,12 +259,20 @@ function (d::DataField)(grid::Grid.AbstractGrid, FT)
     Ig[.!(minimum(d.ω) .< grid.ω .< maximum(d.ω))] .= 0
     Ig .*= grid.ωwin
     Eω = sqrt.(Ig) .* exp.(1im.*ϕg)
-    Eω .*= sqrt(d.energy/energy_ω(Eω))
     τ = length(grid.t) * (grid.t[2] - grid.t[1])/2
     Eω .*= exp.(-1im .* grid.ω .* τ)
     if length(d.ϕ) >= 1
         λ0 = isnan(d.λ0) ? wlfreq(Maths.moment(d.ω, d.Iω)) : d.λ0
         prop_taylor!(Eω, grid, d.ϕ, λ0)
+    end
+    if ~isnothing(d.energy)
+        # rescale to correct *energy*
+        Eω .*= sqrt(d.energy/energy_ω(Eω))
+    elseif ~isnothing(d.power)
+        # rescale to correct *power*
+        Et = FT \ Eω
+        Et .*= sqrt(d.power/maximum(It(Et, grid)))
+        Eω .= FT * Et
     end
     Eω
 end
