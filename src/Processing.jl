@@ -317,9 +317,13 @@ fwhm(x::Vector, I::Vector; minmax=:min) = Maths.fwhm(x, I; minmax)
 Extract the peak power. If `bandpass` is given, bandpass the field according to
 [`window_maybe`](@ref).
 """
-function peakpower(grid, Eω; bandpass=nothing, oversampling=1)
+function peakpower(grid, Eω; bandpass=nothing, sumdims=nothing, oversampling=1)
     to, Eto = getEt(grid, Eω; oversampling=oversampling, bandpass=bandpass)
-    dropdims(maximum(abs2.(Eto); dims=1); dims=1)
+    Pt = abs2.(Eto)
+    if !isnothing(sumdims)
+        Pt = dropdims(sum(Pt; dims=sumdims); dims=sumdims)
+    end
+    dropdims(maximum(Pt; dims=1); dims=1)
 end
 
 function peakpower(output; kwargs...)
