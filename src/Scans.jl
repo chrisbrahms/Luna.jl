@@ -2,7 +2,7 @@ module Scans
 import ArgParse: ArgParseSettings, parse_args, parse_item, @add_arg_table!
 import Logging: @info, @warn
 import Printf: @sprintf
-import Base: length
+import Base: length, size
 import Luna: @hlock, Utils
 import Pidfile: mkpidlock
 import HDF5
@@ -141,6 +141,7 @@ function Scan(name, ex::AbstractExec; kwargs...)
 end
 
 length(s::Scan) = (length(s.arrays) == 0) ? 0 : prod(length, s.arrays)
+size(s::Scan) = (length(s.arrays) == 0) ? (0,) : Tuple(length.(s.arrays))
 
 """
     addvariable!(scan, variable::Symbol, array)
@@ -256,30 +257,34 @@ end
 ```
 """
 function runscan(f, scan::Scan{LocalExec})
+    out = Any[]
     for (scanidx, args) in enumerate(Iterators.product(scan.arrays...))
         logiter(scan, scanidx, args)
         try
-            f(scanidx, args...)
+            push!(out, f(scanidx, args...))
         catch e
             bt = catch_backtrace()
             msg = "Error at scanidx $scanidx:\n"*sprint(showerror, e, bt)
             @warn msg
         end
     end
+    out
 end
 
 function runscan(f, scan::Scan{RangeExec})
+    out = Any[]
     combos = vec(collect(Iterators.product(scan.arrays...)))
     for (scanidx, args) in enumerate(combos[scan.exec.r])
         logiter(scan, scanidx, args)
         try
-            f(scanidx, args...)
+            push!(out, f(scanidx, args...))
         catch e
             bt = catch_backtrace()
             msg = "Error at scanidx $scanidx:\n"*sprint(showerror, e, bt)
             @warn msg
         end
     end
+    out
 end
 
 """
