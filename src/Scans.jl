@@ -95,10 +95,11 @@ struct SSHExec{eT} <: AbstractExec
     scriptfile::String
     hostname::String
     subdir::String
+    files::Vector{String}
 end
 
-function SSHExec(le::CondorExec, hostname, subdir)
-    SSHExec(le, le.scriptfile, hostname, subdir)
+function SSHExec(le::CondorExec, hostname, subdir; files=String[])
+    SSHExec(le, le.scriptfile, hostname, subdir, files)
 end
 
 struct Scan{eT}
@@ -459,7 +460,13 @@ function runscan(f, scan::Scan{<:SSHExec})
         @info "Making directory \$HOME/$subdir/$folder"
         read(`ssh $host "mkdir -p \$HOME/$subdir/$folder"`)
         @info "Transferring file..."
-        read(`scp $script $host:\$HOME/$subdir/$folder`)
+        read(`scp $script $host:\~/$subdir/$folder`)
+        if length(scan.exec.files) > 0
+            @info "Transferring auxiliary files..."
+            for fi in scan.exec.files
+                read(`scp $fi $host:\~/$subdir/$folder`)
+            end
+        end
         @info "Running Luna script on remote host $host"
         read(`ssh $host julia \$HOME/$subdir/$folder/$scriptfile`, String)
     end
