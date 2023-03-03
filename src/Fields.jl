@@ -252,7 +252,6 @@ function (d::DataField)(grid::Grid.AbstractGrid, FT)
     if maximum(grid.ω) < maximum(d.ω)
         @warn("Interpolating onto a coarser grid may clip the input spectrum.")
     end
-    energy_ω = Fields.energyfuncs(grid)[2]
     ϕg = Maths.BSpline(d.ω, d.ϕω).(grid.ω)
     Ig = Maths.BSpline(d.ω, d.Iω).(grid.ω)
     Ig[Ig .< 0] .= 0
@@ -267,6 +266,7 @@ function (d::DataField)(grid::Grid.AbstractGrid, FT)
     end
     if ~isnothing(d.energy)
         # rescale to correct *energy*
+        energy_ω = Fields.energyfuncs(grid)[2]
         Eω .*= sqrt(d.energy/energy_ω(Eω))
     elseif ~isnothing(d.power)
         # rescale to correct *power*
@@ -293,6 +293,16 @@ PropagatedField(::Nothing, field::fT) where fT <:TimeField = field
 function (pf::PropagatedField)(grid::Grid.AbstractGrid, FT)
     Eω = pf.field(grid, FT)
     pf.propagator!(Eω, grid)
+    if ~isnothing(pf.field.energy)
+        # rescale to correct *energy*
+        energy_ω = Fields.energyfuncs(grid)[2]
+        Eω .*= sqrt(pf.field.energy/energy_ω(Eω))
+    elseif ~isnothing(pf.field.power)
+        # rescale to correct *power*
+        Et = FT \ Eω
+        Et .*= sqrt(pf.field.power/maximum(It(Et, grid)))
+        Eω .= FT * Et
+    end
     Eω
 end
 
