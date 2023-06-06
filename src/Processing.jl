@@ -7,8 +7,9 @@ import Luna.PhysData: wlfreq, c
 import Luna.Grid: AbstractGrid, RealGrid, EnvGrid, from_dict
 import Luna.Output: AbstractOutput, HDF5Output
 import Cubature: hcubature
-import ProgressLogging: @progress
+import ProgressMeter: @showprogress
 import Logging: @warn
+import Distributed: pmap, nprocs, put!, RemoteChannel
 
 """
     Common(val)
@@ -68,29 +69,27 @@ end
 ```
 """
 function scanproc(f, scanfiles::AbstractVector{<:AbstractString}; shape=nothing)
-    local scanidcs = nothing
-    local arrays = nothing
     scanfiles = sort(scanfiles)
-    @progress for (idx, fi) in enumerate(scanfiles)
-        try
-            o = HDF5Output(fi)
-            # wraptuple makes sure we definitely have a Tuple, even if f only returns one thing
-            ret = wraptuple(f(o))
-            if isnothing(scanidcs) # initialise arrays
-                isnothing(shape) && (shape = Tuple(o["meta"]["scanshape"]))
-                scanidcs = CartesianIndices(shape)
-                arrays = _arrays(ret, shape)
-            end
-            for (ridx, ri) in enumerate(ret)
-                _addret!(arrays[ridx], scanidcs[idx], ri)
-            end
-        catch e
-            bt = catch_backtrace()
-            msg = "scanproc failed for file: $fi:\n"*sprint(showerror, e, bt)
-            @warn msg
+    # send function to all workers so it is available everywhere
+    for id in 2:nprocs()
+        put!(RemoteChannel(id), f)
+    end
+    pret = @showprogress pmap(scanfiles) do fi
+        o = HDF5Output(fi)
+        # wraptuple makes sure we definitely have a Tuple, even if f only returns one thing
+        tup = wraptuple(f(o))
+        isnothing(shape) && (shape = Tuple(o["meta"]["scanshape"]))
+        shape, tup
+    end
+    isnothing(shape) && (shape = pret[1][1])
+    scanidcs = CartesianIndices(shape)
+    arrays = _arrays(pret[1][2], shape)
+    for (idx, preti) in enumerate(pret)
+        for (ridx, ri) in enumerate(preti[2])
+            _addret!(arrays[ridx], scanidcs[idx], ri)
         end
     end
-    unwraptuple(arrays) # if f only returns one thing, we also only return one array
+    return arrays
 end
 
 """
@@ -110,7 +109,7 @@ wrapped in a `Common`, and `scanproc` only returns these once.
 function scanproc(f, outputs; shape=nothing)
     local scanidcs = nothing
     local arrays = nothing
-    @progress for (idx, o) in enumerate(outputs)
+    @showprogress for (idx, o) in enumerate(outputs)
         try
             # wraptuple makes sure we definitely have a Tuple, even if f only returns one thing
             ret = wraptuple(f(o))
