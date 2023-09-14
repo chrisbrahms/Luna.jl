@@ -2,8 +2,7 @@ using Luna
 import Test: @test, @testset, @test_throws
 import Logging
 
-logger = Logging.SimpleLogger(stdout, Logging.Warn)
-old_logger = Logging.global_logger(logger)
+Logging.with_logger(Logging.SimpleLogger(stdout, Logging.Warn)) do
 
 @testset "Polarisation" begin
     args = (100e-6, 0.1, :He, 1)
@@ -250,6 +249,14 @@ end
     ei2 = Processing.energy(o2)[1]
     @test ei2 ≈ eo1*es
 
+    # Defining the power
+    power = 1e9
+    p = Pulses.LunaPulse(o1; power)
+    o3 = prop_capillary(args...; pulses=p, kwargs...)
+    # check power
+    pow3 = Processing.peakpower(o3)[1]
+    @test pow3 ≈ power
+
 
     # multi-mode
     args = (100e-6, 0.1, :He, 1)
@@ -350,6 +357,5 @@ end
     @test sum(ei2) ≈ sum(eo1) + sum(eo12)
 
 end
-
 ##
-Logging.global_logger(old_logger)
+end # with_logger

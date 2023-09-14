@@ -194,7 +194,7 @@ For multi-mode simulations, only the lowest-order modes is transferred.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
 """
-function LunaPulse(o::Output.AbstractOutput; energy=nothing, scale_energy=nothing, kwargs...)
+function LunaPulse(o::Output.AbstractOutput; energy=nothing, power=nothing, scale_energy=nothing, kwargs...)
     ω = o["grid"]["ω"]
     t = o["grid"]["t"]
     τ = length(t) * (t[2] - t[1])/2 # middle of old time window
@@ -203,23 +203,30 @@ function LunaPulse(o::Output.AbstractOutput; energy=nothing, scale_energy=nothin
         # mode-averaged
         Eωm = Eω[:, end]
         eout = Processing.energy(o)[end]
-        e = make_energies(energy, scale_energy, eout)
-        return DataPulse(ω, Eωm .* exp.(1im .* ω .* τ); energy=e, kwargs...)
+        e = make_energies(energy, scale_energy, eout, power)
+        return DataPulse(ω, Eωm .* exp.(1im .* ω .* τ); energy=e, power, kwargs...)
     elseif ndims(Eω) == 3
         # multi-mode
         modes = Processing.makemodes(o; warn_dispersion=false)
         symbols = makesymbol.(modes)
         eout = Processing.energy(o)[:, end]
-        es = make_energies(energy, scale_energy, eout)
-        return [DataPulse(ω, Eω[:, ii, end] .* exp.(1im .* ω .* τ); mode=symbols[ii], energy=es[ii], kwargs...) for ii in eachindex(modes)]
+        es = make_energies(energy, scale_energy, eout, power)
+        powers = isnothing(power) ? fill(nothing, length(modes)) : power
+        return [
+            DataPulse(ω, Eω[:, ii, end] .* exp.(1im .* ω .* τ);
+                      mode=symbols[ii], energy=es[ii], power=powers[ii], kwargs...)
+            for ii in eachindex(modes)
+        ]
     end
 end
 
 makesymbol(mode::Capillary.MarcatiliMode) = Symbol("$(mode.kind)$(mode.n)$(mode.m)")
 
-make_energies(energy::Number, scale_energy::Nothing, eout) = eout ./ sum(eout) .* energy
-make_energies(energy::Nothing, scale_energy, eout) = eout .* scale_energy
-make_energies(energy::Nothing, scale_energy::Nothing, eout) = eout
+make_energies(energy::Number, scale_energy::Nothing, eout, power) = eout ./ sum(eout) .* energy
+make_energies(energy::Nothing, scale_energy, eout, power) = eout .* scale_energy
+make_energies(energy::Nothing, scale_energy::Nothing, eout, power) = eout
+make_energies(energy, scale_energy, eout::AbstractVector, power::Number) = fill(nothing, length(eout))
+make_energies(energy::Nothing, scale_energy::Nothing, eout::Number, power::Number) = nothing
 
 struct GaussBeamPulse{pT} <: AbstractPulse
     waist::Float64

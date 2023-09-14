@@ -265,10 +265,16 @@ function (d::DataField)(grid::Grid.AbstractGrid, FT)
         prop_taylor!(Eω, grid, d.ϕ, λ0)
     end
     if ~isnothing(d.energy)
+        if ~isnothing(d.power)
+            error("Only one of energy or power can be specified")
+        end
         # rescale to correct *energy*
         energy_ω = Fields.energyfuncs(grid)[2]
         Eω .*= sqrt(d.energy/energy_ω(Eω))
     elseif ~isnothing(d.power)
+        if ~isnothing(d.energy)
+            error("Only one of energy or power can be specified")
+        end
         # rescale to correct *power*
         Et = FT \ Eω
         Et .*= sqrt(d.power/maximum(It(Et, grid)))
