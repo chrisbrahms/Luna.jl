@@ -223,8 +223,8 @@ end
 makesymbol(mode::Capillary.MarcatiliMode) = Symbol("$(mode.kind)$(mode.n)$(mode.m)")
 
 make_energies(energy::Number, scale_energy::Nothing, eout, power) = eout ./ sum(eout) .* energy
-make_energies(energy::Nothing, scale_energy, eout, power) = eout .* scale_energy
-make_energies(energy::Nothing, scale_energy::Nothing, eout, power) = eout
+make_energies(energy::Nothing, scale_energy, eout, power::Nothing) = eout .* scale_energy
+make_energies(energy::Nothing, scale_energy::Nothing, eout, power::Nothing) = eout
 make_energies(energy, scale_energy, eout::AbstractVector, power::Number) = fill(nothing, length(eout))
 make_energies(energy::Nothing, scale_energy::Nothing, eout::Number, power::Number) = nothing
 
