@@ -318,6 +318,9 @@ If `raman` is `true`, then the following options apply:
     - `vibration::Bool = true`: whether to include the vibrational Raman contribution
 
 # Output options
+- `statistics`: Whether to calculate and store statistics during the propagation. Defaults to `true`.
+    Setting this to `false` when no statistics are needed can yield a small (few percent) decrease
+    in the runtime of each propagation.
 - `saveN::Integer`: Number of points along z at which to save the field.
 - `filepath`: If `nothing` (default), create a `MemoryOutput` to store the simulation results
     only in the working memory. If not `nothing`, should be a file path as a `String`,
@@ -357,6 +360,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         raman=nothing, kerr=true, plasma=nothing,
                         rotation=true, vibration=true,
                         saveN=201, filepath=nothing,
+                        statistics=true,
                         scan=nothing, scanidx=nothing, filename=nothing)
 
     pol = needpol(polarisation, pulses) || needpol_modes(modes)
@@ -374,7 +378,11 @@ function prop_capillary_args(radius, flength, gas, pressure;
     inputs = shotnoise_maybe(inputs, mode_s, shotnoise)
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      const_linop(radius, pressure))
-    stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas)
+    if statistics
+        stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas)
+    else
+        stats = (Eω, z, dz) -> Dict{String, Any}()
+    end
     output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
