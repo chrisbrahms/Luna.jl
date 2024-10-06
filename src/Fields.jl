@@ -441,6 +441,49 @@ function gauss_beam(k, ω0; z=0.0, pol=:y)
     end
 end
 
+struct AstigmaticGaussBeam
+    k::Float64
+    w0x::Float64
+    w0y::Float64
+    zx::Float64
+    zy::Float64
+    pol::Symbol
+end
+
+function AstigmaticGaussBeam(k, w0x, w0y; zx=0.0, zy=0.0, pol=:y)
+    AstigmaticGaussBeam(k, w0x, w0y, zx, zy, pol)
+end
+
+function (agb::AstigmaticGaussBeam)(xs)
+    r, θ = xs
+    x = r*cos(θ)
+    y = r*sin(θ)
+
+    # Rayleigh lengths
+    zrx = agb.k*agb.w0x^2/2
+    zry = agb.k*agb.w0y^2/2
+
+    # Beam sizes along x and y
+    wx = agb.w0x*sqrt(1 + (agb.zx/zrx)^2)
+    wy = agb.w0y*sqrt(1 + (agb.zy/zry)^2)
+
+    one_over_Rx = agb.zx/(agb.zx^2 + zrx^2)
+    one_over_Ry = agb.zy/(agb.zy^2 + zry^2)
+
+    qx = 1/(one_over_Rx - 2im/(agb.k*wx^2))
+    qy = 1/(one_over_Ry - 2im/(agb.k*wy^2))
+
+    # Guoy phase
+    ψ = 1/2*(atan(real(qx), imag(qx)) + atan(real(qy), imag(qy)))
+
+    E = exp(1im*ψ -1im*agb.k/2*(x^2/qx + y^2/qy))
+    if agb.pol == :x
+        return SVector(E, 0.0)
+    else
+        return SVector(0.0, E)
+    end
+end
+
 function int2D(field1, field2, lowerlim, upperlim)
     Ifunc(xs) = 0.5*sqrt(ε_0/μ_0)*dot(field1(xs), field2(xs))*xs[1]
     val, _ = hcubature(lowerlim, upperlim) do xs
