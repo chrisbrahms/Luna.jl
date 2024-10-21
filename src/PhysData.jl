@@ -112,7 +112,7 @@ Sellmeier expansion for linear susceptibility from
 J. Opt. Soc. Am. 67, 1550 (1977)
 """
 function γ_Peck(B1, C1, B2, C2, dens)
-    return μm -> @. (((B1 / (C1 - 1/μm^2) + B2 / (C2 - 1/μm^2)) + 1)^2 - 1)/dens
+    return μm -> (((B1 / (C1 - 1/μm^2) + B2 / (C2 - 1/μm^2)) + 1)^2 - 1)/dens
 end
 
 """
@@ -132,7 +132,7 @@ https://doi.org/10.5194/acp-21-14927-2021.
 
 """
 function γ_QuanfuHe(A, B, C, dens)
-    return μm -> ((1 + 1e-8*(A + B/(C - (1e4/μm)^2))))/dens
+    return μm -> complex((1 + 1e-8*(A + B/(C - (1e4/μm)^2))))/dens
 end
 
 """
@@ -437,7 +437,7 @@ Get function which returns refractive index.
 function ref_index_fun(material::Symbol, P=1.0, T=roomtemp; lookup=nothing)
     if material in gas
         χ1 = χ1_fun(material, P, T)
-        return λ -> sqrt(1 + χ1(λ))
+        return λ -> sqrt(1 + complex(χ1(λ)))
     elseif material in glass
         if isnothing(lookup)
             lookup = (material == :SiO2)
