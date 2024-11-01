@@ -6,7 +6,7 @@ Depth = 2
 
 `Luna` can solve several different variations of the unidirectional pulse propagation equation (UPPE). All of these variations have this basic form in common:
 ```math
-\partial_z E(\omega, \mathbf{k}_\perp, z){\mathrm{d}z} = \mathcal{L}(\omega, \mathbf{k}_\perp, z)E(\omega, \mathbf{k}_\perp, z) + \frac{i\omega}{N_{\mathrm{nl}}} P_{\mathrm{nl}}(\omega, \mathbf{k}_\perp, z)\,,
+\partial_z E(\omega, \mathbf{k}_\perp, z) = \mathcal{L}(\omega, \mathbf{k}_\perp, z)E(\omega, \mathbf{k}_\perp, z) + \frac{i\omega}{N_{\mathrm{nl}}} P_{\mathrm{nl}}(\omega, \mathbf{k}_\perp, z)\,,
 ```
 where ``E(\omega, \mathbf{k}_\perp, z)`` is the electric field in "reciprocal space", i.e. frequency and transverse spatial frequency, ``\omega`` is angular frequency, ``\mathbf{k}_\perp`` is some generalised transverse spatial frequency, ``z`` is the propagation direction, ``\mathcal{L}(\omega, \mathbf{k}_\perp, z)`` is a linear operator describing dispersion, loss and diffraction, ``P_{\mathrm{nl}}(\omega, \mathbf{k}_\perp, z)`` is the nonlinear polarisation induced by the field ``E(\omega, \mathbf{k}_\perp, z)``, and ``N_{\mathrm{nl}}`` is a normalisation factor. Since calculating the nonlinear polarisation directly in the frequency domain is not feasible, this is done in the real-space-time domain instead, and ``P_{\mathrm{nl}}(\omega, \mathbf{k}_\perp, z)`` is obtained by transforming back:
 ```math
