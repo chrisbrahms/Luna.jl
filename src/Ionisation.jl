@@ -124,7 +124,7 @@ exists, load this rather than recalculate.
 - `N::Int`: Number of samples with which to create the `CSpline` interpolant.
 - `Emax::Number`: Maximum field strength to include in the interpolant.
 - `cachedir::String`: Path to the directory where the cache should be stored and loaded from.
-    Defaults to \$HOME/.luna/pptcache
+    Defaults to Utils.cachedir()/pptcache
 
 Other keyword arguments are passed on to [`ionrate_fun_PPT`](@ref)
 """
