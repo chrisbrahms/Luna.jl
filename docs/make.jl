@@ -11,6 +11,7 @@ makedocs(
         "The numerical model" => [
             "General description" => "model/model.md",
             "Modal decompositions" => "model/modal_decompositions.md",
+            "Implementation details" => "model/implementation.md",
             "Nonlinear responses" => "model/nonlinear_responses.md"
         ],
         "The simple interface" => "interface.md",
