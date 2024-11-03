@@ -134,5 +134,11 @@ The mode-averaged field UPPE as written above is very useful, but the scaling fr
 
 
 ## Radially symmetric free-space
+```math
+\mathbf{E}_s(t, r, z) = \frac{2\pi}{\left(2\pi\right)^3} \int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  E(\omega, k_\perp, z) J_0(k_\perp r) \mathrm{e}^{-i\omega t}\mathbf{e}_s k_\perp\mathrm{d} k_\perp  \mathrm{d}\omega
+```
 
 ## Three-dimensional free-space
+```math
+\mathbf{E}_s(t, x, y, z) = \frac{1}{\left(2\pi\right)^3}\int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  \int_{-\infty}^{\infty}  E(\omega, k_x, k_y, z) \mathrm{e}^{i\left(k_x x + k_y y - \omega t\right)}\mathbf{e}_s\mathrm{d} k_x \mathrm{d} k_y \mathrm{d} \omega
+```
