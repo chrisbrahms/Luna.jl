@@ -31,5 +31,11 @@ Envelope fields vector
 
 ```
 ## Photoionisation & plasma
+```math
+P_\mathrm{ion}\!\left(t,x, y,z\right) = I_p\int_{-\infty}^t \!\!\mathrm{d}t'\frac{\partial_{t'} \rho_\mathrm{e}(t', x, y,z)}{E\!\left(t',x, y,z\right)} + \frac{e^2}{m_\mathrm{e}}\int_{-\infty}^{t}\!\!\mathrm{d}t'\int_{-\infty}^{t'} \!\!\mathrm{d}t'' \rho_\mathrm{e}(t'',x, y,z)E\left(t'',x, y,z\right)
+```
 
+```math
+\rho_\mathrm{e}(t, x, y,z) = \rho(z)\left(1 - \exp \left\{-\int_{-\infty}^t\!\!\mathrm{d}t'w\!\left(\left\vert E\!\left(t',x, y,z\right)\right\vert\right)\right\}\right)
+```
 ## Raman response
