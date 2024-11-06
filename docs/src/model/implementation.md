@@ -11,7 +11,7 @@ is a general partial differential equation. However, by taking into account the 
 ```
 where $\overrightarrow{y}$ is the (vector of) function(s) to be solved for, and $t$ is the independent variable. Note the difference in notation: in Luna, ``\overrightarrow{y}`` is the field ``E(\omega, \mathbf{k}_\perp, z)`` (evaluated at discrete values of ``\omega`` and ``\mathbf{k}_\perp``) and the "time" ``t`` is actually the distance ``z``. This most general form can be directly solved numerically with various methods. However, that would not make direct use of the fact that *without the nonlinear part*, the UPPE has an analytical solution:
 ```math
-E(\omega, \mathbf{k}_\perp, z_2) = \mathrm{e}^{\int_{z_1}^{z_2}\mathcal{L}(\omega, \mathbf{k}_\perp, z')\mathrm{d}z}E(\omega, \mathbf{k}_\perp, z_1)\,.
+E(\omega, \mathbf{k}_\perp, z_2) = \mathrm{e}^{\int_{z_1}^{z_2}\mathcal{L}(\omega, \mathbf{k}_\perp, z')\mathrm{d}z'}E(\omega, \mathbf{k}_\perp, z_1)\,.
 ```
 We therefore re-write the general form (and drop the vector notation for readability) as
 ```math
