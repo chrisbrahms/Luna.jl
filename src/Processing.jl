@@ -311,13 +311,14 @@ end
 fwhm(x::Vector, I::Vector; minmax=:min) = Maths.fwhm(x, I; minmax)
 
 """
-    peakpower(grid, Eω; bandpass=nothing, oversampling=1)
-    peakpower(output; bandpass=nothing, oversampling=1)
+    peakpower(grid, Eω; bandpass=nothing, oversampling=1, sumdims=nothing)
+    peakpower(output; bandpass=nothing, oversampling=1, sumdims=nothing)
 
 Extract the peak power. If `bandpass` is given, bandpass the field according to
-[`window_maybe`](@ref).
+[`window_maybe`](@ref). If `sumdims` is not `nothing`, sum the time-dependent power
+over these dimensions (e.g. modes) before taking the maximum.
 """
-function peakpower(grid, Eω; bandpass=nothing, sumdims=nothing, oversampling=1)
+function peakpower(grid, Eω; bandpass=nothing, oversampling=1, sumdims=nothing)
     to, Eto = getEt(grid, Eω; oversampling=oversampling, bandpass=bandpass)
     Pt = abs2.(Eto)
     if !isnothing(sumdims)
