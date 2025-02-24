@@ -28,8 +28,16 @@ Envelope fields vector
            (\mathcal{E}_x^2 + \frac{2}{3}\mathcal{E}_y^2)\mathcal{E}_x + \frac{1}{3}\mathcal{E}_x^*\mathcal{E}_y^2 \\[0.5em]
            (\mathcal{E}_y^2 + \frac{2}{3}\mathcal{E}_x^2)\mathcal{E}_y + \frac{1}{3}\mathcal{E}_y^*\mathcal{E}_x^2
 \end{pmatrix}
-
 ```
+## Second-order nonlinarity
+```math
+P_2(t, x, y, z) = \varepsilon_0 \chi^{(2)} \mathbf{E}^2(t, x, y, z)
+```
+```math
+P_{i} = \varepsilon_0 \chi^{(2)}_{ijk} E_j E_k
+```
+
+
 ## Photoionisation & plasma
 ```math
 P_\mathrm{ion}\!\left(t,x, y,z\right) = I_p\int_{-\infty}^t \!\!\mathrm{d}t'\frac{\partial_{t'} \rho_\mathrm{e}(t', x, y,z)}{E\!\left(t',x, y,z\right)} + \frac{e^2}{m_\mathrm{e}}\int_{-\infty}^{t}\!\!\mathrm{d}t'\int_{-\infty}^{t'} \!\!\mathrm{d}t'' \rho_\mathrm{e}(t'',x, y,z)E\left(t'',x, y,z\right)
