@@ -3,8 +3,8 @@ import ArgParse: ArgParseSettings, parse_args, parse_item, @add_arg_table!
 import Logging: @info, @warn
 import Printf: @sprintf
 import Base: length, size
-import Luna: @hlock, Utils
-import Pidfile: mkpidlock
+import Luna: Utils
+import FileWatching.Pidfile: mkpidlock
 import HDF5
 import Distributed: @spawnat, addprocs, rmprocs, fetch, Future, @everywhere
 import Dates
@@ -171,7 +171,7 @@ Make an appropriate file name for an `HDF5Output` or `prop_capillary` output for
 ```
 scan = Scan("scan_example"; energy=collect(range(5e-6, 200e-6; length=64)))
 runscan(scan) do scanidx, energyi
-    prop_capillary(125e-6, 3, :HeJ, 0.8; λ0=800e-9, τfwhm=10e-15, energy=energyi
+    prop_capillary(125e-6, 3, :He, 0.8; λ0=800e-9, τfwhm=10e-15, energy=energyi
                    filepath=makefilename(scan, scanidx))
 end
 ```
@@ -251,7 +251,7 @@ The exact subset and order of scan points which is run depends on `scan.exec`, s
 ```
 scan = Scan("scan_example"; energy=collect(range(5e-6, 200e-6; length=64)))
 runscan(scan) do scanidx, energyi
-    prop_capillary(125e-6, 3, :HeJ, 0.8; λ0=800e-9, τfwhm=10e-15, energy=energyi)
+    prop_capillary(125e-6, 3, :He, 0.8; λ0=800e-9, τfwhm=10e-15, energy=energyi)
 end
 ```
 """
@@ -266,6 +266,7 @@ function runscan(f, scan::Scan{LocalExec})
             msg = "Error at scanidx $scanidx:\n"*sprint(showerror, e, bt)
             @warn msg
         end
+        Base.GC.gc()
     end
     out
 end
@@ -282,6 +283,7 @@ function runscan(f, scan::Scan{RangeExec})
             msg = "Error at scanidx $scanidx:\n"*sprint(showerror, e, bt)
             @warn msg
         end
+        Base.GC.gc()
     end
     out
 end
@@ -328,6 +330,7 @@ function runscan(f, scan::Scan{BatchExec})
             msg = "Error at scanidx $scanidx:\n"*sprint(showerror, e, bt)
             @warn msg
         end
+        Base.GC.gc()
     end
 end
 
@@ -353,23 +356,23 @@ end
 function _runscan(f, scan::Scan{QueueExec})
     if isempty(scan.exec.queuefile)
         h = string(hash(scan.name); base=16)
-        qfile = joinpath(Utils.cachedir(), "qfile_$h.h5")
+        qfile = "qfile_$h.h5"
     else
         qfile = scan.exec.queuefile
     end
-    lockpath = joinpath(Utils.cachedir(), basename(qfile)*"_lock")
+    lockpath = qfile*"_lock"
 
     combos = vec(collect(Iterators.product(scan.arrays...)))
     while true
-        mkpidlock(lockpath) do
+        mkpidlock(lockpath; stale_age=120) do
             # first process to catch the pidlock creates the queue file
             if ~isfile(qfile)
-                @hlock HDF5.h5open(qfile, "cw") do file
+                HDF5.h5open(qfile, "cw") do file
                     file["qdata"] = zeros(Int, length(scan))
                 end
             end
             # read the queue data
-            global qdata = @hlock HDF5.h5open(qfile) do file
+            global qdata = HDF5.h5open(qfile) do file
                 read(file["qdata"])
             end
             # find the first index which is neither done nor in progress
@@ -378,7 +381,7 @@ function _runscan(f, scan::Scan{QueueExec})
             end
             if ~isnothing(scanidx)
                 # mark the index as in progress
-                @hlock HDF5.h5open(qfile, "r+") do file
+                HDF5.h5open(qfile, "r+") do file
                     file["qdata"][scanidx] = 1
                 end
             end
@@ -400,11 +403,12 @@ function _runscan(f, scan::Scan{QueueExec})
             msg = "Error at scanidx $scanidx:\n"*sprint(showerror, e, bt)
             @warn msg
         end
-        mkpidlock(lockpath) do # acquire lock on qfile again
-            @hlock HDF5.h5open(qfile, "r+") do file
+        mkpidlock(lockpath; stale_age=10) do # acquire lock on qfile again
+            HDF5.h5open(qfile, "r+") do file
                 file["qdata"][scanidx] = code # mark as done/failed
             end
         end
+        Base.GC.gc()
     end
 end
 
