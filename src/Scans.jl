@@ -1,4 +1,5 @@
 module Scans
+using Luna
 import ArgParse: ArgParseSettings, parse_args, parse_item, @add_arg_table!
 import Logging: @info, @warn
 import Printf: @sprintf
@@ -8,6 +9,7 @@ import FileWatching.Pidfile: mkpidlock
 import HDF5
 import Distributed: @spawnat, addprocs, rmprocs, fetch, Future, @everywhere
 import Dates
+import Glob: glob
 
 """
     AbstractExec
@@ -127,7 +129,9 @@ function Scan(name, ex::AbstractExec; kwargs...)
     if !isempty(ARGS)
         cmdlineargs = copy(ARGS)
         # remove command-line arguments to avoid infinite recursion:
-        [pop!(ARGS) for _ in eachindex(ARGS)]
+        for _ in eachindex(ARGS)
+            pop!(ARGS)
+        end
         return Scan(name, cmdlineargs; kwargs...)
     end
     variables = Symbol[]
@@ -235,6 +239,29 @@ function getvalue(scan, variable, scanidx)
     values = vec(collect(Iterators.product(scan.arrays...)))[scanidx]
     idx = findfirst(scan.variables .== variable)
     values[idx]
+end
+
+function PostProcessScan(name::AbstractString, folder::AbstractString, ex::AbstractExec,
+                         pattern::AbstractString=Processing.defpattern)
+    scanfiles = glob(pattern, folder) # this returns absolute paths if directory given
+    arrs, order = HDF5.h5open(scanfiles[1]) do file
+        read(file["meta"]["scanarrays"]), read(file["meta"]["scanorder"])
+    end
+    variables = Symbol[]
+    arrays = Vector[]
+    for var in order
+        push!(variables, Symbol(var))
+        push!(arrays, arrs[var])
+    end
+    if !isempty(ARGS)
+        cmdlineargs = copy(ARGS)
+        # remove command-line arguments to avoid infinite recursion:
+        for _ in eachindex(ARGS)
+            pop!(ARGS)
+        end
+        ex = makeexec(cmdlineargs)
+    end
+    Scan(name, variables, arrays, ex)
 end
 
 """

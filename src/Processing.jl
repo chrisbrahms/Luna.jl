@@ -9,7 +9,7 @@ import Luna.Output: AbstractOutput, HDF5Output
 import Cubature: hcubature
 import ProgressMeter: @showprogress
 import Logging: @warn
-import Distributed: pmap, nprocs, put!, RemoteChannel
+import Distributed: pmap, nprocs, put!, RemoteChannel, workers
 
 """
     Common(val)
@@ -71,10 +71,10 @@ end
 function scanproc(f, scanfiles::AbstractVector{<:AbstractString}; shape=nothing)
     scanfiles = sort(scanfiles)
     # send function to all workers so it is available everywhere
-    for id in 2:nprocs()
+    for id in workers()
         put!(RemoteChannel(id), f)
     end
-    pret = @showprogress pmap(scanfiles) do fi
+    pret = pmap(scanfiles) do fi
         o = HDF5Output(fi)
         # wraptuple makes sure we definitely have a Tuple, even if f only returns one thing
         tup = wraptuple(f(o))
