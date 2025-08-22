@@ -37,6 +37,34 @@ function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfun)
     make_const_linop(grid, xygrid, n, β1)
 end
 
+function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfunx, nfuny)
+    # here nfunx(λ, δθ) also takes the angle and returns n_x(λ, θ)
+    # nfuny(λ; z) just takes wavelength
+    out = zeros(ComplexF64, (length(grid.ω), 2, length(xygrid.ky), length(xygrid.kx)))
+    β1 = PhysData.dispersion_func(1, nfuny)(grid.referenceλ)
+    for (iω, si) in enumerate(grid.sidx)
+        if si
+            ny = nfuny(wlfreq(grid.ω[iω]))
+            ksq_ypol = (ny*grid.ω[iω]/c)^2
+            for (ikx, kxi) in enumerate(xygrid.kx)
+                δθ = crystal_internal_angle(nfunx, grid.ω[iω], kxi)
+                nx = nfunx(wlfreq(grid.ω[iω]), δθ)
+                for (iky, kyi) in enumerate(xygrid.ky)
+                    k_xpol = nx*grid.ω[iω]/c
+                    βsq_xpol = k_xpol^2 - kxi^2 - kyi^2
+                    β_xpol = βsq_xpol < 0 ? -min(sqrt(abs(βsq_xpol)), 200) : sqrt(βsq_xpol)
+                    out[iω, 1, iky, ikx] = -im*(β_xpol - β1*grid.ω[iω])
+                    
+                    βsq_ypol = ksq_ypol - kxi^2 - kyi^2
+                    β_ypol = βsq_ypol < 0 ? -min(sqrt(abs(βsq_ypol)), 200) : sqrt(βsq_ypol)
+                    out[iω, 2, iky, ikx] = -im*(β_ypol - β1*grid.ω[iω])
+                end
+            end
+        end
+    end
+    out
+end
+
 function make_const_linop(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
                           n::AbstractArray, β1::Number, β0ref::Number; thg=false)
     kperp2 = @. (xygrid.kx^2)' + xygrid.ky^2
@@ -157,7 +185,7 @@ function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfun)
 end
 
 function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfunx, nfuny)
-    # here nfunx(λ, δθ; z) also takes the angle and returns n_x(λ, θ)
+    # here nfunx(λ, δθ) also takes the angle and returns n_x(λ, θ)
     # nfuny(λ; z) just takes wavelength
     out = zeros(ComplexF64, (length(grid.ω), 2, length(xgrid.kx)))
     β1 = PhysData.dispersion_func(1, nfuny)(grid.referenceλ)
@@ -170,11 +198,11 @@ function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfunx, nf
                 nx = nfunx(wlfreq(grid.ω[iω]), δθ)
                 k_xpol = nx*grid.ω[iω]/c
                 βsq_xpol = k_xpol^2 - kxi^2
-                β_xpol = βsq_xpol < 0 ? -im*min(sqrt(abs(βsq_xpol)), 200) : sqrt(βsq_xpol)
+                β_xpol = βsq_xpol < 0 ? -min(sqrt(abs(βsq_xpol)), 200) : sqrt(βsq_xpol)
                 out[iω, 1, ik] = -im*(β_xpol - β1*grid.ω[iω])
                 
                 βsq_ypol = ksq_ypol - kxi^2
-                β_ypol = βsq_ypol < 0 ? -im*min(sqrt(abs(βsq_ypol)), 200) : sqrt(βsq_ypol)
+                β_ypol = βsq_ypol < 0 ? -min(sqrt(abs(βsq_ypol)), 200) : sqrt(βsq_ypol)
                 out[iω, 2, ik] = -im*(β_ypol - β1*grid.ω[iω])
             end
         end

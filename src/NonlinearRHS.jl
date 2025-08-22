@@ -618,6 +618,17 @@ function const_norm_free(grid, xygrid, nfun)
     return norm
 end
 
+function const_norm_free(grid, xygrid, nfunx, nfuny)
+    nfunωx = (ω, δθ) -> nfunx(wlfreq(ω), δθ)
+    nfunωy = (ω) -> nfuny(wlfreq(ω))
+    normfun = norm_free(grid, xygrid, nfunωx, nfunωy)
+    out = copy(normfun(0.0))
+    function norm(z)
+        return out
+    end
+    return norm
+end
+
 """
     norm_free(grid, xygrid, nfun)
 
@@ -663,15 +674,15 @@ function norm_free(grid, xygrid, nfunx, nfuny)
     function norm(z)
         for iω in eachindex(ω)
             if ω[iω] == 0 || ~grid.sidx[iω]
-                out[iω, :, :] .= 1.0
+                out[iω, :, :, :] .= 1.0
                 continue
             end
             ny = nfuny(wlfreq(ω[iω]))
             ksq_ypol = (ny*ω[iω]/c)^2
             for (ikx, kxi) in enumerate(xygrid.kx)
+                δθ = crystal_internal_angle(nfunx, ω[iω], kxi)
+                nx = nfunx(wlfreq(ω[iω]), δθ)
                 for (iky, kyi) in enumerate(xygrid.ky)
-                    δθ = crystal_internal_angle(nfunx, ω[iω], kxi)
-                    nx = nfunx(wlfreq(ω[iω]), δθ)
                     k_xpol = nx*grid.ω[iω]/c
                     βsq_xpol = k_xpol^2 - kxi^2 - kyi^2
                     if βsq_xpol < 0
