@@ -506,7 +506,7 @@ function norm_radial(grid, q, nfun)
                     continue
                 end
                 for (ip, n) in enumerate(nfun(ω[iω]; z))
-                    k2 = (n*ω[iω]/PhysData.c)^2
+                    k2 = (real(n)*ω[iω]/PhysData.c)^2
                     βsq = k2 - kr2[ir]
                     if βsq <= 0
                         out[iω, ip, ir] = 1.0
@@ -652,7 +652,7 @@ function norm_free(grid, xygrid, nfun)
                     continue
                 end
                 for (ip, n) in enumerate(nfun(ω[iω]; z))
-                    k2 = (n*ω[iω]/PhysData.c)^2
+                    k2 = (real(n)*ω[iω]/PhysData.c)^2
                     βsq = k2 - kperp2[ii]
                     if βsq <= 0
                         out[iω, ip, ii] = 1.0

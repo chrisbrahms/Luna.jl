@@ -26,7 +26,7 @@ end
 
 function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfun)
     ωfirst = grid.ω[findfirst(grid.sidx)]
-    np = length(nfun(wlfreq(ωfirst); z=0)) # 1 if single ref index, 2 if nx, ny
+    np = length(nfun(wlfreq(ωfirst))) # 1 if single ref index, 2 if nx, ny
     n = zeros(Float64, (length(grid.ω), np))
     for (ii, si) in enumerate(grid.sidx)
         if si
@@ -173,7 +173,7 @@ end
 
 function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfun)
     ωfirst = grid.ω[findfirst(grid.sidx)]
-    np = length(nfun(wlfreq(ωfirst); z=0)) # 1 if single ref index, 2 if nx, ny
+    np = length(nfun(wlfreq(ωfirst))) # 1 if single ref index, 2 if nx, ny
     n = zeros(Float64, (length(grid.ω), np))
     for (ii, si) in enumerate(grid.sidx)
         if si
@@ -338,7 +338,7 @@ end
 
 function make_const_linop(grid::Grid.RealGrid, q::Hankel.QDHT, nfun)
     ωfirst = grid.ω[findfirst(grid.sidx)]
-    np = length(nfun(ωfirst; z=0)) # 1 if single ref index, 2 if nx, ny
+    np = length(nfun(ωfirst)) # 1 if single ref index, 2 if nx, ny
     n = zeros(Float64, (length(grid.ω), np))
     for (ii, si) in enumerate(grid.sidx)
         if si
@@ -351,7 +351,7 @@ end
 
 function make_const_linop(grid::Grid.EnvGrid, q::Hankel.QDHT, nfun; thg=false)
     ωfirst = grid.ω[findfirst(grid.sidx)]
-    np = length(nfun(ωfirst; z=0)) # 1 if single ref index, 2 if nx, ny
+    np = length(nfun(ωfirst)) # 1 if single ref index, 2 if nx, ny
     n = zeros(Float64, (length(grid.ω), np))
     for (ii, si) in enumerate(grid.sidx)
         if si
