@@ -114,6 +114,8 @@ end
 
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff;
                norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     xo = Array{Float64}(undef, length(grid.to))
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
@@ -124,11 +126,15 @@ function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff;
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs, βfun!, aeff;
                norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1, flags=settings["fftw_flag"])
@@ -139,6 +145,8 @@ function setup(grid::Grid.EnvGrid, densityfun, responses, inputs, βfun!, aeff;
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
@@ -165,6 +173,8 @@ end
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
                full=false, norm! = NonlinearRHS.norm_modal(grid))
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
     Utils.loadFFTwisdom()
     xt = Array{Float64}(undef, length(grid.t))
@@ -181,12 +191,16 @@ function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
                full=false, norm! = NonlinearRHS.norm_modal(grid))
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
     Utils.loadFFTwisdom()
     xt = Array{ComplexF64}(undef, length(grid.t))
@@ -203,6 +217,8 @@ function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
@@ -225,6 +241,8 @@ end
 
 function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
                densityfun, normfun, responses, inputs)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
     tshape = (length(grid.t), np, length(q.r))
@@ -241,11 +259,15 @@ function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
                densityfun, normfun, responses, inputs)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     shape = size(normfun(0))
     xt = zeros(ComplexF64, shape)
@@ -260,11 +282,15 @@ function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
 function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
                densityfun, normfun, responses, inputs)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
     x = xygrid.x
@@ -280,11 +306,15 @@ function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
                densityfun, normfun, responses, inputs)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
     x = xygrid.x
@@ -342,6 +372,8 @@ function setup(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid,
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
@@ -381,7 +413,7 @@ function run(Eω, grid,
 
     output(Grid.to_dict(grid), group="grid")
     output(simtype(grid, transform, linop), group="simulation_type")
-
+    flush(stderr) # flush std error once before starting to show setup steps
     RK45.solve_precon(
         transform, linop, Eω, z0, init_dz, grid.zmax, stepfun=stepfun,
         max_dt=max_dz, min_dt=min_dz,
