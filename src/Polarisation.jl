@@ -59,7 +59,7 @@ function ellipse(S)
     U = S[3]
     V = S[4]
     aL = sqrt(Q^2 + U^2)
-    θ = angle(aL)/2
+    θ = angle(Q + 1im*U)/2
     A = sqrt((I + aL)/2)
     B = sqrt((abs(I - aL))/2)
     h = sign(V)
