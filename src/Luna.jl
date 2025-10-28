@@ -3,6 +3,7 @@ import FFTW
 import Hankel
 import Logging
 import LinearAlgebra: mul!, ldiv!
+import OrdinaryDiffEq: ODEProblem, solve, Tsit5, DiscreteCallback, get_proposed_dt
 Logging.disable_logging(Logging.BelowMinLevel)
 
 """
@@ -57,6 +58,7 @@ include("Grid.jl")
 include("Modes.jl")
 include("Fields.jl")
 include("RK45.jl")
+include("InteractionPicture.jl")
 include("LinearOps.jl")
 include("Capillary.jl")
 include("Antiresonant.jl")
@@ -371,6 +373,12 @@ function run(Eω, grid,
         output(Eω, z, dz, interpolant)
     end
 
+    function affect!(itg)
+        stepfun(itg.u, itg.t, get_proposed_dt(itg), itg.sol)
+    end
+
+    cb = DiscreteCallback((args...) -> true, affect!)
+
     # check_cache does nothing except for HDF5Outputs
     Eωc, zc, dzc = Output.check_cache(output, Eω, z0, init_dz)
     if zc > z0
@@ -383,14 +391,18 @@ function run(Eω, grid,
     save_modeinfo_maybe(output, transform)
 
     flush(stderr) # flush std error once before starting to show setup steps
-    RK45.solve_precon(
-        transform, linop, Eω, z0, init_dz, grid.zmax, stepfun=stepfun,
-        max_dt=max_dz, min_dt=min_dz,
-        rtol=rtol, atol=atol, safety=safety, norm=norm,
-        status_period=status_period)
+    # RK45.solve_precon(
+        # transform, linop, Eω, z0, init_dz, grid.zmax, stepfun=stepfun,
+        # max_dt=max_dz, min_dt=min_dz,
+        # rtol=rtol, atol=atol, safety=safety, norm=norm,
+        # status_period=status_period)
+    
+    prob = ODEProblem(InteractionPicture.IPfy(linop, transform), Eω, (0.0, grid.zmax))
+    solve(prob, Tsit5(); callback=cb)
 end
 
 # run some code for precompilation
+if false
 Logging.with_logger(Logging.NullLogger()) do
     prop_capillary(125e-6, 0.3, :He, 1.0; λ0=800e-9, energy=1e-9,
                     τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11)
@@ -415,6 +427,7 @@ Logging.with_logger(Logging.NullLogger()) do
     trange = 4e-12
     output = prop_gnlse(γ, flength, βs; λ0, τfwhm, power=P0, pulseshape=:sech, λlims, trange,
                         raman=true, shock=true, fr, shotnoise=true, saveN=11)
+end
 end
 
 end # module
