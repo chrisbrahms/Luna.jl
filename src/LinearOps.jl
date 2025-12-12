@@ -65,12 +65,11 @@ function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfunx, nfu
 end
 
 function make_const_linop(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
-                          n::AbstractArray, β1::Number, β0ref::Number; thg=false)
+                          n::AbstractVecOrMat, β1::Number, β0ref::Number; thg=false)
     kperp2 = @. (xygrid.kx^2)' + xygrid.ky^2
     idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
-    k2 = zero(grid.ω)
-    k2[grid.sidx] .= (n[grid.sidx].*grid.ω[grid.sidx]./c).^2
-    out = zeros(ComplexF64, (length(grid.ω), length(xygrid.ky), length(xygrid.kx)))
+    k2 = @. (n*grid.ω/c)^2
+    out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xygrid.ky), length(xygrid.kx)))
     _fill_linop_xy!(out, grid, β1, k2, kperp2, idcs, β0ref; thg=thg)
     return out
 end
