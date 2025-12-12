@@ -378,7 +378,7 @@ function make_Etr(s::SpatioTemporalField, grid::Grid.EnvGrid, spacegrid)
     sqrt.(s.Ishape(t, spacegrid.r)) .* exp.(im .* (s.ϕ .+ Δω.*t))
 end
 
-transform(spacegrid::Hankel.QDHT, FT, Etr) = spacegrid * (FT * Etr)
+transform(q::Hankel.QDHT, FT, Etr) = q * (FT * Etr)
 transform(spacegrid::Grid.FreeGrid, FT, Etr) = FT * Etr
 transform(spacegrid::Grid.Free2DGrid, FT, Etr) = FT * Etr
 

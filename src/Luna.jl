@@ -231,7 +231,8 @@ function doinputs_fs!(Eωk, grid, spacegrid::Union{Hankel.QDHT, Grid.FreeGrid, G
         if size(Eωk, 2) == 2
             Eωk .+= Eωki
         else
-            Eωk .+= Eωki[:, 2] # take y-polarisation if only 1 polarisation specified
+            # take y-polarisation if only 1 polarisation specified
+            Eωk .+= Eωki[:, [2], :, :] # use array index [2] to preserve dimensionality
         end
     end
 end
@@ -253,7 +254,11 @@ function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
     FT = FFTW.plan_rfft(xt, 1, flags=settings["fftw_flag"])
     Eω = zeros(ComplexF64, ωshape)
     Eωk = q * Eω
-    doinputs_fs!(Eωk, grid, q, FT, inputs)
+    # plan FFT for xy polarisation for field creation
+    tshape_xy = (length(grid.t), 2, length(q.r))
+    xt_xy = zeros(Float64, tshape_xy)
+    FT_xy = FFTW.plan_rfft(xt_xy, 1, flags=settings["fftw_flag"])
+    doinputs_fs!(Eωk, grid, q, FT_xy, inputs)
     oshape = tshape[2:end]
     xo = Array{Float64}(undef, length(grid.to), oshape...)
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
@@ -271,13 +276,19 @@ function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
-    shape = size(normfun(0))
-    xt = zeros(ComplexF64, shape)
+    np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
+    tshape = (length(grid.t), np, length(q.r))
+    ωshape = (length(grid.ω), np, length(q.r))
+    xt = zeros(Float64, tshape)
     FT = FFTW.plan_fft(xt, 1, flags=settings["fftw_flag"])
-    Eω = zeros(ComplexF64, shape)
+    Eω = zeros(ComplexF64, ωshape)
     Eωk = q * Eω
-    doinputs_fs!(Eωk, grid, q, FT, inputs)
-    oshape = shape[2:end]
+    # plan FFT for xy polarisation for field creation
+    tshape_xy = (length(grid.t), 2, length(q.r))
+    xt_xy = zeros(Float64, tshape_xy)
+    FT_xy = FFTW.plan_fft(xt_xy, 1, flags=settings["fftw_flag"])
+    doinputs_fs!(Eωk, grid, q, FT_xy, inputs)
+    oshape = tshape[2:end]
     xo = Array{ComplexF64}(undef, length(grid.to), oshape...)
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransRadial(grid, q, FTo, responses, densityfun, normfun, np > 1)
