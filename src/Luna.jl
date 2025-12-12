@@ -311,7 +311,9 @@ function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
     xr = Array{Float64}(undef, length(grid.t), np, length(y), length(x))
     FT = FFTW.plan_rfft(xr, (1, 3, 4), flags=settings["fftw_flag"])
     Eωk = zeros(ComplexF64, length(grid.ω), np, length(y), length(x))
-    doinputs_fs!(Eωk, grid, xygrid, FT, inputs)
+    xr_xy = Array{Float64}(undef, length(grid.t), 2, length(y), length(x))
+    FT_xy = FFTW.plan_rfft(xr_xy, (1, 3, 4), flags=settings["fftw_flag"])
+    doinputs_fs!(Eωk, grid, xygrid, FT_xy, inputs)
     xo = Array{Float64}(undef, length(grid.to), np, length(y), length(x))
     FTo = FFTW.plan_rfft(xo, (1, 3, 4), flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransFree(grid, xygrid, FTo,

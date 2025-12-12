@@ -14,12 +14,11 @@ Make constant linear operator for full 3D propagation. `n` is the refractive ind
 and β1 is 1/velocity of the reference frame.
 """
 function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
-                          n::AbstractArray, β1::Number)
+                          n::AbstractVecOrMat, β1::Number)
     kperp2 = @. (xygrid.kx^2)' + xygrid.ky^2
     idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
-    k2 = zero(grid.ω)
-    k2[grid.sidx] .= (n[grid.sidx] .* grid.ω[grid.sidx] ./ c).^2
-    out = zeros(ComplexF64, (length(grid.ω), length(xygrid.ky), length(xygrid.kx)))
+    k2 = @. (n*grid.ω/c)^2
+    out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xygrid.ky), length(xygrid.kx)))
     _fill_linop_xy!(out, grid, β1, k2, kperp2, idcs)
     return out
 end
@@ -110,13 +109,15 @@ end
 # Internal routine -- function barrier aids with JIT compilation
 function _fill_linop_xy!(out, grid::Grid.RealGrid, β1::Float64, k2, kperp2, idcs)
     for ii in idcs
-        for iω in eachindex(grid.ω)
-            βsq = k2[iω] - kperp2[ii]
-            if βsq < 0
-                # negative βsq -> evanescent fields -> attenuation
-                out[iω, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-            else
-                out[iω, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
+        for ip in axes(k2, 2)
+            for iω in eachindex(grid.ω)
+                βsq = k2[iω, ip] - kperp2[ii]
+                if βsq < 0
+                    # negative βsq -> evanescent fields -> attenuation
+                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
+                else
+                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
+                end
             end
         end
     end
@@ -137,16 +138,18 @@ end
 
 function _fill_linop_xy!(out, grid::Grid.EnvGrid, β1::Float64, k2, kperp2, idcs, βref; thg)
     for ii in idcs
-        for iω in eachindex(grid.ω)
-            βsq = k2[iω] - kperp2[ii]
-            if βsq < 0
-                # negative βsq -> evanescent fields -> attenuation
-                out[iω, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-            else
-                out[iω, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
-            end
-            if !thg
-                out[iω, ii] -= -im*βref
+        for ip in axes(k2, 2)
+            for iω in eachindex(grid.ω)
+                βsq = k2[iω, ip] - kperp2[ii]
+                if βsq < 0
+                    # negative βsq -> evanescent fields -> attenuation
+                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
+                else
+                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
+                end
+                if !thg
+                    out[iω, ip, ii] -= -im*βref
+                end
             end
         end
     end

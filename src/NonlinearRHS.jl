@@ -654,7 +654,7 @@ function norm_free(grid, xygrid, nfun)
         for ii in idcs
             for iω in eachindex(ω)
                 if ω[iω] == 0 || ~grid.sidx[iω]
-                    out[iω, :, ii] = 1.0
+                    out[iω, :, ii] .= 1.0
                     continue
                 end
                 for (ip, n) in enumerate(nfun(ω[iω]; z))
