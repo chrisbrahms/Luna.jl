@@ -4,6 +4,22 @@ import Hankel
 import Luna: Modes, Grid, PhysData, Maths
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
 
+function fill_linop_matrix!(out, grid, β1::Number, βref::Number, k2, kperp2, idcs)
+    for ii in idcs
+        for ip in axes(k2, 2)
+            for iω in eachindex(grid.ω)
+                βsq = k2[iω, ip] - kperp2[ii]
+                if βsq < 0
+                    # negative βsq -> evanescent fields -> attenuation
+                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω] - βref) - min(sqrt(abs(βsq)), 200)
+                else
+                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω] - βref)
+                end
+            end
+        end
+    end
+end
+
 #=================================================#
 #===============    FREE SPACE     ===============#
 #=================================================#
@@ -19,7 +35,7 @@ function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
     idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
     k2 = @. (n*grid.ω/c)^2
     out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xygrid.ky), length(xygrid.kx)))
-    _fill_linop_xy!(out, grid, β1, k2, kperp2, idcs)
+    fill_linop_matrix!(out, grid, β1, 0.0, k2, kperp2, idcs)
     return out
 end
 
@@ -70,7 +86,7 @@ function make_const_linop(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
     idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
     k2 = @. (n*grid.ω/c)^2
     out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xygrid.ky), length(xygrid.kx)))
-    _fill_linop_xy!(out, grid, β1, k2, kperp2, idcs, β0ref; thg=thg)
+    fill_linop_matrix!(out, grid, β1, β0ref, k2, kperp2, idcs)
     return out
 end
 
@@ -101,24 +117,7 @@ function make_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfun)
     function linop!(out, z)
         β1 = PhysData.dispersion_func(1, nfunλ(z))(grid.referenceλ)
         k2[grid.sidx] .= (nfun.(grid.ω[grid.sidx]; z=z) .* grid.ω[grid.sidx] ./ c).^2
-        _fill_linop_xy!(out, grid, β1, k2, kperp2, idcs)
-    end
-end
-
-# Internal routine -- function barrier aids with JIT compilation
-function _fill_linop_xy!(out, grid::Grid.RealGrid, β1::Float64, k2, kperp2, idcs)
-    for ii in idcs
-        for ip in axes(k2, 2)
-            for iω in eachindex(grid.ω)
-                βsq = k2[iω, ip] - kperp2[ii]
-                if βsq < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-                else
-                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
-                end
-            end
-        end
+        fill_linop_matrix!(out, grid, β1, 0.0, k2, kperp2, idcs)
     end
 end
 
@@ -131,26 +130,7 @@ function make_linop(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid, nfun; thg=false)
         β1 = PhysData.dispersion_func(1, nfunλ(z))(grid.referenceλ)
         k2[grid.sidx] .= (nfun.(grid.ω[grid.sidx]; z=z).*grid.ω[grid.sidx]./c).^2
         βref = thg ? 0.0 : grid.ω0/c * nfun(grid.ω0; z=z)
-        _fill_linop_xy!(out, grid, β1, k2, kperp2, idcs, βref; thg=thg)
-    end
-end
-
-function _fill_linop_xy!(out, grid::Grid.EnvGrid, β1::Float64, k2, kperp2, idcs, βref; thg)
-    for ii in idcs
-        for ip in axes(k2, 2)
-            for iω in eachindex(grid.ω)
-                βsq = k2[iω, ip] - kperp2[ii]
-                if βsq < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-                else
-                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
-                end
-                if !thg
-                    out[iω, ip, ii] -= -im*βref
-                end
-            end
-        end
+        fill_linop_matrix!(out, grid, β1, βref, k2, kperp2, idcs)
     end
 end
 
@@ -169,7 +149,7 @@ function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid,
     idcs = CartesianIndices(xgrid.kx)
     k2 = @. (n*grid.ω/c)^2
     out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xgrid.kx)))
-    _fill_linop_x!(out, grid, β1, k2, kperp2, idcs)
+    fill_linop_matrix!(out, grid, β1, 0.0, k2, kperp2, idcs)
     return out
 end
 
@@ -213,12 +193,12 @@ function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfunx, nf
 end
 
 function make_const_linop(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid,
-                          n::AbstractArray, β1::Number, β0ref::Number; thg=false)
+                          n::AbstractArray, β1::Number, β0ref::Number)
     kperp2 = xgrid.kx.^2
     idcs = CartesianIndices(xgrid.kx)
     k2 = @. (n*grid.ω/c)^2
     out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xgrid.kx)))
-    _fill_linop_x!(out, grid, β1, k2, kperp2, idcs, β0ref; thg=thg)
+    fill_linop_matrix!(out, grid, β1, β0ref, k2, kperp2, idcs)
     return out
 end
 
@@ -261,24 +241,7 @@ function make_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfun)
                 k2[ii, :] .= (nfun(grid.ω[ii]; z) .* grid.ω[ii]./c).^2
             end
         end
-        _fill_linop_x!(out, grid, β1, k2, kperp2, idcs)
-    end
-end
-
-# Internal routine -- function barrier aids with JIT compilation
-function _fill_linop_x!(out, grid::Grid.RealGrid, β1::Float64, k2, kperp2, idcs)
-    for ii in idcs
-        for ip in axes(k2, 2)
-            for iω in eachindex(grid.ω)
-                βsq = k2[iω, ip] - kperp2[ii]
-                if βsq < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-                else
-                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
-                end
-            end
-        end
+        fill_linop_matrix!(out, grid, β1, 0.0, k2, kperp2, idcs)
     end
 end
 
@@ -297,26 +260,7 @@ function make_linop(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid, nfun; thg=false)
             end
         end
         βref = thg ? 0.0 : grid.ω0/c * nfun(grid.ω0; z=z)[end]
-        _fill_linop_x!(out, grid, β1, k2, kperp2, idcs, βref; thg=thg)
-    end
-end
-
-function _fill_linop_x!(out, grid::Grid.EnvGrid, β1::Float64, k2, kperp2, idcs, βref; thg)
-    for ii in idcs
-        for ip in axes(k2, 2)
-            for iω in eachindex(grid.ω)
-                βsq = k2[iω, ip] - kperp2[ii]
-                if βsq < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-                else
-                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω])
-                end
-                if !thg
-                    out[iω, ip, ii] -= -im*βref
-                end
-            end
-        end
+        fill_linop_matrix!(out, grid, β1, βref, k2, kperp2, idcs)
     end
 end
 
@@ -334,7 +278,7 @@ function make_const_linop(grid::Grid.RealGrid, q::Hankel.QDHT,
     out = Array{ComplexF64}(undef, (length(grid.ω), size(n, 2), q.N))
     k2 = @. (n*grid.ω/c)^2
     kr2 = q.k.^2
-    _fill_linop_r!(out, grid, β1, k2, kr2, q.N)
+    fill_linop_matrix!(out, grid, β1, 0.0, k2, kr2, eachindex(q.k))
     return out
 end
 
@@ -366,15 +310,15 @@ function make_const_linop(grid::Grid.EnvGrid, q::Hankel.QDHT, nfun; thg=false)
     else
         β0const = grid.ω0/c * nfun(2π*c./grid.ω0)[1]
     end
-    make_const_linop(grid, q, n, β1, β0const; thg=thg)
+    make_const_linop(grid, q, n, β1, β0const)
 end
 
 function make_const_linop(grid::Grid.EnvGrid, q::Hankel.QDHT,
-                          n::AbstractVecOrMat, β1::Number, β0ref::Number; thg=false)
+                          n::AbstractVecOrMat, β1::Number, β0ref::Number)
     out = Array{ComplexF64}(undef, (length(grid.ω), size(n, 2), q.N))
     k2 = @. (n*grid.ω/c)^2
     kr2 = q.k.^2
-    _fill_linop_r!(out, grid, β1, k2, kr2, q.N, β0ref, thg)
+    fill_linop_matrix!(out, grid, β1, β0ref, k2, kr2, eachindex(q.k))
     return out
 end
 
@@ -394,23 +338,7 @@ function make_linop(grid::Grid.RealGrid, q::Hankel.QDHT, nfun)
     function linop!(out, z)
         β1 = PhysData.dispersion_func(1, nfunλ(z))(grid.referenceλ)
         k2[grid.sidx, :] .= (nfun.(grid.ω[grid.sidx]; z=z) .* grid.ω[grid.sidx]./c).^2
-        _fill_linop_r!(out, grid, β1, k2, kr2, q.N)
-    end
-end
-
-function _fill_linop_r!(out, grid::Grid.RealGrid, β1, k2, kr2, Nr)
-    for ir = 1:Nr
-        for ip in axes(k2, 2)
-            for iω = 1:length(grid.ω)
-                βsq = k2[iω, ip] - kr2[ir]
-                if βsq < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ir] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-                else
-                    out[iω, ip, ir] = -im*(sqrt(βsq) - β1*grid.ω[iω])
-                end
-            end
-        end
+        fill_linop_matrix!(out, grid, β1, 0.0, k2, kr2, eachindex(q.k))
     end
 end
 
@@ -424,26 +352,7 @@ function make_linop(grid::Grid.EnvGrid, q::Hankel.QDHT, nfun; thg=false)
         β1 = PhysData.dispersion_func(1, nfunλ(z))(grid.referenceλ)
         k2[grid.sidx, :] .= (nfun.(grid.ω[grid.sidx]; z=z) .* grid.ω[grid.sidx]./c).^2
         βref = thg ? 0.0 : grid.ω0/c * nfun(grid.ω0; z=z)[end]
-        _fill_linop_r!(out, grid, β1, k2, kr2, q.N, βref, thg)
-    end
-end
-
-function _fill_linop_r!(out, grid::Grid.EnvGrid, β1, k2, kr2, Nr, βref, thg)
-    for ir = 1:Nr
-        for ip in axes(k2, 2)
-            for iω = 1:length(grid.ω)
-                βsq = k2[iω, ip] - kr2[ir]
-                if βsq < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ir] = -im*(-β1*grid.ω[iω]) - min(sqrt(abs(βsq)), 200)
-                else
-                    out[iω, ip, ir] = -im*(sqrt(βsq) - β1*grid.ω[iω])
-                end
-                if !thg
-                    out[iω, ip, ir] -= -im*βref
-                end
-            end
-        end
+        fill_linop_matrix!(out, grid, β1, βref, k2, kr2, eachindex(q.k))
     end
 end
 
