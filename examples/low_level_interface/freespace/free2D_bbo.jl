@@ -17,7 +17,7 @@ material = :BBO
 thickness = 200e-6 # BBO thickness
 
 R = 4*w0 # radius of the spatial window
-N = 2^6 # number of spatial points
+N = 2^7 # number of spatial points
 
 grid = Grid.RealGrid(thickness, λ0, (250e-9, 2e-6), 120e-15)
 xgrid = Grid.Free2DGrid(R, N)
@@ -35,9 +35,9 @@ which allows make_const_linop to calculate the actual internal angle depending
 on frequency and transverse k-vector component.
 =#
 nfunx, nfuny = PhysData.ref_index_fun_xy(material, θ)
-linop = LinearOps.make_const_linop(grid, xgrid, nfunx, nfuny)
+linop = LinearOps.make_const_linop(grid, xgrid, (nfunx, nfuny))
 
-normfun = NonlinearRHS.const_norm_free2D(grid, xgrid, nfunx, nfuny)
+normfun = NonlinearRHS.const_norm_free2D(grid, xgrid, (nfunx, nfuny))
 densityfun = z -> 1 # density is unity because we're considering a solid.
 ##
 # scaling factor in front of the energy corresponds to the integral over y
@@ -155,7 +155,6 @@ plt.ylabel("SED (J/Hz)")
 plt.legend()
 
 ##
-lwe = Utils.load_dict_h5(joinpath(@__DIR__, "field_for_luna.h5"))
 fig = plt.figure()
 fig.set_size_inches(12, 7)
 plt.subplot(1, 2, 1)

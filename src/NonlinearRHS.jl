@@ -624,10 +624,11 @@ function const_norm_free(grid, xygrid, nfun)
     return norm
 end
 
-function const_norm_free(grid, xygrid, nfunx, nfuny)
-    nfunωx = (ω, δθ) -> nfunx(wlfreq(ω), δθ)
-    nfunωy = (ω) -> nfuny(wlfreq(ω))
-    normfun = norm_free(grid, xygrid, nfunωx, nfunωy)
+function const_norm_free(grid, xygrid, nfuns::Tuple)
+    nfunx, nfuny = nfuns
+    nfunzx = (λ, δθ; z) -> nfunx(λ, δθ)
+    nfunzy = (λ; z) -> nfuny(λ)
+    normfun = norm_free(grid, xygrid, (nfunzx, nfunzy))
     out = copy(normfun(0.0))
     function norm(z)
         return out
@@ -672,7 +673,8 @@ function norm_free(grid, xygrid, nfun)
     end
 end
 
-function norm_free(grid, xygrid, nfunx, nfuny)
+function norm_free(grid, xygrid, nfuns::Tuple)
+    nfunx, nfuny = nfuns
     # here nfunx(λ, δθ; z) also takes the angle and returns n_x(λ, θ+δθ)
     # nfuny(λ; z) just takes wavelength
     ω = grid.ω
@@ -683,11 +685,11 @@ function norm_free(grid, xygrid, nfunx, nfuny)
                 out[iω, :, :, :] .= 1.0
                 continue
             end
-            ny = nfuny(wlfreq(ω[iω]))
+            ny = nfuny(wlfreq(ω[iω]); z)
             ksq_ypol = (ny*ω[iω]/c)^2
             for (ikx, kxi) in enumerate(xygrid.kx)
-                δθ = crystal_internal_angle(nfunx, ω[iω], kxi)
-                nx = nfunx(wlfreq(ω[iω]), δθ)
+                δθ = crystal_internal_angle((λ, δθ) -> nfunx(λ, δθ; z), ω[iω], kxi)
+                nx = nfunx(wlfreq(ω[iω]), δθ; z)
                 for (iky, kyi) in enumerate(xygrid.ky)
                     k_xpol = nx*grid.ω[iω]/c
                     βsq_xpol = k_xpol^2 - kxi^2 - kyi^2
@@ -806,10 +808,11 @@ function const_norm_free2D(grid, xgrid, nfun)
     return norm
 end
 
-function const_norm_free2D(grid, xgrid, nfunx, nfuny)
-    nfunωx = (ω, δθ) -> nfunx(wlfreq(ω), δθ)
-    nfunωy = (ω) -> nfuny(wlfreq(ω))
-    normfun = norm_free2D(grid, xgrid, nfunωx, nfunωy)
+function const_norm_free2D(grid, xgrid, nfuns::Tuple)
+    nfunx, nfuny = nfuns
+    nfunzx = (λ, δθ; z) -> nfunx(λ, δθ)
+    nfunzy = (λ; z) -> nfuny(λ)
+    normfun = norm_free2D(grid, xgrid, (nfunzx, nfunzy))
     out = copy(normfun(0.0))
     function norm(z)
         return out
@@ -853,7 +856,8 @@ function norm_free2D(grid, xgrid, nfun)
     end
 end
 
-function norm_free2D(grid, xgrid, nfunx, nfuny)
+function norm_free2D(grid, xgrid, nfuns::Tuple)
+    nfunx, nfuny = nfuns
     # here nfunx(λ, δθ; z) also takes the angle and returns n_x(λ, θ+δθ)
     # nfuny(λ; z) just takes wavelength
     ω = grid.ω
@@ -864,11 +868,11 @@ function norm_free2D(grid, xgrid, nfunx, nfuny)
                 out[iω, :, :] .= 1.0
                 continue
             end
-            ny = nfuny(wlfreq(ω[iω]))
+            ny = nfuny(wlfreq(ω[iω]); z)
             ksq_ypol = (ny*ω[iω]/c)^2
             for (ik, kxi) in enumerate(xgrid.kx)
-                δθ = crystal_internal_angle(nfunx, ω[iω], kxi)
-                nx = nfunx(wlfreq(ω[iω]), δθ)
+                δθ = crystal_internal_angle((λ, δθ) -> nfunx(λ, δθ; z), ω[iω], kxi)
+                nx = nfunx(wlfreq(ω[iω]), δθ; z)
                 k_xpol = nx*grid.ω[iω]/c
                 βsq_xpol = k_xpol^2 - kxi^2
                 if βsq_xpol < 0
