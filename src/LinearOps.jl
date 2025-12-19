@@ -4,16 +4,20 @@ import Hankel
 import Luna: Modes, Grid, PhysData, Maths
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
 
+getω0(grid::Grid.EnvGrid) = grid.ω0
+getω0(grid::Grid.RealGrid) = 0.0
+
 function fill_linop_matrix!(out, grid, β1::Number, βref::Number, k2, kperp2, idcs)
+    ω0 = getω0(grid)
     for ii in idcs
         for ip in axes(k2, 2)
             for iω in eachindex(grid.ω)
                 βsq = k2[iω, ip] - kperp2[ii]
                 if βsq < 0
                     # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ii] = -im*(-β1*grid.ω[iω] - βref) - min(sqrt(abs(βsq)), 200)
+                    out[iω, ip, ii] = -im*(-β1*(grid.ω[iω] - ω0) - βref) - min(sqrt(abs(βsq)), 200)
                 else
-                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*grid.ω[iω] - βref)
+                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*(grid.ω[iω] - ω0) - βref)
                 end
             end
         end
@@ -23,23 +27,54 @@ end
 #=================================================#
 #===============    FREE SPACE     ===============#
 #=================================================#
+function transverse_k2(xygrid::Grid.FreeGrid)
+    kperp2 = @. (xygrid.kx^2)' + xygrid.ky^2
+    idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
+    kperp2, idcs
+end
+
+function transverse_k2(xgrid::Grid.Free2DGrid)
+    kperp2 = xgrid.kx.^2
+    idcs = CartesianIndices(xgrid.kx)
+    kperp2, idcs
+end
+
+function transverse_k2(xygrid::Hankel.QDHT)
+    kperp2 = @. (xygrid.kx^2)' + xygrid.ky^2
+    idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
+    kperp2, idcs
+end
+
+
 """
     make_const_linop(grid, xygrid, n, β1)
 
 Make constant linear operator for full 3D propagation. `n` is the refractive index (array)
 and β1 is 1/velocity of the reference frame.
 """
-function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
-                          n::AbstractVecOrMat, β1::Number)
-    kperp2 = @. (xygrid.kx^2)' + xygrid.ky^2
-    idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
+function make_const_linop(grid::Grid.AbstractGrid,
+                          xygrid::Union{Grid.FreeGrid, Grid.Free2DGrid, Hankel.QDHT},
+                          n::AbstractVecOrMat, β1::Number, β0::Number)
+    kperp2, idcs = transverse_k2(xygrid)
     k2 = @. (n*grid.ω/c)^2
-    out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xygrid.ky), length(xygrid.kx)))
-    fill_linop_matrix!(out, grid, β1, 0.0, k2, kperp2, idcs)
+    out = zeros(ComplexF64, (length(grid.ω), size(n, 2), size(idcs)...))
+    fill_linop_matrix!(out, grid, β1, β0, k2, kperp2, idcs)
     return out
 end
 
-function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfun)
+thg_default(grid::Grid.RealGrid) = true
+thg_default(grid::Grid.EnvGrid) = false
+
+checkthg(grid::Grid.EnvGrid, thg) = nothing
+checkthg(grid::Grid.RealGrid, thg) = thg || error("`thg` must be `true` for `RealGrid`s")
+
+getβ0_n(grid::Grid.RealGrid, nfun, thg) = 0.0
+getβ0_n(grid::Grid.EnvGrid, nfun, thg) = thg ? 0.0 : grid.ω0/c * nfun(wlfreq(grid.ω0))[end]
+
+function make_const_linop(grid::Grid.AbstractGrid,
+                          xygrid::Union{Grid.FreeGrid, Grid.Free2DGrid, Hankel.QDHT},
+                          nfun, thg::Bool=thg_default(grid))
+    checkthg(grid, thg)
     ωfirst = grid.ω[findfirst(grid.sidx)]
     np = length(nfun(wlfreq(ωfirst))) # 1 if single ref index, 2 if nx, ny
     n = zeros(Float64, (length(grid.ω), np))
@@ -49,10 +84,12 @@ function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfun)
         end
     end
     β1 = PhysData.dispersion_func(1, λ -> nfun(λ)[end])(grid.referenceλ)
-    make_const_linop(grid, xygrid, n, β1)
+    β0 = getβ0_n(grid, nfun, thg)
+    make_const_linop(grid, xygrid, n, β1, β0)
 end
 
-function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfunx, nfuny)
+function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfuns)
+    nfunx, nfuny = nfuns
     # here nfunx(λ, δθ) also takes the angle and returns n_x(λ, θ)
     # nfuny(λ; z) just takes wavelength
     out = zeros(ComplexF64, (length(grid.ω), 2, length(xygrid.ky), length(xygrid.kx)))
@@ -78,29 +115,6 @@ function make_const_linop(grid::Grid.RealGrid, xygrid::Grid.FreeGrid, nfunx, nfu
         end
     end
     out
-end
-
-function make_const_linop(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
-                          n::AbstractVecOrMat, β1::Number, β0ref::Number; thg=false)
-    kperp2 = @. (xygrid.kx^2)' + xygrid.ky^2
-    idcs = CartesianIndices((length(xygrid.ky), length(xygrid.kx)))
-    k2 = @. (n*grid.ω/c)^2
-    out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xygrid.ky), length(xygrid.kx)))
-    fill_linop_matrix!(out, grid, β1, β0ref, k2, kperp2, idcs)
-    return out
-end
-
-function make_const_linop(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid, nfun,     
-                          thg=false)
-    n = zero(grid.ω)
-    n[grid.sidx] = nfun.(wlfreq.(grid.ω[grid.sidx]))
-    β1 = PhysData.dispersion_func(1, nfun)(grid.referenceλ)
-    if thg
-        β0const = 0.0
-    else
-        β0const = grid.ω0/c * nfun(wlfreq(grid.ω0))
-    end
-    make_const_linop(grid, xygrid, n, β1, β0const; thg=thg)
 end
 
 """
@@ -137,36 +151,9 @@ end
 #=================================================#
 #============   FREE SPACE (2D)   ================#
 #=================================================#
-"""
-    make_const_linop(grid, xgrid, n, β1)
 
-Make constant linear operator for 2D free-space propagation. `n` is the refractive index (array)
-and β1 is 1/velocity of the reference frame.
-"""
-function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid,
-                          n::AbstractArray, β1::Number)
-    kperp2 = xgrid.kx.^2
-    idcs = CartesianIndices(xgrid.kx)
-    k2 = @. (n*grid.ω/c)^2
-    out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xgrid.kx)))
-    fill_linop_matrix!(out, grid, β1, 0.0, k2, kperp2, idcs)
-    return out
-end
-
-function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfun)
-    ωfirst = grid.ω[findfirst(grid.sidx)]
-    np = length(nfun(wlfreq(ωfirst))) # 1 if single ref index, 2 if nx, ny
-    n = zeros(Float64, (length(grid.ω), np))
-    for (ii, si) in enumerate(grid.sidx)
-        if si
-            n[ii, :] .= nfun(wlfreq(grid.ω[ii]))
-        end
-    end
-    β1 = PhysData.dispersion_func(1, λ -> nfun(λ)[end])(grid.referenceλ)
-    make_const_linop(grid, xgrid, n, β1)
-end
-
-function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfunx, nfuny)
+function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfuns::Tuple)
+    nfunx, nfuny = nfuns
     # here nfunx(λ, δθ) also takes the angle and returns n_x(λ, θ)
     # nfuny(λ; z) just takes wavelength
     out = zeros(ComplexF64, (length(grid.ω), 2, length(xgrid.kx)))
@@ -190,35 +177,6 @@ function make_const_linop(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid, nfunx, nf
         end
     end
     out
-end
-
-function make_const_linop(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid,
-                          n::AbstractArray, β1::Number, β0ref::Number)
-    kperp2 = xgrid.kx.^2
-    idcs = CartesianIndices(xgrid.kx)
-    k2 = @. (n*grid.ω/c)^2
-    out = zeros(ComplexF64, (length(grid.ω), size(n, 2), length(xgrid.kx)))
-    fill_linop_matrix!(out, grid, β1, β0ref, k2, kperp2, idcs)
-    return out
-end
-
-function make_const_linop(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid, nfun,     
-                          thg=false)
-    ωfirst = grid.ω[findfirst(grid.sidx)]
-    np = length(nfun(ωfirst; z=0)) # 1 if single ref index, 2 if nx, ny
-    n = zeros(Float64, (length(grid.ω), np))
-    for (ii, si) in enumerate(grid.sidx)
-        if si
-            n[ii, :] .= nfun(wlfreq(grid.ω[ii]))
-        end
-    end
-    β1 = PhysData.dispersion_func(1, λ -> nfun(λ)[end])(grid.referenceλ)
-    if thg
-        β0const = 0.0
-    else
-        β0const = grid.ω0/c * nfun(wlfreq(grid.ω0))
-    end
-    make_const_linop(grid, xgrid, n, β1, β0const; thg=thg)
 end
 
 """
@@ -384,27 +342,20 @@ See also [`αlim!`](@ref).
 """
 conj_clamp(n, ω) = clamp(real(n), 1e-3, Inf) - im*clamp(imag(n), 0, 3000*c/ω)
 
-function make_const_linop(grid::Grid.RealGrid, βfun!, αfun!, β1)
+function make_const_linop(grid::Grid.AbstractGrid, βfun!, αfun!, β1::Number, β0::Number)
+    ω0 = getω0(grid)
     β = similar(grid.ω)
     βfun!(β, 0)
     α = similar(grid.ω)
     αfun!(α, 0)
     αlim!(α)
-    linop = @. -im*(β-β1*grid.ω) - α/2
+    linop = @. -im*(β - β1*(grid.ω - ω0) - β0) - α/2
     linop[.!grid.sidx] .= 0
     return linop
 end
 
-function make_const_linop(grid::Grid.EnvGrid, βfun!, αfun!, β1, β0ref)
-    β = similar(grid.ω)
-    βfun!(β, 0)
-    α = similar(grid.ω)
-    αfun!(α, 0)
-    αlim!(α)
-    linop = -im.*(β .- β1.*(grid.ω .- grid.ω0) .- β0ref) .- α./2
-    linop[.!grid.sidx] .= 0
-    return linop
-end
+getβ0_mode(grid::Grid.RealGrid, mode, λ0, thg) = 0.0
+getβ0_mode(grid::Grid.EnvGrid, mode, λ0, thg) = thg ? 0.0 : Modes.β(mode, wlfreq(λ0))
 
 """
     make_const_linop(grid, mode, λ0)
@@ -412,13 +363,11 @@ end
 Make constant linear operator for mode-averaged propagation in mode `mode` with a reference
 wavelength `λ0`.
 """
-function make_const_linop(grid::Grid.EnvGrid, mode::Modes.AbstractMode, λ0; thg=false)
-    β1const = Modes.dispersion(mode, 1, wlfreq(λ0))
-    if thg
-        β0const = 0.0
-    else
-        β0const = Modes.β(mode, wlfreq(λ0))
-    end
+function make_const_linop(grid::Grid.AbstractGrid, mode::Modes.AbstractMode, λ0;               
+                          thg::Bool=thg_default(grid))
+    checkthg(grid, thg)
+    β1 = Modes.dispersion(mode, 1, wlfreq(λ0))
+    β0 = getβ0_mode(grid, mode, λ0, thg)
     βconst = zero(grid.ω)
     βconst[grid.sidx] = Modes.β.(mode, grid.ω[grid.sidx])
     βconst[.!grid.sidx] .= 1
@@ -430,24 +379,9 @@ function make_const_linop(grid::Grid.EnvGrid, mode::Modes.AbstractMode, λ0; thg
     function αfun!(out, z)
         out .= αconst
     end
-    make_const_linop(grid, βfun!, αfun!, β1const, β0const), βfun!, β1const, αfun!
+    make_const_linop(grid, βfun!, αfun!, β1, β0), βfun!, β1, αfun!
 end
 
-function make_const_linop(grid::Grid.RealGrid, mode::Modes.AbstractMode, λ0)
-    β1const = Modes.dispersion(mode, 1, wlfreq(λ0))
-    βconst = zero(grid.ω)
-    βconst[grid.sidx] = Modes.β.(mode, grid.ω[grid.sidx])
-    βconst[.!grid.sidx] .= 1
-    function βfun!(out, z)
-        out .= βconst
-    end
-    αconst = zero(grid.ω)
-    αconst[grid.sidx] = Modes.α.(mode, grid.ω[grid.sidx])
-    function αfun!(out, z)
-        out .= αconst
-    end
-    make_const_linop(grid, βfun!, αfun!, β1const), βfun!, β1const, αfun!
-end
 
 """
     neff_β_grid(grid, mode, λ0; ref_mode=1)
@@ -529,7 +463,7 @@ Make constant (z-invariant) linear operator for multimode propagation. The frame
 taken as the group velocity at wavelength `λ0` in the mode given by `ref_mode` (which 
 indexes into `modes`)
 """
-function make_const_linop(grid::Grid.RealGrid, modes, λ0; ref_mode=1)
+function make_const_linop(grid::Grid.RealGrid, modes::Modes.ModeCollection, λ0; ref_mode=1)
     β1 = Modes.dispersion(modes[ref_mode], 1, wlfreq(λ0))
     nmodes = length(modes)
     linops = zeros(ComplexF64, length(grid.ω), nmodes)
@@ -545,7 +479,7 @@ function make_const_linop(grid::Grid.RealGrid, modes, λ0; ref_mode=1)
     linops
 end
 
-function make_const_linop(grid::Grid.EnvGrid, modes, λ0; ref_mode=1, thg=false)
+function make_const_linop(grid::Grid.EnvGrid, modes::Modes.ModeCollection, λ0; ref_mode=1, thg=false)
     β1 = Modes.dispersion(modes[ref_mode], 1, wlfreq(λ0))
     if thg
         βref = 0.0

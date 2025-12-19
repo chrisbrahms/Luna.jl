@@ -839,7 +839,7 @@ function norm_free2D(grid, xgrid, nfun)
                     continue
                 end
                 for (ip, n) in enumerate(nfun(ω[iω]; z))
-                    k2 = (n*ω[iω]/PhysData.c)^2
+                    k2 = (real(n)*ω[iω]/PhysData.c)^2
                     βsq = k2 - kperp2[ii]
                     if βsq <= 0
                         out[iω, ip, ii] = 1.0
