@@ -65,7 +65,7 @@ Ir = zeros(Float64, (length(q.r), length(zout)))
 
 Et = Maths.hilbert(Etout)
 energy = zeros(length(zout))
-for ii = 1:size(Etout, 4)
+for ii in axes(Etout, 4)
     energy[ii] = energyfun(Etout[:, 1, :, ii]);
     Ir[:, ii] = integrate(grid.ω, Iωr[:, 1, :, ii], SimpsonEven());
 end

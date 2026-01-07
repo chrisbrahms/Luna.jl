@@ -14,22 +14,22 @@ using EllipsisNotation
 
 Transform ``A(ω)`` on normal grid to ``A(t)`` on oversampled time grid.
 """
-function to_time!(Ato::Array{<:Real, D}, Aω, Aωo, IFTplan) where D
+function to_time!(Ato::Array{<:Real, D}, Aω, Aωo, FT) where D
     N = size(Aω, 1)
     No = size(Aωo, 1)
     scale = (No-1)/(N-1) # Scale factor makes up for difference in FFT array length
     fill!(Aωo, 0)
     copy_scale!(Aωo, Aω, N, scale)
-    mul!(Ato, IFTplan, Aωo)
+    ldiv!(Ato, FT, Aωo)
 end
 
-function to_time!(Ato::Array{<:Complex, D}, Aω, Aωo, IFTplan) where D
+function to_time!(Ato::Array{<:Complex, D}, Aω, Aωo, FT) where D
     N = size(Aω, 1)
     No = size(Aωo, 1)
     scale = No/N # Scale factor makes up for difference in FFT array length
     fill!(Aωo, 0)
     copy_scale_both!(Aωo, Aω, N÷2, scale)
-    mul!(Ato, IFTplan, Aωo)
+    ldiv!(Ato, FT, Aωo)
 end
 
 """
@@ -82,7 +82,7 @@ function copy_scale_both!(dest::Vector, source::Vector, N, scale)
 end
 
 function copy_scale!(dest, source, N, scale)
-    (size(dest)[2:end] == size(source)[2:end] 
+    (size(dest)[2:end] == size(source)[2:end]
      || error("dest and source must be same size except along first dimension"))
     idcs = CartesianIndices(size(dest)[2:end])
     _cpsc_core(dest, source, N, scale, idcs)
@@ -97,7 +97,7 @@ function _cpsc_core(dest, source, N, scale, idcs)
 end
 
 function copy_scale_both!(dest, source, N, scale)
-    (size(dest)[2:end] == size(source)[2:end] 
+    (size(dest)[2:end] == size(source)[2:end]
      || error("dest and source must be same size except along first dimension"))
     idcs = CartesianIndices(size(dest)[2:end])
     _cpscb_core(dest, source, N, scale, idcs)
@@ -273,7 +273,7 @@ end
 
 function Erω_to_Prω!(t, x)
     Modes.to_space!(t.Erω, t.Emω, x, t.ts, z=t.z)
-    to_time!(t.Er, t.Erω, t.Erωo, inv(t.FT))
+    to_time!(t.Er, t.Erω, t.Erωo, t.FT)
     # get nonlinear pol at r,θ
     Et_to_Pt!(t.Pr, t.Er, t.resp, t.density)
     @. t.Pr *= t.grid.towin
@@ -289,13 +289,13 @@ function (t::TransModal)(nl, Eω, z)
         val, err = Cubature.hcubature_v(
             length(Eω)*2,
             (x, fval) -> pointcalc!(fval, x, t),
-            ll, ul, 
+            ll, ul,
             reltol=t.rtol, abstol=t.atol, maxevals=t.mfcn, error_norm=Cubature.L2)
     else
         val, err = Cubature.pcubature_v(
             length(Eω)*2,
             (x, fval) -> pointcalc!(fval, x, t),
-            (ll[1],), (ul[1],), 
+            (ll[1],), (ul[1],),
             reltol=t.rtol, abstol=t.atol, maxevals=t.mfcn, error_norm=Cubature.L2)
     end
     t.err .= reshape(reinterpret(ComplexF64, err), size(nl))
@@ -361,7 +361,7 @@ end
 const nlscale = sqrt(PhysData.ε_0*PhysData.c/2)
 
 function (t::TransModeAvg)(nl, Eω, z)
-    to_time!(t.Eto, Eω, t.Eωo, inv(t.FT))
+    to_time!(t.Eto, Eω, t.Eωo, t.FT)
     @. t.Eto /= nlscale*sqrt(t.aeff(z))
     Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z))
     @. t.Pto *= t.grid.towin
@@ -416,6 +416,10 @@ struct TransRadial{TT, HTT, FTT, nT, rT, gT, dT, iT}
     Eωo::Array{ComplexF64, 3} # Buffer array for field on oversampled frequency grid
     Pωo::Array{ComplexF64, 3} # Buffer array for NL polarisation on oversampled frequency grid
     idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
+    Tfwd::Matrix{TT}
+    Tbwd::Matrix{TT}
+    Qbuf1::Matrix{TT}
+    Qbuf2::Matrix{TT}
 end
 
 function show(io::IO, t::TransRadial)
@@ -429,12 +433,18 @@ function show(io::IO, t::TransRadial)
 end
 
 function TransRadial(TT, grid, HT, FT, responses, densityfun, normfun, pol=false)
-    Eωo = zeros(ComplexF64, (length(grid.ωo), pol ? 2 : 1, HT.N))
-    Eto = zeros(TT, (length(grid.to), pol ? 2 : 1, HT.N))
+    np = pol ? 2 : 1
+    Eωo = zeros(ComplexF64, (length(grid.ωo), np, HT.N))
+    Eto = zeros(TT, (length(grid.to), np, HT.N))
     Pto = similar(Eto)
     Pωo = similar(Eωo)
     idcs = CartesianIndices(size(Pto)[3:end])
-    TransRadial(HT, FT, normfun, responses, grid, densityfun, Pto, Eto, Eωo, Pωo, idcs)
+    Tfwd = convert(Matrix{TT}, HT.T .* HT.scaleRK)
+    Tbwd = convert(Matrix{TT}, HT.T ./ HT.scaleRK)
+    Qbuf1 = zeros(TT, (HT.N, length(grid.to)))
+    Qbuf2 = zeros(TT, (HT.N, length(grid.to)))
+    TransRadial(HT, FT, normfun, responses, grid, densityfun, Pto, Eto, Eωo, Pωo, idcs,
+                Tfwd, Tbwd, Qbuf1, Qbuf2)
 end
 
 """
@@ -465,11 +475,21 @@ Calculate the reciprocal-domain (ω-k-space) nonlinear response due to the field
 place the result in `nl`
 """
 function (t::TransRadial)(nl, Eω, z)
-    to_time!(t.Eto, Eω, t.Eωo, inv(t.FT)) # transform ω -> t
-    ldiv!(t.Eto, t.QDHT, t.Eto) # transform k -> r
+    to_time!(t.Eto, Eω, t.Eωo, t.FT) # transform ω -> t
+    # ldiv!(t.Eto, t.QDHT, t.Eto) # transform k -> r
+    for ip in axes(t.Eto, 2)
+        permutedims!(t.Qbuf1, view(t.Eto, :, ip, :), (2, 1))
+        mul!(t.Qbuf2, t.Tbwd, t.Qbuf1)
+        permutedims!(view(t.Eto, :, ip, :), t.Qbuf2, (2, 1))
+    end
     Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z), t.idcs) # add up responses
     @. t.Pto *= t.grid.towin # apodisation
-    mul!(t.Pto, t.QDHT, t.Pto) # transform r -> k
+    # mul!(t.Pto, t.QDHT, t.Pto) # transform r -> k
+    for ip in axes(t.Eto, 2)
+        permutedims!(t.Qbuf1, view(t.Pto, :, ip, :), (2, 1))
+        mul!(t.Qbuf2, t.Tfwd, t.Qbuf1)
+        permutedims!(view(t.Pto, :, ip, :), t.Qbuf2, (2, 1))
+    end
     to_freq!(nl, t.Pωo, t.Pto, t.FT) # transform t -> ω
     nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
 end
@@ -478,7 +498,7 @@ end
     const_norm_radial(ω, q, nfun)
 
 Make function to return normalisation factor for radial symmetry without re-calculating at
-every step. 
+every step.
 """
 function const_norm_radial(grid, q, nfun)
     nfunω = (ω; z) -> nfun(wlfreq(ω))
@@ -493,7 +513,7 @@ end
 """
     norm_radial(ω, q, nfun)
 
-Make function to return normalisation factor for radial symmetry. 
+Make function to return normalisation factor for radial symmetry.
 
 !!! note
     Here, `nfun(ω; z)` needs to take frequency `ω` and a keyword argument `z`.
@@ -698,7 +718,7 @@ function norm_free(grid, xygrid, nfuns::Tuple)
                     else
                         out[iω, 1, iky, ikx] = sqrt(βsq_xpol)/(PhysData.μ_0*ω[iω])
                     end
-                    
+
                     βsq_ypol = ksq_ypol - kxi^2 - kyi^2
                     if βsq_ypol < 0
                         out[iω, 2, iky, ikx] .= 1.0
@@ -880,7 +900,7 @@ function norm_free2D(grid, xgrid, nfuns::Tuple)
                 else
                     out[iω, 1, ik] = sqrt(βsq_xpol)/(PhysData.μ_0*ω[iω])
                 end
-                
+
                 βsq_ypol = ksq_ypol - kxi^2
                 if βsq_ypol < 0
                     out[iω, 2, ik] .= 1.0

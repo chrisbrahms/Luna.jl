@@ -19,7 +19,7 @@ R = 4e-3
 N = 128
 
 grid = Grid.RealGrid(L, 800e-9, (400e-9, 2000e-9), 0.2e-12)
-q = Hankel.QDHT(R, N, dim=2)
+q = Hankel.QDHT(R, N, dim=3)
 
 energyfun, energyfun_ω = Fields.energyfuncs(grid, q)
 
@@ -55,7 +55,7 @@ Iωr = abs2.(Erout)
 
 ω0idx = argmin(abs.(grid.ω .- 2π*PhysData.c/λ0))
 
-Iλ0 = Iωr[ω0idx, :, :]
+Iλ0 = Iωr[ω0idx, 1, :, :]
 λ0 = 2π*PhysData.c/grid.ω[ω0idx]
 w1 = w0*sqrt(1+(L/2*λ0/(π*w0^2))^2)
 Iλ0_analytic = Maths.gauss.(q.r, w1/2)*(w0/w1)^2 # analytical solution (in paraxial approx)
