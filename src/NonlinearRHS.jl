@@ -416,10 +416,10 @@ struct TransRadial{TT, HTT, FTT, nT, rT, gT, dT, iT}
     Eωo::Array{ComplexF64, 3} # Buffer array for field on oversampled frequency grid
     Pωo::Array{ComplexF64, 3} # Buffer array for NL polarisation on oversampled frequency grid
     idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
-    Tfwd::Matrix{TT}
-    Tbwd::Matrix{TT}
-    Qbuf1::Matrix{TT}
-    Qbuf2::Matrix{TT}
+    Tfwd::Matrix{TT} # forward Hankel transform matrix
+    Tbwd::Matrix{TT} # backward Hankel transform matrix
+    Qbuf1::Matrix{TT} # buffer array for Hankel transform
+    Qbuf2::Matrix{TT} # buffer array for Hankel transform
 end
 
 function show(io::IO, t::TransRadial)
@@ -476,15 +476,24 @@ place the result in `nl`
 """
 function (t::TransRadial)(nl, Eω, z)
     to_time!(t.Eto, Eω, t.Eωo, t.FT) # transform ω -> t
-    # ldiv!(t.Eto, t.QDHT, t.Eto) # transform k -> r
+    # transform Eto k -> r
+    # iterate over polarisation directions (either 1:2 or just 1)
     for ip in axes(t.Eto, 2)
+        # transform matrix Tbwd has shape Nr × Nr, but t.Eto has Nto × Np × Nr
+        # for fast matrix multiplication, we need the inner dimensions to match
+        # so first permute the dimensions (into the buffer array)
+        # now its shape is Nr × Nto
+        # note the view() to avoid allocating by indexing
         permutedims!(t.Qbuf1, view(t.Eto, :, ip, :), (2, 1))
+        # now do matrix multiplication (Nr × Nr) × (Nr × Nto) -> (Nr × Nto)
         mul!(t.Qbuf2, t.Tbwd, t.Qbuf1)
+        # permute dims back into the original array
         permutedims!(view(t.Eto, :, ip, :), t.Qbuf2, (2, 1))
     end
     Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z), t.idcs) # add up responses
     @. t.Pto *= t.grid.towin # apodisation
-    # mul!(t.Pto, t.QDHT, t.Pto) # transform r -> k
+    # transform Pto r -> k
+    # same as above but with forward transform matrix Tfwd
     for ip in axes(t.Eto, 2)
         permutedims!(t.Qbuf1, view(t.Pto, :, ip, :), (2, 1))
         mul!(t.Qbuf2, t.Tfwd, t.Qbuf1)
