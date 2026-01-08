@@ -411,15 +411,15 @@ struct TransRadial{TT, HTT, FTT, nT, rT, gT, dT, iT}
     resp::rT # nonlinear responses (tuple of callables)
     grid::gT # time grid
     densityfun::dT # callable which returns density
-    Pto::Array{TT, 3} # Buffer array for NL polarisation on oversampled time grid
-    Eto::Array{TT, 3} # Buffer array for field on oversampled time grid
+    Pto_r::Array{TT, 3} # Buffer array for NL polarisation on oversampled time grid
+    Pto_k::Array{TT, 3} # Buffer array for NL polarisation on oversampled time grid
+    Eto_r::Array{TT, 3} # Buffer array for field on oversampled time grid
+    Eto_k::Array{TT, 3} # Buffer array for field on oversampled time grid
     Eωo::Array{ComplexF64, 3} # Buffer array for field on oversampled frequency grid
     Pωo::Array{ComplexF64, 3} # Buffer array for NL polarisation on oversampled frequency grid
     idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
     Tfwd::Matrix{TT} # forward Hankel transform matrix
     Tbwd::Matrix{TT} # backward Hankel transform matrix
-    Qbuf1::Matrix{TT} # buffer array for Hankel transform
-    Qbuf2::Matrix{TT} # buffer array for Hankel transform
 end
 
 function show(io::IO, t::TransRadial)
@@ -435,16 +435,16 @@ end
 function TransRadial(TT, grid, HT, FT, responses, densityfun, normfun, pol=false)
     np = pol ? 2 : 1
     Eωo = zeros(ComplexF64, (length(grid.ωo), np, HT.N))
-    Eto = zeros(TT, (length(grid.to), np, HT.N))
-    Pto = similar(Eto)
+    Eto_r = zeros(TT, (length(grid.to), np, HT.N))
+    Pto_r = similar(Eto_r)
+    Eto_k = similar(Eto_r)
+    Pto_k = similar(Eto_r)
     Pωo = similar(Eωo)
-    idcs = CartesianIndices(size(Pto)[3:end])
-    Tfwd = convert(Matrix{TT}, HT.T .* HT.scaleRK)
-    Tbwd = convert(Matrix{TT}, HT.T ./ HT.scaleRK)
-    Qbuf1 = zeros(TT, (HT.N, length(grid.to)))
-    Qbuf2 = zeros(TT, (HT.N, length(grid.to)))
-    TransRadial(HT, FT, normfun, responses, grid, densityfun, Pto, Eto, Eωo, Pωo, idcs,
-                Tfwd, Tbwd, Qbuf1, Qbuf2)
+    idcs = CartesianIndices(size(Pto_r)[3:end])
+    Tfwd = convert(Matrix{TT}, transpose(HT.T) .* HT.scaleRK)
+    Tbwd = convert(Matrix{TT}, transpose(HT.T) ./ HT.scaleRK)
+    TransRadial(HT, FT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
+                Tfwd, Tbwd)
 end
 
 """
@@ -475,31 +475,19 @@ Calculate the reciprocal-domain (ω-k-space) nonlinear response due to the field
 place the result in `nl`
 """
 function (t::TransRadial)(nl, Eω, z)
-    to_time!(t.Eto, Eω, t.Eωo, t.FT) # transform ω -> t
+    to_time!(t.Eto_k, Eω, t.Eωo, t.FT) # transform ω -> t
     # transform Eto k -> r
     # iterate over polarisation directions (either 1:2 or just 1)
-    for ip in axes(t.Eto, 2)
-        # transform matrix Tbwd has shape Nr × Nr, but t.Eto has Nto × Np × Nr
-        # for fast matrix multiplication, we need the inner dimensions to match
-        # so first permute the dimensions (into the buffer array)
-        # now its shape is Nr × Nto
-        # note the view() to avoid allocating by indexing
-        permutedims!(t.Qbuf1, view(t.Eto, :, ip, :), (2, 1))
-        # now do matrix multiplication (Nr × Nr) × (Nr × Nto) -> (Nr × Nto)
-        mul!(t.Qbuf2, t.Tbwd, t.Qbuf1)
-        # permute dims back into the original array
-        permutedims!(view(t.Eto, :, ip, :), t.Qbuf2, (2, 1))
+    for ip in axes(t.Eto_k, 2)
+        mul!(view(t.Eto_r, :, ip, :), view(t.Eto_k, :, ip, :), t.Tbwd)
     end
-    Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z), t.idcs) # add up responses
-    @. t.Pto *= t.grid.towin # apodisation
+    Et_to_Pt!(t.Pto_r, t.Eto_r, t.resp, t.densityfun(z), t.idcs) # add up responses
+    @. t.Pto_r *= t.grid.towin # apodisation
     # transform Pto r -> k
-    # same as above but with forward transform matrix Tfwd
-    for ip in axes(t.Eto, 2)
-        permutedims!(t.Qbuf1, view(t.Pto, :, ip, :), (2, 1))
-        mul!(t.Qbuf2, t.Tfwd, t.Qbuf1)
-        permutedims!(view(t.Pto, :, ip, :), t.Qbuf2, (2, 1))
+    for ip in axes(t.Pto_k, 2)
+        mul!(view(t.Pto_k, :, ip, :), view(t.Pto_r, :, ip, :), t.Tfwd)
     end
-    to_freq!(nl, t.Pωo, t.Pto, t.FT) # transform t -> ω
+    to_freq!(nl, t.Pωo, t.Pto_k, t.FT) # transform t -> ω
     nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
 end
 
