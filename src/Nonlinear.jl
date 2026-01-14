@@ -132,6 +132,35 @@ function PlasmaScalar!(Plas::PlasmaCumtrapz, E)
     Maths.cumtrapz!(Plas.P, Plas.J, Plas.δt)
 end
 
+"The plasma response for a scalar electric field"
+function PlasmaScalarFast!(out, Plas::PlasmaCumtrapz, E, ρ)
+    Plas.ratefunc(Plas.rate, E)
+    rateint = zero(E[1])
+    phase = zero(E[1])
+    Jphase = zero(E[1])
+    Jtot = zero(E[1])
+    P = zero(E[1])
+    out[1] = 0
+    for ii in 2:length(E)
+        rateint += (Plas.rate[ii-1] + Plas.rate[ii])*Plas.δt/2
+        fraction = 1 - exp(-rateint)
+        # Plas.fraction[ii] = fraction
+        phase_temp = phase
+        phase = fraction * e_ratio * E[ii]
+        # Plas.phase[ii] = phase
+        Jphase += (phase_temp + phase)*Plas.δt/2
+        Jtot_temp = Jtot
+        Jtot = if abs(E[ii]) > 0
+            Jphase + Plas.ionpot * Plas.rate[ii] * (1-fraction)/E[ii]
+        else
+            Jphase
+        end
+        P += ρ*(Jtot_temp + Jtot)*Plas.δt/2
+        # Plas.J[ii] = Jtot
+        out[ii] += P
+    end
+end
+
 """
 The plasma response for a vector electric field.
 
@@ -139,7 +168,7 @@ We take the magnitude of the electric field to calculate the ionization
 rate and fraction, and then solve the plasma polarisation component-wise
 for the vector field.
 
-A similar approach was used in: C Tailliez et al 2020 New J. Phys. 22 103038.  
+A similar approach was used in: C Tailliez et al 2020 New J. Phys. 22 103038.
 """
 function PlasmaVector!(Plas::PlasmaCumtrapz, E)
     Ex = E[:,1]
@@ -164,15 +193,15 @@ end
 function (Plas::PlasmaCumtrapz)(out, Et, ρ)
     if ndims(Et) > 1
         if size(Et, 2) == 1 # handle scalar case but within modal simulation
-            PlasmaScalar!(Plas, reshape(Et, size(Et,1)))
-            out .+= ρ .* reshape(Plas.P, size(Et))
+            # PlasmaScalarFast!(out, Plas, reshape(Et, size(Et,1)), ρ)
+            PlasmaScalarFast!(out, Plas, view(Et, :, 1), ρ)
+            # out .+= ρ .* reshape(Plas.P, size(Et))
         else
             PlasmaVector!(Plas, Et) # vector case
             out .+= ρ .* Plas.P
         end
     else
-        PlasmaScalar!(Plas, Et) # straight scalar case
-        out .+= ρ .* Plas.P
+        PlasmaScalarFast!(out, Plas, Et, ρ) # straight scalar case
     end
 end
 
@@ -182,7 +211,7 @@ abstract type RamanPolar end
 "Raman polarisation response type for a carrier resolved field"
 struct RamanPolarField{TR, Tt, Thv, Tω, Tv, FTt, HTt} <: RamanPolar
     r::TR # Raman response
-    h::Tt # doubled buffer to hold response + padding 
+    h::Tt # doubled buffer to hold response + padding
     ht::Thv # buffer to hold time domain response
     hω::Tω # the frequency domain Raman response function
     Eω2::Tω # buffer to hold the Fourier transform of E^2
@@ -200,7 +229,7 @@ end
 "Raman polarisation response type for an envelope"
 struct RamanPolarEnv{TR, Tt, Thv, Tω, Tv, FTt} <: RamanPolar
     r::TR # Raman response
-    h::Tt # doubled buffer to hold response + padding 
+    h::Tt # doubled buffer to hold response + padding
     ht::Thv # buffer to hold time domain response
     hω::Tω # the frequency domain Raman response function
     Eω2::Tω # buffer to hold the Fourier transform of E^2
@@ -302,7 +331,7 @@ function (R::RamanPolar)(out, Et, ρ)
     # i.e. only the part corresponding to the original time grid
     # note that the response function time 0 is put into the first element of the response array
     # this ensures that causality is maintained, and no artificial delay between the field and
-    # the start of the response function occurs, at each convolution point.  
+    # the start of the response function occurs, at each convolution point.
     R.r(R.ht, ρ)
     R.hω .= R.FT * R.h
 
@@ -323,7 +352,7 @@ function (R::RamanPolar)(out, Et, ρ)
     for i = 1:length(E)
         R.Pout[i] = ρ*E[i]*R.P[i]
     end
-    
+
     # copy to output in dimensions requested
     if ndims(Et) > 1
         out .+= reshape(R.Pout, size(Et))
