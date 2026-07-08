@@ -12,7 +12,8 @@ makedocs(
             "General description" => "model/model.md",
             "Modal decompositions" => "model/modal_decompositions.md",
             "Implementation details" => "model/implementation.md",
-            "Nonlinear responses" => "model/nonlinear_responses.md"
+            "Nonlinear responses" => "model/nonlinear_responses.md",
+            "Noise model" => "model/noise.md"
         ],
         "The simple interface" => "interface.md",
         "Parameter scans" => "scans.md",

@@ -56,7 +56,7 @@ Possible values for `nproc` are:
 - `-1`: spawn as many subprocesses as the number of logical cores on the CPU
     (`Base.Sys.CPU_THREADS`)
 
-If `queuefile` is given, the queuefile is stored at that path. If omitted, the queuefile is 
+If `queuefile` is given, the queuefile is stored at that path. If omitted, the queuefile is
 stored in `Utils.cachedir()`. Note that the queuefile is deleted at the end of the scan.
 """
 struct QueueExec <: AbstractExec
@@ -80,12 +80,28 @@ struct CondorExec <: AbstractExec
 end
 
 """
-    SSHExec(localexec, scriptfile, hostname, subdir)
+    SlurmExec(scriptfile, ncores)
+
+Execution mode which submits a scan to an slurm queue system claiming `ncores` cores.
+
+!!! note
+    `scriptfile` must **always** be `@__FILE__`
+"""
+struct SlurmExec <: AbstractExec
+    scriptfile::String
+    ncores::Int
+end
+
+"""
+    SSHExec(localexec, scriptfile, hostname, subdir; files=String[])
 
 Execution mode which transfers the `scriptfile` file to the host given by `hostname` via SSH
 and executes the scan on that host with a mode defined by `localexec`. `subdir` gives the
 subdirectory (relative to the home directory) where scans are stored on the remote host. A
 subfolder with automatically chosen name will be created in `subdir` to store this scan.
+
+Optional keyword argument `files` is a list of auxiliary files to transfer to the remote host
+along with the script. These files will be placed in the same directory as the scan script.
 
 !!! note
     `scriptfile` must **always** be `@__FILE__`
@@ -95,10 +111,15 @@ struct SSHExec{eT} <: AbstractExec
     scriptfile::String
     hostname::String
     subdir::String
+    files::Vector{String}
 end
 
-function SSHExec(le::CondorExec, hostname, subdir)
-    SSHExec(le, le.scriptfile, hostname, subdir)
+function SSHExec(le::CondorExec, hostname, subdir; files=String[])
+    SSHExec(le, le.scriptfile, hostname, subdir, files)
+end
+
+function SSHExec(le::SlurmExec, hostname, subdir; files=String[])
+    SSHExec(le, le.scriptfile, hostname, subdir, files)
 end
 
 struct Scan{eT}
@@ -146,7 +167,7 @@ size(s::Scan) = (length(s.arrays) == 0) ? (0,) : Tuple(length.(s.arrays))
     addvariable!(scan, variable::Symbol, array)
     addvariable!(scan; kwargs...)
 
-Add scan variable(s) to the `scan`, either as a single pair of `Symbol` and array, or as a 
+Add scan variable(s) to the `scan`, either as a single pair of `Symbol` and array, or as a
 sequence of keyword arguments.
 """
 function addvariable!(scan, variable::Symbol, array)
@@ -363,14 +384,24 @@ function _runscan(f, scan::Scan{QueueExec})
     lockpath = qfile*"_lock"
 
     combos = vec(collect(Iterators.product(scan.arrays...)))
+    qfile_created = false
     while true
         mkpidlock(lockpath; stale_age=120) do
             # first process to catch the pidlock creates the queue file
             if ~isfile(qfile)
+                if qfile_created
+                    # The queue file was already created, so another process
+                    # must have completed the scan and removed it. Signal
+                    # that we should stop by setting scanidx to nothing.
+                    global scanidx = nothing
+                    global qdata = fill(2, length(scan))
+                    return
+                end
                 HDF5.h5open(qfile, "cw") do file
                     file["qdata"] = zeros(Int, length(scan))
                 end
             end
+            qfile_created = true
             # read the queue data
             global qdata = HDF5.h5open(qfile) do file
                 read(file["qdata"])
@@ -388,8 +419,7 @@ function _runscan(f, scan::Scan{QueueExec})
         end # release pidlock
         if isnothing(scanidx) # no scan points left to start
             if all(qdata .> 1) # completely done--either all done or failed
-                # this point is only reached by one process
-                rm(qfile) # remove the queue file
+                rm(qfile; force=true) # remove the queue file
             end
             break # break out of the loop
         end
@@ -404,12 +434,45 @@ function _runscan(f, scan::Scan{QueueExec})
             @warn msg
         end
         mkpidlock(lockpath; stale_age=10) do # acquire lock on qfile again
-            HDF5.h5open(qfile, "r+") do file
-                file["qdata"][scanidx] = code # mark as done/failed
+            if isfile(qfile)
+                HDF5.h5open(qfile, "r+") do file
+                    file["qdata"][scanidx] = code # mark as done/failed
+                end
             end
         end
         Base.GC.gc()
     end
+end
+
+function runscan(f, scan::Scan{SlurmExec})
+    # make submission file for slurm
+    script = scan.exec.scriptfile
+    dir = dirname(script)
+    cores = scan.exec.ncores
+    name = scan.name
+    @info "Submitting slurm job for $script running on $cores cores."
+    # Adding the --queue command-line argument below means that when running the Condor job,
+    # the SlurmExec is ignored even if explicitly defined inside the script.
+    lines = [
+        "#!/bin/bash",
+        "#SBATCH --ntasks=1",
+        "#SBATCH --cpus-per-task=1",
+        "#SBATCH -o %x_%a.stdout",
+        "#SBATCH -e %x_%a.stderr",
+        "#SBATCH --array=1-$cores",
+        "#SBATCH --chdir $dir",
+        "julia $(basename(script)) --queue"
+    ]
+    subfile = joinpath(dir, "$name.sh")
+    @info "Writing job file to $subfile..."
+    open(subfile, "w") do file
+        for l in lines
+            write(file, l*"\n")
+        end
+    end
+    @info "Submitting job..."
+    out = read(`sbatch $subfile`, String)
+    @info "Slurm submission output:\n$out"
 end
 
 function runscan(f, scan::Scan{CondorExec})
@@ -469,6 +532,12 @@ function runscan(f, scan::Scan{<:SSHExec})
         read(`ssh $host "mkdir -p \$HOME/$subdir/$folder"`)
         @info "Transferring file..."
         read(`scp $script $host:\~/$subdir/$folder`)
+        if length(scan.exec.files) > 0
+            @info "Transferring auxiliary files..."
+            for fi in scan.exec.files
+                read(`scp $fi $host:\~/$subdir/$folder`)
+            end
+        end
         @info "Running Luna script on remote host $host"
         read(`ssh $host julia \$HOME/$subdir/$folder/$scriptfile`, String)
     end

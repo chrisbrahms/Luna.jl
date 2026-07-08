@@ -36,7 +36,7 @@ end
 """
     set_fftw_threads(nthr)
 
-Set number of threads to be used by FFTW. If set to `0`, the number of threads used by 
+Set number of threads to be used by FFTW. If set to `0`, the number of threads used by
 FFTW is determined automatically (see [`Utils.FFTWthreads()`](@ref))
 """
 function set_fftw_threads(nthr=0)
@@ -113,32 +113,44 @@ function doinput_sm(grid, inputs::Tuple{Vararg{T} where T <: NamedTuple{<:Any, <
 end
 
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff;
-               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
+               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff),
+               noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     xo = Array{Float64}(undef, length(grid.to))
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff)
+    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff;
+                                          noise_field)
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1, flags=settings["fftw_flag"])
     Eω = doinput_sm(grid, inputs, FT)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs, βfun!, aeff;
-               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
+               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff),
+               noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1, flags=settings["fftw_flag"])
     xo = Array{ComplexF64}(undef, length(grid.to))
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff)
+    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff;
+                                          noise_field)
     Eω = doinput_sm(grid, inputs, FT)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
@@ -164,7 +176,10 @@ end
 
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
-               full=false, norm! = NonlinearRHS.norm_modal(grid))
+               full=false, norm! = NonlinearRHS.norm_modal(grid),
+               rtol=1e-3, atol=0.0, mfcn=512, noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
     Utils.loadFFTwisdom()
     xt = Array{Float64}(undef, length(grid.t))
@@ -176,17 +191,22 @@ function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
     xo = Array{Float64}(undef, length(grid.to), ts.npol)
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransModal(grid, ts, FTo,
-                                 responses, densityfun, norm!,
-                                 rtol=1e-3, atol=0.0, mfcn=300, full=full)
+                                 responses, densityfun, norm!;
+                                 rtol, atol, mfcn, full, noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
-               full=false, norm! = NonlinearRHS.norm_modal(grid))
+               full=false, norm! = NonlinearRHS.norm_modal(grid),
+               rtol=1e-3, atol=0.0, mfcn=512, noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
     Utils.loadFFTwisdom()
     xt = Array{ComplexF64}(undef, length(grid.t))
@@ -198,11 +218,13 @@ function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
     xo = Array{ComplexF64}(undef, length(grid.to), ts.npol)
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransModal(grid, ts, FTo,
-                                 responses, densityfun, norm!,
-                                 rtol=1e-3, atol=0.0, mfcn=300, full=full)
+                                 responses, densityfun, norm!;
+                                 rtol, atol, mfcn, full, noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eω, transform, FT
 end
 
@@ -219,7 +241,9 @@ function doinputs_fs!(Eωk, grid, spacegrid::Union{Hankel.QDHT,Grid.FreeGrid}, F
 end
 
 function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
-               densityfun, normfun, responses, inputs)
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     xt = zeros(Float64, length(grid.t), length(q.r))
     FT = FFTW.plan_rfft(xt, 1, flags=settings["fftw_flag"])
@@ -228,15 +252,20 @@ function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
     doinputs_fs!(Eωk, grid, q, FT, inputs)
     xo = Array{Float64}(undef, length(grid.to), length(q.r))
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransRadial(grid, q, FTo, responses, densityfun, normfun)
+    transform = NonlinearRHS.TransRadial(grid, q, FTo, responses, densityfun, normfun;
+                                         noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
-               densityfun, normfun, responses, inputs)
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     xt = zeros(ComplexF64, length(grid.t), length(q.r))
     FT = FFTW.plan_fft(xt, 1, flags=settings["fftw_flag"])
@@ -245,18 +274,23 @@ function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
     doinputs_fs!(Eωk, grid, q, FT, inputs)
     xo = Array{ComplexF64}(undef, length(grid.to), length(q.r))
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransRadial(grid, q, FTo, responses, densityfun, normfun)
+    transform = NonlinearRHS.TransRadial(grid, q, FTo, responses, densityfun, normfun;
+                                         noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
 function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs)
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     x = xygrid.x
-    y = xygrid.y          
+    y = xygrid.y
     xr = Array{Float64}(undef, length(grid.t), length(y), length(x))
     FT = FFTW.plan_rfft(xr, (1, 2, 3), flags=settings["fftw_flag"])
     Eωk = zeros(ComplexF64, length(grid.ω), length(y), length(x))
@@ -264,18 +298,23 @@ function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
     xo = Array{Float64}(undef, length(grid.to), length(y), length(x))
     FTo = FFTW.plan_rfft(xo, (1, 2, 3), flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun)
+                                       responses, densityfun, normfun;
+                                       noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
 function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs)
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    Logging.@info("Setting up and planning FFTs...")
+    flush(stderr)
     Utils.loadFFTwisdom()
     x = xygrid.x
-    y = xygrid.y          
+    y = xygrid.y
     xr = Array{ComplexF64}(undef, length(grid.t), length(y), length(x))
     FT = FFTW.plan_fft(xr, (1, 2, 3), flags=settings["fftw_flag"])
     Eωk = zeros(ComplexF64, length(grid.ω), length(y), length(x))
@@ -283,10 +322,13 @@ function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
     xo = Array{ComplexF64}(undef, length(grid.to), length(y), length(x))
     FTo = FFTW.plan_fft(xo, (1, 2, 3), flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun)
+                                       responses, densityfun, normfun;
+                                       noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
+    Logging.@info("Setup finished.")
+    flush(stderr)
     Eωk, transform, FT
 end
 
@@ -301,15 +343,25 @@ simtype(g, t, l) = Dict("field" => gridtype(g),
                         "transform" => string(t),
                         "linop" => linoptype(l))
 
-function dumps(t, l)
-    io = IOBuffer()
-    dump(io, t)
-    tr = String(take!(io))
-    io = IOBuffer()
-    dump(io, l)
-    lo = String(take!(io))
-    Dict("transform" => tr, "linop" => lo)
+function save_modeinfo_maybe(output, t::NonlinearRHS.TransModal)
+    pol = t.ts.indices == 1:2 ? "xy" : t.ts.indices == 1 ? "x" : "y"
+    modeinfos = unnest([Modes.modeinfo(m) for m in t.ts.ms])
+    output(modeinfos; group="modes")
+    output("polarisation", pol)
 end
+
+function unnest(dicts)
+    out = Dict{String, Any}()
+    for k in keys(dicts[1]) # assuming all dicts have the same keys
+        out[sym2string(k)] = [sym2string(di[k]) for di in dicts]
+    end
+    out
+end
+
+sym2string(sym::Symbol) = string(sym)
+sym2string(other) = other
+
+save_modeinfo_maybe(output, t) = nothing
 
 function run(Eω, grid,
              linop, transform, FT, output;
@@ -336,8 +388,9 @@ function run(Eω, grid,
 
     output(Grid.to_dict(grid), group="grid")
     output(simtype(grid, transform, linop), group="simulation_type")
-    output(dumps(transform, linop), group="dumps")
+    save_modeinfo_maybe(output, transform)
 
+    flush(stderr) # flush std error once before starting to show setup steps
     RK45.solve_precon(
         transform, linop, Eω, z0, init_dz, grid.zmax, stepfun=stepfun,
         max_dt=max_dz, min_dt=min_dz,
@@ -348,12 +401,14 @@ end
 # run some code for precompilation
 Logging.with_logger(Logging.NullLogger()) do
     prop_capillary(125e-6, 0.3, :He, 1.0; λ0=800e-9, energy=1e-9,
-                    τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11)
+                    τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11,
+                    PPT_options=Dict(:cache => false))
     prop_capillary(125e-6, 0.3, :He, (1.0, 0); λ0=800e-9, energy=1e-9,
-                    τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11)
+                    τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11,
+                    PPT_options=Dict(:cache => false))
     prop_capillary(125e-6, 0.3, :He, 1.0; λ0=800e-9, energy=1e-9,
                     τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11,
-                    modes=4)
+                    modes=4, PPT_options=Dict(:cache => false))
     p = Tools.capillary_params(120e-6, 10e-15, 800e-9, 125e-6, :He, P=1.0)
 
     # gnlse_sol.jl example but with N=1 and 100th of the fibre length

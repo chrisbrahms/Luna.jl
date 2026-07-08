@@ -1,7 +1,8 @@
 module Interface
 using Luna
-import Luna.PhysData: wlfreq
+import Luna.PhysData: wlfreq, roomtemp
 import Luna: Grid, Modes, Output, Fields
+import Random: AbstractRNG, GLOBAL_RNG
 import Logging: @info, @debug
 
 module Pulses
@@ -221,19 +222,20 @@ make_energies(energy::Number, scale_energy::Nothing, eout) = eout ./ sum(eout) .
 make_energies(energy::Nothing, scale_energy, eout) = eout .* scale_energy
 make_energies(energy::Nothing, scale_energy::Nothing, eout) = eout
 
-struct GaussBeamPulse{pT} <: AbstractPulse
+struct GaussBeamPulse{pT, NmT} <: AbstractPulse
     waist::Float64
     timepulse::pT
     polarisation
+    Nmodes::NmT
 end
 
 """
-    GaussBeamPulse(waist, timepulse)
+    GaussBeamPulse(waist, timepulse, Nmodes=:all)
 
-A pulse whose shape in time is defined by the `timepulse::AbstractPulse`, and whose modal content is calculated by considering the overlap of an ideal Gaussian laser beam with 1/e² radius `waist` with the modes of the waveguide.
+A pulse whose shape in time is defined by the `timepulse::AbstractPulse`, and whose modal content is calculated by considering the overlap of an ideal Gaussian laser beam with 1/e² radius `waist` with the modes of the waveguide. `Nmodes` determines how many of the available modes to couple to. By default (`Nmodes=:all`) all modes are taken into account, but this can lead to numerical inaccuracies.
 """
-function GaussBeamPulse(waist, timepulse)
-    GaussBeamPulse(waist, timepulse, timepulse.polarisation)
+function GaussBeamPulse(waist, timepulse, Nmodes=:all)
+    GaussBeamPulse(waist, timepulse, timepulse.polarisation, Nmodes)
 end
 
 end
@@ -286,13 +288,26 @@ In this case, all keyword arguments except for `λ0` are ignored.
     elliptical polarisation is always the y-axis.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
-- `shotnoise`:  If `true` (default), one-photon-per-mode quantum noise is included.
+- `shotnoise`: Whether and how to include quantum noise. Can be one of:
+    - `true` (default) -- same as `:modified`.
+    - `false` -- disable all noise.
+    - `:modified` -- use the modified shot-noise model of Chen & Wise
+      (arXiv:2410.20567), where a constant noise field enters the nonlinear operator
+      at every step but is excluded from dispersion. This prevents artificial FWM
+      phase-matching and elevated noise floor artefacts.
+    - `:input` -- use traditional one-photon-per-mode shot noise added to the input
+      field at `z = 0`.
+    See the [Noise model](@ref) documentation for details.
+- `rng`: Random number generator for noise field generation. Defaults to `GLOBAL_RNG`.
+    Pass a seeded RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations,
+    or different seeds for ensemble/shot-to-shot statistics.
 
 # Modes options
 - `modes`: Defines which modes are included in the propagation. Can be any of:
     - a single mode signifier (default: :HE11), which leads to mode-averaged propagation
         (as long as all inputs are linearly polarised).
-    - a list of mode signifiers, which leads to multi-mode propagation in those modes.
+    - a `Dict` mode signifier with keys `:kind`, `:n`, and `:m`, e.g. `Dict(:kind=>:HE, :n=>1, :m=>1)`
+    - a `Tuple` of mode signifiers (`Symbol`s or `Dict`s), which leads to multi-mode propagation in those modes.
     - a `Number` `N` of modes, which simply creates the first `N` `HE` modes.
     Note that when elliptical or circular polarisation is included, each mode is present
     twice in the output, once for `x` and once for `y` polarisation.
@@ -301,6 +316,7 @@ In this case, all keyword arguments except for `λ0` are ignored.
     commonly seen in the literature. See `Luna.Capillary` for more details.
     Defaults to `:full`.
 - `loss::Bool`: Whether to include propagation loss. Defaults to `true`.
+- `temperature::Number`: Temperature of the gas in Kelvin. Defaults to room temperature.
 
 # Nonlinear interaction options
 - `kerr`: Whether to include the Kerr effect. Defaults to `true`.
@@ -311,9 +327,13 @@ In this case, all keyword arguments except for `λ0` are ignored.
     - `true` (default) -- same as `:PPT`.
     - `false` -- ignore plasma.
     Note that plasma is only available for full-field simulations.
-- `PPT_stark_shift::Bool`: when using the PPT ionisation rate, determines whether
-    to include the effect of the Stark shift of the ground-state energy levels.
-    *The necessary data is only available for helium, neon, and argon!*
+- `PPT_options::Dict{Symbol, Any}`: when using the PPT ionisation rate for the
+    plasma nonlinearity, this allows for fine-tuning of the options in calculating
+    the ionisation. See [`IonRatePPTAccel`](@ref Ionisation.IonRatePPTAccel) for possible
+    keyword arguments.
+- `preionfrac::Float64`: fraction of the gas that is pre-ionised before the pulse. Defaults to `0.0`.
+    Note that this is a very simplistic model of pre-ionisation and should be used with
+    caution.
 - `thg::Bool`: Whether to include third-harmonic generation. Defaults to `true` for
     full-field simulations and to `false` for envelope simulations.
 If `raman` is `true`, then the following options apply:
@@ -321,6 +341,7 @@ If `raman` is `true`, then the following options apply:
     - `vibration::Bool = true`: whether to include the vibrational Raman contribution
 
 # Output options
+- `stats_kwargs::Dict{Symbol, Any}`: a dictionary of keyword arguments to `Stats.default`
 - `saveN::Integer`: Number of points along z at which to save the field.
 - `filepath`: If `nothing` (default), create a `MemoryOutput` to store the simulation results
     only in the working memory. If not `nothing`, should be a file path as a `String`,
@@ -356,34 +377,50 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         pulseshape=:gauss, polarisation=:linear, propagator=nothing,
                         pulses=nothing,
                         shotnoise=true,
+                        rng=GLOBAL_RNG,
                         modes=:HE11, model=:full, loss=true,
+                        radial_integral_rtol=1e-3,
                         raman=nothing, kerr=true, plasma=nothing,
-                        PPT_stark_shift=true,
-                        rotation=true, vibration=true,
+                        stats_kwargs=Dict{Symbol, Any}(),
+                        PPT_options=Dict{Symbol, Any}(), preionfrac=0.0,
+                        rotation=true, vibration=true, temperature=roomtemp,
                         saveN=201, filepath=nothing,
                         scan=nothing, scanidx=nothing, filename=nothing)
 
-    pol = needpol(polarisation, pulses) || needpol_modes(modes)
-    @info "X+Y polarisation "* (pol ? "required." : "not required.")
+    # do we have energy in the orthogonal polarisation states, or just the fundamental?
+    # if so, we need to treat double the number of modes
+    both_modes = needpol(polarisation, pulses)
+    @info "Orthogonal polarisation modes are "* (both_modes ? "required." : "not required.")
+    #= need to treat vector fields if:
+        a) we have both polarisation states in the field AND/OR
+        b) the modes themselves contain x and y polarisation components
+    =#
+    pol = both_modes || needpol_modes(modes)
+    @info "Vector fields are "* (pol ? "required." : "not required.")
+
     plasma = isnothing(plasma) ? !envelope : plasma
     thg = isnothing(thg) ? !envelope : thg
 
     grid = makegrid(flength, λ0, λlims, trange, envelope, thg, δt)
-    mode_s = makemode_s(modes, flength, radius, gas, pressure, model, loss, pol)
+    mode_s = makemode_s(
+        modes, flength, radius, gas, pressure, temperature, model, loss, both_modes)
     check_orth(mode_s)
-    density = makedensity(flength, gas, pressure)
-    resp = makeresponse(grid, gas, raman, kerr, plasma, thg, pol, rotation, vibration, PPT_stark_shift)
+    density = makedensity(flength, gas, pressure, temperature)
+    resp = makeresponse(grid, gas, raman, kerr, plasma, thg, pol, rotation, vibration,
+                        PPT_options, preionfrac, temperature)
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
-    inputs = shotnoise_maybe(inputs, mode_s, shotnoise)
+    inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
-                                     const_linop(radius, pressure))
-    stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas)
+                                     radial_integral_rtol, const_linop(radius, pressure);
+                                     noise_field)
+    stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
     output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
-        λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses, 
-        shotnoise, modes, model, loss, raman, kerr, plasma, saveN, filepath, filename)
+        λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
+        shotnoise, modes, model, loss, raman, kerr, plasma, PPT_options,
+        temperature, saveN, filepath, filename)
 
     return Eω, grid, linop, transform, FT, output
 end
@@ -427,7 +464,7 @@ needpol(pol, pulses) = any(needpol, pulses)
 needpol_modes(mode::Symbol) = false # mode average
 needpol_modes(modes::Number) = false # only HE1m modes
 
-function needpol_modes(modes::NTuple{N, Symbol}) where N
+function needpol_modes(modes::Tuple)
     any(modes) do mode
         md = parse_mode(mode)
         md[:kind] ≠ :HE || md[:n] > 1
@@ -451,15 +488,24 @@ makegrid(flength, λ0::Tuple, args...) = makegrid(flength, λ0[1], args...)
 
 function parse_mode(mode)
     ms = String(mode)
-    Dict(:kind => Symbol(ms[1:2]), :n => parse(Int, ms[3]), :m => parse(Int, ms[4]))
+    kind_string = ms[1:2]
+    if length(ms) > 4
+        throw(DomainError(mode, "Ambiguous mode designation $mode. Pass modes as `Dict`s to disambiguate, e.g. Dict(:kind => :HE, :n => 1, :m => 12)."))
+    else
+        nstring = ms[3]
+        mstring = ms[4]
+    end
+    Dict(:kind => Symbol(kind_string), :n => parse(Int, nstring), :m => parse(Int, mstring))
 end
 
-function makemodes_pol(pol, args...; kwargs...)
-    if pol
-        if kwargs[:kind] == :HE && kwargs[:n] == 1
+parse_mode(mode::Dict) = mode
+
+function makemodes_pol(both, args...; kwargs...)
+    if both
+        if kwargs[:kind] == :HE
             return [Capillary.MarcatiliMode(args...; ϕ=0.0, kwargs...),
-                    Capillary.MarcatiliMode(args...; ϕ=π/2, kwargs...)]
-        else
+                    Capillary.MarcatiliMode(args...; ϕ=π/(2*kwargs[:n]), kwargs...)]
+        else # TE/TM: there is only one mode
             return [Capillary.MarcatiliMode(args...; ϕ=0.0, kwargs...)]
         end
     else
@@ -467,27 +513,27 @@ function makemodes_pol(pol, args...; kwargs...)
     end
 end
 
-function makemode_s(mode::Symbol, flength, radius, gas, pressure::Number, model, loss, pol)
-    makemodes_pol(pol, radius, gas, pressure; model, loss, parse_mode(mode)...)
+function makemode_s(mode::Union{Symbol, Dict}, flength, radius, gas, pressure::Number, temperature, model, loss, both)
+    makemodes_pol(both, radius, gas, pressure; T=temperature, model, loss, parse_mode(mode)...)
 end
 
-function makemode_s(mode::Symbol, flength, radius, gas, pressure::Tuple{<:Number, <:Number},
-                    model, loss, pol)
-    coren, _ = Capillary.gradient(gas, flength, pressure...)
-    makemodes_pol(pol, radius, coren; model, loss, parse_mode(mode)...)
+function makemode_s(mode::Union{Symbol, Dict}, flength, radius, gas, pressure::Tuple{<:Number, <:Number},
+                    temperature, model, loss, both)
+    coren, _ = Capillary.gradient(gas, flength, pressure..., T=temperature)
+    makemodes_pol(both, radius, coren; model, loss, parse_mode(mode)...)
 end
 
-function makemode_s(mode::Symbol, flength, radius, gas, pressure, model, loss, pol)
+function makemode_s(mode::Union{Symbol, Dict}, flength, radius, gas, pressure, temperature, model, loss, both)
     Z, P = pressure
-    coren, _ = Capillary.gradient(gas, Z, P)
-    makemodes_pol(pol, radius, coren; model, loss, parse_mode(mode)...)
+    coren, _ = Capillary.gradient(gas, Z, P, T=temperature)
+    makemodes_pol(both, radius, coren; model, loss, parse_mode(mode)...)
 end
 
 function makemode_s(modes::Int, args...)
-    _flatten([makemode_s(Symbol("HE1$n"), args...) for n=1:modes])
+    _flatten([makemode_s(Dict(:kind => :HE, :n => 1, :m => m), args...) for m=1:modes])
 end
 
-function makemode_s(modes::NTuple{N, Symbol}, args...) where N 
+function makemode_s(modes::Tuple, args...)
     _flatten([makemode_s(m, args...) for m in modes])
 end
 
@@ -495,23 +541,23 @@ end
 _flatten(modes::Vector{<:AbstractArray}) = collect(Iterators.flatten(modes))
 _flatten(mode) = mode
 
-function makedensity(flength, gas, pressure::Number)
-    ρ0 = PhysData.density(gas, pressure)
+function makedensity(flength, gas, pressure::Number, temperature)
+    ρ0 = PhysData.density(gas, pressure, temperature)
     z -> ρ0
 end
 
-function makedensity(flength, gas, pressure::Tuple{<:Number, <:Number})
-    _, density = Capillary.gradient(gas, flength, pressure...)
+function makedensity(flength, gas, pressure::Tuple{<:Number, <:Number}, temperature)
+    _, density = Capillary.gradient(gas, flength, pressure..., T=temperature)
     density
 end
 
-function makedensity(flength, gas, pressure)
-    _, density = Capillary.gradient(gas, pressure...)
+function makedensity(flength, gas, pressure, temperature)
+    _, density = Capillary.gradient(gas, pressure..., T=temperature)
     density
 end
 
 function makeresponse(grid::Grid.RealGrid, gas, raman, kerr, plasma, thg, pol,
-                      rotation, vibration, PPT_stark_shift)
+                      rotation, vibration, PPT_options, preionfrac, temperature)
     out = Any[]
     if kerr
         if thg
@@ -520,13 +566,14 @@ function makeresponse(grid::Grid.RealGrid, gas, raman, kerr, plasma, thg, pol,
             push!(out, Nonlinear.Kerr_field_nothg(PhysData.γ3_gas(gas), length(grid.to)))
         end
     end
-    makeplasma!(out, grid, gas, plasma, pol, PPT_stark_shift)
+    makeplasma!(out, grid, gas, plasma, pol, PPT_options, preionfrac)
     if isnothing(raman)
         raman = gas in (:N2, :H2, :D2, :N2O, :CH4, :SF6)
     end
     if raman
         @info("Including the Raman response (due to molecular gas choice).")
-        rr = Raman.raman_response(grid.to, gas, rotation=rotation, vibration=vibration)
+        rr = Raman.raman_response(grid.to, gas;
+            rotation, vibration, temp=temperature)
         if thg
             push!(out, Nonlinear.RamanPolarField(grid.to, rr))
         else
@@ -536,7 +583,8 @@ function makeresponse(grid::Grid.RealGrid, gas, raman, kerr, plasma, thg, pol,
     Tuple(out)
 end
 
-function makeplasma!(out, grid, gas, plasma::Bool, pol, PPT_stark_shift)
+function makeplasma!(out, grid, gas, plasma::Bool, pol,
+                     PPT_options, preionfrac)
     # simple true/false => default to PPT for atoms, ADK for molecules
     if ~plasma
         return
@@ -548,26 +596,28 @@ function makeplasma!(out, grid, gas, plasma::Bool, pol, PPT_stark_shift)
         @info("Using PPT ionisation rate.")
         model = :PPT
     end
-    makeplasma!(out, grid, gas, model, pol, PPT_stark_shift)
+    makeplasma!(out, grid, gas, model, pol, PPT_options, preionfrac)
 end
 
-function makeplasma!(out, grid, gas, plasma::Symbol, pol, stark_shift)
+function makeplasma!(out, grid, gas, plasma::Symbol, pol,
+                     PPT_options, preionfrac)
     ionpot = PhysData.ionisation_potential(gas)
     if plasma == :ADK
-        ionrate = Ionisation.ionrate_fun!_ADK(gas)
+        ionrate = Ionisation.IonRateADK(gas)
     elseif plasma == :PPT
-        ionrate = Ionisation.ionrate_fun!_PPTcached(gas, grid.referenceλ; stark_shift)
+        ionrate = Ionisation.IonRatePPTCached(gas, grid.referenceλ;
+                                                    PPT_options...)
     else
         throw(DomainError(plasma, "Unknown ionisation rate $plasma."))
     end
     Et = pol ? Array{Float64}(undef, length(grid.to), 2) : grid.to
-    push!(out, Nonlinear.PlasmaCumtrapz(grid.to, Et, ionrate, ionpot))
+    push!(out, Nonlinear.PlasmaCumtrapz(grid.to, Et, ionrate, ionpot; preionfrac))
 end
 
 function makeresponse(grid::Grid.EnvGrid, gas, raman, kerr, plasma, thg, pol,
-                      rotation, vibration, PPT_stark_shift)
+                      rotation, vibration, PPT_options, preionfrac, temperature)
     plasma && error("Plasma response for envelope fields has not been implemented yet.")
-    isnothing(thg) && (thg = false) 
+    isnothing(thg) && (thg = false)
     out = Any[]
     if kerr
         if thg
@@ -583,7 +633,8 @@ function makeresponse(grid::Grid.EnvGrid, gas, raman, kerr, plasma, thg, pol,
     end
     if raman
         @info("Including the Raman response (due to molecular gas choice).")
-        rr = Raman.raman_response(grid.to, gas, rotation=rotation, vibration=vibration)
+        rr = Raman.raman_response(grid.to, gas;
+            rotation, vibration, temp=temperature)
         push!(out, Nonlinear.RamanPolarEnv(grid.to, rr))
     end
     Tuple(out)
@@ -632,18 +683,22 @@ end
 function makeinputs(mode_s, λ0, pulse::Pulses.GaussBeamPulse)
     k = 2π/λ0
     gauss = Fields.normalised_gauss_beam(k, pulse.waist)
-    facs = [abs2(Modes.overlap(mi, gauss)) for mi in mode_s]
+    ovlps = [Modes.overlap(mi, gauss) for mi in selectmodes(mode_s, pulse.Nmodes, pulse.polarisation)]
     fields = Any[]
     if pulse.polarisation == :linear
-        for (modeidx, fac) in enumerate(facs)
-            sf = scalefield(pulse.timepulse.field, fac)
+        for (modeidx, ovlp) in enumerate(ovlps)
+            energyfac = abs2(ovlp)
+            phase = -angle(ovlp)
+            sf = scalefield(pulse.timepulse.field, energyfac, phase)
             push!(fields, (mode=modeidx, fields=(sf,)))
         end
     else
         fy, fx = ellfields(pulse.timepulse)
-        for (idx, fac) in enumerate(facs[1:2:end])
-            sfy = scalefield(fy, fac)
-            sfx = scalefield(fx, fac)
+        for (idx, ovlp) in enumerate(ovlps[1:2:end])
+            energyfac = abs2(ovlp)
+            phase = -angle(ovlp)
+            sfy = scalefield(fy, energyfac, phase)
+            sfx = scalefield(fx, energyfac, phase)
             push!(fields, (mode=2idx-1, fields=(sfy,)))
             push!(fields, (mode=2idx, fields=(sfx,)))
         end
@@ -651,16 +706,39 @@ function makeinputs(mode_s, λ0, pulse::Pulses.GaussBeamPulse)
     Tuple(fields)
 end
 
-function scalefield(f::Fields.PulseField, fac)
-    Fields.PulseField(f.λ0, nmult(f.energy, fac), nmult(f.power, fac), f.ϕ, f.Itshape)
+function selectmodes(mode_s, Nmodes, pol)
+    if pol == :linear
+        mode_s[1:Nmodes]
+    else
+        mode_s[1:2Nmodes]
+    end
 end
 
-function scalefield(f::Fields.DataField, fac)
-    Fields.DataField(f.ω, f.Iω, f.ϕω, nmult(f.energy, fac), f.ϕ, f.λ0)
+selectmodes(mode_s, Nmodes::Symbol, pol) = mode_s
+
+function scalefield(f::Fields.PulseField, fac, phase)
+    Fields.PulseField(f.λ0, nmult(f.energy, fac), nmult(f.power, fac), addphase(f.ϕ, phase), f.Itshape)
 end
 
-function scalefield(f::Fields.PropagatedField, fac)
-    Fields.PropagatedField(f.propagator!, scalefield(f.field, fac))
+function scalefield(f::Fields.DataField, fac, phase)
+    Fields.DataField(f.ω, f.Iω, f.ϕω, nmult(f.energy, fac), addphase(f.ϕ, phase), f.λ0)
+end
+
+function scalefield(f::Fields.PropagatedField, fac, phase)
+    Fields.PropagatedField(f.propagator!, scalefield(f.field, fac, phase))
+end
+
+function addphase(ϕ, phase)
+    if phase == 0
+        return copy(ϕ)
+    end
+    if length(ϕ) == 0
+        return [phase]
+    else
+        out = copy(ϕ)
+        out[1] += phase
+        return out
+    end
 end
 
 _findmode(mode_s, md) = _findmode([mode_s], md)
@@ -686,17 +764,7 @@ function makeinputs(mode_s, λ0, pulses::AbstractVector)
 end
 
 ellphase(ϕ, pol::Symbol) = ellphase(ϕ, 1.0)
-
-function ellphase(ϕ, ε)
-    shift = π/2 * sign(ε)
-    if length(ϕ) == 0
-        return [shift]
-    else
-        out = copy(ϕ)
-        out[1] += shift
-        return out
-    end
-end
+ellphase(ϕ, ε) = addphase(ϕ, π/2 * sign(ε))
 
 ellfac(pol::Symbol) = (1/2, 1/2) # circular
 function ellfac(ε::Number)
@@ -717,9 +785,10 @@ function ellfields(pulse::Union{Pulses.CustomPulse, Pulses.GaussPulse, Pulses.Se
     f1, f2
 end
 
-function ellfields(pulse::Pulses.DataPulse)
-    f = pulse.field.field
-    pf = pulse.field
+ellfields(pulse::Pulses.DataPulse) = ellfields(pulse, pulse.field)
+
+function ellfields(pulse::Pulses.DataPulse, pf::Fields.PropagatedField)
+    f = pf.field
     py, px = ellfac(pulse.polarisation)
     f1 = Fields.DataField(f.ω, f.Iω, f.ϕω, nmult(f.energy, py), f.ϕ, f.λ0)
     f2 = Fields.DataField(f.ω, f.Iω, f.ϕω, nmult(f.energy, px),
@@ -727,31 +796,59 @@ function ellfields(pulse::Pulses.DataPulse)
     Fields.PropagatedField(pf.propagator!, f1), Fields.PropagatedField(pf.propagator!, f2)
 end
 
-function shotnoise_maybe(inputs, mode::Modes.AbstractMode, shotnoise::Bool)
-    shotnoise || return inputs
-    (inputs..., (mode=1, fields=(Fields.ShotNoise(),)))
+function ellfields(pulse::Pulses.DataPulse, pf)
+    f = pf
+    py, px = ellfac(pulse.polarisation)
+    f1 = Fields.DataField(f.ω, f.Iω, f.ϕω, nmult(f.energy, py), f.ϕ, f.λ0)
+    f2 = Fields.DataField(f.ω, f.Iω, f.ϕω, nmult(f.energy, px),
+                          ellphase(f.ϕ, pulse.polarisation), f.λ0)
+    f1, f2
 end
 
-function shotnoise_maybe(inputs, modes, shotnoise::Bool)
-    shotnoise || return inputs
-    (inputs..., [(mode=ii, fields=(Fields.ShotNoise(),)) for ii in eachindex(modes)]...)
+function makenoise(grid, mode_s, inputs, shotnoise::Bool, rng)
+    shotnoise ? makenoise(grid, mode_s, inputs, :modified, rng) : (inputs, nothing)
 end
 
-function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, c::Val{true})
+function makenoise(grid, mode_s, inputs, shotnoise::Symbol, rng)
+    if shotnoise == :modified
+        nm = mode_s isa AbstractArray ? length(mode_s) : 1
+        noise_field = Fields.generate_noise_field(grid; rng, nmodes=nm)
+        @info("Modified shot-noise model enabled. Traditional input shot noise is " *
+              "disabled (noise enters through nonlinear operator instead).")
+        return (inputs, noise_field)
+    elseif shotnoise == :input
+        inputs = _add_input_shotnoise(inputs, mode_s, rng)
+        return (inputs, nothing)
+    else
+        throw(DomainError(shotnoise, "Unknown shotnoise=$shotnoise. Use true, false, :modified, or :input."))
+    end
+end
+
+function _add_input_shotnoise(inputs, mode::Modes.AbstractMode, rng)
+    (inputs..., (mode=1, fields=(Fields.ShotNoise(rng),)))
+end
+
+function _add_input_shotnoise(inputs, modes, rng)
+    (inputs..., [(mode=ii, fields=(Fields.ShotNoise(rng),)) for ii in eachindex(modes)]...)
+end
+
+function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
+               c::Val{true}; noise_field=nothing)
     @info("Using mode-averaged propagation.")
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ)
-    
+
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-    βfun!, z -> Modes.Aeff(mode, z=z))
+                                   βfun!, z -> Modes.Aeff(mode, z=z); noise_field)
     linop, Eω, transform, FT
 end
 
-function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, c::Val{false})
+function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
+               c::Val{false}; noise_field=nothing)
     @info("Using mode-averaged propagation.")
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ)
 
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z))
+                                   βfun!, z -> Modes.Aeff(mode, z=z); noise_field)
     linop, Eω, transform, FT
 end
 
@@ -759,21 +856,23 @@ needfull(modes) = !all(modes) do mode
     (mode.kind == :HE) && (mode.n == 1)
 end
 
-function setup(grid, modes, density, responses, inputs, pol, c::Val{true})
+function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
+               noise_field=nothing)
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_const_linop(grid, modes, grid.referenceλ)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf)
+                                   pol ? :xy : :y; full=nf, rtol, noise_field)
     linop, Eω, transform, FT
 end
 
-function setup(grid, modes, density, responses, inputs, pol, c::Val{false})
+function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
+               noise_field=nothing)
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_linop(grid, modes, grid.referenceλ)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf)
+                                   pol ? :xy : :y; full=nf, rtol, noise_field)
     linop, Eω, transform, FT
 end
 
@@ -832,7 +931,19 @@ Note that the current GNLSE model is single mode only.
     elliptical polarisation is always the y-axis.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
-- `shotnoise`:  If `true` (default), one-photon-per-mode quantum noise is included.
+- `shotnoise`: Whether and how to include quantum noise. Can be one of:
+    - `true` (default) -- same as `:modified`.
+    - `false` -- disable all noise.
+    - `:modified` -- use the modified shot-noise model of Chen & Wise
+      (arXiv:2410.20567), where a constant noise field enters the nonlinear operator
+      at every step but is excluded from dispersion. This prevents artificial FWM
+      phase-matching and elevated noise floor artefacts.
+    - `:input` -- use traditional one-photon-per-mode shot noise added to the input
+      field at `z = 0`.
+    See the [Noise model](@ref) documentation for details.
+- `rng`: Random number generator for noise field generation. Defaults to `GLOBAL_RNG`.
+    Pass a seeded RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations,
+    or different seeds for ensemble/shot-to-shot statistics.
 
 # GNLSE options
 - `shock::Bool`: Whether to include the shock derivative term. Default is `true`.
@@ -881,6 +992,7 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
                         pulseshape=:gauss, propagator=nothing,
                         pulses=nothing,
                         shotnoise=true, shock=true,
+                        rng=GLOBAL_RNG,
                         loss=0.0, raman=true, fr=0.18,
                         ramanmodel=:sdo, τ1=12.2e-15, τ2=32e-15,
                         saveN=201, filepath=nothing,
@@ -921,16 +1033,18 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
 
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
-    inputs = shotnoise_maybe(inputs, mode_s, shotnoise)
+    inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
 
     norm! = NonlinearRHS.norm_mode_average_gnlse(grid, aeff; shock)
-    Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff, norm! = norm!)
+    Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
+                                   norm!, noise_field)
     stats = Stats.default(grid, Eω, mode_s, linop, transform)
     output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; γ, flength, βs, λlims, trange, envelope, thg, δt,
-        λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses, 
-        shotnoise, shock, loss, raman, ramanmodel, fr, τ1, τ2, saveN, filepath, filename)
+        λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
+        shotnoise, shock, loss, raman, ramanmodel, fr, τ1, τ2,
+        saveN, filepath, filename)
 
     return Eω, grid, linop, transform, FT, output
 end

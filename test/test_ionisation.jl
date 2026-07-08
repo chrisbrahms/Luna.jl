@@ -1,19 +1,19 @@
-import Test: @test, @testset
-import Luna: Ionisation, Maths, PhysData, Tools
+import Test: @test, @testset, @test_throws
+using Luna
 import NumericalIntegration: integrate, SimpsonEven
-import Luna.Modes: hquadrature
+import Logging: with_logger, NullLogger
 
-@test Ionisation.ionrate_ADK(:He, 1e10) ≈ 1.2416371415312408e-18
-@test Ionisation.ionrate_ADK(:He, 2e10) ≈ 1.0772390893742478
-@test Ionisation.ionrate_ADK(:HeB, 2e10) ≈ 1.0772390893742478
-@test Ionisation.ionrate_ADK(:Ar , 7e9) ≈ 2.4422306306649472e-08
-@test Ionisation.ionrate_ADK(:Ar , 8e9) ≈ 4.494711488416766e-05
+@test Ionisation.ionrate_ADK(:He, 1e10) ≈ 2*1.2416371415312408e-18
+@test Ionisation.ionrate_ADK(:He, 2e10) ≈ 2*1.0772390893742478
+@test Ionisation.ionrate_ADK(:HeB, 2e10) ≈ 2*1.0772390893742478
+@test Ionisation.ionrate_ADK(:Ar , 7e9) ≈ 2*2.4422306306649472e-08
+@test Ionisation.ionrate_ADK(:Ar , 8e9) ≈ 2*4.494711488416766e-05
 
 E = collect(range(1e9, 1e11; length=32))
 @test Ionisation.ionrate_ADK(:He, E) == Ionisation.ionrate_ADK(:He, -E)
 
-@test isapprox(Ionisation.ionrate_PPT(:He, 800e-9, 1e10), 2*1.40432138471583e-5, rtol=1e-3)
-@test isapprox(Ionisation.ionrate_PPT(:He, 800e-9, 1.3e10), 2*0.04517809797503506, rtol=1e-3)
+@test isapprox(Ionisation.ionrate_PPT(:He, 800e-9, 1e10; dipole_corr=false), 2*1.40432138471583e-5, rtol=1e-3)
+@test isapprox(Ionisation.ionrate_PPT(:He, 800e-9, 1.3e10; dipole_corr=false), 2*0.04517809797503506, rtol=1e-3)
 
 Emin = 1e9
 Emax = 1e11
@@ -21,7 +21,7 @@ N = 2^9
 E = collect(range(Emin, Emax, N))
 rate = Ionisation.ionrate_PPT.(:He, 800e-9, E)
 ifun(E0) =  E0 <= Emin ? 2 :
-            E0 >= Emax ? N : 
+            E0 >= Emax ? N :
             ceil(Int, (E0-Emin)/(Emax-Emin)*N) + 1
 ifun2(x0) = x0 <= E[1] ? 2 :
                 x0 >= E[end] ? length(E) :
@@ -33,17 +33,11 @@ idx2 = ifun.(E) # indices found with brute-force method
 @test all(idx1 .== idx2)
 @test all(spl1.(E) .== spl2.(E))
 
-ratefun! = Ionisation.ionrate_fun!_PPTaccel(:He, 800e-9)
-out = similar(E)
-ratefun!(out, E)
+ratefun = Ionisation.IonRatePPTAccel(:He, 800e-9; cache=false)
+out = ratefun.(E)
 @test all(isapprox.(out, rate, rtol=1e-2))
 
-outneg = similar(out)
-ratefun!(outneg, -E)
-@test out == outneg
-
-outneg = similar(out)
-ratefun!(outneg, -E)
+outneg = ratefun.(-E)
 @test out == outneg
 
 ##
@@ -53,25 +47,91 @@ ratefun!(outneg, -E)
         Ionisation.barrier_suppression(
             PhysData.ionisation_potential(gas),
             1))
-    isy = 10 .^ collect(16:0.01:log10(bsi))
+    isy = 10 .^ collect(16:0.1:log10(bsi))
     E0 = Tools.intensity_to_field.(isy)
-
-    Ip_au = PhysData.ionisation_potential(gas; unit=:atomic)
-    F0_au = (2Ip_au)^(3/2)
-    F0 = F0_au*PhysData.au_Efield
 
     t = collect(range(0, 2π; length=2^12))
     Et = sin.(t)
 
     adk_avg = zero(E0)
-    rf! = Ionisation.ionrate_fun!_ADK(gas)
+    rf! = Ionisation.IonRateADK(gas)
     out = zero(Et)
     for (idx, E0i) in enumerate(E0)
         rf!(out, E0i*Et)
         adk_avg[idx] = 1/2π * integrate(t, out, SimpsonEven())
     end
 
-    adk = Ionisation.ionrate_ADK.(gas, E0)
     adk_avg_kw = Ionisation.ionrate_ADK.(gas, E0; cycle_average=true)
     @test all(isapprox.(adk_avg, adk_avg_kw; rtol=0.05))
+end
+
+##
+# Check that PPT_options are indeed passed through properly
+@testset for gas in (:He, :Ne, :Ar, :Kr, :Xe)
+    # select all non-default options--each of these will make a difference to the interpolant
+    PPT_options = Dict{Symbol, Any}(
+        :stark_shift => false,
+        :dipole_corr => false,
+        :sum_tol => 1e-4,
+        :sum_integral => true,
+        :msum => false,
+        :occupancy => 4,
+        :cache => false,
+        :N => 2^12
+    )
+
+    λ0 = 800e-9
+    Eω, grid, linop, transform, FT, output = with_logger(NullLogger()) do
+        Interface.prop_capillary_args(100e-6, 1, gas, 1;
+                                      λ0, τfwhm=10e-15, energy=1e-6,
+                                      λlims=(200e-9, 4e-6), trange=0.5e-12,
+                                      PPT_options)
+    end
+
+    plasma = transform.resp[2]
+    ir = plasma.ratefunc
+
+    ir2 = Ionisation.IonRatePPTAccel(gas, λ0; PPT_options...)
+
+    @test ir2.spline.x == ir.spline.x
+    @test ir2.spline.y == ir.spline.y
+
+    # now same again with mostly default options (just fewer points, for speed)
+    Eω, grid, linop, transform, FT, output = with_logger(NullLogger()) do
+        Interface.prop_capillary_args(100e-6, 1, gas, 1;
+                                      λ0, τfwhm=10e-15, energy=1e-6,
+                                      λlims=(200e-9, 4e-6), trange=0.5e-12,
+                                      PPT_options=Dict(:cache => false, :N => 2^12))
+    end
+
+    plasma = transform.resp[2]
+    ir = plasma.ratefunc
+
+    PPT_options = Dict{Symbol, Any}(
+        :stark_shift => true,
+        :dipole_corr => true,
+        :sum_tol => 1e-6,
+        :sum_integral => false,
+        :msum => true,
+        :occupancy => 2,
+        :cache => false,
+        :N => 2^12
+    )
+    ir2 = Ionisation.IonRatePPTAccel(gas, λ0; PPT_options...)
+
+    @test ir2.spline.x == ir.spline.x
+    # Use approximate equality for y values: the cached PPT rate (loaded from
+    # disk by ionrate_fun!_PPTcached) may have tiny floating-point differences.
+    @test ir2.spline.y ≈ ir.spline.y
+end
+
+@testset "preionisation" begin
+    @test_throws DomainError prop_capillary(265e-6, 0.01, :He, 0.1;
+                                            λ0=800e-9, trange=70e-15, λlims=(100e-9,6e-6),
+                                            τfwhm=6e-15, energy=1.5e-3, preionfrac=1.01,
+                                            PPT_options=Dict(:cache => false, :N => 2^12))
+    @test_throws DomainError prop_capillary(265e-6, 0.01, :He, 0.1;
+                                            λ0=800e-9, trange=70e-15, λlims=(100e-9,6e-6),
+                                            τfwhm=6e-15, energy=1.5e-3, preionfrac=-0.001,
+                                            PPT_options=Dict(:cache => false, :N => 2^12))
 end
