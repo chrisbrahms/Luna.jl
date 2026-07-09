@@ -886,6 +886,11 @@ function norm_free(grid, xygrid, nfuns::Tuple)
     end
 end
 
+"""
+    TransFree2D
+
+Transform E(ω) -> Pₙₗ(ω) for 2D free-space propagation.
+"""
 mutable struct TransFree2D{TT, FTT, nT, rT, gT, xgT, dT, iT}
     FT::FTT # 2D Fourier transform (space to k-space and time to frequency)
     normfun::nT # Function which returns normalisation factor
