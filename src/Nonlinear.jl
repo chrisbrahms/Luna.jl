@@ -20,7 +20,11 @@ function KerrVector!(out, E, fac)
     end
 end
 
-"Kerr response for real field"
+"""
+    Kerr_field(γ3)
+
+Kerr response for real field.
+"""
 function Kerr_field(γ3)
     Kerr = let γ3 = γ3
         function Kerr(out, E, ρ)
@@ -33,7 +37,11 @@ function Kerr_field(γ3)
     end
 end
 
-"Kerr response for real field but without THG"
+"""
+    Kerr_field_nothg(γ3, n)
+
+Kerr response for real field but without THG.
+"""
 function Kerr_field_nothg(γ3, n)
     E = Array{Float64}(undef, n)
     hilbert = Maths.plan_hilbert(E)
@@ -59,7 +67,11 @@ function KerrVectorEnv!(out, E, fac)
     end
 end
 
-"Kerr response for envelope"
+"""
+    Kerr_env(γ3)
+
+Kerr response for envelope.
+"""
 function Kerr_env(γ3)
     Kerr = let γ3 = γ3
         function Kerr(out, E, ρ)
@@ -72,8 +84,13 @@ function Kerr_env(γ3)
     end
 end
 
-"Kerr response for envelope but with THG"
-# see Eq. 4, Genty et al., Opt. Express 15 5382 (2007)
+"""
+    Kerr_env_thg(γ3, ω0, t)
+
+Kerr response for envelope but with THG.
+
+See Eq. 4, Genty et al., Opt. Express 15 5382 (2007).
+"""
 function Kerr_env_thg(γ3, ω0, t)
     C = exp.(2im*ω0.*t)
     Kerr = let γ3 = γ3, C = C
@@ -83,8 +100,12 @@ function Kerr_env_thg(γ3, ω0, t)
     end
 end
 
-"Response type for cumtrapz-based plasma polarisation, adapted from:
-M. Geissler, G. Tempea, A. Scrinzi, M. Schnürer, F. Krausz, and T. Brabec, Physical Review Letters 83, 2930 (1999)."
+"""
+    PlasmaCumtrapz
+
+Response type for cumtrapz-based plasma polarisation, adapted from:
+M. Geissler, G. Tempea, A. Scrinzi, M. Schnürer, F. Krausz, and T. Brabec, Physical Review Letters 83, 2930 (1999).
+"""
 struct PlasmaCumtrapz{R, EType, tType}
     ratefunc::R # the ionization rate function
     ionpot::Float64 # the ionization potential (for calculation of ionization loss)
@@ -117,7 +138,11 @@ function PlasmaCumtrapz(t, E, ratefunc, ionpot; preionfrac=0.0)
     return PlasmaCumtrapz(ratefunc, ionpot, rate, fraction, phase, J, P, t[2]-t[1], preionfrac)
 end
 
-"The plasma response for a scalar electric field"
+"""
+    PlasmaScalar!(Plas::PlasmaCumtrapz, E)
+
+The plasma response for a scalar electric field.
+"""
 function PlasmaScalar!(Plas::PlasmaCumtrapz, E)
     Plas.ratefunc(Plas.rate, E)
     Maths.cumtrapz!(Plas.fraction, Plas.rate, Plas.δt)
@@ -133,13 +158,15 @@ function PlasmaScalar!(Plas::PlasmaCumtrapz, E)
 end
 
 """
+    PlasmaVector!(Plas::PlasmaCumtrapz, E)
+
 The plasma response for a vector electric field.
 
 We take the magnitude of the electric field to calculate the ionization
 rate and fraction, and then solve the plasma polarisation component-wise
 for the vector field.
 
-A similar approach was used in: C Tailliez et al 2020 New J. Phys. 22 103038.  
+A similar approach was used in: C Tailliez et al 2020 New J. Phys. 22 103038.
 """
 function PlasmaVector!(Plas::PlasmaCumtrapz, E)
     Ex = E[:,1]
@@ -160,7 +187,11 @@ function PlasmaVector!(Plas::PlasmaCumtrapz, E)
     Maths.cumtrapz!(Plas.P, Plas.J, Plas.δt)
 end
 
-"Handle plasma polarisation routing to `PlasmaVector` or `PlasmaScalar`."
+"""
+    (Plas::PlasmaCumtrapz)(out, Et, ρ)
+
+Handle plasma polarisation routing to `PlasmaVector` or `PlasmaScalar`.
+"""
 function (Plas::PlasmaCumtrapz)(out, Et, ρ)
     if ndims(Et) > 1
         if size(Et, 2) == 1 # handle scalar case but within modal simulation
@@ -176,10 +207,18 @@ function (Plas::PlasmaCumtrapz)(out, Et, ρ)
     end
 end
 
-"Raman polarisation response type"
+"""
+    RamanPolar
+
+Abstract supertype for Raman polarisation response types.
+"""
 abstract type RamanPolar end
 
-"Raman polarisation response type for a carrier resolved field"
+"""
+    RamanPolarField{TR, Tt, Thv, Tω, Tv, FTt, HTt}
+
+Raman polarisation response type for a carrier resolved field.
+"""
 struct RamanPolarField{TR, Tt, Thv, Tω, Tv, FTt, HTt} <: RamanPolar
     r::TR # Raman response
     h::Tt # doubled buffer to hold response + padding 
@@ -197,7 +236,11 @@ struct RamanPolarField{TR, Tt, Thv, Tω, Tv, FTt, HTt} <: RamanPolar
     dt::Float64 # time step for scaling
 end
 
-"Raman polarisation response type for an envelope"
+"""
+    RamanPolarEnv{TR, Tt, Thv, Tω, Tv, FTt}
+
+Raman polarisation response type for an envelope.
+"""
 struct RamanPolarEnv{TR, Tt, Thv, Tω, Tv, FTt} <: RamanPolar
     r::TR # Raman response
     h::Tt # doubled buffer to hold response + padding 
@@ -214,7 +257,7 @@ struct RamanPolarEnv{TR, Tt, Thv, Tω, Tv, FTt} <: RamanPolar
 end
 
 """
-    RamanPolarField(t, ht; thg=true)
+    RamanPolarField(t, r; thg=true)
 
 Construct Raman polarisation response for a field on time grid `t`
 using response function `r`. If `thg=false` then exclude the third
@@ -240,7 +283,7 @@ function RamanPolarField(t, r; thg=true)
 end
 
 """
-    RamanPolarEnv(t, ht)
+    RamanPolarEnv(t, r)
 
 Construct Raman polarisation response for an envelope on time grid `t`
 using response function `r`.
@@ -263,7 +306,11 @@ function RamanPolarEnv(t, r)
     RamanPolarEnv(r, h, ht, hω, Eω2, Pω, E2, E2v, P, Pout, FT, t[2] - t[1])
 end
 
-"Square the field or envelope"
+"""
+    sqr!(R::RamanPolarField, E)
+
+Square the field or envelope.
+"""
 function sqr!(R::RamanPolarField, E)
     if !R.thg
         # see documentation for factor of 1/2 here
@@ -278,7 +325,11 @@ function sqr!(R::RamanPolarEnv, E)
     R.E2v .= 1/2 .* abs2.(E)
 end
 
-"Calculate Raman polarisation for field/envelope Et"
+"""
+    (R::RamanPolar)(out, Et, ρ)
+
+Calculate Raman polarisation for field/envelope Et.
+"""
 function (R::RamanPolar)(out, Et, ρ)
     # get the field as a 1D Array
     n = size(Et, 1)

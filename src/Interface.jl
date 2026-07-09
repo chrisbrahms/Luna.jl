@@ -11,6 +11,14 @@ import Luna: Fields, Output, Processing, Capillary
 
 export AbstractPulse, CustomPulse, GaussPulse, SechPulse, DataPulse, LunaPulse
 
+"""
+    AbstractPulse
+
+Abstract supertype for input pulse specifications used with `prop_capillary` and
+`prop_gnlse`. Concrete subtypes ([`CustomPulse`](@ref), [`GaussPulse`](@ref),
+[`SechPulse`](@ref), [`DataPulse`](@ref), [`LunaPulse`](@ref)) each carry a `mode`,
+a `polarisation`, and the underlying `Fields` input pulse.
+"""
 abstract type AbstractPulse end
 
 struct CustomPulse{fT<:Fields.TimeField} <: AbstractPulse
@@ -20,7 +28,7 @@ struct CustomPulse{fT<:Fields.TimeField} <: AbstractPulse
 end
 
 """
-    CustomPulse(;λ0, energy=nothing, power=nothing, ϕ=Float64[],
+    CustomPulse(;λ0, Itshape, energy=nothing, power=nothing, ϕ=Float64[],
                 mode=:lowest, polarisation=:linear, propagator=nothing)
 
 A custom pulse defined by a function for use with `prop_capillary`, with either energy or
@@ -316,6 +324,8 @@ In this case, all keyword arguments except for `λ0` are ignored.
     commonly seen in the literature. See `Luna.Capillary` for more details.
     Defaults to `:full`.
 - `loss::Bool`: Whether to include propagation loss. Defaults to `true`.
+- `radial_integral_rtol::Number`: Relative tolerance for the radial overlap integrals used
+    in multi-mode propagation. Defaults to `1e-3`.
 - `temperature::Number`: Temperature of the gas in Kelvin. Defaults to room temperature.
 
 # Nonlinear interaction options
@@ -925,10 +935,6 @@ Note that the current GNLSE model is single mode only.
 - `power`: Peak power **after any spectral phases are added**.
 - `pulseshape`: Shape of the transform-limited pulse. Can be `:gauss` for a Gaussian pulse
     or `:sech` for a sech² pulse.
-- `polarisation`: Polarisation of the input pulse. Can be `:linear` (default), `:circular`,
-    or an ellipticity number -1 ≤ ε ≤ 1, where ε=-1 corresponds to left-hand circular,
-    ε=1 to right-hand circular, and ε=0 to linear polarisation. The major axis for
-    elliptical polarisation is always the y-axis.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
 - `shotnoise`: Whether and how to include quantum noise. Can be one of:

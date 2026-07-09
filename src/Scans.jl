@@ -93,10 +93,11 @@ struct SlurmExec <: AbstractExec
 end
 
 """
-    SSHExec(localexec, scriptfile, hostname, subdir; files=String[])
+    SSHExec(localexec, hostname, subdir; files=String[])
 
-Execution mode which transfers the `scriptfile` file to the host given by `hostname` via SSH
-and executes the scan on that host with a mode defined by `localexec`. `subdir` gives the
+Execution mode which transfers the scan script to the host given by `hostname` via SSH
+and executes the scan on that host with a mode defined by `localexec` (a `CondorExec` or
+`SlurmExec`, from which the script file is taken). `subdir` gives the
 subdirectory (relative to the home directory) where scans are stored on the remote host. A
 subfolder with automatically chosen name will be created in `subdir` to store this scan.
 

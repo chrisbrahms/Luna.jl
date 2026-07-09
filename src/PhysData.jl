@@ -83,6 +83,11 @@ Convert Δλ (wavelength bandwidth) at λ (central wavelength) to Δω (angular 
 """
 ΔλΔω(Δλ, λ) = (2π*c)*Δλ/λ^2
 
+"""
+    eV_to_m(eV)
+
+Convert a photon energy in electron-volts to its wavelength in metres.
+"""
 eV_to_m(eV) = wlfreq(electron*eV/ħ)
 
 
@@ -391,6 +396,12 @@ function sellmeier_crystal(material, axis)
     end
 end
 
+"""
+    ref_index_fun_uniax(material; axes=(:o, :e))
+
+Get a function `n(λ, θ)` returning the refractive index of the uniaxial crystal `material`
+for propagation at angle `θ` to the optic axis.
+"""
 function ref_index_fun_uniax(material; axes=(:o, :e))
     n_o = sellmeier_crystal(material, axes[1])
     n_e = sellmeier_crystal(material, axes[2])
@@ -556,7 +567,8 @@ end
 """
     fresnel(n2, θi; n1=1.0)
 
-Calcualte reflection coefficients from Fresnel's equations.
+Calculate the reflectivities and phases (`abs2(rs)`, `angle(rs)`, `abs2(rp)`, `angle(rp)`)
+from Fresnel's equations.
 """
 function fresnel(n2, θi; n1=1.0)
     θt = asin(n1*sin(θi)/n2)
@@ -656,6 +668,12 @@ function γ3_gas(material::Symbol; source=nothing)
     end
 end
 
+"""
+    χ3(material::Symbol, P=1.0, T=roomtemp; source=nothing)
+
+Get the third-order nonlinear susceptibility χ⁽³⁾ of `material` at pressure `P` [bar]
+and temperature `T` [K].
+"""
 function χ3(material::Symbol, P=1.0, T=roomtemp; source=nothing)
     if material in glass
         n2 = n2_glass(material, λ=1030e-9)
@@ -665,6 +683,12 @@ function χ3(material::Symbol, P=1.0, T=roomtemp; source=nothing)
     return γ3_gas(material, source=source) .* density.(material, P, T)
 end
 
+"""
+    n2(material::Symbol, P=1.0, T=roomtemp; λ=nothing, source=nothing)
+
+Get the nonlinear refractive index n₂ of `material` at pressure `P` [bar], temperature `T` [K]
+and wavelength `λ`.
+"""
 function n2(material::Symbol, P=1.0, T=roomtemp; λ=nothing, source=nothing)
     material in glass && return n2_glass(material::Symbol, λ=λ)
     λ = isnothing(λ) ? 800e-9 : λ
@@ -672,6 +696,11 @@ function n2(material::Symbol, P=1.0, T=roomtemp; λ=nothing, source=nothing)
     return @. 3/4 * χ3(material, P, T, source=source) / (ε_0*c*n0^2)
 end
 
+"""
+    n2_glass(material::Symbol; λ=nothing)
+
+Get the nonlinear refractive index n₂ of a glass `material`.
+"""
 function n2_glass(material::Symbol; λ=nothing)
     if material == :SiO2
         return 2.7e-20

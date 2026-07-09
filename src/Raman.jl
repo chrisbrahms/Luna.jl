@@ -4,6 +4,11 @@ import Luna.PhysData: raman_parameters
 import Cubature: hquadrature
 import Luna.Maths: planck_taper
 
+"""
+    AbstractRamanResponse
+
+Abstract supertype for Raman response functions.
+"""
 abstract type AbstractRamanResponse end
 
 # make Raman responses broadcast like a scalar
@@ -35,6 +40,11 @@ function (R::AbstractRamanResponse)(t, ρ)
     hrpre(R, t) * exp(-t/hrdamp(R, ρ))
 end
 
+"""
+    RamanRespSingleDampedOscillator{Tτ2}
+
+Single damped oscillator Raman response with scale factor `K`, angular frequency `Ω` and density-dependent dephasing time `τ2ρ`.
+"""
 struct RamanRespSingleDampedOscillator{Tτ2} <: AbstractRamanResponse
     K::Float64 # overall scale factor
     Ω::Float64 # frequency
@@ -66,7 +76,7 @@ hrdamp(R::RamanRespSingleDampedOscillator, ρ) = R.τ2ρ(ρ)
 
 
 """
-    RamanRespIntermediateBroadening(ωi, Ai, Γi, γi, scale)
+    RamanRespIntermediateBroadening(t, ωi, Ai, Γi, γi, scale)
 
 Construct an intermediate broadened model with component positions `ωi` [rad/s], amplitudes `Ai`,
 Gaussian widths `Γi` [rad/s] and Lorentzian widths `γi` [rad/s]. The overall response is scaled by `scale`.
@@ -114,7 +124,7 @@ end
 
 
 """
-    RamanRespVibrational(Ωv, dαdQ, μ; τ2=nothing, Bρ=nothing, Aρ=nothing)
+    RamanRespVibrational(Ωv, dαdQ, μ; τ2=nothing, Bρ=nothing, Aρ=nothing, C=0.0)
 
 Construct a molecular vibrational Raman model (single damped oscillator).
 
@@ -164,7 +174,7 @@ struct RamanRespRotationalNonRigid{TR, Tτ2} <: AbstractRamanResponse
 end
 
 """
-    RamanRespRotationalNonRigid(B, Δα, τ2, qJodd, qJeven;
+    RamanRespRotationalNonRigid(B, Δα, qJodd, qJeven;
                                 D=0.0, minJ=0, maxJ=50, temp=roomtemp,
                                 τ2=nothing, Bρ=nothing, Aρ=nothing)
 
@@ -239,6 +249,12 @@ hrpre(R::RamanRespRotationalNonRigid, t) = sum(hrpre(Ri, t) for Ri in R.Rs)
 
 hrdamp(R::RamanRespRotationalNonRigid, ρ) = R.τ2ρ(ρ)
 
+"""
+    CombinedRamanResponse(t, Rs)
+
+Combine the list of Raman responses `Rs` onto time grid `t`, summing their contributions
+and applying a smoothing window.
+"""
 struct CombinedRamanResponse
     Rs::Vector{Any} # list of Raman responses
     t::Vector{Float64} # time grid
@@ -265,7 +281,7 @@ end
 
 
 """
-    molecular_raman_response(rp; kwargs...)
+    molecular_raman_response(t, rp; kwargs...)
 
 Get the Raman response function for the Raman parameters in named tuple `rp`.
 
@@ -307,7 +323,7 @@ function molecular_raman_response(t, rp; rotation=true, vibration=true, minJ=0, 
 end
 
 """
-    raman_response(t, material; kwargs...)
+    raman_response(t, material, scale=1; kwargs...)
 
 Get the Raman response function for time grid `t` and the `material`.
 

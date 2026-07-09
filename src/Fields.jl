@@ -16,6 +16,11 @@ import HCubature: hquadrature
 import DSP: unwrap
 import Logging: @warn
 
+"""
+    AbstractField
+
+Abstract supertype for all input field types.
+"""
 abstract type AbstractField end
 
 """
@@ -26,7 +31,7 @@ Abstract supertype for time-domain only fields.
 abstract type TimeField <: AbstractField end
 
 """
-    PulseField(λ0, energy, ϕ, τ0, Itshape)
+    PulseField(λ0, energy, power, ϕ, Itshape)
 
 Represents a temporal pulse with shape defined by `Itshape`.
 
@@ -122,9 +127,10 @@ function make_Et(p::PulseField, grid::Grid.EnvGrid)
 end
 
 """
-    (p::PulseField)(Eω, grid, energy_t, FT)
+    (p::PulseField)(grid, FT)
 
-Add the field to `Eω` for the provided `grid`, `energy_t` function and Fourier transform `FT`
+Get the frequency-domain field for the provided `grid` and Fourier transform `FT`, scaled to
+the specified `energy` or peak `power`.
 """
 function (p::PulseField)(grid, FT)
     Et = make_Et(p, grid)
@@ -296,7 +302,7 @@ function ShotNoise(rng=GLOBAL_RNG)
 end
 
 """
-    (s::ShotNoise)(Eω, grid)
+    (s::ShotNoise)(grid::Grid.RealGrid, FT=nothing)
 
 Get shotnoise for the provided `grid`. The optional parameter `FT`
 is unused and is present for interface compatibility with [`TimeField`](@ref).
@@ -398,7 +404,7 @@ function generate_noise_field(grid::Grid.EnvGrid; rng=GLOBAL_RNG, nmodes=1)
 end
 
 """
-    SpatioTemporalField(λ0, energy, ϕ, τ0, Ishape)
+    SpatioTemporalField(λ0, energy, ϕ, τ0, Ishape, propz)
 
 Represents a spatiotemporal pulse with shape defined by `Ishape`.
 
@@ -408,6 +414,7 @@ Represents a spatiotemporal pulse with shape defined by `Ishape`.
 - `ϕ::Float64`: the CEO phase
 - `τ0::Float64`: the temproal shift from grid time 0
 - `Ishape`: a callable `f(t, xs)` to get the shape of the intensity/power in the time-space domain
+- `propz::Float64`: the distance to propagate the field from its waist before use
 """
 struct SpatioTemporalField{iT} <: AbstractField
     λ0::Float64
@@ -418,12 +425,20 @@ struct SpatioTemporalField{iT} <: AbstractField
     propz::Float64
 end
 
-"Gaussian temporal-spatial field defined radially"
+"""
+    GaussGauss(t, r::AbstractVector, fwhm, m, w0)
+
+Gaussian temporal-spatial field defined radially.
+"""
 function GaussGauss(t, r::AbstractVector, fwhm, m, w0)
     Maths.gauss.(t, fwhm=fwhm, power=2*m) .* Maths.gauss.(r, w0/2)'
 end
 
-"Gaussian temporal-spatial field defined on x-y grid"
+"""
+    GaussGauss(t, r::AbstractArray{T,3} where T, fwhm, m, w0)
+
+Gaussian temporal-spatial field defined on x-y grid.
+"""
 function GaussGauss(t, r::AbstractArray{T,3} where T, fwhm, m, w0)
     Maths.gauss.(t, fwhm=fwhm, power=2*m) .* Maths.gauss.(r, w0/2)
 end
@@ -583,7 +598,11 @@ It(Et, grid::Grid.EnvGrid) = abs2.(Et)
 iFT(Eω, grid::Grid.RealGrid) = FFTW.irfft(Eω, length(grid.t), 1)
 iFT(Eω, grid::Grid.EnvGrid) = FFTW.ifft(Eω, 1)
 
-"Calculate energy from modal field E(t)"
+"""
+    energyfuncs(grid::Grid.RealGrid)
+
+Calculate energy from modal field E(t).
+"""
 function energyfuncs(grid::Grid.RealGrid)
     function energy_t(Et)
         return integrate(grid.t, It(Et, grid), SimpsonEven())
@@ -847,6 +866,12 @@ end
 
 prop_mode!(Eω, grid::Grid.AbstractGrid, args...) = prop_mode!(Eω, grid.ω, args...)
 
+"""
+    prop_mode(Eω, ω, mode, distance, λ0=nothing)
+
+Return a copy of the field `Eω` after linear propagation by `distance` in `mode`. For other
+arguments see [`prop_mode!`](@ref).
+"""
 prop_mode(Eω, args...) = prop_mode!(copy(Eω), args...)
 
 

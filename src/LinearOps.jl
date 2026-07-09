@@ -8,7 +8,7 @@ import Luna.PhysData: wlfreq
 #===============    FREE SPACE     ===============#
 #=================================================#
 """
-    make_const_linop(grid, xygrid, n, frame_vel)
+    make_const_linop(grid, xygrid, n, β1)
 
 Make constant linear operator for full 3D propagation. `n` is the refractive index (array)
 and β1 is 1/velocity of the reference frame.
@@ -122,7 +122,7 @@ end
 #==============   RADIAL SYMMETRY   ==============#
 #=================================================#
 """
-    make_const_linop(grid, q::QDHT, n, frame_vel)
+    make_const_linop(grid, q::QDHT, n, β1)
 
 Make constant linear operator for radial free-space. `n` is the refractive index (array)
 and β1 is 1/velocity of the reference frame.

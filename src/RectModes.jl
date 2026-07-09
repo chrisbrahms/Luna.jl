@@ -13,6 +13,12 @@ export RectMode, dimlimits, neff, field, N, Aeff
 # (possibly complex) refractive index as a function of freq
 # pol is either :x or :y
 # a and b are the half widths of the waveguide in each dimension.
+"""
+    RectMode(a, b, gas, P, clad; n=1, m=1, pol=:x, T=roomtemp)
+
+Mode of a rectangular hollow dielectric waveguide with half-widths `a` and `b`, filled with
+`gas` at pressure `P` and with cladding material `clad`.
+"""
 struct RectMode{Ta, Tb, Tcore, Tclad} <: AbstractMode
     a::Ta
     b::Tb
@@ -39,7 +45,11 @@ RectMode(a::Number, args...; kwargs...) = RectMode(z->a, args...; kwargs...)
 RectMode(afun, b::Number, args...; kwargs...) = RectMode(afun, z->b, args...; kwargs...)
 RectMode(a::Number, b::Number, args...; kwargs...) = RectMode(z->a, z->b, args...; kwargs...)
 
-"convenience constructor assunming single gas filling and specified cladding"
+"""
+    RectMode(afun, bfun, gas, P, clad; n=1, m=1, pol=:x, T=roomtemp)
+
+Convenience constructor assuming single gas filling and specified cladding.
+"""
 function RectMode(afun, bfun, gas, P, clad; n=1, m=1, pol=:x, T=roomtemp)
     rfg = ref_index_fun(gas, P, T)
     rfs = ref_index_fun(clad)
@@ -48,13 +58,22 @@ function RectMode(afun, bfun, gas, P, clad; n=1, m=1, pol=:x, T=roomtemp)
     RectMode(afun, bfun, n, m, pol, coren, cladn)
 end
 
-"convenience constructor for non-constant core index"
+"""
+    RectMode(afun, bfun, coren, clad; n=1, m=1, pol=:x)
+
+Convenience constructor for non-constant core index.
+"""
 function RectMode(afun, bfun, coren, clad; n=1, m=1, pol=:x)
     rfs = ref_index_fun(clad)
     cladn = (ω; z) -> rfs(2π*c./ω)
     RectMode(afun, bfun, n, m, pol, coren, cladn)
 end
 
+"""
+    dimlimits(m::RectMode; z=0)
+
+Return the coordinate system and integration limits for a `RectMode`.
+"""
 dimlimits(m::RectMode; z=0) = (:cartesian, (-m.a(z), -m.b(z)), (m.a(z), m.b(z)))
 
 """
@@ -89,6 +108,11 @@ function neff(m::RectMode, ω; z=0)
 end
 
 # here we use cartesian coords, so xs = (x, y)
+"""
+    field(m::RectMode, xs; z=0)
+
+Return the transverse field of a `RectMode` at Cartesian coordinates `xs = (x, y)`.
+"""
 function field(m::RectMode, xs; z=0)
     if isodd(m.m)
         Ea = cos(m.m*π*xs[1]/(2*m.a(z)))
@@ -108,8 +132,18 @@ function field(m::RectMode, xs; z=0)
     end
 end
 
+"""
+    N(m::RectMode; z=0)
+
+Return the normalisation constant of a `RectMode`.
+"""
 N(m::RectMode; z=0) = 0.5*sqrt(ε_0/μ_0)*m.a(z)*m.b(z)
 
+"""
+    Aeff(m::RectMode; z=0)
+
+Return the effective area of a `RectMode`.
+"""
 Aeff(m::RectMode; z=0) = 16/9*m.a(z)*m.b(z)
 
 end

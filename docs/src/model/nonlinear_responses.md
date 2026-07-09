@@ -5,7 +5,7 @@ This page describes the nonlinear polarisation terms ``P_\mathrm{nl}`` that appe
 Each response is written to be independent of the propagation geometry, so the same functions are used for mode-averaged, multi-mode, radial and full 3D simulations.
 
 ## Kerr effect
-The Kerr effect is the third-order (``\chi^{(3)}``) nonlinearity responsible for self- and cross-phase modulation, four-wave mixing and third-harmonic generation. In Luna the susceptibility is built at runtime from the number density and a single-molecule hyperpolarisability, ``\chi^{(3)} = \rho\,\gamma_3``, where ``\gamma_3`` is provided by [`PhysData.γ3_gas`](@ref) and ``\rho`` is the gas density at the current position (allowing the nonlinearity to follow a pressure gradient). The macroscopic susceptibility can equivalently be obtained from the nonlinear index ``n_2`` via `PhysData.χ3`, ``\chi^{(3)} = \tfrac{4}{3} n_2 \varepsilon_0 c\, n_0^2``.
+The Kerr effect is the third-order (``\chi^{(3)}``) nonlinearity responsible for self- and cross-phase modulation, four-wave mixing and third-harmonic generation. In Luna the susceptibility is built at runtime from the number density and a single-molecule hyperpolarisability, ``\chi^{(3)} = \rho\,\gamma_3``, where ``\gamma_3`` is provided by [`PhysData.γ3_gas`](@ref) and ``\rho`` is the gas density at the current position (allowing the nonlinearity to follow a pressure gradient). The macroscopic susceptibility can equivalently be obtained from the nonlinear index ``n_2`` via [`PhysData.χ3`](@ref), ``\chi^{(3)} = \tfrac{4}{3} n_2 \varepsilon_0 c\, n_0^2``.
 
 Which form of the response is used depends on whether the simulation is field-resolved or envelope, and whether it is scalar (a single polarisation state) or vector (full polarisation resolution).
 
@@ -30,7 +30,7 @@ For an **envelope, scalar** simulation the rapidly oscillating THG term is dropp
 ```math
 P_\mathrm{Kerr}(t, x, y, z) = \frac{3}{4}\varepsilon_0 \chi^{(3)} \left\vert\mathcal{E}(t, x, y, z)\right\vert^2\mathcal{E}(t, x, y, z)
 ```
-If the third harmonic *is* required in an envelope simulation, `Nonlinear.Kerr_env_thg` restores it as an explicitly up-shifted term ``\propto \mathrm{e}^{2i\omega_0 t}\mathcal{E}^2\mathcal{E}`` (see Eq. 4 of Genty et al., *Opt. Express* **15**, 5382 (2007)).
+If the third harmonic *is* required in an envelope simulation, [`Nonlinear.Kerr_env_thg`](@ref) restores it as an explicitly up-shifted term ``\propto \mathrm{e}^{2i\omega_0 t}\mathcal{E}^2\mathcal{E}`` (see Eq. 4 of Genty et al., *Opt. Express* **15**, 5382 (2007)).
 
 For an **envelope, vector** simulation the response additionally carries the cross-polarisation coupling terms, with the characteristic ``\tfrac{2}{3}`` cross-phase and ``\tfrac{1}{3}`` phase-conjugate (coherent coupling) coefficients that arise from separating the co- and counter-rotating circular components:
 ```math
@@ -65,7 +65,7 @@ The first term is the **ionisation loss**: it removes energy proportional to the
 ```
 where ``\rho(z)`` is the neutral density. Numerically, the two nested time integrals in the equation above are evaluated as successive cumulative-trapezoidal integrations of the plasma current, which is why the response is named `PlasmaCumtrapz`. For a vector field the ionisation rate is computed from the field magnitude ``\vert\mathbf{E}\vert`` and the resulting polarisation is applied component-wise.
 
-The ionisation rate ``w(\vert E\vert)`` is supplied by one of the rate models in [Ionisation.jl](@ref), for example the ADK rate [`Ionisation.IonRateADK`](@ref) or the PPT rate [`Ionisation.IonRatePPT`](@ref) (and its accelerated, spline-interpolated form [`Ionisation.IonRatePPTAccel`](@ref), used through `IonRatePPTCached`, which is much faster for repeated runs). The same ``1 - \exp(-\int w\,\mathrm{d}t')`` electron fraction is available directly via [`Ionisation.ionfrac`](@ref).
+The ionisation rate ``w(\vert E\vert)`` is supplied by one of the rate models in [Ionisation.jl](@ref), for example the ADK rate [`Ionisation.IonRateADK`](@ref) or the PPT rate [`Ionisation.IonRatePPT`](@ref) (and its cached, spline-interpolated form [`Ionisation.IonRatePPTCached`](@ref), which is much faster for repeated runs). The same ``1 - \exp(-\int w\,\mathrm{d}t')`` electron fraction is available directly via [`Ionisation.ionfrac`](@ref).
 
 ## Raman response
 Raman scattering from the vibration and rotation of molecules produces a *delayed* (non-instantaneous) nonlinear response: the polarisation at time ``t`` depends on the field at earlier times through a convolution with a response function ``h``. Luna models this with the non-rigid-rotor / single-vibrational-transition treatment of [Wahlstrand et al., *Phys. Rev. A* **92**, 063828 (2015)] as applied to gas-filled hollow-core fibres by [Gao et al., *Laser & Photonics Reviews* **16**, 2100426 (2022)]. In general the Raman polarisation has the form
@@ -76,7 +76,7 @@ where ``N`` is the number density and the sum runs over the contributing Raman t
 ```math
 h(\nu, T_2, t) = \sin (2\pi \nu t)\exp(-t/T_2)\,,\qquad T_2=(\pi \Delta\nu)^{-1}\,,
 ```
-with ``\nu`` the transition frequency, ``T_2`` the dephasing (coherence) time and ``\Delta\nu`` the full-width at half-maximum linewidth of the transition. This single-oscillator response is implemented by `Raman.RamanRespSingleDampedOscillator`; the convolution with ``E(t-\tau)^2`` is carried out (via FFT, on a doubled time grid to avoid truncation of the long-lived response) when the response is applied to the field by [`Nonlinear.RamanPolarField`](@ref) (field-resolved) or [`Nonlinear.RamanPolarEnv`](@ref) (envelope). As with the Kerr effect, the field-resolved response can optionally include or exclude the third-harmonic component of the ``E^2`` driving term.
+with ``\nu`` the transition frequency, ``T_2`` the dephasing (coherence) time and ``\Delta\nu`` the full-width at half-maximum linewidth of the transition. This single-oscillator response is implemented by [`Raman.RamanRespSingleDampedOscillator`](@ref); the convolution with ``E(t-\tau)^2`` is carried out (via FFT, on a doubled time grid to avoid truncation of the long-lived response) when the response is applied to the field by [`Nonlinear.RamanPolarField`](@ref) (field-resolved) or [`Nonlinear.RamanPolarEnv`](@ref) (envelope). As with the Kerr effect, the field-resolved response can optionally include or exclude the third-harmonic component of the ``E^2`` driving term.
 
 ### Vibrational Raman
 Because the vibrational frequency ``\nu_v`` is usually much larger than the rotational frequencies — large enough that only the ground vibrational state is thermally populated at room temperature — scattering from molecular stretching is captured by a *single* vibrational transition:
@@ -106,16 +106,16 @@ P^\mathrm{r} = E(t)\,N\,(4\pi\epsilon_0)^2\sum_{J}\kappa_r^J\int_{0}^{\infty}h(\
 where ``\Delta\alpha`` is the molecular polarisability anisotropy. The per-line linewidth is pressure-broadened, ``\Delta\nu_r = (\pi T_2^r)^{-1} = \rho\, b_r``, with ``\rho`` the gas density (in amagat) and ``b_r`` an experimentally determined constant. This is implemented by [`Raman.RamanRespRotationalNonRigid`](@ref).
 
 ### Assembling the response
-For a molecular gas, [`Raman.molecular_raman_response`](@ref) builds the rotational and/or vibrational parts and sums them into a `Raman.CombinedRamanResponse`. The top-level [`Raman.raman_response`](@ref) dispatches on the material: molecular gases use the vibrational/rotational model above, while solids such as fused silica use the multi-mode broadened model [`Raman.RamanRespIntermediateBroadening`](@ref) (Hollenbeck & Cantrell, *J. Opt. Soc. Am. B* **19**, 2886 (2002)). In the simple interface, the fractional Raman contribution ``f_r`` to the third-order response of a glass is set by the `fr` keyword (default ``0.18``).
+For a molecular gas, [`Raman.molecular_raman_response`](@ref) builds the rotational and/or vibrational parts and sums them into a [`Raman.CombinedRamanResponse`](@ref). The top-level [`Raman.raman_response`](@ref) dispatches on the material: molecular gases use the vibrational/rotational model above, while solids such as fused silica use the multi-mode broadened model [`Raman.RamanRespIntermediateBroadening`](@ref) (Hollenbeck & Cantrell, *J. Opt. Soc. Am. B* **19**, 2886 (2002)). In the simple interface, the fractional Raman contribution ``f_r`` to the third-order response of a glass is set by the `fr` keyword (default ``0.18``).
 
 ### Implementation
 - [`Raman.raman_response`](@ref)
 - [`Raman.molecular_raman_response`](@ref)
 - [`Raman.RamanRespVibrational`](@ref)
 - [`Raman.RamanRespRotationalNonRigid`](@ref)
-- `Raman.RamanRespSingleDampedOscillator`
+- [`Raman.RamanRespSingleDampedOscillator`](@ref)
 - [`Raman.RamanRespIntermediateBroadening`](@ref)
-- `Raman.CombinedRamanResponse`
+- [`Raman.CombinedRamanResponse`](@ref)
 - [`Nonlinear.RamanPolarField`](@ref)
 - [`Nonlinear.RamanPolarEnv`](@ref)
 

@@ -364,7 +364,7 @@ function _energy(Eω, energyω)
 end
 
 """
-    field_autocorrelation(Et; dims=1)
+    field_autocorrelation(Et, grid; dims=1)
 
 Calculate the field autocorrelation of `Et`.
 """
@@ -479,6 +479,8 @@ function _specres(ω, Iω, resolution, xrange, window, nsamples, ωtox, xtoω)
 end
 
 """
+    _specres_kernel!(Ix, cidcs, istart, iend, Iω, window, x, xg, δω)
+
 Convolution kernel for each output point. We simply loop over all outer indices
 and output points. The inner loop adds up the contributions from the specified window
 around the target point. Note that this works without scaling also for wavelength ranges
@@ -582,7 +584,7 @@ x-axis:
 - `specrange::Tuple` can be set to a pair of limits on the spectral range (in `specaxis` units).
 - `resolution::Real` is set, smooth the spectral energy density as defined by [`specres`](@ref).
 
-Note that `resolution` is set and `specaxis=:λ` it is highly recommended to also set `specrange`.
+Note that if `resolution` is set and `specaxis=:λ` it is highly recommended to also set `specrange`.
 """
 getIω(output::AbstractOutput, specaxis; kwargs...) = getIω(getEω(output)..., specaxis; kwargs...)
 
@@ -677,9 +679,6 @@ domain field `Eω`. The field can be cropped in time using `trange`, it is overs
 a factor of `oversampling` (default 4) and can be bandpassed with `bandpass`
 (see [`window_maybe`](@ref)). If `FTL` is `true`, return the Fourier-transform limited pulse,
 i.e. remove any spectral phase.
-
-If `zslice` is given, returs only the slices of `Eω` closest to the given distances. `zslice`
-can be a single number or an array.
 """
 function getEt(grid::AbstractGrid, Eω::AbstractArray;
                trange=nothing, oversampling=4, bandpass=nothing,

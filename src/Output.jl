@@ -9,9 +9,18 @@ import Printf: @sprintf
 import Luna: Scans, Utils
 import FileWatching.Pidfile: mkpidlock
 
+"""
+    AbstractOutput
+
+Abstract supertype for simulation output handlers.
+"""
 abstract type AbstractOutput end
 
-"Output handler for writing only to memory"
+"""
+    MemoryOutput{sT, S}
+
+Output handler for writing only to memory.
+"""
 mutable struct MemoryOutput{sT, S} <: AbstractOutput
     save_cond::sT
     yname::AbstractString  # Name for solution (e.g. "Eω")
@@ -45,8 +54,12 @@ function initialise(o::MemoryOutput, y)
     o.data[o.tname] = Array{Float64}(undef, (dims[end],))
 end
 
-"getindex works interchangeably so when switching from one Output to
-another, subsequent code can stay the same"
+"""
+    getindex(o::MemoryOutput, ds::AbstractString)
+
+getindex works interchangeably so when switching from one Output to
+another, subsequent code can stay the same.
+"""
 getindex(o::MemoryOutput, ds::AbstractString) = o.data[ds]
 getindex(o::MemoryOutput, ds::AbstractString, I...) = o.data[ds][I...]
 
@@ -54,13 +67,18 @@ show(io::IO, o::MemoryOutput) = print(io, "MemoryOutput$(collect(keys(o.data)))"
 
 haskey(o::MemoryOutput, key) = haskey(o.data, key)
 
-"""Calling the output handler saves data in the arrays
-    Arguments:
-        y: current function value
-        t: current propagation point
-        dt: current stepsize
-        yfun: callable which returns interpolated function value at different t
-    Note that from RK45.jl, this will be called with yn and tn as arguments.
+"""
+    (o::MemoryOutput)(y, t, dt, yfun)
+
+Calling the output handler saves data in the arrays.
+
+# Arguments
+- `y`: current function value
+- `t`: current propagation point
+- `dt`: current stepsize
+- `yfun`: callable which returns interpolated function value at different t
+
+Note that from RK45.jl, this will be called with yn and tn as arguments.
 """
 function (o::MemoryOutput)(y, t, dt, yfun)
     save, ts = o.save_cond(y, t, dt, o.saved)
@@ -104,14 +122,22 @@ function append_stat!(o::MemoryOutput, name, value::AbstractArray)
     end
 end
 
-"Calling the output on a dictionary writes the items to the array"
+"""
+    (o::MemoryOutput)(d::Dict; force=false, meta=false, group=nothing)
+
+Calling the output on a dictionary writes the items to the array.
+"""
 function (o::MemoryOutput)(d::Dict; force=false, meta=false, group=nothing)
     for (k, v) in pairs(d)
         o(k, v; force=force, meta=meta, group=group)
     end
 end
 
-"Calling the output with a key, value pair writes the value to the array."
+"""
+    (o::MemoryOutput)(key::AbstractString, val; force=false, meta=false, group=nothing)
+
+Calling the output with a key, value pair writes the value to the array.
+"""
 function (o::MemoryOutput)(key::AbstractString, val; force=false, meta=false, group=nothing)
     parent = meta ? o.data["meta"] : o.data
     if haskey(parent, key)
@@ -142,7 +168,11 @@ function fastcat(A, v)
     return reshape(Av, (dims[1:end-1]..., dims[end]+1))
 end
 
-"Output handler for writing to an HDF5 file"
+"""
+    HDF5Output{sT, S}
+
+Output handler for writing to an HDF5 file.
+"""
 mutable struct HDF5Output{sT, S} <: AbstractOutput
     fpath::AbstractString  # Path to output file
     save_cond::sT  # callable, determines when data is saved and where it is interpolated
@@ -157,7 +187,11 @@ mutable struct HDF5Output{sT, S} <: AbstractOutput
     readonly::Bool
 end
 
-"Simple constructor"
+"""
+    HDF5Output(fpath, tmin, tmax, saveN::Integer, statsfun=nostats; yname="Eω", tname="z", compression=false, script=nothing, cache=true, readonly=false)
+
+Simple constructor.
+"""
 function HDF5Output(fpath, tmin, tmax, saveN::Integer, statsfun=nostats;
                     yname="Eω", tname="z", compression=false, script=nothing, cache=true,
                     readonly=false)
@@ -165,7 +199,11 @@ function HDF5Output(fpath, tmin, tmax, saveN::Integer, statsfun=nostats;
     HDF5Output(fpath, save_cond, yname, tname, statsfun, compression, script, cache, readonly)
 end
 
-"Internal constructor - creates the file"
+"""
+    HDF5Output(fpath, save_cond, yname, tname, statsfun, compression, script=nothing, cache=true, readonly=false)
+
+Internal constructor - creates the file.
+"""
 function HDF5Output(fpath, save_cond, yname, tname, statsfun, compression,
                     script=nothing, cache=true, readonly=false)
     if isfile(fpath) && cache
@@ -310,13 +348,18 @@ function haskey(o::HDF5Output, key)
 end
 
 
-"""Calling the output handler writes data to the file
-    Arguments:
-        y: current function value
-        t: current propagation point
-        dt: current stepsize
-        yfun: callable which returns interpolated function value at different t
-    Note that from RK45.jl, this will be called with yn and tn as arguments.
+"""
+    (o::HDF5Output)(y, t, dt, yfun)
+
+Calling the output handler writes data to the file.
+
+# Arguments
+- `y`: current function value
+- `t`: current propagation point
+- `dt`: current stepsize
+- `yfun`: callable which returns interpolated function value at different t
+
+Note that from RK45.jl, this will be called with yn and tn as arguments.
 """
 function (o::HDF5Output)(y, t, dt, yfun)
     o.readonly && error("Cannot add data to read-only output!")
@@ -393,7 +436,11 @@ function create_dataset(parent, name, x::AbstractArray)
                   chunk=dims)
 end
 
-"Calling the output on a dictionary writes the items to the file"
+"""
+    (o::HDF5Output)(d::AbstractDict; force=false, meta=false, group=nothing)
+
+Calling the output on a dictionary writes the items to the file.
+"""
 function (o::HDF5Output)(d::AbstractDict; force=false, meta=false, group=nothing)
     o.readonly && error("Cannot add data to read-only output!")
     HDF5.h5open(o.fpath, "r+") do file
@@ -430,7 +477,11 @@ function (o::HDF5Output)(d::AbstractDict; force=false, meta=false, group=nothing
     end
 end
 
-"Calling the output on a key, value pair writes the value to the file"
+"""
+    (o::HDF5Output)(key::AbstractString, val; force=false, meta=false, group=nothing)
+
+Calling the output on a key, value pair writes the value to the file.
+"""
 function (o::HDF5Output)(key::AbstractString, val; force=false, meta=false, group=nothing)
     o.readonly && error("Cannot add data to read-only output!")
     HDF5.h5open(o.fpath, "r+") do file
@@ -486,7 +537,11 @@ end
 # For other outputs (e.g. MemoryOutput or another function), checking the cache does nothing.
 check_cache(o, y, t, dt) = y, t, dt
 
-"Condition callable that distributes save points evenly on a grid"
+"""
+    GridCondition
+
+Condition callable that distributes save points evenly on a grid.
+"""
 struct GridCondition
     grid::Vector{Float64}
     saveN::Integer
@@ -501,12 +556,20 @@ function (cond::GridCondition)(y, t, dt, saved)
     return save, save ? cond.grid[saved+1] : 0
 end
 
-"Condition which saves every native point of the propagation"
+"""
+    always(y, t, dt, saved)
+
+Condition which saves every native point of the propagation.
+"""
 function always(y, t, dt, saved)
     return true, t
 end
 
-"Condition which saves every nth native point"
+"""
+    every_nth(n)
+
+Condition which saves every nth native point.
+"""
 function every_nth(n)
     i = 0
     cond = let i = i, n = n
@@ -519,14 +582,21 @@ function every_nth(n)
     return cond
 end
 
-"""Making initial array dimensions.
+"""
+    init_dims(ydims, save_cond::GridCondition)
+
+Making initial array dimensions.
 For a GridCondition, we know in advance how many points there will be.
 """
 function init_dims(ydims, save_cond::GridCondition)
     return (ydims..., save_cond.saveN)
 end
 
-"For other conditions, we do not know in advance."
+"""
+    init_dims(ydims, save_cond)
+
+For other conditions, we do not know in advance.
+"""
 function init_dims(ydims, save_cond)
     return (ydims..., 1)
 end
@@ -556,6 +626,12 @@ function ScanHDF5Output(scan, scanidx, args...; fname=nothing, fdir=nothing, kwa
     savescan(HDF5Output(fpath, args...; kwargs...), scan, scanidx)
 end
 
+"""
+    ScanMemoryOutput(scan, scanidx, args...; kwargs...)
+
+Create a [`MemoryOutput`](@ref) for the given `scan` at the current `scanidx` and
+automatically store the scan arrays and current values of the scan variables in it.
+"""
 function ScanMemoryOutput(scan, scanidx, args...; kwargs...)
     savescan(MemoryOutput(args...; kwargs...), scan, scanidx)
 end

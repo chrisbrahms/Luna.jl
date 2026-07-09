@@ -14,7 +14,6 @@ Approximate transition dipole moment for hydrogen 1s as a function of momentum p
 
 B. Podolsky & L. Pauling. Phys. Rev.34 no. 1, 109 (1929)
 """
-
 function approx_dipole(gas)
     Ip = PhysData.ionisation_potential(gas; unit=:atomic)
     κ = sqrt(2Ip)

@@ -201,7 +201,7 @@ function show(io::IO, t::TransModal)
 end
 
 """
-    TransModal(grid, ts, FT, resp, densityfun, norm!; rtol=1e-3, atol=0.0, mfcn=300, full=false, noise_field=nothing)
+    TransModal(grid, ts, FT, resp, densityfun, norm!; rtol=1e-3, atol=0.0, mfcn=512, full=false, noise_field=nothing)
 
 Construct a `TransModal`, transform E(ω) -> Pₙₗ(ω) for modal fields.
 
@@ -455,6 +455,14 @@ function (t::TransModeAvg)(nl, Eω, z)
     end
 end
 
+"""
+    norm_mode_average(grid, βfun!, aeff; shock=true)
+
+Make the normalisation function for mode-averaged propagation, given the propagation constant
+`βfun!(β, z)` and effective-area function `aeff(z)`. If `shock` is `false`, the intrinsic
+frequency dependence of the nonlinear response is ignored, turning off optical shock
+formation/self-steepening.
+"""
 function norm_mode_average(grid, βfun!, aeff; shock=true)
     β = zeros(Float64, length(grid.ω))
     shockterm = shock ? grid.ω.^2 : grid.ω .* PhysData.wlfreq(grid.referenceλ)
@@ -469,6 +477,13 @@ function norm_mode_average(grid, βfun!, aeff; shock=true)
     end
 end
 
+"""
+    norm_mode_average_gnlse(grid, aeff; shock=true)
+
+Make the normalisation function for mode-averaged GNLSE propagation, given the effective-area
+function `aeff(z)`. If `shock` is `false`, the intrinsic frequency dependence of the nonlinear
+response is ignored, turning off optical shock formation/self-steepening.
+"""
 function norm_mode_average_gnlse(grid, aeff; shock=true)
     shockterm = shock ? grid.ω.^2 : grid.ω .* PhysData.wlfreq(grid.referenceλ)
     pre = @. -im*shockterm/(2*PhysData.c^(3/2)*sqrt(2*PhysData.ε_0))/(grid.ω/PhysData.c)
@@ -581,7 +596,7 @@ function (t::TransRadial)(nl, Eω, z)
 end
 
 """
-    const_norm_radial(ω, q, nfun)
+    const_norm_radial(grid, q, nfun)
 
 Make function to return normalisation factor for radial symmetry without re-calculating at
 every step. 
@@ -597,7 +612,7 @@ function const_norm_radial(grid, q, nfun)
 end
 
 """
-    norm_radial(ω, q, nfun)
+    norm_radial(grid, q, nfun)
 
 Make function to return normalisation factor for radial symmetry. 
 

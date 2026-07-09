@@ -47,6 +47,11 @@ centred at `x0`.
 """
 gauss(x; x0=0, power=2, fwhm) = gauss(x, fwhm_to_σ(fwhm; power=power), x0 = x0, power=power)
 
+"""
+    fwhm_to_σ(fwhm; power=2)
+
+Convert the FWHM of a (hyper)Gaussian to its standard deviation `σ`.
+"""
 fwhm_to_σ(fwhm; power=2) = fwhm / (2 * (2 * log(2))^(1 / power))
 
 """
@@ -754,7 +759,7 @@ function check_spline_args(x, y)
 end
 
 """
-     make_spline_ifun(x, ifun)
+    make_spline_ifun(x, ifun)
 
 If `ifun != nothing` then `ifun(x0)` should return the index of the first element in x
 which is bigger than x0. Otherwise, it defaults two one of two options:
@@ -956,7 +961,7 @@ end
 
 Find the first index in `f.x` which is larger than `x0`.
 
-This is similar to [`findfirst`](@ref), but it starts at the index which was last used.
+This is similar to `findfirst`, but it starts at the index which was last used.
 If the new value `x0` is close to the previous `x0`, this is much faster than `findfirst`.
 """
 function (f::FastFinder)(x0::Number)
@@ -1020,7 +1025,7 @@ Broadcast.broadcastable(cs::CmplxBSpline) = Ref(cs)
 """
     BSpline(x, y)
 
-Construct a `RealBSpline` or `CmplxSpline` of given `order` (1 to 5, default=3)
+Construct a `RealBSpline` or `CmplxBSpline` of given `order` (1 to 5, default=3)
 to interpolate the values `y` on axis `x`.
 
 If given, `ifun(x0)` should return the index of the first element in x which is bigger
@@ -1054,7 +1059,7 @@ function (rs::RealBSpline)(x)
 end
 
 """
-    (cs::CmplxSpline)(x)
+    (cs::CmplxBSpline)(x)
 
 Evaluate the `CmplxBSpline` at coordinate(s) `x`
 """
@@ -1091,7 +1096,7 @@ function derivative(cs::CmplxBSpline, x, order::Integer)
 end
 
 """
-    differentiate_spline(rs::RealBSpline; order::Integer=1)
+    differentiate_spline(rs::RealBSpline, order::Integer)
 
 Return a new spline which is the derivative of `rs` and has the same support.
 Higher orders are obtained by repeated spline differentiation.
@@ -1107,9 +1112,9 @@ function differentiate_spline(rs::RealBSpline, order::Integer)
 end
 
 """
-    roots(rs::RealBSpline)
+    roots(rs::RealBSpline; maxn::Int=128)
 
-Find the roots of the spline `rs`.
+Find the roots of the spline `rs`. At most `maxn` roots are returned.
 """
 function roots(rs::RealBSpline; maxn::Int=128)
     Dierckx.roots(rs.rspl; maxn=maxn)
@@ -1122,8 +1127,8 @@ end
 Evaluate a spline s(x) of degree k, given in its b-spline representation.
 
 # Arguments
-- `h::ArrayPT<:Real,1}`: work space
-- `hh::ArrayPT<:Real,1}`: work space
+- `h::Array{T<:Real,1}`: work space
+- `hh::Array{T<:Real,1}`: work space
 - `t::Array{T<:Real,1}`: the positions of the knots
 - `c::Array{T<:Real,1}`: the b-spline coefficients
 - `k::Integer`: the degree of s(x)
@@ -1163,8 +1168,8 @@ degree k at t[l] <= x < t[l+1] using the stable recurrence
 relation of de boor and cox.
 
 # Arguments
-- `h::ArrayPT<:Real,1}`: work space
-- `hh::ArrayPT<:Real,1}`: work space
+- `h::Array{T<:Real,1}`: work space
+- `hh::Array{T<:Real,1}`: work space
 - `t::Array{T<:Real,1}`: the positions of the knots
 - `k::Integer`: the degree of s(x)
 - `x::Real`: the point to evaluate at
