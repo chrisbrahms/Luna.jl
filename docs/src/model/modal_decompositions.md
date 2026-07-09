@@ -134,11 +134,41 @@ The mode-averaged field UPPE as written above is very useful, but the scaling fr
 
 
 ## Radially symmetric free-space
+For free-space propagation of a radially symmetric beam, the transverse basis is no longer a set of waveguide modes but the continuum of Bessel beams ``J_0(k_\perp r)``, so the generalised transverse spatial frequency ``\mathbf{k}_\perp`` becomes the (scalar) radial spatial frequency ``k_\perp``. The field is written as
 ```math
-\mathbf{E}_s(t, r, z) = \frac{2\pi}{\left(2\pi\right)^3} \int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  E(\omega, k_\perp, z) J_0(k_\perp r) \mathrm{e}^{-i\omega t}\mathbf{e}_s k_\perp\mathrm{d} k_\perp  \mathrm{d}\omega
+\mathbf{E}_s(t, r, z) = \frac{2\pi}{\left(2\pi\right)^3} \int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  E(\omega, k_\perp, z) J_0(k_\perp r) \mathrm{e}^{-i\omega t}\mathbf{e}_s k_\perp\mathrm{d} k_\perp  \mathrm{d}\omega\,,
 ```
+where the ``k_\perp\,\mathrm{d}k_\perp`` measure and the leading ``2\pi`` (from the azimuthal integration) are the conventions of the Hankel transform. In Luna this transverse transform is a zeroth-order quasi-discrete Hankel transform (`Hankel.QDHT`), and the whole radial UPPE is implemented in [`NonlinearRHS.TransRadial`](@ref). On each step the nonlinear polarisation is evaluated by transforming the field from reciprocal space to real-space–time (an inverse Fourier transform ``\omega\to t`` and an inverse Hankel transform ``k_\perp\to r``), calculating ``\mathbf{P}_\mathrm{nl}`` pointwise, and transforming back (``r\to k_\perp`` and ``t\to\omega``), followed by the ``i\omega/N_\mathrm{nl}`` prefactor of the UPPE.
+
+The normalisation factor here is not constant but depends on the propagation angle of each plane-wave component. For a component at frequency ``\omega`` and radial spatial frequency ``k_\perp`` it is (see [`NonlinearRHS.norm_radial`](@ref) and its ``z``-independent form [`NonlinearRHS.const_norm_radial`](@ref))
+```math
+N_\mathrm{nl}(\omega, k_\perp, z) = \frac{\beta(\omega, k_\perp, z)}{\mu_0 \omega}\,,\qquad \beta = \sqrt{\left(\frac{\omega}{c}n(\omega, z)\right)^2 - k_\perp^2}\,,
+```
+where ``\beta`` is the longitudinal wave vector. On axis (``k_\perp = 0``) this reduces to the ``n\varepsilon_0 c`` impedance factor familiar from the guided cases, while for oblique components it applies the corresponding angular-spectrum correction. Evanescent components (``\beta^2 \le 0``) are guarded and do not propagate. The propagating array is two-dimensional in ``(\omega, k_\perp)``.
+
+!!! note
+    The polarisation unit vector ``\mathbf{e}_s`` in the equation above is a notational device: the free-space transforms propagate a **scalar** field along a single fixed polarisation state and do not carry a polarisation-component axis (unlike the vector-capable [`NonlinearRHS.TransModal`](@ref)).
+
+### Implementation
+- [`NonlinearRHS.TransRadial`](@ref)
+- [`NonlinearRHS.norm_radial`](@ref)
+- [`NonlinearRHS.const_norm_radial`](@ref)
 
 ## Three-dimensional free-space
+For full ``(3+1)``-dimensional free-space propagation without any symmetry, the transverse basis is the two-dimensional plane-wave spectrum ``\mathrm{e}^{i(k_x x + k_y y)}``, so ``\mathbf{k}_\perp = (k_x, k_y)``. The field is
 ```math
-\mathbf{E}_s(t, x, y, z) = \frac{1}{\left(2\pi\right)^3}\int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  \int_{-\infty}^{\infty}  E(\omega, k_x, k_y, z) \mathrm{e}^{i\left(k_x x + k_y y - \omega t\right)}\mathbf{e}_s\mathrm{d} k_x \mathrm{d} k_y \mathrm{d} \omega
+\mathbf{E}_s(t, x, y, z) = \frac{1}{\left(2\pi\right)^3}\int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  \int_{-\infty}^{\infty}  E(\omega, k_x, k_y, z) \mathrm{e}^{i\left(k_x x + k_y y - \omega t\right)}\mathbf{e}_s\mathrm{d} k_x \mathrm{d} k_y \mathrm{d} \omega\,,
 ```
+with the standard three-fold inverse-Fourier-transform measure ``1/(2\pi)^3``. The Cartesian ``x``/``y`` grid and its spatial frequencies ``k_x``/``k_y`` are held by [`Grid.FreeGrid`](@ref), and the transform is implemented in [`NonlinearRHS.TransFree`](@ref). Here a single combined three-dimensional FFT handles both transverse spatial axes *and* time at once: the field is transformed ``(\omega, k_y, k_x)\to(t, y, x)``, the nonlinear polarisation is evaluated pointwise, and the result is transformed back before applying the ``i\omega/N_\mathrm{nl}`` prefactor.
+
+The normalisation takes the same form as the radial case, now with the two-dimensional transverse spatial frequency ``k_\perp^2 = k_x^2 + k_y^2`` (see [`NonlinearRHS.norm_free`](@ref) and [`NonlinearRHS.const_norm_free`](@ref)):
+```math
+N_\mathrm{nl}(\omega, k_x, k_y, z) = \frac{\beta(\omega, k_x, k_y, z)}{\mu_0 \omega}\,,\qquad \beta = \sqrt{\left(\frac{\omega}{c}n(\omega, z)\right)^2 - k_x^2 - k_y^2}\,,
+```
+with the same evanescent-component guard. The propagating array is three-dimensional in ``(\omega, k_y, k_x)``.
+
+### Implementation
+- [`Grid.FreeGrid`](@ref)
+- [`NonlinearRHS.TransFree`](@ref)
+- [`NonlinearRHS.norm_free`](@ref)
+- [`NonlinearRHS.const_norm_free`](@ref)

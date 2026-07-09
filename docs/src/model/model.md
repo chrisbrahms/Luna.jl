@@ -1,6 +1,6 @@
 # The numerical model
 ```@contents
-Pages = ["model.md", "modal_decompositions.md", "nonlinear_responses.md", "implementation.md"]
+Pages = ["model.md", "modal_decompositions.md", "implementation.md", "nonlinear_responses.md", "noise.md"]
 Depth = 2
 ```
 
