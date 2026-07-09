@@ -4,6 +4,8 @@ import Luna.PhysData: ε_0, e_ratio
 import Luna: Maths, Utils
 import FFTW
 import LinearAlgebra: mul!, ldiv!
+import Rotations: RotZY, RotYZ, RotMatrix, RotMatrix3
+import StaticArrays: SMatrix, MArray
 
 function KerrScalar!(out, E, fac)
     @. out += fac*E^3
@@ -98,6 +100,77 @@ function Kerr_env_thg(γ3, ω0, t)
             @. out += ρ*ε_0*γ3/4*(3*abs2(E) + C*E^2)*E
         end
     end
+end
+
+struct Chi2Field{χT}
+    χ2::χT
+    toCrystal::RotMatrix3{Float64}
+    toLab::RotMatrix3{Float64}
+    χ2_toLab::χT # combined matrix to multiply by toLab * χ2
+    El::Vector{Float64} # field in the lab frame
+    Ec::Vector{Float64} # field in the crystal frame
+    Enl::Vector{Float64} # field products in the crystal frame
+    Pl::Vector{Float64} # polarisation in the lab frame
+end
+
+"""
+    Chi2Field(θ, ϕ, χ2)
+
+Construct a second-order nonlinear polarisation response for real, two-component
+electric fields in the lab frame.
+
+`θ` and `ϕ` (radians) define the crystal orientation relative to the lab frame.
+`χ2` must be a 3×6 second-order susceptibility tensor in contracted notation,
+with column order `[xx, yy, zz, yz, xz, xy]` (where mixed terms are multiplied by 2
+in [`field_products!`](@ref)).
+
+The returned callable adds \$ε_0 P_{NL}\$ to `out` when invoked as
+`response(out, E, ρ)`. Note that the density `ρ` is ignored.
+"""
+function Chi2Field(θ, ϕ, χ2)
+    toCrystal = RotMatrix(RotZY(-ϕ, -θ)) # RotMatrix converts to static matrix
+    toLab = RotMatrix(RotYZ(θ, ϕ))
+    sv3 = zeros(3)
+    sv6 = zeros(6)
+    χ2 = SMatrix{3, 6}(χ2) # just χ2
+    χ2_toLab = SMatrix{3, 6}(toLab * χ2) # χ2 and coordinate transform in one step
+    Chi2Field(χ2, toCrystal, toLab, χ2_toLab, sv3, copy(sv3), sv6, copy(sv3))
+end
+
+function (c::Chi2Field)(out, E, ρ)
+    for i in axes(E, 1)
+        @inbounds c.El[1] = E[i, 1]
+        @inbounds c.El[2] = E[i, 2]
+        # note c.El[3] (Ez in the lab frame) is always zero here
+        mul!(c.Ec, c.toCrystal, c.El) # transform to crystal frame
+        @inbounds field_products!(c.Enl, c.Ec) # calculate nonlinear products
+        mul!(c.Pl, c.χ2_toLab, c.Enl) # multiply by χ2 tensor and transform to lab frame
+        @inbounds out[i, 1] += ε_0*c.Pl[1]
+        @inbounds out[i, 2] += ε_0*c.Pl[2]
+    end
+end
+
+
+"""
+    field_products!(Enl, Ec)
+
+Fill the contracted second-order field-product vector `Enl` from crystal-frame
+field components `Ec`.
+
+The output ordering is
+`[Ex^2, Ey^2, Ez^2, 2EyEz, 2ExEz, 2ExEy]`, matching the 3x6 `χ2` tensor
+column order `[xx, yy, zz, yz, xz, xy]` used by [`Chi2Field`](@ref).
+
+Both `Enl` and `Ec` are mutated/read in place and are expected to have length 6
+and 3, respectively.
+"""
+function field_products!(Enl, Ec)
+    Enl[1] = Ec[1]^2
+    Enl[2] = Ec[2]^2
+    Enl[3] = Ec[3]^2
+    Enl[4] = 2*Ec[2]*Ec[3]
+    Enl[5] = 2*Ec[1]*Ec[3]
+    Enl[6] = 2*Ec[1]*Ec[2]
 end
 
 """
@@ -221,7 +294,7 @@ Raman polarisation response type for a carrier resolved field.
 """
 struct RamanPolarField{TR, Tt, Thv, Tω, Tv, FTt, HTt} <: RamanPolar
     r::TR # Raman response
-    h::Tt # doubled buffer to hold response + padding 
+    h::Tt # doubled buffer to hold response + padding
     ht::Thv # buffer to hold time domain response
     hω::Tω # the frequency domain Raman response function
     Eω2::Tω # buffer to hold the Fourier transform of E^2
@@ -243,7 +316,7 @@ Raman polarisation response type for an envelope.
 """
 struct RamanPolarEnv{TR, Tt, Thv, Tω, Tv, FTt} <: RamanPolar
     r::TR # Raman response
-    h::Tt # doubled buffer to hold response + padding 
+    h::Tt # doubled buffer to hold response + padding
     ht::Thv # buffer to hold time domain response
     hω::Tω # the frequency domain Raman response function
     Eω2::Tω # buffer to hold the Fourier transform of E^2
@@ -353,7 +426,7 @@ function (R::RamanPolar)(out, Et, ρ)
     # i.e. only the part corresponding to the original time grid
     # note that the response function time 0 is put into the first element of the response array
     # this ensures that causality is maintained, and no artificial delay between the field and
-    # the start of the response function occurs, at each convolution point.  
+    # the start of the response function occurs, at each convolution point.
     R.r(R.ht, ρ)
     R.hω .= R.FT * R.h
 
@@ -374,7 +447,7 @@ function (R::RamanPolar)(out, Et, ρ)
     for i = 1:length(E)
         R.Pout[i] = ρ*E[i]*R.P[i]
     end
-    
+
     # copy to output in dimensions requested
     if ndims(Et) > 1
         out .+= reshape(R.Pout, size(Et))
