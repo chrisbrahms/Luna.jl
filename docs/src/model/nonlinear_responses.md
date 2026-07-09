@@ -47,11 +47,13 @@ P_2(t, x, y, z) = \varepsilon_0 \chi^{(2)} \mathbf{E}^2(t, x, y, z)
 ```
 and more generally, with the second-order susceptibility tensor,
 ```math
-P_{i} = \varepsilon_0 \chi^{(2)}_{ijk} E_j E_k
+P_{i} = \varepsilon_0 \chi^{(2)}_{ijk} E_j E_k\,.
 ```
-
-!!! note "Not yet implemented"
-    The ``\chi^{(2)}`` response is documented here for completeness but is **not currently part of Luna's response set** — there is no corresponding response function in `Nonlinear.jl`. This section describes the intended model only.
+This is implemented by [`Nonlinear.Chi2Field`](@ref) for field-resolved, two-component ``(E_x, E_y)`` free-space simulations (see [Polarisation in free space](@ref)). Because ``\chi^{(2)}`` mixes the transverse field components and depends on the orientation of the crystal, the response is evaluated in the *crystal frame*: the lab-frame field ``(E_x, E_y, 0)`` is rotated into the crystal frame (using the crystal orientation angles ``\theta`` and ``\phi``), the contracted second-order field-product vector
+```math
+\big[E_x^2,\; E_y^2,\; E_z^2,\; 2E_yE_z,\; 2E_xE_z,\; 2E_xE_y\big]
+```
+is formed (see [`Nonlinear.field_products!`](@ref)) and multiplied by the ``3\times 6`` susceptibility tensor ``\chi^{(2)}`` in contracted notation (from [`PhysData.χ2`](@ref), with column order ``[xx, yy, zz, yz, xz, xy]``), and the resulting polarisation is rotated back into the lab frame and added as ``\varepsilon_0 \mathbf{P}``. Because it needs a genuine vector field, this response is only available in the polarisation-resolved free-space geometries on a real (carrier-resolved) grid; the phase-matching angle of the crystal enters through the birefringent linear operator described in [Birefringent crystals](@ref).
 
 
 ## Photoionisation & plasma

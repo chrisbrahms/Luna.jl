@@ -132,43 +132,75 @@ The mode-averaged field UPPE as written above is very useful, but the scaling fr
 ```
 
 
-
 ## Radially symmetric free-space
 For free-space propagation of a radially symmetric beam, the transverse basis is no longer a set of waveguide modes but the continuum of Bessel beams ``J_0(k_\perp r)``, so the generalised transverse spatial frequency ``\mathbf{k}_\perp`` becomes the (scalar) radial spatial frequency ``k_\perp``. The field is written as
 ```math
-\mathbf{E}_s(t, r, z) = \frac{2\pi}{\left(2\pi\right)^3} \int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  E(\omega, k_\perp, z) J_0(k_\perp r) \mathrm{e}^{-i\omega t}\mathbf{e}_s k_\perp\mathrm{d} k_\perp  \mathrm{d}\omega\,,
+\mathbf{E}(t, r, z) = \sum_{s\in\{x,y\}}\hat{\mathbf{e}}_s\, \frac{2\pi}{\left(2\pi\right)^3} \int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  E_s(\omega, k_\perp, z) J_0(k_\perp r) \mathrm{e}^{-i\omega t} k_\perp\mathrm{d} k_\perp  \mathrm{d}\omega\,,
 ```
-where the ``k_\perp\,\mathrm{d}k_\perp`` measure and the leading ``2\pi`` (from the azimuthal integration) are the conventions of the Hankel transform. In Luna this transverse transform is a zeroth-order quasi-discrete Hankel transform (`Hankel.QDHT`), and the whole radial UPPE is implemented in [`NonlinearRHS.TransRadial`](@ref). On each step the nonlinear polarisation is evaluated by transforming the field from reciprocal space to real-space–time (an inverse Fourier transform ``\omega\to t`` and an inverse Hankel transform ``k_\perp\to r``), calculating ``\mathbf{P}_\mathrm{nl}`` pointwise, and transforming back (``r\to k_\perp`` and ``t\to\omega``), followed by the ``i\omega/N_\mathrm{nl}`` prefactor of the UPPE.
+where ``E_s`` is the amplitude of polarisation component ``s``, and the ``k_\perp\,\mathrm{d}k_\perp`` measure and the leading ``2\pi`` (from the azimuthal integration) are the conventions of the Hankel transform. In Luna this transverse transform is a zeroth-order quasi-discrete Hankel transform (`Hankel.QDHT`), and the whole radial UPPE is implemented in [`NonlinearRHS.TransRadial`](@ref). On each step the nonlinear polarisation is evaluated by transforming the field from reciprocal space to real-space–time (an inverse Fourier transform ``\omega\to t`` and an inverse Hankel transform ``k_\perp\to r``, the latter applied to each polarisation component in turn), calculating ``\mathbf{P}_\mathrm{nl}`` pointwise on the ``(E_x, E_y)`` field at each radial point, and transforming back (``r\to k_\perp`` and ``t\to\omega``), followed by the ``i\omega/N_\mathrm{nl}`` prefactor of the UPPE.
 
-The normalisation factor here is not constant but depends on the propagation angle of each plane-wave component. For a component at frequency ``\omega`` and radial spatial frequency ``k_\perp`` it is (see [`NonlinearRHS.norm_radial`](@ref) and its ``z``-independent form [`NonlinearRHS.const_norm_radial`](@ref))
+The normalisation factor here is not constant but depends on the propagation angle of each plane-wave component, and on its polarisation. For a component at frequency ``\omega`` and radial spatial frequency ``k_\perp`` in polarisation ``s`` it is (see [`NonlinearRHS.norm_radial`](@ref) and its ``z``-independent form [`NonlinearRHS.const_norm_radial`](@ref))
 ```math
-N_\mathrm{nl}(\omega, k_\perp, z) = \frac{\beta(\omega, k_\perp, z)}{\mu_0 \omega}\,,\qquad \beta = \sqrt{\left(\frac{\omega}{c}n(\omega, z)\right)^2 - k_\perp^2}\,,
+N_\mathrm{nl}(\omega, k_\perp, z) = \frac{\beta_s(\omega, k_\perp, z)}{\mu_0 \omega}\,,\qquad \beta_s = \sqrt{\left(\frac{\omega}{c}n_s(\omega, z)\right)^2 - k_\perp^2}\,,
 ```
-where ``\beta`` is the longitudinal wave vector. On axis (``k_\perp = 0``) this reduces to the ``n\varepsilon_0 c`` impedance factor familiar from the guided cases, while for oblique components it applies the corresponding angular-spectrum correction. Evanescent components (``\beta^2 \le 0``) are guarded and do not propagate. The propagating array is two-dimensional in ``(\omega, k_\perp)``.
-
-!!! note
-    The polarisation unit vector ``\mathbf{e}_s`` in the equation above is a notational device: the free-space transforms propagate a **scalar** field along a single fixed polarisation state and do not carry a polarisation-component axis (unlike the vector-capable [`NonlinearRHS.TransModal`](@ref)).
+where ``\beta_s`` is the longitudinal wave vector for polarisation ``s``. On axis (``k_\perp = 0``) this reduces to the ``n_s\varepsilon_0 c`` impedance factor familiar from the guided cases, while for oblique components it applies the corresponding angular-spectrum correction. Evanescent components (``\beta_s^2 \le 0``) are guarded and do not propagate. The propagating array is three-dimensional in ``(\omega, N_\mathrm{pol}, k_\perp)``.
 
 ### Implementation
 - [`NonlinearRHS.TransRadial`](@ref)
 - [`NonlinearRHS.norm_radial`](@ref)
 - [`NonlinearRHS.const_norm_radial`](@ref)
 
+## Two-dimensional (planar) free-space
+For planar propagation with a single transverse dimension ``x`` (a field that is uniform along ``y``, e.g. a sheet beam in the ``x``–``z`` plane), the transverse basis is the one-dimensional plane-wave spectrum ``\mathrm{e}^{i k_x x}``. The Cartesian ``x`` grid and its spatial frequencies ``k_x`` are held by [`Grid.Free2DGrid`](@ref), and the transform is implemented in [`NonlinearRHS.TransFree2D`](@ref):
+```math
+\mathbf{E}(t, x, z) = \sum_{s\in\{x,y\}}\hat{\mathbf{e}}_s\,\frac{1}{\left(2\pi\right)^2}\int_{-\infty}^{\infty}\int_{-\infty}^{\infty}  E_s(\omega, k_x, z) \mathrm{e}^{i\left(k_x x - \omega t\right)}\mathrm{d} k_x \mathrm{d} \omega\,.
+```
+A combined FFT over ``(\omega, k_x)\to(t, x)`` (skipping the polarisation axis) transforms to real space, where ``\mathbf{P}_\mathrm{nl}`` is evaluated pointwise, before the inverse transform and the ``i\omega/N_\mathrm{nl}`` prefactor. The normalisation is the same ``\beta_s/(\mu_0\omega)`` as the radial case, with ``\beta_s = \sqrt{(\omega n_s/c)^2 - k_x^2}`` (implemented in `NonlinearRHS.norm_free2D` / `NonlinearRHS.const_norm_free2D`). The propagating array is three-dimensional in ``(\omega, N_\mathrm{pol}, k_x)``. Note that both ``x`` **and** ``y`` polarisation components exist even though there is only one transverse *spatial* dimension — this geometry is what makes birefringent-crystal ``\chi^{(2)}`` interactions cheap to simulate.
+
+### Implementation
+- [`Grid.Free2DGrid`](@ref)
+- [`NonlinearRHS.TransFree2D`](@ref)
+
 ## Three-dimensional free-space
 For full ``(3+1)``-dimensional free-space propagation without any symmetry, the transverse basis is the two-dimensional plane-wave spectrum ``\mathrm{e}^{i(k_x x + k_y y)}``, so ``\mathbf{k}_\perp = (k_x, k_y)``. The field is
 ```math
-\mathbf{E}_s(t, x, y, z) = \frac{1}{\left(2\pi\right)^3}\int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  \int_{-\infty}^{\infty}  E(\omega, k_x, k_y, z) \mathrm{e}^{i\left(k_x x + k_y y - \omega t\right)}\mathbf{e}_s\mathrm{d} k_x \mathrm{d} k_y \mathrm{d} \omega\,,
+\mathbf{E}(t, x, y, z) = \sum_{s\in\{x,y\}}\hat{\mathbf{e}}_s\,\frac{1}{\left(2\pi\right)^3}\int_{-\infty}^{\infty} \int_{-\infty}^{\infty}  \int_{-\infty}^{\infty}  E_s(\omega, k_x, k_y, z) \mathrm{e}^{i\left(k_x x + k_y y - \omega t\right)}\mathrm{d} k_x \mathrm{d} k_y \mathrm{d} \omega\,,
 ```
-with the standard three-fold inverse-Fourier-transform measure ``1/(2\pi)^3``. The Cartesian ``x``/``y`` grid and its spatial frequencies ``k_x``/``k_y`` are held by [`Grid.FreeGrid`](@ref), and the transform is implemented in [`NonlinearRHS.TransFree`](@ref). Here a single combined three-dimensional FFT handles both transverse spatial axes *and* time at once: the field is transformed ``(\omega, k_y, k_x)\to(t, y, x)``, the nonlinear polarisation is evaluated pointwise, and the result is transformed back before applying the ``i\omega/N_\mathrm{nl}`` prefactor.
+with the standard three-fold inverse-Fourier-transform measure ``1/(2\pi)^3``. The Cartesian ``x``/``y`` grid and its spatial frequencies ``k_x``/``k_y`` are held by [`Grid.FreeGrid`](@ref), and the transform is implemented in [`NonlinearRHS.TransFree`](@ref). Here a single combined FFT handles both transverse spatial axes *and* time at once (over dimensions ``(\omega, k_y, k_x)``, again skipping the polarisation axis): the field is transformed ``(\omega, k_y, k_x)\to(t, y, x)``, the nonlinear polarisation is evaluated pointwise on the ``(E_x, E_y)`` field, and the result is transformed back before applying the ``i\omega/N_\mathrm{nl}`` prefactor.
 
 The normalisation takes the same form as the radial case, now with the two-dimensional transverse spatial frequency ``k_\perp^2 = k_x^2 + k_y^2`` (see [`NonlinearRHS.norm_free`](@ref) and [`NonlinearRHS.const_norm_free`](@ref)):
 ```math
-N_\mathrm{nl}(\omega, k_x, k_y, z) = \frac{\beta(\omega, k_x, k_y, z)}{\mu_0 \omega}\,,\qquad \beta = \sqrt{\left(\frac{\omega}{c}n(\omega, z)\right)^2 - k_x^2 - k_y^2}\,,
+N_\mathrm{nl}(\omega, k_x, k_y, z) = \frac{\beta_s(\omega, k_x, k_y, z)}{\mu_0 \omega}\,,\qquad \beta_s = \sqrt{\left(\frac{\omega}{c}n_s(\omega, z)\right)^2 - k_x^2 - k_y^2}\,,
 ```
-with the same evanescent-component guard. The propagating array is three-dimensional in ``(\omega, k_y, k_x)``.
+with the same evanescent-component guard. The propagating array is four-dimensional in ``(\omega, N_\mathrm{pol}, k_y, k_x)``.
 
 ### Implementation
 - [`Grid.FreeGrid`](@ref)
 - [`NonlinearRHS.TransFree`](@ref)
 - [`NonlinearRHS.norm_free`](@ref)
 - [`NonlinearRHS.const_norm_free`](@ref)
+
+## Polarisation in free space
+Free-space geometries can propagate a two-component transverse vector field ``\mathbf{E} = E_x\hat{\mathbf{x}} + E_y\hat{\mathbf{y}}``. Every free-space field, nonlinear-polarisation, linear-operator and normalisation array therefore carries a **polarisation axis** (of length ``N_\mathrm{pol}``) immediately after the frequency/time axis, giving the shape ``(N_\omega, N_\mathrm{pol}, N_\perp\ldots)``. ``N_\mathrm{pol}`` is either
+
+- **1** — a scalar simulation along a single (``y``) polarisation, or
+- **2** — a full ``(E_x, E_y)`` vector simulation.
+
+Which one is used is determined by the refractive-index function passed to the linear operator: if it returns a single index the run is scalar, and if it returns a pair ``(n_x, n_y)`` the run is polarisation-resolved. Because the two components can be given different indices, birefringent media are supported (for uniaxial crystals ``n_x`` is evaluated at the internal angle, see below and [`LinearOps.make_const_linop`](@ref)). The input polarisation state can be set by a rotation angle ``\theta`` on the spatiotemporal input field (see [`Fields.GaussGaussField`](@ref)), which splits the pulse into ``E_x = E\sin\theta`` and ``E_y = E\cos\theta`` (so the default ``\theta = 0`` is ``y``-polarised). Vector nonlinear responses — the second-order response [`Nonlinear.Chi2Field`](@ref), and the vector Kerr and plasma responses — then couple the two components; this is what makes e.g. birefringent-crystal ``\chi^{(2)}`` interactions possible in free space. In the equations above, the sum over ``s \in \{x, y\}`` collapses to a single term for a scalar (``N_\mathrm{pol} = 1``) run.
+
+## Birefringent crystals
+One motivation for polarisation-resolved free-space propagation is nonlinear frequency conversion in birefringent crystals (for example ``\chi^{(2)}`` second-harmonic generation, implemented by [`Nonlinear.Chi2Field`](@ref)). These require a genuine two-component field, but they also complicate the *linear* operator, because in a uniaxial crystal the **extraordinary refractive index depends on the propagation angle** relative to the optic axis.
+
+This matters in free space specifically because the transverse decomposition spreads the field over a range of plane-wave directions: a component with transverse wavevector ``k_x`` is a plane wave travelling at an angle ``\theta_i`` to the ``z`` axis, with ``k_x = (\omega/c)\sin\theta_i``. For the ordinary (``y``) polarisation the index is angle-independent, so a single ``n_y(\omega)`` suffices as in the isotropic case. For the extraordinary (``x``) polarisation, **each transverse wavevector sees a different index**, so ``n_x`` cannot be tabulated as a function of ``\omega`` alone.
+
+Two helpers in [PhysData.jl](@ref) provide the angle-dependent index:
+
+- [`PhysData.ref_index_fun_xy`](@ref)`(material, θ)` returns the pair ``(n_x, n_y)`` for a crystal cut at angle ``\theta`` to the optic axis. ``n_y(\lambda)`` is the ordinary index; ``n_x(\lambda, \delta\theta)`` is the extraordinary index at propagation angle ``\theta + \delta\theta``, where ``\delta\theta`` is the offset of a given plane-wave component from the nominal cut angle.
+- [`PhysData.crystal_internal_angle`](@ref)`(n_x, ω, k_x)` recovers that offset ``\delta\theta`` from the transverse wavevector. Refraction at the crystal surface conserves the transverse wavevector, so the external ``k_x`` must equal the internal ``(\omega/c)\,n_x(\lambda, \delta\theta)\sin\delta\theta``. Because ``n_x`` itself depends on ``\delta\theta``, this is a transcendental equation and is solved numerically.
+
+The birefringent linear operator is assembled by the tuple-valued methods of [`LinearOps.make_const_linop`](@ref) (and its ``z``-dependent counterpart), which take ``\mathrm{nfuns} = (n_x, n_y)``. For each frequency ``\omega`` and transverse wavevector, the operator fills the two polarisation columns separately:
+```math
+\beta_y = \sqrt{\left(\tfrac{\omega}{c} n_y(\omega)\right)^2 - k_\perp^2}\,,\qquad
+\beta_x = \sqrt{\left(\tfrac{\omega}{c} n_x\!\big(\omega, \delta\theta(k_x)\big)\right)^2 - k_\perp^2}\,,
+```
+where ``\delta\theta(k_x)`` comes from [`PhysData.crystal_internal_angle`](@ref) for that ``k_x`` (the optic axis is taken to lie in the ``x``–``z`` plane, so only ``k_x`` tilts a component towards or away from it). The reference-frame velocity is taken from the ordinary index ``n_y``. Everything else — the transforms and normalisation — is exactly as for the isotropic free-space cases above, now simply carrying two polarisation columns with different longitudinal wavevectors.

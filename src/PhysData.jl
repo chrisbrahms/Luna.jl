@@ -466,6 +466,17 @@ function ref_index_fun_uniax(material; axes=(:o, :e))
     return n
 end
 
+"""
+    ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
+
+Get the pair of refractive-index functions `(nfunx, nfuny)` for a uniaxial crystal `material`
+cut at angle `θ` to the optic axis, for use in polarisation-resolved free-space propagation.
+
+`nfuny(λ)` is the ordinary index seen by the `y` polarisation. `nfunx(λ, δθ=0)` is the
+extraordinary index seen by the `x` polarisation at propagation angle `θ+δθ`, where the angle
+offset `δθ` accounts for the internal angle of an off-axis plane-wave component (see
+[`crystal_internal_angle`](@ref)).
+"""
 function ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
     # y polarisation: ordinary polarisation
     no = ref_index_fun(material; axis=ordinary)
@@ -476,6 +487,17 @@ function ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
     nfunx, nfuny
 end
 
+"""
+    crystal_internal_angle(nfun, ω, kx)
+
+Find the internal propagation-angle offset `δθ` for a plane-wave component with transverse
+wavevector `kx` in a uniaxial crystal with (angle-dependent) extraordinary index `nfun`.
+
+Momentum conservation at the crystal surface requires the external transverse wavevector `kx`
+to equal the internal one, `ω/c · nfun(λ, δθ) · sin(δθ)`. Since the extraordinary index itself
+depends on angle, this is solved numerically for `δθ`. Used by the birefringent free-space
+linear operators (the tuple-valued methods of `LinearOps.make_const_linop`).
+"""
 function crystal_internal_angle(nfun, ω, kx)
     # External wavevector is kx = ω/c*sin(θ_i) with θ_i the AOI of the plane wave
     # Internal wavevector is kx2 = ω/c * n(θ+δθ) * sin(δθ)
