@@ -16,6 +16,7 @@ makedocs(
             "Noise model" => "model/noise.md"
         ],
         "The simple interface" => "interface.md",
+        "The low-level interface" => "lowlevel.md",
         "Parameter scans" => "scans.md",
         "Modules" => [
             "$(split(fi, ".")[1]).jl" => "modules/$fi" for fi in readdir(modulesdir)
