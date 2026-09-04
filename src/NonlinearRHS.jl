@@ -18,6 +18,8 @@ import LinearAlgebra: mul!, ldiv!
 import NumericalIntegration: integrate, SimpsonEven
 import Luna: PhysData, Modes, Maths, Grid
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
+import Luna.LinearOps: βz, transverse_k2
+import Logging
 using EllipsisNotation
 
 """
@@ -618,57 +620,218 @@ function (t::TransRadial)(nl, Eω, z)
     nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
 end
 
-"""
-    const_norm_radial(ω, q, nfun)
+#=================================================#
+#==========  FREE-SPACE NORMALISATION  ===========#
+#=================================================#
 
-Make function to return normalisation factor for radial symmetry without re-calculating at
-every step.
 """
-function const_norm_radial(grid, q, nfun)
-    nfunω = (ω; z) -> nfun(wlfreq(ω))
-    normfun = norm_radial(grid, q, nfunω)
-    out = copy(normfun(0.0))
-    function norm(z)
-        return out
+    FreeSpaceNorm
+
+Normalisation factor for the free-space transforms ([`TransRadial`](@ref),
+[`TransFree`](@ref), [`TransFree2D`](@ref)): a callable `normfun(z)` returning an array
+`(Nω, Npol, Nk...)` by which the transforms *divide* the nonlinear polarisation, so that
+the source term of the UPPE is ``-i\\omega/(2\\,\\mathrm{norm})\\,P_\\mathrm{nl}``.
+
+# Physics
+
+The factor is ``\\beta_z/(\\mu_0\\omega)`` with ``\\beta_z = \\sqrt{k^2 - k_\\perp^2}`` the
+longitudinal wavevector ([`LinearOps.βz`](@ref)), giving the standard UPPE source
+``-i\\mu_0\\omega^2 P_\\mathrm{nl}/(2\\beta_z)``. Below cutoff (``k_\\perp > k``) ``\\beta_z``
+is imaginary, ``-i\\kappa``, and the same expression gives the evanescent source
+``\\mu_0\\omega^2 P_\\mathrm{nl}/(2\\kappa)`` — real, finite and consistent with the decay
+``e^{-\\kappa z}`` the linear operator applies. Historically this branch was set to `1.0`,
+which is dimensionally inconsistent and arbitrary. The factor is exactly `1.0` only at
+``\\omega = 0`` and outside the simulation band, where the nonlinear polarisation is zero
+anyway.
+
+# Source taper
+
+An evanescent component driven by a nonlinear source settles to its adiabatic amplitude
+``S/\\kappa`` within a distance ``1/\\kappa``, and it does not radiate. Luna's
+interaction-picture stepper, however, cannot integrate such a channel when
+``\\kappa\\,\\Delta z \\gg 1``: it back-propagates the source by ``e^{+\\kappa\\Delta z}``. The
+remedy (the same one [`Luna.Boundaries`](@ref) uses for the spectral window) is to taper the
+*source* in those channels: the normalisation is divided by
+```math
+W = \\exp\\big[-\\min(\\kappa, \\kappa_\\mathrm{max})\\,\\ell\\big] \\, W_k(k_\\perp)\\,,
+```
+where ``\\ell`` is the reference length over which the stepper is allowed to take one
+step (`max_dz ≤ ℓ`), ``\\kappa_\\mathrm{max}`` is the cap [`Luna.Boundaries`](@ref) also
+applies to the decay rate of the linear operator, and ``W_k`` is the k-space absorbing
+window. The amplification ``e^{\\kappa\\Delta z}`` is then never larger than ``1/W``, which
+is bounded. Channels with ``\\kappa\\ell \\gg 1`` have their source removed altogether,
+which is the correct limit: their adiabatic amplitude vanishes as ``1/\\kappa``. Channels
+with ``\\kappa\\ell \\lesssim 1`` are integrated exactly.
+
+`ℓ`, `κmax` and `W_k` are set by [`reflength!`](@ref), which `Luna.run` calls through
+`Boundaries.setup` once the reference length is known. Until then `ℓ = 0` and there is no
+taper: the factor is the pure physics, which is only usable with steps `Δz ≲ 1/κ`.
+
+# Fields
+- `grid`, `spacegrid`: the temporal and transverse grids
+- `nfun`: refractive index, either `nfun(ω; z)` returning one index or a tuple (one per
+  polarisation), or a tuple `(nfunx, nfuny)` of crystal-optics functions
+  `nfunx(λ, δθ; z)`, `nfuny(λ; z)` (see [`Luna.PhysData.crystal_internal_angle`](@ref))
+- `kperp2`, `kidcs`: squared transverse wavevector and the indices of the k axes
+- `out`: the normalisation array (`ComplexF64`, since ``\\beta_z`` is complex below cutoff)
+- `ℓ`, `κmax`, `kwin`: taper parameters (see above)
+- `constant`: if `true`, `out` is computed once and reused (the index does not depend on `z`)
+"""
+mutable struct FreeSpaceNorm{gT, sT, nT, kT, iT, oT, wT}
+    grid::gT
+    spacegrid::sT
+    nfun::nT
+    kperp2::kT
+    kidcs::iT
+    out::oT
+    ℓ::Float64
+    κmax::Float64
+    kwin::wT
+    constant::Bool
+    filled::Bool
+end
+
+npol(nfun::Tuple, grid) = 2 # crystal optics: (nfunx, nfuny)
+npol(nfun, grid) = length(nfun(grid.ω[findfirst(grid.sidx)]; z=0)) # 1 if single index, 2 if nx, ny
+
+function FreeSpaceNorm(grid, spacegrid, nfun; constant)
+    kperp2, kidcs = transverse_k2(spacegrid)
+    np = npol(nfun, grid)
+    out = zeros(ComplexF64, (length(grid.ω), np, size(kidcs)...))
+    kwin = ones(Float64, size(kidcs))
+    FreeSpaceNorm(grid, spacegrid, nfun, kperp2, kidcs, out, 0.0, Inf, kwin, constant, false)
+end
+
+function (nf::FreeSpaceNorm)(z)
+    if !(nf.constant && nf.filled)
+        fillnorm!(nf, z)
+        nf.filled = true
     end
-    return norm
+    nf.out
 end
 
 """
-    norm_radial(ω, q, nfun)
+    reflength!(normfun, ℓ; κmax=Inf, kwin=nothing)
+    reflength!(transform, ℓ; κmax=Inf, kwin=nothing)
 
-Make function to return normalisation factor for radial symmetry.
+Set the reference length `ℓ` of the source taper of a [`FreeSpaceNorm`](@ref) (or of the
+normalisation held by a free-space transform), the cap `κmax` on the evanescent decay rate
+it assumes, and the k-space window profile `kwin` (an array over the k axes, or `nothing`
+for none). Called by `Boundaries.setup`; see [`FreeSpaceNorm`](@ref) for the meaning.
 
-!!! note
-    Here, `nfun(ω; z)` needs to take frequency `ω` and a keyword argument `z`.
+For transforms which are not free-space, or whose normalisation is not a
+[`FreeSpaceNorm`](@ref), this does nothing (with a warning in the latter case, since the
+evanescent channels are then left untapered).
 """
-function norm_radial(grid, q, nfun)
-    ω = grid.ω
-    ωfirst = ω[findfirst(grid.sidx)]
-    np = length(nfun(ωfirst; z=0)) # 1 if single ref index, 2 if nx, ny
-    out = zeros(Float64, (length(ω), np, q.N))
-    kr2 = q.k.^2
-    function norm(z)
-        for ir = 1:q.N
-            for iω in eachindex(ω)
-                if ω[iω] == 0 || ~grid.sidx[iω]
-                    out[iω, :, ir] .= 1.0
-                    continue
-                end
-                for (ip, n) in enumerate(nfun(ω[iω]; z))
-                    k2 = (real(n)*ω[iω]/PhysData.c)^2
-                    βsq = k2 - kr2[ir]
-                    if βsq <= 0
-                        out[iω, ip, ir] = 1.0
-                        continue
-                    end
-                    out[iω, ip, ir] = sqrt(βsq)/(PhysData.μ_0*ω[iω])
-                end
+function reflength!(nf::FreeSpaceNorm, ℓ; κmax=Inf, kwin=nothing)
+    nf.ℓ = ℓ
+    nf.κmax = κmax
+    isnothing(kwin) ? fill!(nf.kwin, 1) : (nf.kwin .= kwin)
+    nf.filled = false
+    nf
+end
+
+function reflength!(normfun::Function, ℓ; kwargs...)
+    Logging.@warn("The normalisation function is not a FreeSpaceNorm, so the evanescent " *
+                  "source cannot be tapered. Use norm_radial/norm_free/norm_free2D (or the " *
+                  "const_ variants) to build it.")
+    nothing
+end
+
+#= The factor for one (ω, polarisation, k⊥) element: physics divided by the taper. Exactly
+   at cutoff (βsq == 0) the physical factor vanishes and the source would be infinite; that
+   point is measure-zero and was always returned as 1.0, so keep doing that. =#
+function normfactor(nf::FreeSpaceNorm, βsq, ω, wk)
+    βsq == 0 && return complex(1.0)
+    W = wk
+    if βsq < 0
+        W *= exp(-min(sqrt(-βsq), nf.κmax)*nf.ℓ)
+    end
+    βz(βsq)/(PhysData.μ_0*ω)/W
+end
+
+# isotropic: nfun(ω; z) -> n or (nx, ny), the same k⊥ for every polarisation
+function fillnorm!(nf::FreeSpaceNorm, z)
+    ω = nf.grid.ω
+    out = nf.out
+    for ii in nf.kidcs
+        for iω in eachindex(ω)
+            if ω[iω] == 0 || !nf.grid.sidx[iω]
+                out[iω, :, ii] .= 1
+                continue
+            end
+            for (ip, n) in enumerate(nf.nfun(ω[iω]; z))
+                βsq = (real(n)*ω[iω]/PhysData.c)^2 - nf.kperp2[ii]
+                out[iω, ip, ii] = normfactor(nf, βsq, ω[iω], nf.kwin[ii])
             end
         end
-        return out
     end
-    return norm
+end
+
+#= crystal optics: nfunx(λ, δθ; z) depends on the internal angle, which depends on kx only,
+   so the angle is found once per (ω, kx) and reused along ky. For Free2DGrid the k axes are
+   (Nkx,) and the trailing ky index below is the (allowed) singleton 1. =#
+function fillnorm!(nf::FreeSpaceNorm{<:Any, <:Any, <:Tuple}, z)
+    nfunx, nfuny = nf.nfun
+    ω = nf.grid.ω
+    out = nf.out
+    kx = nf.spacegrid.kx
+    for iω in eachindex(ω)
+        if ω[iω] == 0 || !nf.grid.sidx[iω]
+            out[iω, :, nf.kidcs] .= 1
+            continue
+        end
+        ny = real(nfuny(wlfreq(ω[iω]); z))
+        ksq_ypol = (ny*ω[iω]/PhysData.c)^2
+        for ix in eachindex(kx)
+            δθ = crystal_internal_angle((λ, δθ) -> nfunx(λ, δθ; z), ω[iω], kx[ix])
+            nx = real(nfunx(wlfreq(ω[iω]), δθ; z))
+            ksq_xpol = (nx*ω[iω]/PhysData.c)^2
+            for iy in axes(nf.kperp2, 2)
+                kperp2 = nf.kperp2[ix, iy]
+                wk = nf.kwin[ix, iy]
+                out[iω, 1, ix, iy] = normfactor(nf, ksq_xpol - kperp2, ω[iω], wk)
+                out[iω, 2, ix, iy] = normfactor(nf, ksq_ypol - kperp2, ω[iω], wk)
+            end
+        end
+    end
+end
+
+"""
+    norm_radial(grid, q, nfun)
+    norm_free(grid, xygrid, nfun)
+    norm_free2D(grid, xgrid, nfun)
+
+Make the normalisation factor ([`FreeSpaceNorm`](@ref)) for radial, full-3D and 2D (x-z)
+free-space propagation with a `z`-dependent refractive index, recomputed on every call.
+
+`nfun(ω; z)` takes frequency `ω` and a keyword argument `z` and returns either one index
+or a tuple of indices (one per polarisation). For crystal optics (`norm_free`,
+`norm_free2D` only) pass a tuple `(nfunx, nfuny)` with `nfunx(λ, δθ; z)` and `nfuny(λ; z)`,
+as for [`LinearOps.make_const_linop`](@ref).
+"""
+norm_radial(grid, q::Hankel.QDHT, nfun) = FreeSpaceNorm(grid, q, nfun; constant=false)
+norm_free(grid, xygrid::Grid.FreeGrid, nfun) = FreeSpaceNorm(grid, xygrid, nfun; constant=false)
+norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun) = FreeSpaceNorm(grid, xgrid, nfun; constant=false)
+
+"""
+    const_norm_radial(grid, q, nfun)
+    const_norm_free(grid, xygrid, nfun)
+    const_norm_free2D(grid, xgrid, nfun)
+
+Make the normalisation factor ([`FreeSpaceNorm`](@ref)) for a `z`-independent refractive
+index, computed once and reused. `nfun(λ)` takes wavelength; for crystal optics pass
+`(nfunx, nfuny)` with `nfunx(λ, δθ)` and `nfuny(λ)`.
+"""
+const_norm_radial(grid, q::Hankel.QDHT, nfun) = FreeSpaceNorm(grid, q, _zfun(nfun); constant=true)
+const_norm_free(grid, xygrid::Grid.FreeGrid, nfun) = FreeSpaceNorm(grid, xygrid, _zfun(nfun); constant=true)
+const_norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun) = FreeSpaceNorm(grid, xgrid, _zfun(nfun); constant=true)
+
+# wrap a z-independent index function in the (ω; z) / (λ, δθ; z), (λ; z) forms
+_zfun(nfun) = (ω; z) -> nfun(wlfreq(ω))
+function _zfun(nfuns::Tuple)
+    nfunx, nfuny = nfuns
+    ((λ, δθ; z) -> nfunx(λ, δθ), (λ; z) -> nfuny(λ))
 end
 
 """
@@ -782,110 +945,6 @@ function (t::TransFree)(nl, Eωk, z)
     nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
 end
 
-"""
-    const_norm_free(grid, xygrid, nfun)
-
-Make function to return normalisation factor for 3D propagation without re-calculating at
-every step.
-"""
-function const_norm_free(grid, xygrid, nfun)
-    nfunω = (ω; z) -> nfun(wlfreq(ω))
-    normfun = norm_free(grid, xygrid, nfunω)
-    out = copy(normfun(0.0))
-    function norm(z)
-        return out
-    end
-    return norm
-end
-
-function const_norm_free(grid, xygrid, nfuns::Tuple)
-    nfunx, nfuny = nfuns
-    nfunzx = (λ, δθ; z) -> nfunx(λ, δθ)
-    nfunzy = (λ; z) -> nfuny(λ)
-    normfun = norm_free(grid, xygrid, (nfunzx, nfunzy))
-    out = copy(normfun(0.0))
-    function norm(z)
-        return out
-    end
-    return norm
-end
-
-"""
-    norm_free(grid, xygrid, nfun)
-
-Make function to return normalisation factor for 3D propagation.
-
-!!! note
-    Here, `nfun(ω; z)` needs to take frequency `ω` and a keyword argument `z`.
-"""
-function norm_free(grid, xygrid, nfun)
-    ω = grid.ω
-    ωfirst = ω[findfirst(grid.sidx)]
-    np = length(nfun(ωfirst; z=0)) # 1 if single ref index, 2 if nx, ny
-    kperp2 = @. xygrid.kx^2 + (xygrid.ky^2)'
-    idcs = CartesianIndices((length(xygrid.kx), length(xygrid.ky)))
-    out = zeros(Float64, (length(grid.ω), np, length(xygrid.kx), length(xygrid.ky)))
-    function norm(z)
-        for ii in idcs
-            for iω in eachindex(ω)
-                if ω[iω] == 0 || ~grid.sidx[iω]
-                    out[iω, :, ii] .= 1.0
-                    continue
-                end
-                for (ip, n) in enumerate(nfun(ω[iω]; z))
-                    k2 = (real(n)*ω[iω]/PhysData.c)^2
-                    βsq = k2 - kperp2[ii]
-                    if βsq <= 0
-                        out[iω, ip, ii] = 1.0
-                        continue
-                    end
-                    out[iω, ip, ii] = sqrt(βsq)/(PhysData.μ_0*ω[iω])
-                end
-            end
-        end
-        return out
-    end
-end
-
-function norm_free(grid, xygrid, nfuns::Tuple)
-    nfunx, nfuny = nfuns
-    # here nfunx(λ, δθ; z) also takes the angle and returns n_x(λ, θ+δθ)
-    # nfuny(λ; z) just takes wavelength
-    ω = grid.ω
-    out = zeros(Float64, (length(ω), 2, length(xygrid.kx), length(xygrid.ky)))
-    function norm(z)
-        for iω in eachindex(ω)
-            if ω[iω] == 0 || ~grid.sidx[iω]
-                out[iω, :, :, :] .= 1.0
-                continue
-            end
-            ny = nfuny(wlfreq(ω[iω]); z)
-            ksq_ypol = (ny*ω[iω]/c)^2
-            for (ikx, kxi) in enumerate(xygrid.kx)
-                δθ = crystal_internal_angle((λ, δθ) -> nfunx(λ, δθ; z), ω[iω], kxi)
-                nx = nfunx(wlfreq(ω[iω]), δθ; z)
-                for (iky, kyi) in enumerate(xygrid.ky)
-                    k_xpol = nx*grid.ω[iω]/c
-                    βsq_xpol = k_xpol^2 - kxi^2 - kyi^2
-                    if βsq_xpol < 0
-                        out[iω, 1, ikx, iky] = 1.0
-                    else
-                        out[iω, 1, ikx, iky] = sqrt(βsq_xpol)/(PhysData.μ_0*ω[iω])
-                    end
-
-                    βsq_ypol = ksq_ypol - kxi^2 - kyi^2
-                    if βsq_ypol < 0
-                        out[iω, 2, ikx, iky] .= 1.0
-                    else
-                        out[iω, 2, ikx, iky] = sqrt(βsq_ypol)/(PhysData.μ_0*ω[iω])
-                    end
-                end
-            end
-        end
-        return out
-    end
-end
-
 mutable struct TransFree2D{TT, FTT, nT, rT, gT, xgT, dT, iT}
     FT::FTT # 2D Fourier transform (space to k-space and time to frequency)
     normfun::nT # Function which returns normalisation factor
@@ -963,105 +1022,9 @@ function (t::TransFree2D)(nl, Eωk, z)
     nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
 end
 
-"""
-    const_norm_free2D(grid, xgrid, nfun)
-
-Make function to return normalisation factor for 3D propagation without re-calculating at
-every step.
-"""
-function const_norm_free2D(grid, xgrid, nfun)
-    nfunω = (ω; z) -> nfun(wlfreq(ω))
-    normfun = norm_free2D(grid, xgrid, nfunω)
-    out = copy(normfun(0.0))
-    function norm(z)
-        return out
-    end
-    return norm
-end
-
-function const_norm_free2D(grid, xgrid, nfuns::Tuple)
-    nfunx, nfuny = nfuns
-    nfunzx = (λ, δθ; z) -> nfunx(λ, δθ)
-    nfunzy = (λ; z) -> nfuny(λ)
-    normfun = norm_free2D(grid, xgrid, (nfunzx, nfunzy))
-    out = copy(normfun(0.0))
-    function norm(z)
-        return out
-    end
-    return norm
-end
-
-"""
-    norm_free2D(grid, xgrid, nfun)
-
-Make function to return normalisation factor for 3D propagation.
-
-!!! note
-    Here, `nfun(ω; z)` needs to take frequency `ω` and a keyword argument `z`.
-"""
-function norm_free2D(grid, xgrid, nfun)
-    kperp2 = xgrid.kx.^2
-    ω = grid.ω
-    ωfirst = ω[findfirst(grid.sidx)]
-    np = length(nfun(ωfirst; z=0)) # 1 if single ref index, 2 if nx, ny
-    out = zeros(Float64, (length(ω), np, length(xgrid.kx)))
-    function norm(z)
-        for ii in eachindex(xgrid.kx)
-            for iω in eachindex(ω)
-                if ω[iω] == 0 || ~grid.sidx[iω]
-                    out[iω, :, ii] .= 1.0
-                    continue
-                end
-                for (ip, n) in enumerate(nfun(ω[iω]; z))
-                    k2 = (real(n)*ω[iω]/PhysData.c)^2
-                    βsq = k2 - kperp2[ii]
-                    if βsq <= 0
-                        out[iω, ip, ii] = 1.0
-                        continue
-                    end
-                    out[iω, ip, ii] = sqrt(βsq)/(PhysData.μ_0*ω[iω])
-                end
-            end
-        end
-        return out
-    end
-end
-
-function norm_free2D(grid, xgrid, nfuns::Tuple)
-    nfunx, nfuny = nfuns
-    # here nfunx(λ, δθ; z) also takes the angle and returns n_x(λ, θ+δθ)
-    # nfuny(λ; z) just takes wavelength
-    ω = grid.ω
-    out = zeros(Float64, (length(ω), 2, length(xgrid.kx)))
-    function norm(z)
-        for iω in eachindex(ω)
-            if ω[iω] == 0 || ~grid.sidx[iω]
-                out[iω, :, :] .= 1.0
-                continue
-            end
-            ny = nfuny(wlfreq(ω[iω]); z)
-            ksq_ypol = (ny*ω[iω]/c)^2
-            for (ik, kxi) in enumerate(xgrid.kx)
-                δθ = crystal_internal_angle((λ, δθ) -> nfunx(λ, δθ; z), ω[iω], kxi)
-                nx = nfunx(wlfreq(ω[iω]), δθ; z)
-                k_xpol = nx*grid.ω[iω]/c
-                βsq_xpol = k_xpol^2 - kxi^2
-                if βsq_xpol < 0
-                    out[iω, 1, ik] = 1.0
-                else
-                    out[iω, 1, ik] = sqrt(βsq_xpol)/(PhysData.μ_0*ω[iω])
-                end
-
-                βsq_ypol = ksq_ypol - kxi^2
-                if βsq_ypol < 0
-                    out[iω, 2, ik] .= 1.0
-                else
-                    out[iω, 2, ik] = sqrt(βsq_ypol)/(PhysData.μ_0*ω[iω])
-                end
-            end
-        end
-        return out
-    end
-end
+#= reflength! on a transform forwards to its normalisation; defined here, after every
+   transform type exists. Transforms which are not free-space have nothing to taper. =#
+reflength!(t::Union{TransRadial, TransFree, TransFree2D}, ℓ; kwargs...) = reflength!(t.normfun, ℓ; kwargs...)
+reflength!(t, ℓ; kwargs...) = nothing
 
 end

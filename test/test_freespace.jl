@@ -13,7 +13,11 @@ Luna.set_fftw_mode(:estimate)
 import LinearAlgebra: norm
 import Test: @test, @testset
 
-R = 0.6e-3
+#= 1 mm rather than 0.6 mm: the transverse absorbing collars (r > 0.9R radially, |x| > R
+   on the Cartesian grids) absorb the wings of the beam coherently, and a wing amplitude
+   of 1e-2 at the collar shifts the focal profile by ~1e-3, which the Cartesian tests
+   resolve. At 1 mm the input beam (w = 280 μm) has an amplitude below 1e-4 there. =#
+R = 1.0e-3
 Nr = 64
 Nx = 64
 Ny = 32
@@ -24,7 +28,8 @@ pressure = 1
 w0 = 200e-6
 τfwhm = 20e-15
 energy = 1e-12
-L = 0.3
+# 0.15 m rather than 0.3 m so that the input beam stays clear of the collars, see R above
+L = 0.15
 
 rgrid = Grid.RealGrid(L, λ0, (400e-9, 2000e-9), 0.2e-12)
 egrid = Grid.EnvGrid(L, λ0, (400e-9, 2000e-9), 0.2e-12)
@@ -242,4 +247,110 @@ operators: a frame which subtracts a constant carrier phase adds a spurious phas
     @test etot_r ≈ etot_e rtol=1e-6
     @test ethg_r > 1e5*eps(etot_r) # THG was actually generated
     @test ethg_r ≈ ethg_e rtol=0.05
+end
+##
+# counts the accepted steps of a run, forwarding everything to a real output
+mutable struct CountingOutput{oT}
+    out::oT
+    n::Int
+end
+CountingOutput(o) = CountingOutput(o, 0)
+(c::CountingOutput)(Eω, z, dz, interp) = (c.n += 1; c.out(Eω, z, dz, interp))
+(c::CountingOutput)(args...; kwargs...) = c.out(args...; kwargs...)
+Base.getindex(c::CountingOutput, k) = c.out[k]
+
+#= Evanescent channels: a transverse grid fine enough that k⊥,max exceeds k(ω) at the
+   long-wavelength end of the band, and an input with a hard edge to populate those
+   channels. The exact, uncapped decay rate reaches ~4e6 /m here; without the clamp and the
+   matching source taper the stepper would collapse its step to ~1/κ or produce NaN. =#
+@testset "evanescent channels" begin
+    Re = 100e-6
+    qe = Hankel.QDHT(Re, 128, dim=3)
+    gride = Grid.RealGrid(2e-3, 800e-9, (400e-9, 4000e-9), 100e-15)
+    ℓe = gride.zmax/Boundaries.DEFAULT_N
+    nfunλ = PhysData.ref_index_fun(gas, pressure)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    ωs = gride.ω[gride.sidx]
+    k = [real(nfunλ(wlfreq(ω)))*ω/PhysData.c for ω in ωs]
+    κ = sqrt.(max.(-(k.^2 .- (qe.k.^2)'), 0))
+    @test maximum(κ) > 1e6 # the evanescent region exists and is stiff
+    function runedge(aperture)
+        linop = LinearOps.make_const_linop(gride, qe, nfun, true)
+        dens0 = PhysData.density(gas, pressure)
+        responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+        normfun = NonlinearRHS.const_norm_radial(gride, qe, nfun)
+        inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy=1e-9, w0=30e-6)
+        Eω, transform, FT = Luna.setup(gride, qe, z -> dens0, normfun, responses, inputs)
+        if aperture
+            Eωr = qe \ Eω
+            Eωr[:, :, qe.r .> 40e-6] .= 0
+            Eω = qe * Eωr
+        end
+        output = CountingOutput(Output.MemoryOutput(0, gride.zmax, 3))
+        Luna.run(Eω, gride, linop, transform, FT, output)
+        output.n, output["Eω"][:, 1, :, end]
+    end
+    nsmooth, Es = runedge(false)
+    nedge, Ee = runedge(true)
+    @test !any(isnan, Ee)
+    @test nedge <= 2nsmooth
+    # channels the clamp touches decay by at least exp(-30) per reference length
+    strong = κ .> Boundaries.MAX_αℓ/(2ℓe)
+    @test count(strong) > 0
+    Eb = Ee[gride.sidx, :]
+    @test sum(abs2, Eb[strong])/sum(abs2, Eb) < 1e-12
+end
+##
+#= Nothing reaches any edge: the absorbers must not change the answer. =#
+@testset "rate and none agree away from the edges" begin
+    function runfocus(boundary)
+        nfunλ = PhysData.ref_index_fun(gas, pressure)
+        nfun = (λ; z=0.0) -> nfunλ(λ)
+        linop = LinearOps.make_const_linop(rgrid, q, nfun, true)
+        dens0 = PhysData.density(gas, pressure)
+        responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+        normfun = NonlinearRHS.const_norm_radial(rgrid, q, nfun)
+        inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0, propz=-L)
+        Eω, transform, FT = Luna.setup(rgrid, q, z -> dens0, normfun, responses, inputs)
+        output = Output.MemoryOutput(0, rgrid.zmax, 3)
+        Luna.run(Eω, rgrid, linop, transform, FT, output; init_dz=0.1, boundary)
+        output["Eω"][:, 1, :, end]
+    end
+    Er = runfocus(:rate)
+    En = runfocus(:none)
+    @test norm(Er - En)/norm(En) < 1e-4
+end
+##
+#= The transverse collar: a beam diverging into the aperture of the QDHT, whose E(R) = 0
+   wall otherwise reflects it back into the beam. With the collar the inner part of the
+   profile stays close to the analytic Gaussian; without it the reflection spoils it. =#
+@testset "transverse collar" begin
+    Ld = 0.1
+    w0d = 30e-6
+    gridd = Grid.RealGrid(Ld, λ0, (400e-9, 2000e-9), 0.2e-12)
+    zR = π*w0d^2/λ0
+    wL = w0d*sqrt(1 + (Ld/zR)^2)
+    @test wL > 0.8R # the beam really does reach the wall
+    function rundiverge(boundary)
+        nfunλ = PhysData.ref_index_fun(gas, pressure)
+        nfun = (λ; z=0.0) -> nfunλ(λ)
+        linop = LinearOps.make_const_linop(gridd, q, nfun, true)
+        dens0 = PhysData.density(gas, pressure)
+        responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+        normfun = NonlinearRHS.const_norm_radial(gridd, q, nfun)
+        inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0=w0d)
+        Eω, transform, FT = Luna.setup(gridd, q, z -> dens0, normfun, responses, inputs)
+        output = Output.MemoryOutput(0, gridd.zmax, 3)
+        Luna.run(Eω, gridd, linop, transform, FT, output; init_dz=0.1, boundary)
+        Eωr = q \ output["Eω"][:, :, :, end]
+        dropdims(sum(abs2.(Eωr); dims=(1, 2)); dims=(1, 2))
+    end
+    inner = q.r .< 0.5R
+    Ia = Maths.gauss.(q.r, wL/2)
+    err(I) = norm(I[inner]/I[1] - Ia[inner]/Ia[1])/norm(Ia[inner]/Ia[1])
+    er = err(rundiverge(:rate))
+    en = err(rundiverge(:none))
+    @info "transverse collar: inner-profile error with collar $er, without $en"
+    @test er < en
+    @test er < 0.05
 end

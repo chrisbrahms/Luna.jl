@@ -54,7 +54,6 @@ include("Output.jl")
 include("Maths.jl")
 include("PhysData.jl")
 include("Grid.jl")
-include("Boundaries.jl")
 include("Modes.jl")
 include("Fields.jl")
 include("RK45.jl")
@@ -67,6 +66,7 @@ include("SimpleFibre.jl")
 include("Nonlinear.jl")
 include("Ionisation.jl")
 include("NonlinearRHS.jl")
+include("Boundaries.jl")
 include("Processing.jl")
 include("Stats.jl")
 include("Polarisation.jl")
@@ -469,6 +469,17 @@ Run the propagation.
 - `tcollar::Real=$(Boundaries.DEFAULT_TCOLLAR)`: width of the temporal absorber collar as a
     fraction of the time window. Only used if it is wider than the collar `grid.twin`
     already has (which can be nearly zero, depending on how `trange` rounds up).
+- `kcollar::Real=$(Boundaries.DEFAULT_KCOLLAR)`: free space only; width of the k-space
+    absorber collar as a fraction of the largest transverse wavevector on the grid. `0`
+    disables it.
+- `rcollar::Real=$(Boundaries.DEFAULT_RCOLLAR)`: free space only; width of the transverse
+    absorber collar of a radial (`QDHT`) grid as a fraction of its aperture `R`. The Cartesian
+    grids use the window they were built with (`window_factor`) instead.
+
+In free space the evanescent part of `linop` is also made safe for the stepper in every
+`boundary` mode: its decay is clamped and the nonlinear source is tapered to match, over
+the absorber reference length (`:rate`) or `max_dz` (`:none`, `:legacy`). See "Free
+space" in [`Luna.Boundaries`](@ref) and [`NonlinearRHS.FreeSpaceNorm`](@ref).
 
 See [`Luna.Boundaries`](@ref) for the rationale.
 """
@@ -478,7 +489,8 @@ function run(Eω, grid,
              rtol=1e-6, atol=1e-10, safety=0.9, norm=RK45.weaknorm,
              status_period=1,
              boundary=:rate, boundary_N=Boundaries.DEFAULT_N, boundary_length=nothing,
-             tcollar=Boundaries.DEFAULT_TCOLLAR)
+             tcollar=Boundaries.DEFAULT_TCOLLAR, kcollar=Boundaries.DEFAULT_KCOLLAR,
+             rcollar=Boundaries.DEFAULT_RCOLLAR)
 
     Et = FT \ Eω
 
@@ -491,9 +503,10 @@ function run(Eω, grid,
 
     #= NOTE: this must come after check_cache, which can move z0 and init_dz: the temporal
        absorber measures the distance it is applied over from z0. =#
-    absorber = Boundaries.setup(boundary, grid, linop, Et, FT, output, z0,
+    absorber = Boundaries.setup(boundary, grid, transform, linop, Et, FT, output, z0,
                                 max_dz, init_dz;
-                                N=boundary_N, ℓ=boundary_length, collar=tcollar)
+                                N=boundary_N, ℓ=boundary_length, collar=tcollar,
+                                kcollar, rcollar)
     stepfun = absorber.stepfun
     linop, max_dz, init_dz = absorber.linop, absorber.max_dz, absorber.init_dz
 
@@ -509,6 +522,10 @@ function run(Eω, grid,
     st = simtype(grid, transform, linop)
     st["boundary"] = string(boundary)
     boundary === :rate && (st["boundary_length"] = string(absorber.ℓ))
+    if !isnothing(Boundaries.spacegrid(transform))
+        st["kcollar"] = string(kcollar)
+        st["rcollar"] = string(rcollar)
+    end
     output(st, group="simulation_type")
     save_modeinfo_maybe(output, transform)
 

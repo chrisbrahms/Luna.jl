@@ -179,3 +179,45 @@ for zi in range(0, L, length=10)
     @test outm == outdm
 end
 end
+
+#= Evanescent region: components with k⊥ > k(ω) decay at exactly sqrt(k⊥² - k²), with no
+   cap, and carry no propagation phase; out of band the operator is exactly zero. A small
+   aperture makes k⊥,max exceed k(ω) at the long-wavelength end of the band. =#
+@testset "evanescent region" begin
+    @test LinearOps.βz(4.0) == 2
+    @test LinearOps.βz(-4.0) == -2im
+    @test LinearOps.βz(0.0) == 0
+
+    Rs = 50e-6
+    grid = Grid.RealGrid(1e-3, 800e-9, (400e-9, 4000e-9), 0.2e-12)
+    qs = Hankel.QDHT(Rs, 64, dim=3)
+    xygrids = Grid.FreeGrid(Rs, 32, Rs, 32)
+    xgrids = Grid.Free2DGrid(Rs, 64)
+    nfunλ = PhysData.ref_index_fun(gas, pressure)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    nfunω = (ω; z) -> nfun(wlfreq(ω); z)
+    β1 = PhysData.dispersion_func(1, λ -> nfun(λ)[end])(grid.referenceλ)
+    ωs = grid.ω[grid.sidx]
+    k = [real(nfunλ(wlfreq(ω)))*ω/PhysData.c for ω in ωs]
+    for sg in (qs, xgrids, xygrids)
+        linop = LinearOps.make_const_linop(grid, sg, nfun, true)
+        kperp2, idcs = LinearOps.transverse_k2(sg)
+        nd = ndims(kperp2)
+        cols = ntuple(_ -> :, nd)
+        lin = linop[grid.sidx, 1, cols...]
+        ωa = reshape(ωs, :, ntuple(_ -> 1, nd)...)
+        βsq = reshape(k.^2, :, ntuple(_ -> 1, nd)...) .- reshape(kperp2, 1, size(kperp2)...)
+        evan = βsq .< 0
+        @test count(evan) > 0
+        @test all(real(lin[evan]) .== -sqrt.(-βsq[evan]))
+        @test all(imag(lin[evan]) .≈ (β1 .* ωa .* ones(size(βsq)))[evan])
+        @test all(real(lin[.!evan]) .== 0)
+        @test all(imag(lin[.!evan]) .≈ -(sqrt.(max.(βsq, 0)) .- β1 .* ωa)[.!evan])
+        @test minimum(real(lin)) < -1e5 # far beyond the 200/m cap this replaces
+        @test all(linop[.!grid.sidx, :, cols...] .== 0)
+        linopf = LinearOps.make_linop(grid, sg, nfunω, true)
+        out = similar(linop)
+        linopf(out, 0.0)
+        @test out ≈ linop
+    end
+end

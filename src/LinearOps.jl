@@ -23,17 +23,39 @@ getω0(grid::Grid.RealGrid, thg=true) = 0.0
 #===============    FREE SPACE     ===============#
 #=================================================#
 
+"""
+    βz(βsq)
+
+Longitudinal wavevector ``β_z`` of a plane-wave component from its square
+``β_z^2 = k^2 - k_\\perp^2``, as a complex number.
+
+Above cutoff (`βsq ≥ 0`) it is real and the component propagates. Below cutoff (`βsq < 0`)
+the component is evanescent: ``β_z = -iκ`` with ``κ = \\sqrt{k_\\perp^2 - k^2}``, the sign
+chosen so that Luna's propagator `exp(-im*βz*z)` *decays* as `exp(-κz)`. This is the exact
+one-way solution of the Helmholtz equation, and it is used as is. There is deliberately no
+cap on `κ` here: a strongly damped component makes the interaction-picture stepper stiff,
+but that is a property of the solver, not the physics, and is handled by
+[`Luna.Boundaries`](@ref) (which clamps the decay rate of the operator and tapers the
+nonlinear source to match) rather than by falsifying the operator.
+"""
+βz(βsq) = βsq < 0 ? -im*sqrt(-βsq) : complex(sqrt(βsq))
+
+#= Out of band (`!grid.sidx`) the operator is exactly zero. Nothing propagates there: the
+   field is band-limited at the start of `Luna.run` and `NonlinearRHS` zeroes the nonlinear
+   polarisation there. A nonzero value would be harmless in principle, but any decay written
+   there (as the evanescent `-κ` would be, since `k2 == 0` out of band) is amplified by the
+   interaction-picture back-propagation, and `exp(k⊥ Δz)` overflows for the k⊥ of any fine
+   transverse grid. Zero is the only value that is safe for every step size. =#
 function fill_linop_matrix!(out, grid, β1::Number, βref::Number, ω0::Number, k2, kperp2, idcs)
     for ii in idcs
         for ip in axes(k2, 2)
             for iω in eachindex(grid.ω)
-                βsq = k2[iω, ip] - kperp2[ii]
-                if βsq < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, ip, ii] = -im*(-β1*(grid.ω[iω] - ω0) - βref) - min(sqrt(abs(βsq)), 200)
-                else
-                    out[iω, ip, ii] = -im*(sqrt(βsq) - β1*(grid.ω[iω] - ω0) - βref)
+                if !grid.sidx[iω]
+                    out[iω, ip, ii] = 0
+                    continue
                 end
+                βsq = k2[iω, ip] - kperp2[ii]
+                out[iω, ip, ii] = -im*(βz(βsq) - β1*(grid.ω[iω] - ω0) - βref)
             end
         end
     end
@@ -158,22 +180,9 @@ function make_const_linop(grid::Grid.AbstractGrid, xygrid::Grid.FreeGrid, nfuns:
                 for (iky, kyi) in enumerate(xygrid.ky)
                     kperp2 = kxi^2 + kyi^2
                     k_xpol = nx*grid.ω[iω]/c
-                    βsq_xpol = k_xpol^2 - kperp2
-                    if βsq_xpol < 0
-                        # negative βsq -> evanescent fields -> attenuation
-                        out[iω, 1, ikx, iky] = (-im*(-β1*grid.ω[iω])
-                                                - min(sqrt(abs(βsq_xpol)), 200))
-                    else
-                        out[iω, 1, ikx, iky] = -im*(sqrt(βsq_xpol) - β1*grid.ω[iω])
-                    end
-
-                    βsq_ypol = ksq_ypol - kperp2
-                    if βsq_ypol < 0
-                        out[iω, 2, ikx, iky] = (-im*(-β1*grid.ω[iω])
-                                                - min(sqrt(abs(βsq_ypol)), 200))
-                    else
-                        out[iω, 2, ikx, iky] = -im*(sqrt(βsq_ypol) - β1*grid.ω[iω])
-                    end
+                    # evanescent components (βsq < 0) decay at their exact rate, see βz
+                    out[iω, 1, ikx, iky] = -im*(βz(k_xpol^2 - kperp2) - β1*grid.ω[iω])
+                    out[iω, 2, ikx, iky] = -im*(βz(ksq_ypol - kperp2) - β1*grid.ω[iω])
                 end
             end
         end
@@ -205,22 +214,9 @@ function make_const_linop(grid::Grid.AbstractGrid, xgrid::Grid.Free2DGrid, nfuns
                 δθ = crystal_internal_angle(nfunx, grid.ω[iω], kxi)
                 nx = nfunx(wlfreq(grid.ω[iω]), δθ)
                 k_xpol = nx*grid.ω[iω]/c
-                βsq_xpol = k_xpol^2 - kxi^2
-                if βsq_xpol < 0
-                    # negative βsq -> evanescent fields -> attenuation
-                    out[iω, 1, ik] = (-im*(-β1*grid.ω[iω])
-                                      - min(sqrt(abs(βsq_xpol)), 200))
-                else
-                    out[iω, 1, ik] = -im*(sqrt(βsq_xpol) - β1*grid.ω[iω])
-                end
-
-                βsq_ypol = ksq_ypol - kxi^2
-                if βsq_ypol < 0
-                    out[iω, 2, ik] = (-im*(-β1*grid.ω[iω])
-                                      - min(sqrt(abs(βsq_ypol)), 200))
-                else
-                    out[iω, 2, ik] = -im*(sqrt(βsq_ypol) - β1*grid.ω[iω])
-                end
+                # evanescent components (βsq < 0) decay at their exact rate, see βz
+                out[iω, 1, ik] = -im*(βz(k_xpol^2 - kxi^2) - β1*grid.ω[iω])
+                out[iω, 2, ik] = -im*(βz(ksq_ypol - kxi^2) - β1*grid.ω[iω])
             end
         end
     end

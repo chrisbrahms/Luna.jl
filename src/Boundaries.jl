@@ -41,6 +41,43 @@ The *hard* band limit — the 0/1 part of the spectral window — is not applied
 is zero there, so once the field has been band-limited at the start of `Luna.run` nothing
 can put anything back.
 
+# Free space
+
+A free-space simulation has two more finite axes, and one more decaying process, all of
+which end up in the same place: a negative real part of the linear operator over the
+transverse wavevector `k⊥`.
+
+- **Evanescent decay.** Components with `k⊥ > k(ω)` do not propagate; the exact one-way
+  solution is `exp(-κz)` with `κ = sqrt(k⊥² - k²)`, which `LinearOps` writes into the
+  operator uncapped (see [`LinearOps.βz`](@ref)). At the low-frequency end of a grid (where
+  `k → 0`) `κ` reaches `k⊥,max`, i.e. `1e5–1e6 /m` for micron transverse sampling. That is
+  physics, not a boundary, so it is applied in every `boundary` mode. What it needs from
+  this module is the same treatment as the spectral absorber: the decay rate of the
+  operator is clamped at `MAX_αℓ/(2ℓ)` ([`clampdecay`](@ref)) and the nonlinear source in
+  those channels is tapered by the matching factor `exp(-κℓ)`
+  ([`NonlinearRHS.FreeSpaceNorm`](@ref), set up through [`NonlinearRHS.reflength!`](@ref)),
+  so that the interaction picture never amplifies by more than `exp(MAX_αℓ/2)`. Components
+  with `κℓ ≫ 1` thereby lose their source, which is the correct limit — their driven
+  amplitude `S/κ` vanishes — and components with `κℓ ≲ 1` are integrated exactly. In
+  `:rate` mode `ℓ` is the absorber reference length; in `:none` and `:legacy` it is
+  `max_dz`, since the only requirement is `Δz ≤ ℓ`. Before this the operator capped `κ` at
+  an arbitrary `200 /m` and the source prefactor below cutoff was an arbitrary `1.0`, so
+  free-space `:legacy` results are *not* bit-identical to historical ones.
+- **k-space window** (`:rate` only). Where `k⊥,max < k(ω)` — the whole optical band on a
+  typical grid — nothing attenuates content piling up at the edge of the transverse k
+  grid, exactly as at the edge of the frequency window. A Planck taper over the outer
+  `kcollar` fraction of `|k⊥|` ([`kprofile`](@ref)) becomes a rate ([`rate`](@ref)), rides
+  the propagator through [`addloss_k`](@ref) and tapers the source through the same
+  `FreeSpaceNorm`. Where the evanescent region reaches the grid edge this is redundant
+  with `κ`, and harmless.
+- **Transverse collar** (`:rate` only). The analogue of the temporal collar: a beam
+  reaching the transverse edge wraps around (FFT grids) or reflects off the `E(R) = 0`
+  wall of the QDHT. A rate over the outer part of the transverse grid ([`rprofile`](@ref))
+  is applied as a split-step factor per accepted step ([`RadialCollar`](@ref),
+  [`CartesianCollar`](@ref)), with the same first-order, collar-confined
+  non-commutation error as the temporal collar. As for the temporal collar, what it removes
+  is measured and reported once if it becomes noticeable.
+
 # Step size
 
 `Luna.run` caps `max_dz` (and `init_dz`) at the reference length `ℓ`. This is not about
@@ -65,6 +102,8 @@ module Boundaries
 
 import ..Maths
 import ..Grid
+import ..NonlinearRHS
+import Hankel
 import LinearAlgebra: mul!, ldiv!
 import Logging
 import Printf: @sprintf
@@ -74,6 +113,12 @@ const DEFAULT_N = 20
 
 "Default minimum temporal collar width, as a fraction of the full time window."
 const DEFAULT_TCOLLAR = 0.05
+
+"Default width of the k-space absorber collar, as a fraction of the largest `|k⊥|`."
+const DEFAULT_KCOLLAR = 0.1
+
+"Default width of the transverse absorber collar of a radial grid, as a fraction of `R`."
+const DEFAULT_RCOLLAR = 0.1
 
 "Fraction of the pulse the temporal absorber may remove before `Luna.run` warns about it."
 const DEFAULT_WARNFRAC = 1e-3
@@ -85,6 +130,10 @@ Two jobs. It keeps `α` finite at all — the tapers reach exactly zero at the b
 `Inf*0` is `NaN` — and, given the step-size cap described in the module docstring, it keeps
 `exp(α Δz/2)` finite in the interaction picture. At 60 the field is attenuated by at most
 `exp(-30) ≈ 1e-13` over one reference length, far below anything physically meaningful.
+
+The same number caps the evanescent decay of a free-space operator ([`clampdecay`](@ref)):
+a field decay rate of `MAX_αℓ/(2ℓ)`, so that the clamped components still fall by
+`exp(-30)` per reference length.
 """
 const MAX_αℓ = 60.0
 
@@ -210,6 +259,202 @@ function addloss(linop!, α)
     end
 end
 
+# ---------------------------------------------------------------------------- free space
+
+"""
+    spacegrid(transform)
+
+The transverse grid of a free-space transform (`Hankel.QDHT`, `Grid.FreeGrid` or
+`Grid.Free2DGrid`), or `nothing` for a modal transform. The free-space parts of the
+boundaries are set up only when this is not `nothing`.
+"""
+spacegrid(t::NonlinearRHS.TransRadial) = t.QDHT
+spacegrid(t::NonlinearRHS.TransFree) = t.xygrid
+spacegrid(t::NonlinearRHS.TransFree2D) = t.xgrid
+spacegrid(t) = nothing
+
+# Planck taper over |k|: 1 up to (1-collar)*K and 0 at K, the largest |k| on the axis.
+function ktaper(k, collar)
+    K = maximum(abs, k)
+    Maths.planck_taper(abs.(k), -K, -(1 - collar)*K, (1 - collar)*K, K)
+end
+
+"""
+    kprofile(spacegrid, collar)
+
+The k-space absorber profile over the transverse k axes of `spacegrid`: 1 in the interior,
+falling to 0 over the outer `collar` fraction of the largest wavevector the grid holds
+(`q.K` for a `QDHT`, the Nyquist wavevector for FFT grids). For a `FreeGrid` it is the
+product of the tapers along `kx` and `ky`, matching the square edge of the grid. Sized
+like the k axes, `(Nk,)` or `(Nkx, Nky)`, so that it broadcasts over a linop's trailing
+axes ([`addloss_k`](@ref)) and matches [`NonlinearRHS.FreeSpaceNorm`](@ref)'s `kwin`.
+`collar = 0` gives a profile of ones, i.e. no k-space absorber.
+"""
+kprofile(q::Hankel.QDHT, collar) = Maths.planck_taper(
+    q.k, -q.K, -(1 - collar)*q.K, (1 - collar)*q.K, q.K)
+kprofile(sg::Grid.Free2DGrid, collar) = ktaper(sg.kx, collar)
+kprofile(sg::Grid.FreeGrid, collar) = ktaper(sg.kx, collar) .* ktaper(sg.ky, collar)'
+
+"""
+    rprofile(spacegrid, collar)
+
+The transverse absorber profile in real space. For a `QDHT` it is a Planck taper from
+`(1 - collar)R` to the aperture `R`, where the transform imposes `E(R) = 0`. The Cartesian
+grids already carry the window they were built with (`window_factor` in
+[`Grid.FreeGrid`](@ref) and [`Grid.Free2DGrid`](@ref) extends the box to make room for
+it), so for those `collar` is ignored and that window is returned.
+"""
+rprofile(q::Hankel.QDHT, collar) = Maths.planck_taper(
+    q.r, -q.R, -(1 - collar)*q.R, (1 - collar)*q.R, q.R)
+rprofile(sg::Grid.Free2DGrid, collar) = copy(sg.xwin)
+rprofile(sg::Grid.FreeGrid, collar) = dropdims(sg.xywin; dims=1)
+
+"""
+    addloss_k(linop, α)
+
+Like [`addloss`](@ref), for a power absorption coefficient `α` defined over the transverse
+k axes of a free-space operator: the operator has shape `(Nω, Npol, Nk...)` and `α` has
+shape `Nk...`, so it is broadcast along ω and polarisation.
+"""
+addloss_k(linop::AbstractArray, α) = linop .- reshape(α, 1, 1, size(α)...)./2
+
+function addloss_k(linop!, α)
+    αr = reshape(α, 1, 1, size(α)...)
+    function linop_kabsorbing!(out, z)
+        linop!(out, z)
+        out .-= αr./2
+        out
+    end
+end
+
+"""
+    clampdecay(linop, ratemax)
+
+Limit the decay of a free-space linear operator — its negative real part, which is the
+evanescent `-κ` ([`LinearOps.βz`](@ref)) — to the *field* rate `ratemax` in 1/m, keeping the
+imaginary part. Returns a new operator of the same kind as [`addloss`](@ref) does.
+
+`κ` is exact and unbounded in `LinearOps`, and the interaction picture amplifies the
+nonlinear source in a channel by `exp(κ Δz)`, which overflows for the `κ` of any fine
+transverse grid. Clamping alone would inflate the driven amplitude of those channels from
+`S/κ` to `S/ratemax`; it is only correct together with the matching taper of the source
+([`NonlinearRHS.reflength!`](@ref)), which removes the source from exactly the channels the
+clamp touches. See "Free space" in the module docstring.
+"""
+clampdecay(linop::AbstractArray, ratemax) = @. complex(max(real(linop), -ratemax), imag(linop))
+
+function clampdecay(linop!, ratemax)
+    function linop_clamped!(out, z)
+        linop!(out, z)
+        @. out = complex(max(real(out), -ratemax), imag(out))
+        out
+    end
+end
+
+"""
+    evanescent(linop, transform, ℓ; kwin=nothing)
+
+Make the evanescent channels of a free-space operator safe for the interaction-picture
+stepper taking steps up to `ℓ`: clamp the decay of `linop` at `MAX_αℓ/(2ℓ)`
+([`clampdecay`](@ref)) and taper the nonlinear source of `transform` over `ℓ` to match
+([`NonlinearRHS.reflength!`](@ref)), including the k-space window profile `kwin` if given.
+Returns the new operator. A modal `transform` has no evanescent channels and `linop` is
+returned unchanged.
+"""
+function evanescent(linop, transform, ℓ; kwin=nothing)
+    isnothing(spacegrid(transform)) && return linop
+    ratemax = MAX_αℓ/(2ℓ)
+    NonlinearRHS.reflength!(transform, ℓ; κmax=ratemax, kwin)
+    clampdecay(linop, ratemax)
+end
+
+"""
+    RadialCollar(q, αr, Eω)
+
+Transverse absorbing boundary for radially symmetric propagation: the power rate `αr` over
+`q.r`, applied as `exp(-αr Δz/2)` per accepted step. The QDHT imposes `E(R) = 0`, a hard
+wall which reflects whatever reaches the aperture, and the collar absorbs it first. It is
+applied to `Eω` directly (the collar is diagonal in ω) with one inverse and one forward
+Hankel transform along the last axis, into the buffer `buf` sized like `Eω`.
+"""
+struct RadialCollar{qT, bT}
+    q::qT
+    αr::Vector{Float64}
+    ridcs::Vector{Int} # only the collar is ever ≠ 1
+    weight::Vector{Float64} # radial integration weights, to measure what is removed
+    buf::bT
+    removed::Base.RefValue{Float64}
+    reference::Base.RefValue{Float64}
+    warned::Base.RefValue{Bool}
+end
+
+RadialCollar(q, αr, Eω) = RadialCollar(q, αr, findall(>(0), αr), copy(q.scaleR), similar(Eω),
+                                       Ref(0.0), Ref(0.0), Ref(false))
+
+# applied before the temporal collar, in (ω, k⊥) space
+function apply_kspace!(c::RadialCollar, Eω, Δz)
+    ldiv!(c.buf, c.q, Eω) # (ω, pol, k) -> (ω, pol, r)
+    d = ndims(c.buf)
+    if c.reference[] == 0
+        c.reference[] = sum(i -> c.weight[i]*sum(abs2, selectdim(c.buf, d, i)), axes(c.buf, d))
+    end
+    removed = 0.0
+    for i in c.ridcs
+        fac = exp(-c.αr[i]*Δz/2)
+        s = selectdim(c.buf, d, i)
+        removed += c.weight[i]*sum(abs2, s)*(1 - fac^2)
+        s .*= fac
+    end
+    c.removed[] += removed
+    mul!(Eω, c.q, c.buf)
+    nothing
+end
+apply_kspace!(c, Eω, Δz) = nothing
+
+"""
+    CartesianCollar(αxy)
+
+Transverse absorbing boundary for the Cartesian free-space grids: the power rate `αxy` over
+the spatial axes `(Nx,)` or `(Nx, Ny)`, applied as `exp(-αxy Δz/2)` per accepted step. The
+Fourier transform of those grids is joint in `(t, x[, y])`, so the collar is applied in
+the same real-space pass as the temporal collar, at no extra transform cost.
+"""
+struct CartesianCollar{N}
+    αxy::Array{Float64, N}
+    idcs::Vector{CartesianIndex{N}} # only the collar is ever ≠ 1
+    removed::Base.RefValue{Float64}
+    reference::Base.RefValue{Float64}
+    warned::Base.RefValue{Bool}
+end
+
+CartesianCollar(αxy) = CartesianCollar(
+    αxy, vec(collect(CartesianIndices(αxy)))[vec(αxy .> 0)], Ref(0.0), Ref(0.0), Ref(false))
+
+# applied after the temporal collar, in (t, x[, y]) space
+function apply_realspace!(c::CartesianCollar, Et, Δz)
+    c.reference[] == 0 && (c.reference[] = sum(abs2, Et))
+    removed = 0.0
+    for J in c.idcs
+        fac = exp(-c.αxy[J]*Δz/2)
+        s = view(Et, :, :, J)
+        removed += sum(abs2, s)*(1 - fac^2)
+        s .*= fac
+    end
+    c.removed[] += removed
+    nothing
+end
+apply_realspace!(c, Et, Δz) = nothing
+
+"""
+    spatialcollar(spacegrid, αr, grid, Et)
+
+The transverse absorber functor for `spacegrid`, given the power rate `αr` over its real
+space. `grid` and `Et` size the buffer the radial collar needs.
+"""
+spatialcollar(q::Hankel.QDHT, αr, grid, Et) = RadialCollar(
+    q, αr, zeros(ComplexF64, (length(grid.ω), size(Et)[2:end]...)))
+spatialcollar(sg::Union{Grid.Free2DGrid, Grid.FreeGrid}, αr, grid, Et) = CartesianCollar(αr)
+
 # --------------------------------------------------------------------------- application
 
 #= The three ways a boundary can be applied per accepted step. Each is a functor rather than
@@ -219,20 +464,25 @@ end
    because that is what `RK45.solve` expects of a `stepfun`. =#
 
 """
-    RateAbsorber(αt, Et, FT, output, z0)
+    RateAbsorber(αt, Et, FT, output, z0; spatial=nothing)
 
 Applies the temporal absorber as `exp(-αt Δz/2)` over the distance actually travelled.
 Successive factors telescope to `exp(-αt L/2)` however the solver subdivides the
 propagation, which is the whole point of rate semantics. The spectral absorber is not here:
 it rides the propagator, having been folded into the linear operator by [`addloss`](@ref).
+
+In free space `spatial` is the transverse collar ([`RadialCollar`](@ref) or
+[`CartesianCollar`](@ref)), applied in the same step; the k-space absorber rides the
+propagator like the spectral one.
 """
-struct RateAbsorber{tT, fT, oT}
+struct RateAbsorber{tT, fT, oT, sT}
     αt::Vector{Float64}
     tidcs::Vector{Int} # only the collar is ever ≠ 1, so only those need touching each step
     tfac::Vector{Float64}
     Et::tT
     FT::fT
     output::oT
+    spatial::sT
     zprev::Base.RefValue{Float64}
     removed::Base.RefValue{Float64} # running total of |E|² taken out of the collar
     reference::Base.RefValue{Float64} # |E|² over the whole window, at the first step
@@ -240,14 +490,15 @@ struct RateAbsorber{tT, fT, oT}
     warnfrac::Float64
 end
 
-RateAbsorber(αt, Et, FT, output, z0; warnfrac=DEFAULT_WARNFRAC) = RateAbsorber(
-    αt, findall(>(0), αt), ones(Float64, length(αt)), Et, FT, output, Ref(float(z0)),
+RateAbsorber(αt, Et, FT, output, z0; warnfrac=DEFAULT_WARNFRAC, spatial=nothing) = RateAbsorber(
+    αt, findall(>(0), αt), ones(Float64, length(αt)), Et, FT, output, spatial, Ref(float(z0)),
     Ref(0.0), Ref(0.0), Ref(false), warnfrac)
 
 function (b::RateAbsorber)(Eω, z, dz, interpolant)
     Δz = z - b.zprev[]
     b.zprev[] = z
     if Δz > 0
+        apply_kspace!(b.spatial, Eω, Δz) # radial collar: transforms to r and back itself
         @inbounds for i in b.tidcs
             b.tfac[i] = exp(-b.αt[i]*Δz/2) # αt is a power coefficient, tfac hits the field
         end
@@ -265,8 +516,10 @@ function (b::RateAbsorber)(Eω, z, dz, interpolant)
             removed += before - abs2(b.Et[i, J])
         end
         b.removed[] += removed
+        apply_realspace!(b.spatial, b.Et, Δz) # Cartesian collar: Et is already (t, x[, y])
         mul!(Eω, b.FT, b.Et)
         warn_maybe(b, z)
+        warn_maybe(b.spatial, z, b.warnfrac)
     end
     b.output(Eω, z, dz, interpolant)
 end
@@ -299,6 +552,20 @@ function warn_maybe(b::RateAbsorber, z)
          intended, widen `trange`. (Reported once.)", 100frac, z))
     nothing
 end
+
+# the same, for the transverse collar of a free-space simulation
+function warn_maybe(c::Union{RadialCollar, CartesianCollar}, z, warnfrac)
+    (c.warned[] || c.reference[] == 0) && return nothing
+    frac = c.removed[]/c.reference[]
+    frac > warnfrac || return nothing
+    c.warned[] = true
+    Logging.@warn(@sprintf(
+        "Transverse absorbing boundary has removed %.2g%% of the beam by z = %.3g m. Light \
+         is reaching the edge of the transverse grid and being absorbed; if that is not \
+         intended, enlarge the grid. (Reported once.)", 100frac, z))
+    nothing
+end
+warn_maybe(c::Nothing, z, warnfrac) = nothing
 
 """
     LegacyAbsorber(grid, Et, FT, output)
@@ -335,7 +602,7 @@ end
 (b::NoAbsorber)(Eω, z, dz, interpolant) = b.output(Eω, z, dz, interpolant)
 
 "Report the absorbing-boundary configuration."
-function log_setup(grid, ℓ, collar)
+function log_setup(grid, ℓ, collar, sg=nothing, kcollar=0, rcollar=0)
     w = tcollarwidth(grid, collar)
     trange = maximum(grid.t) - minimum(grid.t)
     #= The clamp in `rate` is not worth reporting: it bites only where the profile is
@@ -347,11 +614,19 @@ function log_setup(grid, ℓ, collar)
          the window profile over %.3g m; a 50%% point of the taper attenuates by %.1e over \
          the propagation). Temporal collar %.3g fs, %.1f%% of the time window.",
         ℓ, grid.zmax/ℓ, grid.zmax, 0.5^(grid.zmax/ℓ), w*1e15, 100*w/trange))
+    isnothing(sg) && return nothing
+    rdesc = sg isa Hankel.QDHT ? @sprintf("%.1f%% of the aperture", 100rcollar) :
+                                 "the grid's own window"
+    Logging.@info(@sprintf(
+        "Free-space boundaries: k-space collar %.1f%% of the largest k⊥, transverse \
+         collar %s. Evanescent decay clamped at %.3g /m and its source tapered over %.3g m.",
+        100kcollar, rdesc, MAX_αℓ/(2ℓ), ℓ))
 end
 
 """
-    setup(boundary, grid, linop, Et, FT, output, z0, max_dz, init_dz;
-          N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR, warnfrac=DEFAULT_WARNFRAC)
+    setup(boundary, grid, transform, linop, Et, FT, output, z0, max_dz, init_dz;
+          N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR,
+          kcollar=DEFAULT_KCOLLAR, rcollar=DEFAULT_RCOLLAR, warnfrac=DEFAULT_WARNFRAC)
 
 Everything `Luna.run` needs in order to apply absorbing boundaries, as a named tuple
 `(; stepfun, linop, max_dz, init_dz, ℓ)`. `ℓ` is the reference length actually used, or
@@ -361,14 +636,22 @@ Three of those are returned because setting up an absorber genuinely changes the
 clearer to hand them back than to mutate them from inside a branch:
 
 - `linop` gains the spectral absorber, which the interaction-picture propagator then applies
-  exactly (see [`addloss`](@ref)).
+  exactly (see [`addloss`](@ref)). In free space it also gains the k-space absorber
+  ([`addloss_k`](@ref)) and, in *every* mode, the clamp of its evanescent decay
+  ([`evanescent`](@ref)), the nonlinear source of `transform` being tapered to match.
 - `max_dz` is capped at the reference length `ℓ`, and `init_dz` with it, so that the
   step-size controller is not thrown by the amplified band-edge elements the interaction
   picture produces. See "Step size" in the module docstring.
+
+`transform` is used only to find the transverse grid ([`spacegrid`](@ref)) and to taper its
+normalisation; for a modal transform it is untouched. `kcollar` and `rcollar` are the
+k-space and transverse collar widths ([`kprofile`](@ref), [`rprofile`](@ref)).
 """
-function setup(boundary, grid, linop, Et, FT, output, z0, max_dz, init_dz;
-               N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR, warnfrac=DEFAULT_WARNFRAC)
+function setup(boundary, grid, transform, linop, Et, FT, output, z0, max_dz, init_dz;
+               N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR,
+               kcollar=DEFAULT_KCOLLAR, rcollar=DEFAULT_RCOLLAR, warnfrac=DEFAULT_WARNFRAC)
     ℓabs = nothing
+    sg = spacegrid(transform)
     if boundary === :rate
         ℓabs = reflength(grid, N, ℓ)
         if max_dz > ℓabs
@@ -379,16 +662,33 @@ function setup(boundary, grid, linop, Et, FT, output, z0, max_dz, init_dz;
         end
         init_dz = min(init_dz, max_dz)
         αt = temporal_rate(grid; N, ℓ, collar)
-        linop = addloss(linop, spectral_rate(grid; N, ℓ))
-        log_setup(grid, ℓabs, collar)
-        stepfun = RateAbsorber(αt, Et, FT, output, z0; warnfrac)
-    elseif boundary === :legacy
-        Logging.@warn(
-            "boundary=:legacy applies the absorbing boundaries once per accepted step, " *
-            "so the absorption depends on the step count and the result depends on rtol.")
-        stepfun = LegacyAbsorber(grid, Et, FT, output)
-    elseif boundary === :none
-        stepfun = NoAbsorber(output)
+        spatial = nothing
+        if isnothing(sg)
+            linop = addloss(linop, spectral_rate(grid; N, ℓ))
+        else
+            #= Order matters: the clamp must see only the physical decay, not the absorbers
+               added after it. The source taper carries the k-window at its clamped depth,
+               never zero, so the division in FreeSpaceNorm stays finite. =#
+            Wk = kprofile(sg, kcollar)
+            linop = evanescent(linop, transform, ℓabs; kwin=max.(Wk, exp(-MAX_αℓ/2)))
+            linop = addloss(linop, spectral_rate(grid; N, ℓ))
+            linop = addloss_k(linop, rate(Wk, ℓabs))
+            spatial = spatialcollar(sg, rate(rprofile(sg, rcollar), ℓabs), grid, Et)
+        end
+        log_setup(grid, ℓabs, collar, sg, kcollar, rcollar)
+        stepfun = RateAbsorber(αt, Et, FT, output, z0; warnfrac, spatial)
+    elseif boundary === :legacy || boundary === :none
+        if boundary === :legacy
+            Logging.@warn(
+                "boundary=:legacy applies the absorbing boundaries once per accepted step, " *
+                "so the absorption depends on the step count and the result depends on rtol.")
+            stepfun = LegacyAbsorber(grid, Et, FT, output)
+        else
+            stepfun = NoAbsorber(output)
+        end
+        #= No absorbers, but the evanescent channels still need their clamp and taper, and
+           the only requirement on the reference length is that no step exceeds it. =#
+        linop = evanescent(linop, transform, min(max_dz, grid.zmax))
     else
         error("boundary must be :rate, :legacy or :none, not $boundary")
     end

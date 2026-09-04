@@ -477,6 +477,14 @@ function crystal_internal_angle(nfun, ω, kx)
             ω/c * nfun(wlfreq(ω), δθi)*sin(δθi) - kx
         end
     catch
+        #= No real internal angle exists for |kx| beyond the light cone: the component is
+           evanescent in the crystal. Return the grazing angle, for which the operator and
+           the normalisation then see k_x² > (n ω/c)², i.e. an evanescent entry (see
+           `LinearOps.βz`), rather than failing on a grid fine enough to resolve it. =#
+        grazing = sign(kx)*π/2
+        if abs(kx) >= ω/c*real(nfun(wlfreq(ω), grazing))
+            return grazing
+        end
         error("Crystal index could not be found for λ=$(1e9wlfreq(ω)) nm, kx=$kx")
     end
     δθ

@@ -346,3 +346,132 @@ end
 @test out["simulation_type"]["boundary"] == "rate"
 @test out["prop_capillary_args"]["boundary_N"] == "5"
 end
+
+import Luna: LinearOps, NonlinearRHS, Hankel, Fields, Nonlinear
+import Luna.PhysData: wlfreq
+Luna.set_fftw_mode(:estimate)
+
+@testset "free space" begin
+Rs = 50e-6
+grid = Grid.RealGrid(1e-3, 800e-9, (400e-9, 4000e-9), 0.2e-12)
+q = Hankel.QDHT(Rs, 32, dim=3)
+xgrid = Grid.Free2DGrid(Rs, 32)
+xygrid = Grid.FreeGrid(Rs, 16, Rs, 16)
+nfunλ = PhysData.ref_index_fun(:Ar, 1)
+nfun = (λ; z=0.0) -> nfunλ(λ)
+nfunω = (ω; z) -> nfun(wlfreq(ω); z)
+ℓ = grid.zmax/20
+ratemax = Boundaries.MAX_αℓ/(2ℓ)
+
+# profiles: sized like the k axes, 1 in the interior, tapering to 0 at the edge
+for sg in (q, xgrid, xygrid)
+    kperp2, _ = LinearOps.transverse_k2(sg)
+    Wk = Boundaries.kprofile(sg, 0.1)
+    @test size(Wk) == size(kperp2)
+    @test all(0 .<= Wk .<= 1)
+    @test maximum(Wk) == 1
+    @test minimum(Wk) < 0.5
+    @test all(Boundaries.kprofile(sg, 0.0) .== 1) # no collar
+    Wr = Boundaries.rprofile(sg, 0.1)
+    @test all(0 .<= Wr .<= 1)
+    @test maximum(Wr) == 1
+    @test minimum(Wr) < 0.5
+end
+@test all(Boundaries.rprofile(q, 0.1)[q.r .< 0.85Rs] .== 1)
+@test all(Boundaries.rprofile(q, 0.1)[q.r .> 0.99Rs] .< 0.1)
+@test Boundaries.rprofile(xgrid, 0.1) == xgrid.xwin
+
+# addloss_k broadcasts over the trailing k axes; clampdecay caps the evanescent decay
+linop = LinearOps.make_const_linop(grid, q, nfun, true)
+α = Boundaries.rate(Boundaries.kprofile(q, 0.1), ℓ)
+l2 = Boundaries.addloss_k(linop, α)
+@test size(l2) == size(linop)
+@test l2[:, 1, end] ≈ linop[:, 1, end] .- α[end]/2
+@test l2[:, 1, 1] == linop[:, 1, 1]
+@test minimum(real(linop)) < -ratemax # the raw operator decays faster than the clamp
+lc = Boundaries.clampdecay(linop, ratemax)
+@test minimum(real(lc)) ≈ -ratemax
+@test imag(lc) == imag(linop)
+keep = real(linop) .> -ratemax
+@test real(lc)[keep] == real(linop)[keep]
+linopf = LinearOps.make_linop(grid, q, nfunω, true)
+out = similar(linop)
+Boundaries.addloss_k(linopf, α)(out, 0.0)
+@test out ≈ l2
+Boundaries.clampdecay(linopf, ratemax)(out, 0.0)
+@test out ≈ lc
+
+# FreeSpaceNorm: physical prefactor βz/(μ0 ω) on both sides of cutoff, then the taper
+nf = NonlinearRHS.const_norm_radial(grid, q, nfunλ)
+n0 = copy(nf(0.0))
+@test eltype(n0) == ComplexF64
+ωs = grid.ω[grid.sidx]
+k = [real(nfunλ(wlfreq(ω)))*ω/PhysData.c for ω in ωs]
+βsq = k.^2 .- (q.k.^2)'
+ωa = ωs .* ones(1, q.N)
+evan = βsq .< 0
+nn = n0[grid.sidx, 1, :]
+@test count(evan) > 0
+@test all(nn[.!evan] .≈ (sqrt.(max.(βsq, 0))./(PhysData.μ_0 .* ωa))[.!evan])
+@test all(nn[evan] .≈ (-im .* sqrt.(max.(-βsq, 0))./(PhysData.μ_0 .* ωa))[evan])
+@test all(n0[.!grid.sidx, :, :] .== 1)
+Wk = ones(q.N)
+Wk[end] = 0.5
+NonlinearRHS.reflength!(nf, ℓ; κmax=ratemax, kwin=Wk)
+n1 = copy(nf(0.0))
+κ = min.(sqrt.(max.(-βsq, 0)), ratemax)
+W = exp.(-κ.*ℓ) .* Wk'
+@test n1[grid.sidx, 1, :] ≈ n0[grid.sidx, 1, :] ./ W
+@test !(n1 ≈ n0)
+@test maximum(abs.(n1[grid.sidx, 1, :] ./ n0[grid.sidx, 1, :])) ≈ 2exp(Boundaries.MAX_αℓ/2) # clamped channels
+NonlinearRHS.reflength!(nf, 0.0)
+@test nf(0.0) ≈ n0
+# a z-dependent normalisation re-tapers on every call
+nfz = NonlinearRHS.norm_radial(grid, q, nfunω)
+@test nfz(0.0) ≈ n0
+NonlinearRHS.reflength!(nfz, ℓ; κmax=ratemax, kwin=Wk)
+@test nfz(0.5e-3) ≈ n1
+# and the crystal-optics form gives the same physics for an isotropic index
+nfb = NonlinearRHS.const_norm_free2D(grid, xgrid, ((λ, δθ) -> real(nfunλ(λ)), λ -> real(nfunλ(λ))))
+nfi = NonlinearRHS.const_norm_free2D(grid, xgrid, (λ -> (real(nfunλ(λ)), real(nfunλ(λ)))))
+@test nfb(0.0) ≈ nfi(0.0)
+
+# setup end-to-end: what Luna.run gets back for a free-space transform
+dummy(args...; kwargs...) = nothing
+resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),)
+inputs = Fields.GaussGaussField(;λ0=800e-9, τfwhm=20e-15, energy=1e-9, w0=20e-6)
+for (sg, nfs) in ((q, NonlinearRHS.const_norm_radial(grid, q, nfunλ)),
+                  (xgrid, NonlinearRHS.const_norm_free2D(grid, xgrid, nfunλ)),
+                  (xygrid, NonlinearRHS.const_norm_free(grid, xygrid, nfunλ)))
+    Eω, transform, FT = Luna.setup(grid, sg, z -> 1e25, nfs, resp, inputs)
+    @test Boundaries.spacegrid(transform) === sg
+    Et = FT \ Eω
+    lin = LinearOps.make_const_linop(grid, sg, nfun, true)
+    b = Boundaries.setup(:rate, grid, transform, lin, Et, FT, dummy, 0.0, grid.zmax/2, 1e-4)
+    @test b.max_dz == ℓ
+    @test nfs.ℓ == ℓ && nfs.κmax == ratemax
+    @test minimum(nfs.kwin) >= exp(-Boundaries.MAX_αℓ/2) # never zero: the norm divides by it
+    @test minimum(real(b.linop)) >= -ratemax - 1.5Boundaries.MAX_αℓ/ℓ - 1e-9
+    @test b.stepfun.spatial isa (sg isa Hankel.QDHT ? Boundaries.RadialCollar : Boundaries.CartesianCollar)
+    # one accepted step through the absorber: finite, and only ever removes energy
+    E1 = copy(Eω)
+    e0 = sum(abs2, E1)
+    b.stepfun(E1, 1e-4, 1e-4, nothing)
+    @test all(isfinite, E1)
+    @test sum(abs2, E1) <= e0
+    # without absorbers the evanescent clamp and taper are still applied, over max_dz
+    b2 = Boundaries.setup(:none, grid, transform, lin, Et, FT, dummy, 0.0, grid.zmax/2, 1e-4)
+    @test b2.stepfun isa Boundaries.NoAbsorber
+    @test nfs.ℓ == grid.zmax/2
+    @test minimum(real(b2.linop)) ≈ max(minimum(real(lin)), -Boundaries.MAX_αℓ/grid.zmax)
+    @test all(nfs.kwin .== 1)
+end
+# a modal transform is untouched
+cgrid = Grid.RealGrid(0.3, 800e-9, (150e-9, 4e-6), 1e-12)
+Eω, cgrid, linop, transform, FT, output = prop_capillary_args(125e-6, 0.3, :He, 1.0;
+    λ0=800e-9, energy=1e-9, τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11)
+@test isnothing(Boundaries.spacegrid(transform))
+b = Boundaries.setup(:rate, cgrid, transform, linop, FT \ Eω, FT, dummy, 0.0, 0.15, 1e-4)
+@test isnothing(b.stepfun.spatial)
+@test b.linop == Boundaries.addloss(linop, Boundaries.spectral_rate(cgrid))
+end
