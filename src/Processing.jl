@@ -596,7 +596,7 @@ end
     getEω(output[, zslice])
 
 Get frequency-domain modal field from `output` with correct normalisation (i.e.
-`abs2.(Eω)`` gives angular-frequency spectral energy density in J/(rad/s)).
+`abs2.(Eω)` gives angular-frequency spectral energy density in J/(rad/s)).
 """
 getEω(output::AbstractOutput, args...) = getEω(makegrid(output), output, args...)
 getEω(grid, output) = getEω(grid, output["Eω"])
@@ -626,38 +626,40 @@ fftnorm(grid::EnvGrid) = Maths.fftnorm(grid.t[2] - grid.t[1])
 
 
 """
-    getφ(grid, Eω)
-    getφ(ω, Eω, τ)
+    spectral_phase(grid, Eω)
+    spectral_phase(ω, Eω, τ)
 
 Extract the unwrapped spectral phase from the field `Eω`, subtracting the linear phase ramp corresponding
 to a pulse in the middle of the time window defined by the `grid`.
 """
-function getφ(grid::AbstractGrid, Eω)
+function spectral_phase(grid::AbstractGrid, Eω)
     ω = grid.ω
     t = grid.t
     τ = length(t) * (t[2] - t[1])/2 # middle of time window
-    getφ(ω, Eω, τ)
+    spectral_phase(ω, Eω, τ)
 end
 
-function getφ(ω::AbstractVector, Eω, τ)
+function spectral_phase(ω::AbstractVector, Eω, τ)
     φ = unwrap(angle.(Eω); dims=1)
     φ .- ω*τ
 end
 
 """
-    getφ(output, args...)
+    spectral_phase(output, args...)
 
 Extract the frequency-domain `Eω` from the `output` (additional `args...` are passed to `getEω`) and
 extract the spectral phase, subtracting the linear phase ramp corresponding
 to a pulse in the middle of the time window defined by the frequency grid.
 """
-function getφ(output, args...)
+function spectral_phase(output, args...)
     ω, Eω = getEω(output, args...)
     grid = makegrid(output)
     t = grid.t
     τ = length(t) * (t[2] - t[1])/2 # middle of time window
-    getφ(ω, Eω, τ)
+    spectral_phase(ω, Eω, τ)
 end
+
+Base.@deprecate getφ(args...) spectral_phase(args...) false
 
 """
     getEt(output[, zslice]; kwargs...)

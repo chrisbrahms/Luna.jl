@@ -233,7 +233,7 @@ contain 3 columns:
 """
 function DataField(fpath; energy, ϕ=Float64[], λ0=NaN)
     dat = readdlm(fpath, ' ')
-    DataField(dat[:, 1]*2π, dat[:, 2], dat[:, 3]; energy, ϕ)
+    DataField(dat[:, 1]*2π, dat[:, 2], dat[:, 3]; energy, ϕ, λ0)
 end
 
 """
@@ -568,7 +568,7 @@ end
     coupled_field(i, mode, E, fieldfunc; energy, kwargs...)
 
 Create an element of an input field tuple (for use in `Luna.setup`) based on coupling
-field `E` into a `mode`. The index `i` species the mode index. The temporal fields are
+field `E` into a `mode`. The index `i` specifies the mode index. The temporal fields are
 initialised using `fieldfunc` (e.g. one of `GaussField`, `SechField` etc.) with the
 same keyword arguments.
 """
