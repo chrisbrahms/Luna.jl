@@ -6,6 +6,11 @@ export SimpleMode
 import Polynomials
 import Luna.PhysData: c
 
+"""
+    SimpleMode{TP}
+
+Mode with dispersion defined by a Taylor expansion of β about a reference frequency.
+"""
 struct SimpleMode{TP} <: AbstractMode
     ωref::Float64
     poly::TP
@@ -36,6 +41,11 @@ function SimpleMode(βs)
     SimpleMode(0.0, βs)
 end
 
+"""
+    dispersion_func(m::SimpleMode, order; z=0.0)
+
+Return a function giving the `order`th frequency derivative of β for a `SimpleMode`.
+"""
 function dispersion_func(m::SimpleMode, order; z=0.0)
     p = m.poly
     for i = 1:order
@@ -44,12 +54,32 @@ function dispersion_func(m::SimpleMode, order; z=0.0)
     ω -> p(ω - m.ωref)
 end
 
+"""
+    β(m::SimpleMode, ω; z=0.0)
+
+Propagation constant β of a `SimpleMode` at frequency `ω`.
+"""
 β(m::SimpleMode, ω; z=0.0) = m.poly(ω - m.ωref)
 
+"""
+    α(m::SimpleMode, ω; z=0.0)
+
+Power loss coefficient α of a `SimpleMode`.
+"""
 α(m::SimpleMode, ω; z=0.0) = m.α
 
+"""
+    neff(m::SimpleMode, ω; z=0)
+
+Effective index of a `SimpleMode` at frequency `ω`.
+"""
 neff(m::SimpleMode, ω; z=0) = c/ω * (β(m, ω, z=z) + 0.5im*α(m, ω, z=z))
 
+"""
+    Aeff(m::SimpleMode; z=0.0)
+
+Effective area of a `SimpleMode`.
+"""
 Aeff(m::SimpleMode; z=0.0) = m.Aeff
 
 end

@@ -22,7 +22,17 @@ getω0(grid::Grid.RealGrid, thg=true) = 0.0
 #=================================================#
 #===============    FREE SPACE     ===============#
 #=================================================#
+"""
+    fill_linop_matrix!(out, grid, β1, βref, ω0, k2, kperp2, idcs)
 
+Fill the free-space linear operator `out` with the longitudinal wavevector for each frequency
+and transverse index.
+
+`β = sqrt(k² - k⊥²)` is taken relative to the reference frame, whose subtracted phase is
+`β1*(ω - ω0) + βref` (`β1` is the inverse frame velocity, `βref` the reference wavevector
+offset and `ω0` the reference frequency, see `getω0`); evanescent components (`β² < 0`) are
+turned into (clamped) attenuation. `k2`, `kperp2` and `idcs` come from [`transverse_k2`](@ref).
+"""
 function fill_linop_matrix!(out, grid, β1::Number, βref::Number, ω0::Number, k2, kperp2, idcs)
     for ii in idcs
         for ip in axes(k2, 2)
@@ -39,6 +49,12 @@ function fill_linop_matrix!(out, grid, β1::Number, βref::Number, ω0::Number, 
     end
 end
 
+"""
+    transverse_k2(xygrid)
+
+Return `(kperp2, idcs)`: the squared transverse wavevector `k⊥²` and the `CartesianIndices`
+over the transverse grid `xygrid` (a `Grid.FreeGrid`, `Grid.Free2DGrid`, or `Hankel.QDHT`).
+"""
 function transverse_k2(xygrid::Grid.FreeGrid)
     kperp2 = @. xygrid.kx^2 + (xygrid.ky^2)'
     idcs = CartesianIndices((length(xygrid.kx), length(xygrid.ky)))

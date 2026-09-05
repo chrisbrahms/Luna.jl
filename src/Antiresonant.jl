@@ -7,6 +7,11 @@ import Luna.PhysData: c, wlfreq, ref_index_fun
 @reexport using Luna.Modes
 import Luna.Modes: AbstractMode, dimlimits, neff, field, Aeff, N, α, chkzkwarg
 
+"""
+    ZeisbergerMode{mT, LT}
+
+Antiresonant hollow-core fibre mode using the Zeisberger model for the effective index.
+"""
 struct ZeisbergerMode{mT<:Capillary.MarcatiliMode, LT} <: AbstractMode
     m::mT
     wallthickness::Float64
@@ -93,6 +98,11 @@ __neff(A, B, C, D, σ, nco, loss::Val{false}) = real(nco*(1 - A*σ^2 - B*σ^3 - 
 __neff(A, B, C, D, σ, nco, loss::Number) = nco*(1 - A*σ^2 - B*σ^3 - C*σ^4 + 1im*loss*D*σ^4)
 
 
+"""
+    VincettiMode{mT, Tclad, LT}
+
+Antiresonant hollow-core tube-lattice fibre mode using the semi-empirical Vincetti model.
+"""
 struct VincettiMode{mT<:Capillary.MarcatiliMode, Tclad, LT} <: AbstractMode
     m::mT
     t::Float64 # tube wall thickness
@@ -104,7 +114,7 @@ struct VincettiMode{mT<:Capillary.MarcatiliMode, Tclad, LT} <: AbstractMode
 end
 
 """
-    VincettiMode(a, args...; wallthickness, tube_radius, Ntubes, cladn, Nterms,
+    VincettiMode(Rco, args...; wallthickness, tube_radius, Ntubes, cladn, Nterms,
                              loss=true, kwargs...)
 
 Create a mode with Marcatili-like mode fields but loss, dispersion and effective area given

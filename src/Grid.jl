@@ -4,9 +4,25 @@ import FFTW
 import Printf: @sprintf
 import Luna: PhysData, Maths
 
+"""
+    AbstractGrid
+
+Abstract supertype for all simulation grids.
+"""
 abstract type AbstractGrid end
 
+"""
+    TimeGrid
+
+Abstract supertype for grids defined on a time/frequency axis.
+"""
 abstract type TimeGrid <: AbstractGrid end
+
+"""
+    SpaceGrid
+
+Abstract supertype for grids defined on a spatial axis.
+"""
 abstract type SpaceGrid <: AbstractGrid end
 
 struct RealGrid <: TimeGrid
@@ -23,7 +39,7 @@ struct RealGrid <: TimeGrid
 end
 
 """
-    RealGrid(zmax, referenceλ, λ_lims, trange; δt=1)
+    RealGrid(zmax, referenceλ, λ_lims, trange, δt=1)
 
 Time grid for simulations with real-valued (field-resolved) fields
 
@@ -80,6 +96,11 @@ function RealGrid(zmax, referenceλ, λ_lims, trange, δt=1)
     return RealGrid(float(zmax), referenceλ, t, ω, to, ωo, sidx, ωwindow, twindow, towindow)
 end
 
+"""
+    RealGrid(;zmax, referenceλ, t, ω, to, ωo, sidx, ωwin, twin, towin)
+
+Construct a `RealGrid` directly from its stored fields (used when reconstructing a saved grid).
+"""
 function RealGrid(;zmax, referenceλ, t, ω, to, ωo, sidx, ωwin, twin, towin)
     RealGrid(zmax, referenceλ, t, ω, to, ωo, sidx, ωwin, twin, towin)
 end
@@ -189,6 +210,11 @@ function EnvGrid(zmax, referenceλ, λ_lims, trange; δt=1, thg=false)
     return EnvGrid(float(zmax), referenceλ, ω0, t, ω, to, ωo, sidx, ωwindow, twindow, towindow)
 end
 
+"""
+    EnvGrid(;zmax, referenceλ, ω0, t, ω, to, ωo, sidx, ωwin, twin, towin)
+
+Construct an `EnvGrid` directly from its stored fields (used when reconstructing a saved grid).
+"""
 function EnvGrid(;zmax, referenceλ, ω0, t, ω, to, ωo, sidx, ωwin, twin, towin)
     EnvGrid(zmax, referenceλ, ω0, t, ω, to, ωo, sidx, ωwin, twin, towin)
 end
@@ -235,6 +261,12 @@ function FreeGrid(Rx, Nx, Ry, Ny; window_factor=0.1)
     FreeGrid(x, y, kx, ky, r, xywin)
 end
 
+"""
+    FreeGrid(R, N)
+
+Construct a square [`FreeGrid`](@ref) with equal half-width `R` and sample count `N` in both
+`x` and `y`.
+"""
 FreeGrid(R, N) = FreeGrid(R, N, R, N)
 
 struct Free2DGrid
@@ -265,6 +297,11 @@ function Free2DGrid(R, N; window_factor=0.1)
 end
 
 
+"""
+    to_dict(g::AbstractGrid)
+
+Convert the grid `g` into a `Dict` mapping each field name (as a `String`) to its value.
+"""
 function to_dict(g::GT) where GT <: AbstractGrid
     d = Dict{String, Any}()
     for field in fieldnames(GT)
@@ -273,6 +310,12 @@ function to_dict(g::GT) where GT <: AbstractGrid
     d
 end
 
+"""
+    from_dict(gridtype, d)
+
+Reconstruct a grid of type `gridtype` from a `Dict` `d` of field names to values (the inverse
+of [`to_dict`](@ref)) and check that it is valid via [`validate`](@ref).
+"""
 function from_dict(gridtype, d)
     kwargs = (Symbol(k) => v for (k, v) in pairs(d))
     grid = gridtype(;kwargs...)
@@ -282,9 +325,26 @@ function from_dict(gridtype, d)
     return grid
 end
 
+"""
+    RealGrid(d::AbstractDict)
+
+Reconstruct a `RealGrid` from a `Dict` of its field names to values (as produced by [`to_dict`](@ref)).
+"""
 RealGrid(d::AbstractDict) = from_dict(RealGrid, d)
+
+"""
+    EnvGrid(d::AbstractDict)
+
+Reconstruct an `EnvGrid` from a `Dict` of its field names to values (as produced by [`to_dict`](@ref)).
+"""
 EnvGrid(d::AbstractDict) = from_dict(EnvGrid, d)
 
+"""
+    validate(grid::TimeGrid)
+
+Assert that the coarse and fine time/frequency axes of `grid` are mutually consistent, throwing
+an error if not.
+"""
 function validate(grid::TimeGrid)
     δt = grid.t[2] - grid.t[1]
     δto = grid.to[2] - grid.to[1]

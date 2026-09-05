@@ -18,12 +18,22 @@ Abstract type representing a single mode of a waveguide.
 """
 abstract type AbstractMode end
 
+"""
+    ModeCollection
+
+Type alias for a collection of modes: a `Tuple` or `AbstractArray` of [`AbstractMode`](@ref)s.
+"""
 ModeCollection = Union{Tuple{Vararg{T} where T <: Modes.AbstractMode},
                        AbstractArray{T} where T <: Modes.AbstractMode}
 
 # make modes broadcast like a scalar
 Broadcast.broadcastable(m::AbstractMode) = Ref(m)
 
+"""
+    modeinfo(m::AbstractMode)
+
+Return a `Dict` of additional descriptive information about mode `m` (empty by default).
+"""
 modeinfo(m::AbstractMode) = Dict()
 
 """
@@ -36,7 +46,7 @@ function dimlimits end
 """
     field(m::AbstractMode, xs; z=0.0)
 
-Get the field components `(Ex, Ey)`` at position `xs`, `z`
+Get the field components `(Ex, Ey)` at position `xs`, `z`
 """
 function field end
 
@@ -216,7 +226,7 @@ function zdw(m::AbstractMode; λmin=100e-9, λmax=3000e-9, z=0.0)
 end
 
 """
-    zdw(m::AbstractMode, λ0; z=0.0, rtol=1e-4)
+    zdw(m::AbstractMode, λ0; z=0.0, rtol=1e-6)
 
 Calculate the zero-dispersion wavelength (ZDW) of mode `m` with an initial guess of `λ0`.
 
@@ -265,7 +275,7 @@ function chkzkwarg(func)
 end
 
 """
-    overlap(m::AbstractMode, r, E; dim)
+    overlap(m::AbstractMode, r, E; dim, norm=true)
 
 Calculate mode overlap between radially symmetric field and radially symmetric mode.
 

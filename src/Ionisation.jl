@@ -10,11 +10,16 @@ import Luna.PhysData: ionisation_potential, quantum_numbers
 import Luna: Maths, Utils
 import Printf: @sprintf
 
+"""
+    AbstractIonRate
+
+Abstract supertype for ionisation rate calculations.
+"""
 abstract type AbstractIonRate end
 
 """
-    IonRateADK(ionpot::Float64, threshold=true)
-    IonRateADK(material::Symbol)
+    IonRateADK(ionpot::Number; occupancy=2, threshold=true, cycle_average=false)
+    IonRateADK(material::Symbol; kwargs...)
 
 Ionisation rate based on the ADK formula. If `threshold` is true, use [`ADK_threshold`](@ref)
 to avoid calculation below floating-point precision. If `cycle_average` is `true`, calculate
@@ -310,6 +315,12 @@ function (ir::IonRatePPT)(out::AbstractArray, E::AbstractArray)
     out .= ir.(E)
 end
 
+"""
+    ionrate_PPT(ionpot, λ0, Z, l, E; kwargs...)
+    ionrate_PPT(material::Symbol, λ0, E; kwargs...)
+
+Calculate the PPT ionisation rate for electric field `E`. See [`IonRatePPT`](@ref).
+"""
 function ionrate_PPT(ionpot, λ0, Z, l, E; kwargs...)
     return IonRatePPT(ionpot, λ0, Z, l; kwargs...).(E)
 end
@@ -323,6 +334,11 @@ function ionrate_PPT(material::Symbol, λ0, E;
     return ionrate_PPT(ip, λ0, Z, l, E; Δα, α_ion, kwargs...)
 end
 
+"""
+    IonRatePPTAccel{ST}
+
+Cached, interpolated PPT ionisation rate ([`IonRatePPT`](@ref)) as a function of field strength.
+"""
 struct IonRatePPTAccel{ST} <: AbstractIonRate
     spline::ST # spline interpolant
     Emin::Float64 # minimum electric field strength
@@ -367,6 +383,11 @@ function IonRatePPTAccel(material::Symbol, λ0; stark_shift=true, dipole_corr=tr
     IonRatePPTAccel(ip, λ0, Z, l; Δα, α_ion, kwargs...)
 end
 
+"""
+    IonRatePPTCached(args...; kwargs...)
+
+Create a cached PPT ionisation rate ([`IonRatePPTAccel`](@ref)) with `cache=true`.
+"""
 function IonRatePPTCached(args...; kwargs...)
     IonRatePPTAccel(args...; cache=true, kwargs...)
 end
@@ -485,6 +506,11 @@ function ionfrac(rate, E, δt)
     ionfrac!(frac, rate, E, δt)
 end
 
+"""
+    ionfrac!(frac, rate, E, δt)
+
+In-place version of [`ionfrac`](@ref), writing the ionisation fraction into `frac`.
+"""
 function ionfrac!(frac, rate, E, δt)
     rate(frac, E)
     Maths.cumtrapz!(frac, δt)

@@ -12,7 +12,7 @@ import Base: show
 import Luna.Maths: BSpline, differentiate_spline
 
 """
-    StepIndexMode(a, n, m, kind, coren, cladn; parity=:even, pts=100)
+    StepIndexMode(a, n, m, kind, parity, coren, cladn, pts)
 
 Create a StepIndexMode.
 
@@ -67,8 +67,8 @@ Create a StepIndexMode. Defaults to a silica strand in air.
 - `m::Int=1` : Radial mode index (number of nodes in the field along radial coordinate).
 - `kind::Symbol=:HE` : `:TE` for transverse electric, `:TM` for transverse magnetic,
                    `:HE` or `:EH`, following Snyder and Love convention.
-- `core=:Air` : The core material.
-- `clad=:SiO2` : The clad material.
+- `core=:SiO2` : The core material.
+- `clad=:Air` : The clad material.
 - `parity::Symbol=:even` : `:even` or `:odd`, following Snyder and Love convention.
 - `pts::Int=100` : number of grid points to use in zero search.
 - `accellims::Tuple=nothing` : can be set to (λmin, λmax, npts) to build a spline to
@@ -208,6 +208,11 @@ end
 radius(m::StepIndexMode{<:Number, Tco, Tcl, AT, NT, BT}, z) where {Tcl, Tco, AT, NT, BT} = m.a
 radius(m::StepIndexMode, z) = m.a(z)
 
+"""
+    dimlimits(m::StepIndexMode; z=0)
+
+Return the coordinate system and integration limits for a `StepIndexMode`.
+"""
 dimlimits(m::StepIndexMode; z=0) = (:polar, (0.0, 0.0), (10*radius(m, z), 2π))
 
 """
@@ -256,6 +261,11 @@ end
 # we use polar coords, so xs = (r, θ)
 # TODO: how do we handle wavelength dependence?
 # TODO: how do we handle non-negligible z component?
+"""
+    field(m::StepIndexMode, xs; z=0, ω=wlfreq(1030e-9))
+
+Return the transverse field of a `StepIndexMode` at polar coordinates `xs = (r, θ)`.
+"""
 function field(m::StepIndexMode, xs; z=0, ω=wlfreq(1030e-9))
     # From Snyder & Love, 1983, Table 12-3, Page 250
     r, θ = xs[1], xs[2]

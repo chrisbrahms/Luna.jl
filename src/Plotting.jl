@@ -24,7 +24,7 @@ end
 display(figs::AbstractArray{Figure, N}) where N = [display(fig) for fig in figs]
 
 """
-    cmap_white(cmap, N=512, n=8)
+    cmap_white(cmap; N=2^12, n=8)
 
 Replace the lowest colour stop of `cmap` (after splitting into `n` stops) with white and
 create a new colourmap with `N` stops.
@@ -524,6 +524,21 @@ function _plot_slice_mm(ax, x, y, z, modestrs, log10=false, fwhm=false; kwargs..
     end
 end
 
+"""
+    spectrogram(output[, zslice], specaxis=:λ; trange, N, fw, kwargs...)
+    spectrogram(grid, Eω, specaxis=:λ; trange, N, fw, kwargs...)
+    spectrogram(t, Et, specaxis=:λ; trange, N, fw, kwargs...)
+
+Plot a spectrogram (Gabor transform) of the field.
+
+# Keyword arguments
+- `trange::Tuple`: the time range over which to compute the spectrogram.
+- `N::Int`: number of time samples across `trange`.
+- `fw::Number`: width of the Gabor window.
+- `λrange`: wavelength limits of the plot. Defaults to `(150e-9, 2000e-9)`.
+- `log::Bool`: whether to plot on a dB scale (with floor `dBmin`). Defaults to `false`.
+- `propagate`: optional propagation to apply to `Eω` before plotting.
+"""
 spectrogram(output::AbstractOutput, args...; kwargs...) = spectrogram(
     makegrid(output), output, args...; kwargs...)
 
@@ -564,6 +579,13 @@ function spectrogram(t::AbstractArray, Et::AbstractArray, specaxis=:λ;
     fig
 end
 
+"""
+    energy(output; modes=nothing, bandpass=nothing, figsize=(7, 5))
+
+Plot the pulse energy (and conversion efficiency) as a function of propagation distance.
+`bandpass` optionally restricts the energy to a spectral window (see [`Processing.window_maybe`](@ref)),
+and `modes` selects which modes to show (or `:sum` to sum over modes).
+"""
 function energy(output; modes=nothing, bandpass=nothing, figsize=(7, 5))
     e = Processing.energy(output; bandpass=bandpass)
     eall = Processing.energy(output)
@@ -605,6 +627,14 @@ function energy(output; modes=nothing, bandpass=nothing, figsize=(7, 5))
 end
 
 
+"""
+    auto_fwhm_arrows(ax, x, y; color="k", arrowlength=nothing, hpad=0, linewidth=1,
+                     text=nothing, units="fs", kwargs...)
+
+Draw inward-pointing arrows on axes `ax` marking the FWHM of the curve `(x, y)`. If `text`
+is `:left` or `:right`, annotate with the numerical width (in `units`). Further keyword
+arguments are passed to [`Maths.level_xings`](@ref).
+"""
 function auto_fwhm_arrows(ax, x, y; color="k", arrowlength=nothing, hpad=0, linewidth=1,
                                     text=nothing, units="fs", kwargs...)
     left, right = Maths.level_xings(x, y; kwargs...)
@@ -632,6 +662,11 @@ function auto_fwhm_arrows(ax, x, y; color="k", arrowlength=nothing, hpad=0, line
     end
 end
 
+"""
+    add_fwhm_legends(ax, unit)
+
+Append the FWHM (in `unit`) of each plotted line to its entry in the legend of axes `ax`.
+"""
 function add_fwhm_legends(ax, unit)
     leg = ax.get_legend()
     texts = leg.get_texts()

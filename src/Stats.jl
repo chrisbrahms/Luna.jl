@@ -154,7 +154,7 @@ function peakintensity(grid, aeff)
 end
 
 """
-    peakintensity(grid, mode)
+    peakintensity(grid, modes)
 
 Create stats function to calculate the peak intensity for several modes.
 """
@@ -382,9 +382,9 @@ function zdw(mode::Modes.AbstractMode; λmin=100e-9, λmax=3000e-9)
 end
 
 """
-    zdw(mode)
+    zdw(modes)
 
-Create stats function to capture the zero-dispersion wavelength (ZDW).
+Create stats function to capture the zero-dispersion wavelength (ZDW) for several modes.
 
 !!! warning
     Since [`Modes.zdw`](@ref) is based on root-finding of a derivative, this can be slow!
@@ -492,6 +492,21 @@ function collect_stats(grid, Eω, funcs...)
     return f
 end
 
+"""
+    default(grid, Eω, mode_s, linop, transform; kwargs...)
+
+Build the default set of per-step statistics functions used by `prop_capillary`, dispatched
+on whether `mode_s` is a single [`Modes.AbstractMode`](@ref) (mode-averaged) or a
+[`Modes.ModeCollection`](@ref) (multi-mode).
+
+# Keyword arguments
+- `windows`: optional wavelength windows over which to record windowed energy.
+- `gas`: gas species; if given, gas pressure is also recorded.
+- `onaxis::Bool` (mode-averaged only): record the on-axis rather than mode-averaged peak
+  intensity and electron density.
+- `mode_error::Bool` (multi-mode only): whether to record the mode reconstruction error.
+- `userfuns`: extra stats functions to append to the default set.
+"""
 function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
                  windows=nothing, gas=nothing, onaxis=false, userfuns=Any[])
     _, energyfunω = Fields.energyfuncs(grid)
@@ -531,6 +546,12 @@ function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
     collect_stats(grid, Eω, funs...)
 end
 
+"""
+    default(grid, Eω, modes::Modes.ModeCollection, linop, transform; kwargs...)
+
+Build the default set of per-step statistics functions for multi-mode propagation. See the
+mode-averaged [`default`](@ref) method for the shared keyword arguments.
+"""
 function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
                  windows=nothing, gas=nothing, mode_error=true, userfuns=Any[])
     _, energyfunω = Fields.energyfuncs(grid)

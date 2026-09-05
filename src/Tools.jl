@@ -6,7 +6,11 @@ import Base: show
 import Cubature: hquadrature
 import Printf: @sprintf
 
-"Calculate 'natural' pulse width from FWHM" 
+"""
+    τfw_to_τ0(τfw, shape)
+
+Calculate 'natural' pulse width from FWHM.
+"""
 function τfw_to_τ0(τfw, shape)
     if shape == :sech
         τ0 = τfw/(2*log(1+sqrt(2)))
@@ -18,33 +22,57 @@ function τfw_to_τ0(τfw, shape)
     τ0
 end
 
-"Get dispersion length"
+"""
+    Ld(τfw, β2; shape=:sech)
+
+Get dispersion length.
+"""
 function Ld(τfw, β2; shape=:sech)
     τ0 = τfw_to_τ0(τfw, shape)
     τ0^2/abs(β2)
 end
 
-"Get GVD coefficient"
+"""
+    getβ2(ω, m::Modes.AbstractMode)
+
+Get GVD coefficient.
+"""
 function getβ2(ω, m::Modes.AbstractMode)
     Modes.dispersion(m, 2, ω)
 end
 
-"Get nonlinear length"
+"""
+    Lnl(P0, γ)
+
+Get nonlinear length.
+"""
 function Lnl(P0, γ)
     1/(γ*P0)
 end
 
-"Get fission length"
+"""
+    Lfiss(P0, τfw, γ, β2; shape=:sech)
+
+Get fission length.
+"""
 function Lfiss(P0, τfw, γ, β2; shape=:sech)
     Ld(τfw, β2, shape=shape)/getN(P0, τfw, γ, β2, shape=shape)
 end
 
-"Get nonlinear coefficient"
+"""
+    getγ(ω, m::Modes.AbstractMode, n2)
+
+Get nonlinear coefficient.
+"""
 function getγ(ω, m::Modes.AbstractMode, n2)
     n2*ω/(PhysData.c*Modes.Aeff(m))
 end
 
-"Get linear and nonlinear refractive index and gas number density"
+"""
+    getN0n0n2(ω, material; P=1.0, T=PhysData.roomtemp)
+
+Get linear and nonlinear refractive index and gas number density.
+"""
 function getN0n0n2(ω, material; P=1.0, T=PhysData.roomtemp)
     N0 = PhysData.density(material, P, T)
     χ3 = PhysData.χ3(material, P, T)
@@ -52,11 +80,20 @@ function getN0n0n2(ω, material; P=1.0, T=PhysData.roomtemp)
     N0, n0, 3*χ3/(4*n0^2*PhysData.ε_0*PhysData.c)
 end
 
-"Get soliton order"
+"""
+    getN(P0, τfw, γ, β2; shape=:sech)
+
+Get soliton order.
+"""
 function getN(P0, τfw, γ, β2; shape=:sech)
     sqrt(Ld(τfw, β2, shape=:sech)/Lnl(P0, γ))
 end
 
+"""
+    E_to_P0(E, τfw; shape=:sech)
+
+Calculate the peak power of a pulse with energy `E` and FWHM duration `τfw`.
+"""
 function E_to_P0(E, τfw; shape=:sech)
     τ0 = τfw_to_τ0(τfw, shape)
     if shape == :sech
@@ -67,10 +104,21 @@ function E_to_P0(E, τfw; shape=:sech)
     P0
 end
 
+"""
+    P0_to_I(P0, m)
+
+Calculate the peak intensity from peak power `P0` and the effective area of mode `m`.
+"""
 function P0_to_I(P0, m)
     P0/Modes.Aeff(m)
 end
 
+"""
+    Pcr(ω, n0, n2)
+
+Calculate the critical power for self-focusing at frequency `ω` in a medium with linear
+refractive index `n0` and nonlinear index `n2`.
+"""
 function Pcr(ω, n0, n2)
     # G. Fibich and A. L. Gaeta, Optics Letters, 25, 5, 335, 2000, doi: 10.1364/OL.25.000335.
     1.86225*(2π*PhysData.c/ω)^2/(4π*n0*n2)
@@ -96,7 +144,11 @@ function show(io::IO, p::NamedTuple{paramfields, vT}) where vT
     print(io, out)
 end
 
-"Soliton parameter collection"
+"""
+    params(E, τfw, λ, mode, material; shape=:sech, P=1.0, T=PhysData.roomtemp)
+
+Soliton parameter collection.
+"""
 function params(E, τfw, λ, mode, material; shape=:sech, P=1.0, T=PhysData.roomtemp)
     ω = 2π*PhysData.c/λ
     P0 = E_to_P0(E, τfw, shape=shape)
@@ -121,12 +173,26 @@ function params(E, τfw, λ, mode, material; shape=:sech, P=1.0, T=PhysData.room
          mode=mode)
 end
 
+"""
+    capillary_params(E, τfw, λ, a, material; kwargs...)
+
+Collect soliton and propagation parameters (see [`params`](@ref)) for a pulse of energy `E`
+and FWHM duration `τfw` at wavelength `λ` in a capillary of core radius `a` filled with
+`material`.
+"""
 function capillary_params(E, τfw, λ, a, material;
                           shape=:sech, P=1.0, T=PhysData.roomtemp, clad=:SiO2, n=1, m=1,kind=:HE, ϕ=0.0)
     mode = Capillary.MarcatiliMode(a, material, P, n=n, m=m, kind=kind, ϕ=ϕ, T=T, clad=clad)
     params(E, τfw, λ, mode, material, shape=shape, P=P, T=T)
 end
 
+"""
+    rectangular_params(E, τfw, λ, a, b, material; kwargs...)
+
+Collect soliton and propagation parameters (see [`params`](@ref)) for a pulse of energy `E`
+and FWHM duration `τfw` at wavelength `λ` in a rectangular waveguide of half-widths `a` and
+`b` filled with `material`.
+"""
 function rectangular_params(E, τfw, λ, a, b, material;
                             shape=:sech, P=1.0, T=PhysData.roomtemp, clad=:SiO2, n=1, m=1, 
                             pol=:x)
@@ -134,13 +200,30 @@ function rectangular_params(E, τfw, λ, a, b, material;
     params(E, τfw, λ, mode, material, shape=shape, P=P, T=T)
 end
 
+"""
+    gas_ratio(gas1, gas2, λ)
+
+Return the ratios `(β2r, χ3r)` of the GVD and the third-order susceptibility between `gas1`
+and `gas2` at wavelength `λ` (each evaluated at 1 bar).
+"""
 function gas_ratio(gas1, gas2, λ)
     χ3r = PhysData.χ3(gas1, 1) / PhysData.χ3(gas2, 1)
     β2r = PhysData.dispersion(2, gas1, λ) / PhysData.dispersion(2, gas2, λ)
     β2r, χ3r
 end
 
+"""
+    field_to_intensity(E)
+
+Convert an electric field amplitude `E` to the corresponding intensity.
+"""
 field_to_intensity(E) = 0.5*PhysData.ε_0*PhysData.c*E^2
+
+"""
+    intensity_to_field(I)
+
+Convert an intensity `I` to the corresponding electric field amplitude.
+"""
 intensity_to_field(I) = sqrt(2I/PhysData.ε_0/PhysData.c)
 
 """
@@ -220,6 +303,13 @@ function pressureRDW(a::Number, gas::Symbol, λ_target, λ0; Pmax=100, clad=:SiO
     end
 end
 
+"""
+    pressureZDW(a::Number, gas::Symbol, λzd; Pmax=100, clad=:SiO2, kwargs...)
+
+Calculate the gas pressure at which the zero-dispersion wavelength of a capillary with core
+radius `a` filled with `gas` is `λzd`. Additional `kwargs` are passed onto
+`Capillary.MarcatiliMode`.
+"""
 function pressureZDW(a::Number, gas::Symbol, λzd; Pmax=100, clad=:SiO2, kwargs...)
     rfc = PhysData.ref_index_fun(clad)
     cladn = (ω; z) -> rfc(wlfreq(ω))
@@ -235,6 +325,13 @@ function pressureZDW(a::Number, gas::Symbol, λzd; Pmax=100, clad=:SiO2, kwargs.
     end
 end
 
+"""
+    aperture_filter(a, dist, radius)
+
+Return a function `filter(λ)` giving the power transmission of the fundamental capillary
+mode (core radius `a`), diffracted over a distance `dist`, through a circular aperture of
+the given `radius`.
+"""
 function aperture_filter(a, dist, radius)
     w0 = 0.64*a
     function filter(λ)

@@ -37,7 +37,7 @@ end
     set_fftw_threads(nthr)
 
 Set number of threads to be used by FFTW. If set to `0`, the number of threads used by
-FFTW is determined automatically (see [`Utils.FFTWthreads()`](@ref))
+FFTW is determined automatically (see `Utils.FFTWthreads`)
 """
 function set_fftw_threads(nthr=0)
     settings["fftw_threads"] = nthr
@@ -112,6 +112,17 @@ function doinput_sm(grid, inputs::Tuple{Vararg{T} where T <: NamedTuple{<:Any, <
     doinput_sm(grid, inputs_flat, FT)
 end
 
+"""
+    setup(grid, args...; kwargs...)
+
+Assemble the initial frequency-domain field, the nonlinear transform, and the FFT plans
+for a simulation.
+
+The many methods dispatch on the combination of `grid` (`Grid.RealGrid`/`Grid.EnvGrid`) and
+geometry to select the physics: mode-averaged (given `βfun!`, `aeff`), multi-mode (given a
+`Modes.ModeCollection`), radially symmetric free space (given a `Hankel.QDHT`), or full 3D
+(given a `Grid.FreeGrid`). Returns `(Eω, transform, FT)` for use with [`run`](@ref).
+"""
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff;
                norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff),
                noise_field=nothing)
@@ -439,6 +450,15 @@ sym2string(other) = other
 
 save_modeinfo_maybe(output, t) = nothing
 
+"""
+    run(Eω, grid, linop, transform, FT, output; kwargs...)
+
+Propagate the initial field `Eω` along `z`, writing saved steps to `output`.
+
+Takes the pieces produced by [`setup`](@ref) plus a `linop` (from [`LinearOps.make_const_linop`](@ref))
+and an `output` callable, and integrates the UPPE with the adaptive interaction-picture
+solver `RK45.solve_precon`, applying the spectral/temporal windows each step.
+"""
 function run(Eω, grid,
              linop, transform, FT, output;
              min_dz=0, max_dz=grid.zmax/2, init_dz=1e-4, z0=0.0,
