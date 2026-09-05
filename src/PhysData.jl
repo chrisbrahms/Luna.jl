@@ -448,6 +448,17 @@ function sellmeier_crystal(material, axis=nothing)
     end
 end
 
+"""
+    ref_index_fun_uniax(material; axes=(:o, :e))
+
+Get a function `n(λ, θ)` which returns the refractive index of the extraordinary wave in a
+uniaxial crystal `material` for propagation at angle `θ` to the optic axis,
+
+    n(θ) = [cos²(θ)/n_o² + sin²(θ)/n_e²]^(-1/2),
+
+where `n_o` and `n_e` are the principal (ordinary and extraordinary) indices, obtained from
+the Sellmeier expansions for the crystal axes given in `axes`.
+"""
 function ref_index_fun_uniax(material; axes=(:o, :e))
     n_o = sellmeier_crystal(material, axes[1])
     n_e = sellmeier_crystal(material, axes[2])
@@ -455,6 +466,20 @@ function ref_index_fun_uniax(material; axes=(:o, :e))
     return n
 end
 
+"""
+    ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
+
+Get the pair of refractive-index functions `(nfunx, nfuny)` for a uniaxial crystal
+`material` cut at angle `θ` between the optic axis and the propagation direction `z`, with the
+optic axis lying in the `x`-`z` plane. The `x` polarisation is the extraordinary wave, so
+`nfunx(λ, δθ=0)` returns `n_e(λ, θ+δθ)` (see [`ref_index_fun_uniax`](@ref)), where `δθ` is the
+deviation of the internal propagation direction from `z`; the `y` polarisation is the ordinary
+wave, so `nfuny(λ)` simply returns `n_o(λ)`.
+
+This form is what the birefringent free-space operators `LinearOps.make_const_linop` and
+`NonlinearRHS.const_norm_free`/`NonlinearRHS.const_norm_free2D` (the methods taking
+`nfuns::Tuple`) expect.
+"""
 function ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
     # y polarisation: ordinary polarisation
     no = ref_index_fun(material; axis=ordinary)
@@ -465,6 +490,20 @@ function ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
     nfunx, nfuny
 end
 
+"""
+    crystal_internal_angle(nfun, ω, kx)
+
+Find the internal propagation angle `δθ` (relative to `z`) of the extraordinary plane-wave
+component with frequency `ω` and transverse wave vector `kx` in a uniaxial crystal, where
+`nfun(λ, δθ)` returns the extraordinary index for that internal direction (see
+[`ref_index_fun_xy`](@ref)). Momentum conservation along `x` requires
+
+    kx = ω/c * n(λ, δθ) * sin(δθ),
+
+which is solved numerically for `δθ`. Because `n` itself depends on `δθ`, this differs from
+Snell's law in an isotropic medium, and its solution gives the tilted wave-vector surface which
+is responsible for spatial walk-off.
+"""
 function crystal_internal_angle(nfun, ω, kx)
     # External wavevector is kx = ω/c*sin(θ_i) with θ_i the AOI of the plane wave
     # Internal wavevector is kx2 = ω/c * n(θ+δθ) * sin(δθ)

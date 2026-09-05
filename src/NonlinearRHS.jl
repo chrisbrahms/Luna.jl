@@ -485,10 +485,12 @@ end
 """
     TransRadial
 
-Transform E(ω) -> Pₙₗ(ω) for radially symmetric free-space propagation.
+Transform E(ω) -> Pₙₗ(ω) for radially symmetric free-space propagation. All arrays carry
+a polarisation axis as their second dimension, i.e. fields are `(nω, np, nk)` in reciprocal
+space and `(nto, np, nr)` in real space, with `np` either 1 or 2.
 
 # Fields
-- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, nr)`
+- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, np, nr)`
   for the modified shot-noise model, or `nothing`.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
@@ -524,13 +526,16 @@ function show(io::IO, t::TransRadial)
 end
 
 """
-    TransRadial(TT, grid, HT, FT, responses, densityfun, normfun; noise_field=nothing)
+    TransRadial(TT, grid, HT, FT, responses, densityfun, normfun, pol=false; noise_field=nothing)
 
-Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisation.
+Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisation. If `pol`
+is `true`, both `x` and `y` polarisation components are propagated (`np = 2`), otherwise a
+single component (`np = 1`). Note that the Hankel transform `HT` must act along the third array
+dimension (`Hankel.QDHT(R, N; dim=3)`), since the second dimension is the polarisation axis.
 
 # Keyword arguments
-- `noise_field=nothing`: optional `(nω, nk)` frequency/k-space noise field for the modified
-  shot-noise model. When provided, it is converted to the real-space time domain `(nto, nr)`
+- `noise_field=nothing`: optional `(nω, np, nk)` frequency/k-space noise field for the modified
+  shot-noise model. When provided, it is converted to the real-space time domain `(nto, np, nr)`
   via inverse FFT and inverse Hankel transform, and stored as `Et_noise`.
   Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
 """
@@ -656,10 +661,12 @@ end
 """
     TransFree
 
-Transform E(ω) -> Pₙₗ(ω) for 3D free-space propagation.
+Transform E(ω) -> Pₙₗ(ω) for 3D free-space propagation. All arrays carry a polarisation axis
+as their second dimension, i.e. fields are `(nω, np, nkx, nky)` in reciprocal space and
+`(nto, np, nx, ny)` in real space, with `np` either 1 or 2.
 
 # Fields
-- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, ny, nx)`
+- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, nx, ny)`
   for the modified shot-noise model, or `nothing`.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
@@ -695,12 +702,13 @@ end
     TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false; noise_field=nothing)
 
 Construct a `TransFree` to calculate the reciprocal-domain nonlinear polarisation for 3D
-free-space propagation.
+free-space propagation. If `pol` is `true`, both `x` and `y` polarisation components are
+propagated (`np = 2`), otherwise a single component (`np = 1`).
 
 # Keyword arguments
-- `noise_field=nothing`: optional `(nω, ny, nx)` frequency/k-space noise field for the
+- `noise_field=nothing`: optional `(nω, nkx, nky)` frequency/k-space noise field for the
   modified shot-noise model. When provided, it is converted to the real-space oversampled
-  time domain `(nto, ny, nx)` via `copy_scale!` and 3D inverse FFT, and stored as `Et_noise`.
+  time domain `(nto, nx, ny)` via `copy_scale!` and 3D inverse FFT, and stored as `Et_noise`.
   Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
 """
 function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false;
@@ -904,17 +912,22 @@ function TransFree2D(TT, scale, grid, xgrid, FT, responses, densityfun, normfun,
 end
 
 """
-    TransFree2D(grid, xygrid, FT, responses, densityfun, normfun)
+    TransFree2D(grid, xgrid, FT, responses, densityfun, normfun, pol=false)
 
-Construct a `TransFree2D` to calculate the reciprocal-domain nonlinear polarisation.
+Construct a `TransFree2D` to calculate the reciprocal-domain nonlinear polarisation for 2D
+(`x`-`z`) free-space propagation, i.e. with one transverse dimension. All arrays carry a
+polarisation axis as their second dimension, i.e. fields are `(nω, np, nkx)` in reciprocal
+space and `(nto, np, nx)` in real space, with `np` either 1 or 2.
 
 # Arguments
 - `grid::AbstractGrid` : the grid used in the simulation
-- `xgrid` : the spatial grid (instances of [`Grid.FreeGrid`](@ref))
+- `xgrid` : the spatial grid (an instance of [`Grid.Free2DGrid`](@ref))
 - `FT::FFTW.Plan` : the 2D (t-x) Fourier transform for the oversampled time grid
 - `responses` : `Tuple` of response functions
 - `densityfun` : callable which returns the gas density as a function of `z`
-- `normfun` : normalisation factor as fctn of `z`, can be created via [`norm_free`](@ref)
+- `normfun` : normalisation factor as fctn of `z`, can be created via [`norm_free2D`](@ref)
+- `pol::Bool` : if `true`, both `x` and `y` polarisation components are propagated (`np = 2`),
+    otherwise a single component (`np = 1`)
 """
 function TransFree2D(grid::Grid.RealGrid, args...)
     N = length(grid.ω)
@@ -948,8 +961,8 @@ end
 """
     const_norm_free2D(grid, xgrid, nfun)
 
-Make function to return normalisation factor for 3D propagation without re-calculating at
-every step.
+Make function to return normalisation factor for 2D (`x`-`z`) propagation without
+re-calculating at every step.
 """
 function const_norm_free2D(grid, xgrid, nfun)
     nfunω = (ω; z) -> nfun(wlfreq(ω))
@@ -976,7 +989,7 @@ end
 """
     norm_free2D(grid, xgrid, nfun)
 
-Make function to return normalisation factor for 3D propagation.
+Make function to return normalisation factor for 2D (`x`-`z`) propagation.
 
 !!! note
     Here, `nfun(ω; z)` needs to take frequency `ω` and a keyword argument `z`.

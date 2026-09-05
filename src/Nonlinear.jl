@@ -74,8 +74,19 @@ function Kerr_env(γ3)
     end
 end
 
-"Kerr response for envelope but with THG"
-# see Eq. 4, Genty et al., Opt. Express 15 5382 (2007)
+"""
+    Kerr_env_thg(γ3, ω0, t)
+
+Kerr response for an envelope field *including* third-harmonic generation, see Eq. 4 of
+Genty et al., Opt. Express 15, 5382 (2007). `ω0` is the carrier frequency and `t` the time
+axis on which the response is evaluated—for propagation simulations these must be `grid.ω0`
+and `grid.to` (the oversampled time axis) of a `Grid.EnvGrid` created with `thg=true`.
+
+!!! warning
+    Like [`Chi2Env`](@ref), this response mixes the carrier, so the linear operator must use
+    the reference frame which subtracts only the group delay `β1*ω` (pass `thg=true` to
+    `LinearOps.make_const_linop`/`LinearOps.make_linop`).
+"""
 function Kerr_env_thg(γ3, ω0, t)
     C = exp.(2im*ω0.*t)
     Kerr = let γ3 = γ3, C = C

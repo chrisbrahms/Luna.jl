@@ -430,12 +430,17 @@ function GaussGauss(t, r::AbstractArray{T,3} where T, fwhm, m, w0)
 end
 
 """
-    GaussGaussField(;λ0, τfwhm, energy, w0, ϕ=0.0, τ0=0.0, m=1)
+    GaussGaussField(;λ0, τfwhm, energy, w0, ϕ=0.0, τ0=0.0, m=1, propz=0.0, θ=0.0)
 
 Construct a (super)Gaussian shaped pulse with intensity/power FWHM `τfwhm`,
 superGaussian parameter `m=1` and Gaussian shaped spatial profile with waist `w0`,
 propagation distance from the waist of `propz`,
 and other parameters as defined for [`TimeField`](@ref).
+
+`θ` is the angle of the linear polarisation measured from the `y` axis, so `θ=0` gives a
+`y`-polarised field and `θ=π/2` an `x`-polarised field. The field returned always has both
+polarisation components, with shape `(Nt, 2, N⊥...)`; in single-polarisation simulations,
+only the `y` component is used.
 """
 function GaussGaussField(;λ0, τfwhm, energy, w0, ϕ=0.0, τ0=0.0, m=1, propz=0.0, θ=0.0)
     SpatioTemporalField(λ0, energy, ϕ, τ0,
@@ -608,7 +613,20 @@ It(Et, grid::Grid.EnvGrid) = abs2.(Et)
 iFT(Eω, grid::Grid.RealGrid) = FFTW.irfft(Eω, length(grid.t), 1)
 iFT(Eω, grid::Grid.EnvGrid) = FFTW.ifft(Eω, 1)
 
-"Calculate energy from modal field E(t)"
+"""
+    energyfuncs(grid)
+    energyfuncs(grid, spacegrid)
+
+Create the pair of functions `(energy_t, energy_ω)` which calculate the energy of a field
+from its time-domain or frequency-domain representation, including the normalisation of the
+transforms. With only `grid`, the field is a modal field, i.e. `abs2(Et)` is the instantaneous
+power. With a free-space `spacegrid` (`Hankel.QDHT`, `Grid.Free2DGrid` or `Grid.FreeGrid`),
+the field is the electric field in V/m on the real-space grid (for `energy_t`) or in
+reciprocal space (for `energy_ω`), as used in and returned by free-space simulations, and
+the energy also includes the integral over the transverse dimension(s). Note that for
+`Grid.Free2DGrid`, the field is invariant along `y`, so the "energy" is the energy per unit
+length along `y` in J/m.
+"""
 function energyfuncs(grid::Grid.RealGrid)
     function energy_t(Et)
         return integrate(grid.t, It(Et, grid), SimpsonEven())
