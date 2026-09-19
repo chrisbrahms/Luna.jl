@@ -1,9 +1,11 @@
 #= Tests for Grid.RadialGrid, the Luna-owned transverse grid for radially symmetric
    propagation. This is the only file in test/ which is allowed to build a Hankel.QDHT:
    everywhere else Luna is used through Grid.RadialGrid. =#
-import Test: @test, @testset, @test_throws, @test_logs
-import Luna: Grid, Maths
+import Test: @test, @testset, @test_throws, @test_logs, TestLogger
+import Luna
+import Luna: Grid, Maths, Fields, LinearOps, NonlinearRHS, Nonlinear, PhysData
 import Luna: Hankel
+import Logging
 import LinearAlgebra: mul!, ldiv!
 
 R = 12e-3
@@ -40,7 +42,15 @@ end
 
 @testset "conversion from QDHT" begin
     q = Hankel.QDHT(R, N; dim=3)
-    rg = @test_logs (:warn,) match_mode=:any Grid.RadialGrid(q)
+    #= `Logging.@warn(..., maxlog=1)` is counted per logger, so a plain `@test_logs` would
+       depend on whether anything earlier in the session already converted a QDHT.
+       `respect_maxlog=false` makes the test independent of that. =#
+    logger = TestLogger(respect_maxlog=false)
+    rg = Logging.with_logger(logger) do
+        Grid.RadialGrid(q)
+    end
+    @test any(r -> r.level == Logging.Warn && occursin("deprecated", r.message),
+              logger.logs)
     @test rg.R == q.R
     @test rg.K == q.K
     @test rg.N == q.N
@@ -96,6 +106,17 @@ end
     A = randn(8, N, 3)
     @test Grid.to_kspace(rg, A; dim=2) ≈ Hankel.mul!(similar(A), q, A)
     @test Grid.to_rspace(rg, A; dim=2) ≈ Hankel.ldiv!(similar(A), q, A)
+    # rank 4, every dimension: the result keeps the axes of the input, in order
+    for dim in 1:4
+        sz = [3, 2, 5, 4]
+        sz[dim] = N
+        A4 = randn(sz...)
+        q4 = Hankel.QDHT(R, N; dim=dim)
+        Ak = Grid.to_kspace(rg, A4; dim=dim)
+        @test size(Ak) == size(A4)
+        @test Ak ≈ Hankel.mul!(similar(A4), q4, A4)
+        @test Grid.to_rspace(rg, A4; dim=dim) ≈ Hankel.ldiv!(similar(A4), q4, A4)
+    end
 end
 
 @testset "shape and dimension errors" begin
@@ -103,6 +124,10 @@ end
     @test_throws DimensionMismatch Grid.to_kspace(rg, randn(N+1))
     @test_throws DimensionMismatch Grid.to_kspace!(randn(N+1), rg, randn(N))
     @test_throws DimensionMismatch Grid.integrate_r(rg, randn(N); dim=2)
+    # a dim outside the input's rank is an error, not a BoundsError from the permutation
+    @test_throws DimensionMismatch Grid.to_kspace(rg, randn(N); dim=2)
+    @test_throws DimensionMismatch Grid.to_rspace(rg, randn(4, N); dim=3)
+    @test_throws DimensionMismatch Grid.integrate_k(rg, randn(4, N); dim=0)
 end
 
 @testset "integrals" begin
@@ -134,10 +159,26 @@ end
     @test size(I3) == (16, 2)
     @test I3 ≈ dropdims(Hankel.integrateK(A3, q3; dim=3); dims=3)
 
-    # integrating along a leading dimension
+    #= Integrating along a leading dimension: the result must have the axes of the input
+       with `dim` dropped, in order, not merely the right numbers in some order. =#
     A4 = randn(8, N, 3)
     q4 = Hankel.QDHT(R, N; dim=2)
     @test Grid.integrate_r(rg, A4; dim=2) ≈ dropdims(Hankel.integrateR(A4, q4; dim=2); dims=2)
+
+    # rank 4, with two axes after the integrated one
+    A5 = randn(N, 3, 2, 5)
+    q5 = Hankel.QDHT(R, N; dim=1)
+    I5 = Grid.integrate_r(rg, A5; dim=1)
+    @test size(I5) == (3, 2, 5)
+    @test I5 ≈ dropdims(Hankel.integrateR(A5, q5; dim=1); dims=1)
+    A6 = randn(3, N, 2, 5)
+    q6 = Hankel.QDHT(R, N; dim=2)
+    I6 = Grid.integrate_k(rg, A6; dim=2)
+    @test size(I6) == (3, 2, 5)
+    @test I6 ≈ dropdims(Hankel.integrateK(A6, q6; dim=2); dims=2)
+    O6 = Grid.onaxis(rg, A6; dim=2)
+    @test size(O6) == (3, 2, 5)
+    @test O6 ≈ dropdims(Hankel.onaxis(A6, q6; dim=2); dims=2)
 end
 
 @testset "onaxis and symmetric" begin
@@ -161,6 +202,49 @@ end
     A2 = Maths.gauss.(randn(4), 1.0) .* Maths.gauss.(rg.r, w0/2)'
     q2 = Hankel.QDHT(R, N; dim=2)
     @test Grid.symmetric(rg, A2) ≈ Hankel.symmetric(A2, q2; dim=2)
+end
+
+#= The deprecated entry points: a Hankel.QDHT where a RadialGrid is expected. `Luna.setup`
+   is the one every pre-existing radial script calls, with six positional arguments, which
+   is also the arity of the mode-averaged `setup`; nothing else in the test suite or the
+   examples exercises it any more. =#
+@testset "deprecated Hankel.QDHT entry points" begin
+    Rq = 100e-6
+    Nq = 16
+    λ0 = 800e-9
+    q = Hankel.QDHT(Rq, Nq; dim=3)
+    rg = Grid.RadialGrid(Rq, Nq)
+    nfunλ = PhysData.ref_index_fun(:Ar, 1)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    nfunω = (ω; z) -> nfun(PhysData.wlfreq(ω); z)
+    dens = z -> PhysData.density(:Ar, 1)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy=1e-9, w0=20e-6)
+    grids = (Grid.RealGrid(1e-3, λ0, (400e-9, 2000e-9), 0.2e-12),
+             Grid.EnvGrid(1e-3, λ0, (400e-9, 2000e-9), 0.2e-12))
+    for grid in grids
+        resp = grid isa Grid.RealGrid ?
+            (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),) :
+            (Nonlinear.Kerr_env(PhysData.γ3_gas(:Ar)),)
+        # the legacy call: six positional arguments with a QDHT in second place
+        Eωq, tq, _ = Luna.setup(grid, q, dens,
+                                NonlinearRHS.const_norm_radial(grid, q, nfun), resp, inputs)
+        Eωr, tr, _ = Luna.setup(grid, rg, dens,
+                                NonlinearRHS.const_norm_radial(grid, rg, nfun), resp, inputs)
+        @test Eωq == Eωr
+        @test tq.rgrid.Tfwd == tr.rgrid.Tfwd
+        @test tq.rgrid.N == Nq
+
+        lq = LinearOps.make_const_linop(grid, q, nfun, true)
+        lr = LinearOps.make_const_linop(grid, rg, nfun, true)
+        @test lq == lr
+        oq, or = similar(lr), similar(lr)
+        LinearOps.make_linop(grid, q, nfunω, true)(oq, 0.0)
+        LinearOps.make_linop(grid, rg, nfunω, true)(or, 0.0)
+        @test oq == or
+
+        Et = randn(length(grid.t), Nq)
+        @test Fields.energyfuncs(grid, q)[1](Et) == Fields.energyfuncs(grid, rg)[1](Et)
+    end
 end
 
 @testset "to_dict/from_dict" begin

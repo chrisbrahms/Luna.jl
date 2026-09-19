@@ -51,18 +51,23 @@ rank:
 
 - `to_kspace!(out, rg, A)`, `to_rspace!(out, rg, A)`: one `mul!` on `reshape(A, :, rg.N)`
   via `radial_matmul!`. No allocation unless `out === A`, in which case a temporary copy of
-  the input is made. `Hankel.T` is symmetric, so this right multiplication is the same
-  transform as Hankel's left multiplication along the radial axis, without the
-  `permutedims`. Verified numerically against `Hankel.mul!`/`Hankel.ldiv!` for 1-D, 2-D and
-  3-D inputs in `test/test_radialgrid.jl`.
+  the input is made. With `Tfwd = transpose(q.T) .* scaleRK`,
+  `mul!(out, reshape(A, :, N), Tfwd)` computes `out[.., k] = Σ_j A[.., j] T[k, j] scaleRK`,
+  which is Hankel's `Σ_j T[k, j] A[j, ..] scaleRK` along the radial axis, without the
+  `permutedims`. No symmetry of `q.T` is involved or assumed — `q.T` is in fact strongly
+  asymmetric (it is divided by the row vector `j₁sq'`), so the `transpose` is load-bearing.
+  Verified numerically against `Hankel.mul!`/`Hankel.ldiv!` for ranks 1 to 4 in
+  `test/test_radialgrid.jl`.
 - `to_kspace(rg, A; dim=ndims(A))`, `to_rspace(rg, A; dim=ndims(A))`: allocating forms; a
-  `dim` other than the last is handled with a `permutedims` pair, for post-processing of
-  `(ω, pol, r, z)` arrays.
+  `dim` other than the last is handled by moving that axis to the end and back, for
+  post-processing of `(ω, pol, r, z)` arrays. A `dim` outside the input's rank is a
+  `DimensionMismatch`.
 - `integrate_r(rg, A; dim=ndims(A))`, `integrate_k(rg, A; dim=ndims(A))`: weighted sums
   over `wr`/`wk`, written as one matrix-vector product. They reproduce
   `Hankel.integrateR`/`integrateK` for the shapes Luna uses, including the 1-D and 2-D
   `(t, r)` arrays `Fields.energyfuncs` receives. Unlike `Hankel.integrateR` they drop the
-  integrated dimension instead of leaving it as a singleton.
+  integrated dimension instead of leaving it as a singleton; the remaining axes keep their
+  order.
 - `kperp2(rg)`, `onaxis(rg, Ak; dim)`, `symmetric(rg, A)`, `rsymmetric(rg)`: replacements
   for `q.k .^ 2`, `Hankel.onaxis`, `Hankel.symmetric`, `Hankel.Rsymmetric`. `onaxis` and
   `symmetric` are defined for 0-order grids only, as in Hankel.
@@ -76,15 +81,19 @@ rank:
 ### Other `src/` modules
 
 - `Luna.setup`: the two radial methods take a `Grid.RadialGrid`; `q * Eω` becomes
-  `Grid.to_kspace`. A `setup(grid::Grid.TimeGrid, q::Grid.HankelTransform, args...)` method
-  converts, so scripts written against the old interface still run. `doinputs_fs!` takes
+  `Grid.to_kspace`. Two `setup(grid::Grid.RealGrid/EnvGrid, q::Grid.HankelTransform,
+  densityfun, normfun, responses, inputs)` methods convert, so scripts written against the
+  old interface still run. They repeat the six concrete positional arguments rather than
+  taking `args...`: a `setup(grid::TimeGrid, q::QDHT, args...)` shim is ambiguous with the
+  six-argument mode-averaged `setup(grid::RealGrid, densityfun, responses, inputs, βfun!,
+  aeff)`, which is the same arity as the legacy radial call. `doinputs_fs!` takes
   `Grid.TransverseGrid`.
 - `Luna.run` writes `Grid.to_dict(Boundaries.spacegrid(transform))` to the output under the
   group `"spacegrid"` when the transform is a free-space one. Previously only the time grid
   was written.
-- `LinearOps`: `transverse_k2(::Grid.RadialGrid)`, a converting method for
-  `Grid.HankelTransform`, and `Grid.TransverseGrid` in the `make_const_linop`/`make_linop`
-  signatures in place of the explicit `Union`.
+- `LinearOps`: `transverse_k2(::Grid.RadialGrid)` and `Grid.TransverseGrid` in the
+  `make_const_linop`/`make_linop` signatures in place of the explicit `Union`, plus
+  converting methods for a `Grid.HankelTransform` at the same concrete arities.
 - `NonlinearRHS`: `TransRadial.QDHT` becomes `TransRadial.rgrid`; the constructor takes the
   grid's matrices as `convert(Matrix{TT}, rgrid.Tfwd/Tbwd)` copies in the element type it
   multiplies. The noise-field `ldiv!` becomes a `radial_matmul!` with that same `Tbwd`.
@@ -92,8 +101,9 @@ rank:
   The per-step transform body is unchanged.
 - `Boundaries`: `spacegrid(::TransRadial)` returns the `rgrid`; `kprofile`, `rprofile`,
   `spatialcollar` and `log_setup` dispatch on `Grid.RadialGrid`. `RadialCollar` holds the
-  grid plus its own `Tfwd`/`Tbwd` in the complex spectral type and applies them with
-  `Grid.radial_matmul!` in place of `Hankel.ldiv!`/`mul!`.
+  its own `Tfwd`/`Tbwd` in the complex spectral type plus a copy of the real-space
+  integration weights, and applies them with `Grid.radial_matmul!` in place of
+  `Hankel.ldiv!`/`mul!`. It does not keep the grid itself: nothing per step needs it.
 - `Fields`: `transform`, `prop!` and `energyfuncs` take a `RadialGrid` (with converting
   methods for a `QDHT`) and use `Grid.to_kspace`, `Grid.kperp2`, `Grid.integrate_r/k`.
 
@@ -116,6 +126,10 @@ rank:
   for some time, so the example could not have run as written. The unused
   `import Luna: Hankel` was removed from `free2D_bbo.jl` and `free3D_bbo.jl`.
 
+`docs/src/model/model.md:50` now names `Grid.RadialGrid` instead of "the Hankel transform",
+to match the prose in `src/Boundaries.jl`. Nothing else in `docs/src` constructs a radial
+grid, and the module pages are `@autodocs`, so the new names are picked up automatically.
+
 `grep -rn "Hankel" src/` shows `Hankel.` only in `src/Grid.jl`, plus `import Hankel` in
 `src/Luna.jl` (kept so that `Luna.Hankel` still resolves for existing scripts) and the word
 "Hankel" in comments and docstrings. No `QDHT` is constructed anywhere in `examples/` or
@@ -124,8 +138,11 @@ rank:
 ## Numerical change and its measurement
 
 Hankel's `permutedims` + left GEMM is replaced by a right GEMM on a reshape in three places
-that were not already doing it: `Boundaries.RadialCollar`, `Luna.setup`'s input transform,
-and the `TransRadial` noise setup. Folding the scalar `scaleRK` into the matrix instead of
+that were not already doing it: `Boundaries.RadialCollar`, the input-field transform
+(`Fields.transform`, which `Luna.setup` reaches through `doinputs_fs!`), and the
+`TransRadial` noise setup. (GPU_PLAN.md §4.14 attributes the input-field change to
+`Luna.setup`'s `q * Eω`; that call transforms an all-zero array and contributes nothing.
+The change is in `Fields.transform`.) Folding the scalar `scaleRK` into the matrix instead of
 applying it after the product also changes the order of operations. Both change rounding.
 The per-step nonlinear transform is untouched.
 
@@ -157,7 +174,9 @@ loading it would make the plans, and hence the rounding, depend on what else had
 | gradient, field, 1 pol            | 3.63e-15 | 1.87e-15 |
 | gradient, field, 2 pol            | 4.82e-15 | 4.82e-15 |
 
-**Worst over all cases and all saves: 4.82e-15.** The first save (z = 0, the input field
+**Worst over all cases and all saves: 4.82e-15.** Rerun after the review-round-1 fixes:
+every one of the twelve numbers above reproduces to the last digit, as expected — none of
+those fixes touches the default-`dim` path the propagation uses. The first save (z = 0, the input field
 only) is 8.7e-16 for the envelope grid and 9.7e-16 for the field grid, so the input
 transform alone contributes about one ulp and the rest accumulates over 20 accepted steps.
 This is well inside the 1e-12 gate and nothing needed investigating. The constant-pressure
@@ -177,15 +196,17 @@ All run as `julia --project=<worktree> -t 1`, with `Luna.set_fftw_mode(:estimate
 
 | file | result | time |
 |---|---|---|
-| `test/test_radialgrid.jl` (new) | 126 pass | 5.8 s |
-| `test/test_linops.jl` | 196 pass | 12.3 s |
-| `test/test_boundaries.jl` | 182 pass | 21.9 s |
+| `test/test_radialgrid.jl` (new) | 159 pass | 10.1 s |
+| `test/test_linops.jl` | 196 pass | 12.7 s |
+| `test/test_boundaries.jl` | 182 pass | 21.4 s |
 | `test/test_modes.jl` | 587 pass | 27.2 s |
 | `test/test_output.jl` | 71 pass | 14.0 s |
-| `test/test_fields.jl` | 179 pass | 56.1 s |
-| `test/test_freespace.jl` | 77 pass | 349.6 s |
+| `test/test_fields.jl` | 179 pass | 53.4 s |
+| `test/test_freespace.jl` | 77 pass | 296.7 s |
 
-1418 tests, all passing; no failures, errors or broken tests.
+1451 tests, all passing; no failures, errors or broken tests. (`test_modes.jl` and
+`test_output.jl` were run before the review-round-1 fixes and are unaffected by them; the
+other five were rerun afterwards.)
 
 The five radial examples (`radial.jl`, `radial_env.jl`, `radial_hcf.jl`,
 `radial_xypol_bbo.jl`, `radial_xypol_env.jl`) were run as a smoke test with the plotting
@@ -201,6 +222,36 @@ not run (too slow); the files above are the ones this branch touches, plus
 `test_output.jl` for the new `"spacegrid"` group.
 
 
+## Changes made after review round 1
+
+- **Blocker.** `setup(grid::Grid.TimeGrid, q::Grid.HankelTransform, args...)` was ambiguous
+  with the six-argument mode-averaged `setup(grid::RealGrid, densityfun, responses, inputs,
+  βfun!, aeff)`, so every legacy `setup(grid, q, densityfun, normfun, responses, inputs)`
+  call threw a `MethodError`. Replaced by two methods on `Grid.RealGrid`/`Grid.EnvGrid`
+  with the six concrete positional arguments, which are strictly more specific. A new
+  testset in `test/test_radialgrid.jl` makes that call for both grid types and checks the
+  result against the `RadialGrid` path, together with `make_const_linop`, `make_linop` and
+  `energyfuncs` through a `QDHT`. Nothing in the repository exercised the shim before,
+  which is why it was not caught.
+- **Major.** `Grid._weighted_sum` (behind `integrate_r`, `integrate_k` and `onaxis`)
+  swapped `dim` with the last axis, so for `dim ≤ ndims(A)-2` the remaining axes came back
+  transposed — silently, with the right numbers. It now moves `dim` to the end with an
+  order-preserving permutation, so the result has the axes of the input with `dim` dropped,
+  in order. `_matmul_dim` uses the same permutation and its `invperm`. Tested on rank-4
+  arrays for every `dim`, against `Hankel.integrateR`/`integrateK`/`onaxis`/`mul!`/`ldiv!`
+  plus `dropdims`.
+- The comment and docstring no longer claim `Hankel.T` is symmetric (it is not); they state
+  what `transpose(q.T)` actually computes.
+- `to_kspace`/`to_rspace` with a `dim` outside the input's rank now throw
+  `DimensionMismatch` instead of a `BoundsError` from the permutation.
+- `_weighted_sum`'s `DimensionMismatch` message reads `size(A, dim)` before permuting.
+- `RadialCollar` no longer stores the grid, which nothing read.
+- The `QDHT` conversion-warning test uses a `TestLogger(respect_maxlog=false)`, so it does
+  not depend on whether anything earlier in the session already converted one.
+- `Grid.TransverseGrid` is narrowed to `Union{RadialGrid, FreeGrid, Free2DGrid}`; the
+  `QDHT` entry points are explicit methods.
+- `docs/src/model/model.md:50` updated; the over-long line in `src/Boundaries.jl` wrapped.
+
 ## Known gaps and deviations from GPU_PLAN.md
 
 - The plan's §4.14 says the noise-field transform uses `to_rspace!`. It uses
@@ -215,6 +266,21 @@ not run (too slow); the files above are the ones this branch touches, plus
 - The per-step `TransRadial` transform still does one `mul!` per polarisation on a `view`.
   Turning that into a single GEMM on a reshape is §4.4/§2 work for the device branch and
   would change the results, so it is not done here.
+- The deprecated `QDHT` path rebuilds the grid on every call. `Fields.transform`,
+  `Fields.prop!`, `Fields.energyfuncs`, `LinearOps.transverse_k2`/`make_const_linop`/
+  `make_linop` and `NonlinearRHS.norm_radial`/`const_norm_radial` each call
+  `Grid.RadialGrid(q)`, which evaluates an N×N Bessel matrix from scratch, so one
+  `Fields.SpatioTemporalField(grid, q, FT)` builds it three times. `Luna.setup` converts
+  once and passes the `RadialGrid` on, so a run set up through `setup` pays this only for
+  the input field. `maxlog=1` also means only the first conversion warns. The fix for a
+  user is to build a `Grid.RadialGrid` instead of a `QDHT`.
+- The transform matrices are now held in up to three places for a radial run: the
+  `RadialGrid` (`Float64`), `TransRadial`'s copy in the time-domain element type, and
+  `RadialCollar`'s copy in `ComplexF64`. At `N = 1024` that is roughly 64 MB against
+  roughly 24 MB before (the `QDHT`'s single matrix plus `TransRadial`'s pair). This is what
+  §4.14's per-consumer-copy rule costs; it buys the equal-element-type GEMM the device
+  branches need. It could be reduced later by keeping only `R`, `N`, `order`, `r`, `k` and
+  the weights in the consumers, which is what `RadialCollar` now does.
 - `zmax` is untouched (`gpu/01-zmax`).
 - `order ≠ 0` grids are constructed and transform correctly, but nothing else in Luna
   supports them yet; `onaxis` and `symmetric` throw a `DomainError` for them, as Hankel

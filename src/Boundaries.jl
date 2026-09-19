@@ -72,11 +72,11 @@ transverse wavevector `k⊥`.
   with `κ`, and harmless.
 - **Transverse collar** (`:rate` only). The analogue of the temporal collar: a beam
   reaching the transverse edge wraps around (FFT grids) or reflects off the `E(R) = 0`
-  wall of a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid). A rate over the outer part of the transverse grid ([`rprofile`](@ref))
-  is applied as a split-step factor per accepted step ([`RadialCollar`](@ref),
-  [`CartesianCollar`](@ref)), with the same first-order, collar-confined
-  non-commutation error as the temporal collar. As for the temporal collar, what it removes
-  is measured and reported once if it becomes noticeable.
+  wall of a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid). A rate over the outer part of
+  the transverse grid ([`rprofile`](@ref)) is applied as a split-step factor per accepted
+  step ([`RadialCollar`](@ref), [`CartesianCollar`](@ref)), with the same first-order,
+  collar-confined non-commutation error as the temporal collar. As for the temporal collar,
+  what it removes is measured and reported once if it becomes noticeable.
 
 # Step size
 
@@ -376,11 +376,12 @@ Transverse absorbing boundary for radially symmetric propagation: the power rate
 it first. It is applied to `Eω` directly (the collar is diagonal in ω) with one inverse and
 one forward Hankel transform along the last axis, into the buffer `buf` sized like `Eω`.
 
-`Tfwd` and `Tbwd` are the grid's transform matrices in the element type of `Eω`, so that
-both operands of the matrix multiplication have the same element type.
+`Tfwd` and `Tbwd` are copies of `rgrid`'s transform matrices in the element type of `Eω`,
+so that both operands of the matrix multiplication have the same element type; `weight` is
+a copy of its real-space integration weights. Nothing else of the grid is needed per step,
+so the grid itself is not kept.
 """
-struct RadialCollar{rT, mT, bT}
-    rgrid::rT
+struct RadialCollar{mT, bT}
     Tfwd::Matrix{mT}
     Tbwd::Matrix{mT}
     αr::Vector{Float64}
@@ -394,7 +395,7 @@ end
 
 function RadialCollar(rgrid::Grid.RadialGrid, αr, Eω)
     TT = eltype(Eω)
-    RadialCollar(rgrid, convert(Matrix{TT}, rgrid.Tfwd), convert(Matrix{TT}, rgrid.Tbwd),
+    RadialCollar(convert(Matrix{TT}, rgrid.Tfwd), convert(Matrix{TT}, rgrid.Tbwd),
                  αr, findall(>(0), αr), copy(rgrid.wr), similar(Eω),
                  Ref(0.0), Ref(0.0), Ref(false))
 end

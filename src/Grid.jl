@@ -299,9 +299,10 @@ Transverse grid for radially symmetric free-space propagation: a quasi-discrete 
 transform of order `order` over aperture radius `R` with `N` samples.
 
 The grid owns the transform matrices and the integration weights, so that no per-step code
-needs Hankel.jl. The matrices are laid out for multiplication *from the right* on an array
-reshaped to `(:, N)`, i.e. they transform along the **last** dimension of an array of any
-rank (see [`to_kspace!`](@ref), [`to_rspace!`](@ref)).
+needs Hankel.jl. The matrices are the transpose of Hankel's with the scale factors folded
+in, so that multiplying *from the right* on an array reshaped to `(:, N)` is Hankel's
+transform along the radial axis: they transform along the **last** dimension of an array of
+any rank (see [`to_kspace!`](@ref), [`to_rspace!`](@ref)).
 
 The second form converts an existing `Hankel.QDHT`. Its `dim` field is ignored, since a
 `RadialGrid` always transforms along the last dimension.
@@ -330,9 +331,13 @@ struct RadialGrid <: SpaceGrid
 end
 
 #= The transform matrices are the transpose of Hankel's with its scalar scale factor folded
-   in, exactly as NonlinearRHS.TransRadial built them for itself before. Hankel's matrix is
-   symmetric, so right-multiplying a `(:, N)` reshape by these is the same transform as
-   Hankel's left-multiplication along the radial axis, without the permutedims. =#
+   in, exactly as NonlinearRHS.TransRadial built them for itself before. With
+   `Tfwd = transpose(q.T) .* scaleRK`, `mul!(out, reshape(A, :, N), Tfwd)` computes
+   `out[.., k] = Σ_j A[.., j] * T[k, j] * scaleRK`, which is Hankel's
+   `Σ_j T[k, j] * A[j, ..] * scaleRK` along the radial axis, without the permutedims.
+   Note that `q.T` is NOT symmetric (it is divided by the row vector `j₁sq'`), so the
+   `transpose` is load-bearing: `q.T` in its place would silently give the wrong
+   transform. =#
 function _fromqdht(q::Hankel.QDHT)
     Hankel.sphericaldim(q) == 1 || error(
         "Only cylindrical (spherical dimension 1) Hankel transforms are supported, " *
@@ -382,20 +387,21 @@ function radial_matmul!(out, A, T)
     out
 end
 
-# permutation which swaps dimensions `dim` and `d`; it is its own inverse
-function _swapperm(d, dim)
-    perm = collect(1:d)
-    perm[dim] = d
-    perm[d] = dim
-    Tuple(perm)
+#= Permutation which moves dimension `dim` to the end, keeping the order of all the others.
+   `invperm` of it puts them back, and dropping the last axis of a permuted array leaves the
+   axes of the original with `dim` removed, in order. =#
+function _moveperm(d, dim)
+    1 <= dim <= d || throw(DimensionMismatch(
+        "dimension $dim is out of range for a $d-dimensional array"))
+    (1:dim-1..., dim+1:d..., dim)
 end
 
 function _matmul_dim(rg::RadialGrid, A, T, dim)
     d = ndims(A)
+    perm = _moveperm(d, dim)
     dim == d && return radial_matmul!(similar(A), A, T)
-    perm = _swapperm(d, dim)
     Ap = permutedims(A, perm)
-    permutedims(radial_matmul!(similar(Ap), Ap, T), perm)
+    permutedims(radial_matmul!(similar(Ap), Ap, T), invperm(perm))
 end
 
 """
@@ -435,12 +441,11 @@ to_rspace(rg::RadialGrid, A; dim=ndims(A)) = _matmul_dim(rg, A, rg.Tbwd, dim)
 
 function _weighted_sum(A, w, dim)
     d = ndims(A)
-    dim <= d || throw(DimensionMismatch(
-        "cannot integrate along dimension $dim of a $d-dimensional array"))
-    dim == d || (A = permutedims(A, _swapperm(d, dim)))
+    perm = _moveperm(d, dim)
     N = length(w)
-    size(A, d) == N || throw(DimensionMismatch(
+    size(A, dim) == N || throw(DimensionMismatch(
         "dimension $dim of the input is $(size(A, dim)), expected $N"))
+    dim == d || (A = permutedims(A, perm))
     out = reshape(A, :, N) * w
     d == 1 && return out[1]
     reshape(out, size(A)[1:d-1])
@@ -450,7 +455,8 @@ end
     integrate_r(rg::RadialGrid, A; dim=ndims(A))
 
 Radial integral of `A` over the aperture of `rg` in real space, along dimension `dim`
-(the last by default), which is dropped from the result. A vector input gives a scalar.
+(the last by default). The result has the axes of `A` with `dim` dropped, in order; a
+vector input gives a scalar.
 
 Assuming `A` holds samples of ``f(r)`` at `rg.r`, this approximates ``\\int f(r) r dr``
 from 0 to ∞. Together with [`integrate_k`](@ref) it fulfils Parseval's theorem:
@@ -462,7 +468,8 @@ integrate_r(rg::RadialGrid, A; dim=ndims(A)) = _weighted_sum(A, rg.wr, dim)
     integrate_k(rg::RadialGrid, A; dim=ndims(A))
 
 Radial integral of `A` over the aperture of `rg` in reciprocal space, along dimension `dim`
-(the last by default), which is dropped from the result. See [`integrate_r`](@ref).
+(the last by default). The result has the axes of `A` with `dim` dropped, in order. See
+[`integrate_r`](@ref).
 """
 integrate_k(rg::RadialGrid, A; dim=ndims(A)) = _weighted_sum(A, rg.wk, dim)
 
@@ -470,8 +477,8 @@ integrate_k(rg::RadialGrid, A; dim=ndims(A)) = _weighted_sum(A, rg.wk, dim)
     onaxis(rg::RadialGrid, Ak; dim=ndims(Ak))
 
 The on-axis (``r = 0``) sample of a field given in reciprocal space, obtained from
-`Ak` by integration over `k` along dimension `dim`, which is dropped from the result.
-Only defined for a 0-order grid.
+`Ak` by integration over `k` along dimension `dim`, which is dropped from the result as in
+[`integrate_k`](@ref). Only defined for a 0-order grid.
 """
 function onaxis(rg::RadialGrid, Ak; dim=ndims(Ak))
     rg.order == 0 || throw(DomainError(
@@ -514,10 +521,11 @@ rsymmetric(rg::RadialGrid) = vcat(-reverse(rg.r), 0.0, rg.r)
     Grid.TransverseGrid
 
 The transverse grids `Luna` accepts for free-space propagation: [`RadialGrid`](@ref),
-[`FreeGrid`](@ref) and [`Free2DGrid`](@ref), plus [`HankelTransform`](@ref), which the
-radial entry points convert to a `RadialGrid`.
+[`FreeGrid`](@ref) and [`Free2DGrid`](@ref). A [`HankelTransform`](@ref) is not one of
+them; the radial entry points take it through separate methods which convert it to a
+`RadialGrid` first.
 """
-const TransverseGrid = Union{RadialGrid, FreeGrid, Free2DGrid, HankelTransform}
+const TransverseGrid = Union{RadialGrid, FreeGrid, Free2DGrid}
 
 
 function to_dict(g::GT) where GT <: AbstractGrid

@@ -78,6 +78,7 @@ function transverse_k2(rg::Grid.RadialGrid)
     kperp2, idcs
 end
 
+# Hankel.QDHT is deprecated as a Luna transverse grid; convert it (Grid.RadialGrid warns)
 transverse_k2(q::Grid.HankelTransform) = transverse_k2(Grid.RadialGrid(q))
 
 
@@ -222,6 +223,25 @@ function make_const_linop(grid::Grid.AbstractGrid, xgrid::Grid.Free2DGrid, nfuns
         end
     end
     out
+end
+
+#= Deprecated entry points: a Hankel.QDHT in place of a Grid.RadialGrid. These repeat the
+   concrete arities of the methods above rather than taking `args...`, so that they cannot
+   be ambiguous with the modal or the βfun!/αfun! methods. =#
+function make_const_linop(grid::Grid.AbstractGrid, q::Grid.HankelTransform,
+                          n::AbstractVecOrMat, β1::Number, β0::Number,
+                          ω0::Number=getω0(grid))
+    make_const_linop(grid, Grid.RadialGrid(q), n, β1, β0, ω0)
+end
+
+function make_const_linop(grid::Grid.AbstractGrid, q::Grid.HankelTransform,
+                          nfun, thg::Bool=thg_default(grid))
+    make_const_linop(grid, Grid.RadialGrid(q), nfun, thg)
+end
+
+function make_linop(grid::Grid.AbstractGrid, q::Grid.HankelTransform,
+                    nfun, thg::Bool=thg_default(grid))
+    make_linop(grid, Grid.RadialGrid(q), nfun, thg)
 end
 
 """

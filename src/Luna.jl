@@ -248,9 +248,20 @@ function doinputs_fs!(Eωk, grid, spacegrid::Grid.TransverseGrid, FT,
 end
 
 #= Radial simulations used to be set up with a Hankel.QDHT. Convert, so that scripts
-   written against the old interface keep working; Grid.RadialGrid warns once. =#
-function setup(grid::Grid.TimeGrid, q::Grid.HankelTransform, args...; kwargs...)
-    setup(grid, Grid.RadialGrid(q), args...; kwargs...)
+   written against the old interface keep working; Grid.RadialGrid warns once.
+
+   These take the same six concrete positional arguments as the RadialGrid methods below
+   rather than `args...`: a `setup(grid::TimeGrid, q::QDHT, args...)` shim is ambiguous with
+   the six-argument mode-averaged `setup(grid::RealGrid, densityfun, responses, inputs,
+   βfun!, aeff)`, which is exactly the call a legacy radial script makes. =#
+function setup(grid::Grid.RealGrid, q::Grid.HankelTransform,
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; noise_field)
+end
+
+function setup(grid::Grid.EnvGrid, q::Grid.HankelTransform,
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; noise_field)
 end
 
 function setup(grid::Grid.RealGrid, rg::Grid.RadialGrid,
