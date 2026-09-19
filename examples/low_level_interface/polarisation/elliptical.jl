@@ -11,6 +11,7 @@ import PyPlot:pygui, plt
 a = 225e-6
 gas = :Ar
 pres = 0.4
+flength = 250e-2
 
 τfwhm = 30e-15
 λ0 = 1800e-9
@@ -63,10 +64,10 @@ Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, modes, :xy;
 Eω .= Ew
 
 statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, 250e-2, 201, statsfun)
+output = Output.MemoryOutput(0, flength, 201, statsfun)
 linop = LinearOps.make_const_linop(grid, modes, λ0)
 
-Luna.run(Eω, grid, linop, transform, FT, output; zmax=250e-2)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 
 ω = grid.ω
 t = grid.t
