@@ -108,7 +108,7 @@ import LinearAlgebra: mul!, ldiv!
 import Logging
 import Printf: @sprintf
 
-"Default number of applications of the historical window profile over `zmax`."
+"Default number of applications of the historical window profile over the propagation."
 const DEFAULT_N = 20
 
 "Default minimum temporal collar width, as a fraction of the full time window."
@@ -138,9 +138,10 @@ a field decay rate of `MAX_αℓ/(2ℓ)`, so that the clamped components still f
 const MAX_αℓ = 60.0
 
 """
-    reflength(grid, N, ℓ)
+    reflength(zmax, N, ℓ)
 
-The absorber reference length in metres. `ℓ` wins if given; otherwise `zmax/N`.
+The absorber reference length in metres. `ℓ` wins if given; otherwise `zmax/N`, `zmax`
+being the propagation length passed to [`Luna.run`](@ref).
 
 Both are validated here so that every call site is protected. A non-positive length is not
 merely useless, it is silently destructive: `ℓ == 0` makes [`rate`](@ref) evaluate `0/0` in
@@ -149,11 +150,11 @@ the interior and fills the grid with NaN, and `ℓ < 0` inverts the clamp bounds
 the whole grid rather than just the collar. To switch the absorbers off, use
 `boundary=:none`.
 """
-function reflength(grid, N, ℓ)
+function reflength(zmax, N, ℓ)
     if isnothing(ℓ)
         (N > 0 && isfinite(N)) || error(
             "boundary_N must be finite and positive, got $N")
-        grid.zmax/N
+        zmax/N
     else
         (ℓ > 0 && isfinite(ℓ)) || error(
             "boundary_length must be finite and positive, got $ℓ")
@@ -173,14 +174,15 @@ multiplied the field. Exactly zero where `W == 1`, and clamped at `MAX_αℓ/ℓ
 rate(W, ℓ) = clamp.(.-2 .* log.(W) ./ ℓ, 0.0, MAX_αℓ/ℓ)
 
 """
-    spectral_rate(grid; N=DEFAULT_N, ℓ=nothing)
+    spectral_rate(grid, zmax; N=DEFAULT_N, ℓ=nothing)
 
 Power absorption coefficient in 1/m across the frequency grid, derived from
 `grid.ωwin`. Exactly zero outside `grid.sidx`, where the linear operator is zero by
-construction and there is nothing left to absorb.
+construction and there is nothing left to absorb. `zmax` is the propagation length, used
+only to derive the reference length from `N` (see [`reflength`](@ref)).
 """
-function spectral_rate(grid; N=DEFAULT_N, ℓ=nothing)
-    α = rate(grid.ωwin, reflength(grid, N, ℓ))
+function spectral_rate(grid, zmax; N=DEFAULT_N, ℓ=nothing)
+    α = rate(grid.ωwin, reflength(zmax, N, ℓ))
     α[.!grid.sidx] .= 0
     α
 end
@@ -225,12 +227,13 @@ function tprofile(grid; collar=DEFAULT_TCOLLAR)
 end
 
 """
-    temporal_rate(grid; N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR)
+    temporal_rate(grid, zmax; N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR)
 
-Power absorption coefficient in 1/m across the time grid.
+Power absorption coefficient in 1/m across the time grid. `zmax` is the propagation
+length, used only to derive the reference length from `N` (see [`reflength`](@ref)).
 """
-temporal_rate(grid; N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR) =
-    rate(tprofile(grid; collar), reflength(grid, N, ℓ))
+temporal_rate(grid, zmax; N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR) =
+    rate(tprofile(grid; collar), reflength(zmax, N, ℓ))
 
 """
     addloss(linop, α)
@@ -602,7 +605,7 @@ end
 (b::NoAbsorber)(Eω, z, dz, interpolant) = b.output(Eω, z, dz, interpolant)
 
 "Report the absorbing-boundary configuration."
-function log_setup(grid, ℓ, collar, sg=nothing, kcollar=0, rcollar=0)
+function log_setup(grid, zmax, ℓ, collar, sg=nothing, kcollar=0, rcollar=0)
     w = tcollarwidth(grid, collar)
     trange = maximum(grid.t) - minimum(grid.t)
     #= The clamp in `rate` is not worth reporting: it bites only where the profile is
@@ -613,7 +616,7 @@ function log_setup(grid, ℓ, collar, sg=nothing, kcollar=0, rcollar=0)
         "Absorbing boundaries: rate-based, reference length %.3g m (%.3g applications of \
          the window profile over %.3g m; a 50%% point of the taper attenuates by %.1e over \
          the propagation). Temporal collar %.3g fs, %.1f%% of the time window.",
-        ℓ, grid.zmax/ℓ, grid.zmax, 0.5^(grid.zmax/ℓ), w*1e15, 100*w/trange))
+        ℓ, zmax/ℓ, zmax, 0.5^(zmax/ℓ), w*1e15, 100*w/trange))
     isnothing(sg) && return nothing
     rdesc = sg isa Hankel.QDHT ? @sprintf("%.1f%% of the aperture", 100rcollar) :
                                  "the grid's own window"
@@ -624,7 +627,7 @@ function log_setup(grid, ℓ, collar, sg=nothing, kcollar=0, rcollar=0)
 end
 
 """
-    setup(boundary, grid, transform, linop, Et, FT, output, z0, max_dz, init_dz;
+    setup(boundary, grid, transform, linop, Et, FT, output, z0, zmax, max_dz, init_dz;
           N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR,
           kcollar=DEFAULT_KCOLLAR, rcollar=DEFAULT_RCOLLAR, warnfrac=DEFAULT_WARNFRAC)
 
@@ -645,15 +648,16 @@ clearer to hand them back than to mutate them from inside a branch:
 
 `transform` is used only to find the transverse grid ([`spacegrid`](@ref)) and to taper its
 normalisation; for a modal transform it is untouched. `kcollar` and `rcollar` are the
-k-space and transverse collar widths ([`kprofile`](@ref), [`rprofile`](@ref)).
+k-space and transverse collar widths ([`kprofile`](@ref), [`rprofile`](@ref)). `zmax` is
+the propagation length, which sets the reference length when `N` is used rather than `ℓ`.
 """
-function setup(boundary, grid, transform, linop, Et, FT, output, z0, max_dz, init_dz;
+function setup(boundary, grid, transform, linop, Et, FT, output, z0, zmax, max_dz, init_dz;
                N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR,
                kcollar=DEFAULT_KCOLLAR, rcollar=DEFAULT_RCOLLAR, warnfrac=DEFAULT_WARNFRAC)
     ℓabs = nothing
     sg = spacegrid(transform)
     if boundary === :rate
-        ℓabs = reflength(grid, N, ℓ)
+        ℓabs = reflength(zmax, N, ℓ)
         if max_dz > ℓabs
             Logging.@info(@sprintf(
                 "Reducing max_dz from %.3g m to the absorber reference length %.3g m.",
@@ -661,21 +665,21 @@ function setup(boundary, grid, transform, linop, Et, FT, output, z0, max_dz, ini
             max_dz = ℓabs
         end
         init_dz = min(init_dz, max_dz)
-        αt = temporal_rate(grid; N, ℓ, collar)
+        αt = temporal_rate(grid, zmax; N, ℓ, collar)
         spatial = nothing
         if isnothing(sg)
-            linop = addloss(linop, spectral_rate(grid; N, ℓ))
+            linop = addloss(linop, spectral_rate(grid, zmax; N, ℓ))
         else
             #= Order matters: the clamp must see only the physical decay, not the absorbers
                added after it. The source taper carries the k-window at its clamped depth,
                never zero, so the division in FreeSpaceNorm stays finite. =#
             Wk = kprofile(sg, kcollar)
             linop = evanescent(linop, transform, ℓabs; kwin=max.(Wk, exp(-MAX_αℓ/2)))
-            linop = addloss(linop, spectral_rate(grid; N, ℓ))
+            linop = addloss(linop, spectral_rate(grid, zmax; N, ℓ))
             linop = addloss_k(linop, rate(Wk, ℓabs))
             spatial = spatialcollar(sg, rate(rprofile(sg, rcollar), ℓabs), grid, Et)
         end
-        log_setup(grid, ℓabs, collar, sg, kcollar, rcollar)
+        log_setup(grid, zmax, ℓabs, collar, sg, kcollar, rcollar)
         stepfun = RateAbsorber(αt, Et, FT, output, z0; warnfrac, spatial)
     elseif boundary === :legacy || boundary === :none
         if boundary === :legacy
@@ -688,7 +692,7 @@ function setup(boundary, grid, transform, linop, Et, FT, output, z0, max_dz, ini
         end
         #= No absorbers, but the evanescent channels still need their clamp and taper, and
            the only requirement on the reference length is that no step exceeds it. =#
-        linop = evanescent(linop, transform, min(max_dz, grid.zmax))
+        linop = evanescent(linop, transform, min(max_dz, zmax))
     else
         error("boundary must be :rate, :legacy or :none, not $boundary")
     end

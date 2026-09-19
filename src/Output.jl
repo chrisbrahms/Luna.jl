@@ -131,6 +131,15 @@ function (o::MemoryOutput)(key::AbstractString, val; force=false, meta=false, gr
     end
 end
 
+"""
+    hasdata(o, key)
+
+Whether the output `o` already holds a top-level entry named `key`. Returns `false` for
+outputs which are plain callables and so cannot be queried.
+"""
+hasdata(o::MemoryOutput, key) = haskey(o, key)
+hasdata(o, key) = false
+
 function tofile(fpath, o::MemoryOutput)
     Utils.save_dict_h5(fpath, o.data)
 end
@@ -309,6 +318,8 @@ function haskey(o::HDF5Output, key)
     end
 end
 
+
+hasdata(o::HDF5Output, key) = haskey(o, key)
 
 """Calling the output handler writes data to the file
     Arguments:

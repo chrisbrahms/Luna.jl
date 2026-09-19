@@ -441,9 +441,17 @@ sym2string(other) = other
 save_modeinfo_maybe(output, t) = nothing
 
 """
-    run(Eω, grid, linop, transform, FT, output; kwargs...)
+    run(Eω, grid, linop, transform, FT, output; zmax, kwargs...)
 
-Run the propagation.
+Run the propagation over a distance `zmax`.
+
+# Arguments
+- `zmax::Real`: the propagation length in metres. Required: the grid no longer carries it.
+    If `output` saves on a fixed grid (`Output.GridCondition`, which is what
+    `MemoryOutput(zmin, zmax, saveN)` and `HDF5Output(path, zmin, zmax, saveN)` build),
+    `zmax` must agree with the end of that save grid. `zmax` is written to `output` as a
+    top-level entry.
+- `max_dz::Real=zmax/2`: the largest step the solver may take.
 
 # Absorbing boundaries
 - `boundary::Symbol=:rate`: how the absorbing boundaries at the edges of the frequency and
@@ -485,12 +493,27 @@ See [`Luna.Boundaries`](@ref) for the rationale.
 """
 function run(Eω, grid,
              linop, transform, FT, output;
-             min_dz=0, max_dz=grid.zmax/2, init_dz=1e-4, z0=0.0,
+             zmax=nothing, min_dz=0, max_dz=nothing, init_dz=1e-4, z0=0.0,
              rtol=1e-6, atol=1e-10, safety=0.9, norm=RK45.weaknorm,
              status_period=1,
              boundary=:rate, boundary_N=Boundaries.DEFAULT_N, boundary_length=nothing,
              tcollar=Boundaries.DEFAULT_TCOLLAR, kcollar=Boundaries.DEFAULT_KCOLLAR,
              rcollar=Boundaries.DEFAULT_RCOLLAR)
+
+    isnothing(zmax) && error(
+        "Luna.run requires the propagation length as the keyword argument zmax, e.g. "*
+        "Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength). The grid no "*
+        "longer stores it.")
+    isnothing(max_dz) && (max_dz = zmax/2)
+    #= The save grid and zmax are two separate statements of the propagation length;
+       check here that they cannot drift apart. =#
+    if hasproperty(output, :save_cond) && output.save_cond isa Output.GridCondition
+        zend = output.save_cond.grid[end]
+        zend ≈ zmax || error(
+            "zmax ($zmax m) does not agree with the end of the output's save grid "*
+            "($zend m). The output was created for a different propagation length; pass "*
+            "the same length to both.")
+    end
 
     Et = FT \ Eω
 
@@ -504,7 +527,7 @@ function run(Eω, grid,
     #= NOTE: this must come after check_cache, which can move z0 and init_dz: the temporal
        absorber measures the distance it is applied over from z0. =#
     absorber = Boundaries.setup(boundary, grid, transform, linop, Et, FT, output, z0,
-                                max_dz, init_dz;
+                                zmax, max_dz, init_dz;
                                 N=boundary_N, ℓ=boundary_length, collar=tcollar,
                                 kcollar, rcollar)
     stepfun = absorber.stepfun
@@ -519,6 +542,8 @@ function run(Eω, grid,
     boundary === :legacy || (Eω[.!grid.sidx, ntuple(_ -> :, ndims(Eω) - 1)...] .= 0)
 
     output(Grid.to_dict(grid), group="grid")
+    #= Written once: on a resumed HDF5 propagation it is already in the file. =#
+    Output.hasdata(output, "zmax") || output("zmax", zmax)
     st = simtype(grid, transform, linop)
     st["boundary"] = string(boundary)
     boundary === :rate && (st["boundary_length"] = string(absorber.ℓ))
@@ -531,7 +556,7 @@ function run(Eω, grid,
 
     flush(stderr) # flush std error once before starting to show setup steps
     RK45.solve_precon(
-        transform, linop, Eω, z0, init_dz, grid.zmax, stepfun=stepfun,
+        transform, linop, Eω, z0, init_dz, zmax, stepfun=stepfun,
         max_dt=max_dz, min_dt=min_dz,
         rtol=rtol, atol=atol, safety=safety, norm=norm,
         status_period=status_period)
