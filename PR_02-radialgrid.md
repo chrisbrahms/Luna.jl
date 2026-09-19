@@ -185,7 +185,17 @@ All run as `julia --project=<worktree> -t 1`, with `Luna.set_fftw_mode(:estimate
 | `test/test_fields.jl` | 179 pass | 56.1 s |
 | `test/test_freespace.jl` | 77 pass | 349.6 s |
 
-1418 tests, all passing; no failures, errors or broken tests. (Times are from a run with
+1418 tests, all passing; no failures, errors or broken tests.
+
+The five radial examples (`radial.jl`, `radial_env.jl`, `radial_hcf.jl`,
+`radial_xypol_bbo.jl`, `radial_xypol_env.jl`) were run as a smoke test with the plotting
+sections cut off, the grid sizes reduced so each takes seconds, and `using HiSol` stripped
+from `radial_xypol_env.jl` (that package is not a Luna dependency and the example does not
+use it — pre-existing). All five run to the end of their computation and post-processing.
+The script is `run_radial_examples.jl` in the project scratchpad. That run is what caught
+the `dim=3` needed in `Grid.to_rspace(q, Eout; dim=3)`: the output arrays are
+`(ω, pol, r, z)`, and unlike the old `q \ Eout` (which used `q.dim`) a `RadialGrid`
+defaults to the last dimension. (Times are from a run with
 several other agents' jobs on the same machine, so they are upper bounds.) `Pkg.test()` was
 not run (too slow); the files above are the ones this branch touches, plus
 `test_output.jl` for the new `"spacegrid"` group.

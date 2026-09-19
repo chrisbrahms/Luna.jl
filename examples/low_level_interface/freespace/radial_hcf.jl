@@ -51,7 +51,7 @@ t = grid.t
 zout = output.data["z"]
 Eout = output.data["Eω"]
 
-Erout = Grid.to_rspace(q, Eout) # (ω, pol, r, z)
+Erout = Grid.to_rspace(q, Eout; dim=3) # (ω, pol, r, z)
 Iωr = abs2.(Erout)
 Er0 = dropdims(Grid.onaxis(q, Eout; dim=3), dims=2); # (ω, z)
 Iω0 = abs2.(Er0);

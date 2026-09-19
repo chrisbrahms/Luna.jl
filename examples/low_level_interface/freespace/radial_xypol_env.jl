@@ -42,7 +42,7 @@ Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6)
 z = output["z"]
 Eωk = output["Eω"] # (ω, pol, k, z)
 
-Eωr = Grid.to_rspace(q, Eωk) # (ω, pol, r, z)
+Eωr = Grid.to_rspace(q, Eωk; dim=3) # (ω, pol, r, z)
 Etr = FFTW.ifft(Eωr, 1) # (t, pol, r, z)
 Iωr = abs2.(Eωr) # (ω, pol, r, z)
 Itr = abs2.(Etr) # (t, pol, r, z)

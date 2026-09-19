@@ -47,7 +47,7 @@ zout = output.data["z"]
 Eout = output.data["Eω"];
 Eout = FFTW.fftshift(Eout, 1)
 ##
-Erout = Grid.to_rspace(q, Eout)
+Erout = Grid.to_rspace(q, Eout; dim=3)
 Iωr = abs2.(Erout)
 Er0 = dropdims(Grid.onaxis(q, Eout; dim=3), dims=2)
 Iω0 = abs2.(Er0)

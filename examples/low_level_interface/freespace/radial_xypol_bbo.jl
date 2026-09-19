@@ -48,7 +48,7 @@ Eωk = output["Eω"] # (ω, pol, k, z)
 
 ωprefac = 2π*PhysData.c*PhysData.ε_0/2 * 2π/(grid.ω[end]^2)
 
-Eωr = Grid.to_rspace(q, Eωk) # (ω, pol, r, z)
+Eωr = Grid.to_rspace(q, Eωk; dim=3) # (ω, pol, r, z)
 Etr = FFTW.irfft(Eωr, 2*(length(grid.ω)-1), 1) # (t, pol, r, z)
 Etr = Maths.hilbert(Etr)
 Iωr = abs2.(Eωr) # (ω, pol, r, z)
