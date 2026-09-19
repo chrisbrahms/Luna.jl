@@ -504,7 +504,8 @@ Run the propagation over a distance `zmax`.
     absorber collar as a fraction of the largest transverse wavevector on the grid. `0`
     disables it.
 - `rcollar::Real=$(Boundaries.DEFAULT_RCOLLAR)`: free space only; width of the transverse
-    absorber collar of a radial (`QDHT`) grid as a fraction of its aperture `R`. The Cartesian
+    absorber collar of a radial ([`Grid.RadialGrid`](@ref)) grid as a fraction of its
+    aperture `R`. The Cartesian
     grids use the window they were built with (`window_factor`) instead.
 
 In free space the evanescent part of `linop` is also made safe for the stepper in every

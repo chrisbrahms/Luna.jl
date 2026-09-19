@@ -366,8 +366,8 @@ end
     normfun = NonlinearRHS.const_norm_radial(rgrid, q, nfun)
     inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0)
     Eω, transform, FT = Luna.setup(rgrid, q, z -> dens0, normfun, responses, inputs)
-    output = Output.MemoryOutput(0, rgrid.zmax, 2)
-    Luna.run(Eω, rgrid, linop, transform, FT, output; init_dz=0.1)
+    output = Output.MemoryOutput(0, L, 2)
+    Luna.run(Eω, rgrid, linop, transform, FT, output; init_dz=0.1, zmax=L)
     rg = Grid.RadialGrid(output["spacegrid"])
     @test rg.R == q.R
     @test rg.N == q.N
@@ -379,9 +379,9 @@ end
     Eω2, transform2, FT2 = Luna.setup(
         rgrid, xgrid, z -> dens0,
         NonlinearRHS.const_norm_free2D(rgrid, xgrid, nfun), responses, inputs)
-    output2 = Output.MemoryOutput(0, rgrid.zmax, 2)
+    output2 = Output.MemoryOutput(0, L, 2)
     Luna.run(Eω2, rgrid, LinearOps.make_const_linop(rgrid, xgrid, nfun, true),
-             transform2, FT2, output2; init_dz=0.1)
+             transform2, FT2, output2; init_dz=0.1, zmax=L)
     @test output2["spacegrid"]["x"] == xgrid.x
     @test output2["spacegrid"]["kx"] == xgrid.kx
 end

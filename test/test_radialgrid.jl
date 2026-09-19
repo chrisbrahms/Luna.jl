@@ -219,8 +219,8 @@ end
     nfunω = (ω; z) -> nfun(PhysData.wlfreq(ω); z)
     dens = z -> PhysData.density(:Ar, 1)
     inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy=1e-9, w0=20e-6)
-    grids = (Grid.RealGrid(1e-3, λ0, (400e-9, 2000e-9), 0.2e-12),
-             Grid.EnvGrid(1e-3, λ0, (400e-9, 2000e-9), 0.2e-12))
+    grids = (Grid.RealGrid(λ0, (400e-9, 2000e-9), 0.2e-12),
+             Grid.EnvGrid(λ0, (400e-9, 2000e-9), 0.2e-12))
     for grid in grids
         resp = grid isa Grid.RealGrid ?
             (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),) :
