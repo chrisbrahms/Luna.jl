@@ -84,14 +84,74 @@ frequency axes and their apodisation windows; the propagation length is an argum
 Run with `julia --project=. -t 1`, `Luna.set_fftw_mode(:estimate)`,
 `Luna.set_fftw_threads(1)`, `LinearAlgebra.BLAS.set_num_threads(1)`.
 
-PLACEHOLDER_TESTS
+All files pass. Counts are from the `Test Summary` lines of the runs listed; the runs were
+split across several processes, so the counts are per group.
+
+| file | result |
+|---|---|
+| `test_grid.jl` (new) | 73 passed, 0 failed |
+| `test_output.jl` | 71 passed |
+| `test_boundaries.jl` | 182 passed |
+| `test_linops.jl` | 196 passed |
+| `test_rk45.jl` | 48 passed |
+| `test_freespace.jl` | passed (325 s) |
+| `test_interface.jl` | passed (1457 s) |
+| `test_gradient.jl` | passed |
+| `test_tapers.jl` | passed |
+| `test_multimode.jl` | passed |
+| `test_mixtures.jl` | passed |
+| `test_stats.jl` | passed |
+| `test_processing.jl` | passed (10+16+16+2+2+6+9+3) |
+| `test_vectorplasma.jl` | passed |
+| `test_polarisation_env.jl` | passed |
+| `test_polarisation_field.jl` | passed |
+| `test_modes.jl` | passed |
+| `test_chi2.jl` | passed |
+| `test_gnlse.jl` | passed |
+| `test_raman.jl` | passed |
+| `test_fields.jl` | passed |
+| `test_maths.jl` | passed |
+| `test_noise.jl` | passed |
+
+`test_scans.jl` (unmodified by this branch) fails its "multi-process queue scan with error"
+testset in this working copy, but only because another agent's worktree was running the same
+test at the same time: `Scans.QueueExec` keeps its queue file in `Utils.cachedir()`, which is
+a Julia scratch space keyed by Luna's UUID and therefore shared by every worktree of the
+repository. The two runs consume the same queue, so each sees indices it did not run. The
+same file passes on the base commit when run alone, and the failure was reproduced with the
+other worktree's `test_scans.jl` process visible in `ps`. Nothing in this branch touches
+`Scans`.
+
+Two notes on how the runs were driven: a driver that passes the test file names in `ARGS`
+makes `test_processing.jl` exit through `ArgParse` ("too many arguments"), because the
+`Scans` command-line parsing reads `ARGS`. It was run on its own instead. The same driver's
+`test_interface.jl` run was also killed once by the OS under memory pressure while several
+agents were running; it passed on the rerun.
 
 ## Examples
 
 All 128 `.jl` files under `examples/`, `test/` and `src/` parse. A representative subset of
 examples was run up to the point where they call the plotting stack:
 
-PLACEHOLDER_EXAMPLES
+```
+OK   low_level_interface/basic_modeAvg.jl  (9.1 s)
+OK   low_level_interface/basic_modeAvg_env.jl  (1.9 s)
+OK   low_level_interface/basic_modal.jl  (136.6 s)
+OK   low_level_interface/freespace/radial.jl  (49.4 s)
+OK   low_level_interface/freespace/free2D_env.jl
+OK   low_level_interface/gradients/gradient_modeAvg.jl  (10.1 s)
+OK   low_level_interface/tapers/taper_modeAvg.jl  (21.5 s)
+OK   low_level_interface/gnlse/simplescg_modeAvg_env.jl  (93.6 s)
+OK   low_level_interface/polarisation/elliptical.jl  (11.7 s)
+OK   low_level_interface/rectangular/rectangular_modeAvg.jl  (5.3 s)
+OK   low_level_interface/mixtures/mixture_modeAvg.jl  (7.5 s)
+OK   low_level_interface/Raman/Raman_modeAvg_env.jl  (140.6 s)
+OK   low_level_interface/stepindex/stepscg_modeAvg_env.jl  (102.5 s)
+OK   low_level_interface/plasma_ssfbs_modeAvg.jl  (27.5 s)
+```
+
+The `examples/simple_interface/` scripts use `prop_capillary`/`prop_gnlse`, whose signatures
+are unchanged, and were not rerun.
 
 ## No numerical change
 
@@ -104,7 +164,20 @@ thread, and `rng=MersenneTwister(1234)` for the shot noise:
 2. radial free space (low-level, `Hankel.QDHT`, 256 points, Kerr only);
 3. multimode (`prop_capillary`, `modes=2`).
 
-PLACEHOLDER_REGRESSION
+`output["Eω"]` from the branch `isequal`s the baseline in all three cases:
+
+```
+modeavg_plasma: size=(2049, 11)         isequal=true  max|Δ|=0.0
+multimode:      size=(2049, 2, 11)      isequal=true  max|Δ|=0.0
+radial:         size=(257, 1, 256, 11)  isequal=true  max|Δ|=0.0
+```
+
+Maximum observed difference: 0. Machine: Apple M1 Pro (10 cores), Julia 1.13.0, single
+Julia/FFTW/BLAS thread, FFTW `:estimate`.
+
+A first attempt showed relative differences of 5e-7 and 2e-7 in the two `prop_capillary`
+cases; that was the default `rng=GLOBAL_RNG` for the shot noise, not the change. With a
+fixed RNG the outputs are bit-identical.
 
 ## Known gaps and open questions
 
