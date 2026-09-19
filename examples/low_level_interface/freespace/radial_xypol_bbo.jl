@@ -1,6 +1,5 @@
 using Luna
 import FFTW
-import Luna: Hankel
 import PyPlot: plt
 import NumericalIntegration: integrate
 
@@ -16,7 +15,7 @@ R = 4*w0
 N = 2^6
 
 grid = Grid.RealGrid(λ0, (300e-9, 4e-6), 500e-15)
-q = Hankel.QDHT(R, N, dim=3)
+q = Grid.RadialGrid(R, N)
 
 θ = deg2rad(23.3717)
 ϕ = deg2rad(30)
@@ -49,19 +48,19 @@ Eωk = output["Eω"] # (ω, pol, k, z)
 
 ωprefac = 2π*PhysData.c*PhysData.ε_0/2 * 2π/(grid.ω[end]^2)
 
-Eωr = q \ Eωk # (ω, pol, r, z)
+Eωr = Grid.to_rspace(q, Eωk; dim=3) # (ω, pol, r, z)
 Etr = FFTW.irfft(Eωr, 2*(length(grid.ω)-1), 1) # (t, pol, r, z)
 Etr = Maths.hilbert(Etr)
 Iωr = abs2.(Eωr) # (ω, pol, r, z)
 Itr = 0.5*PhysData.c*PhysData.ε_0*abs2.(Etr) # (t, pol, r, z)
 
 Irxy = dropdims(sum(Iωr; dims=1); dims=1) # (pol, r, z)
-Iωxy = dropdims(Hankel.integrateR(Iωr, q; dim=3); dims=3)*ωprefac # (ω, pol, z)
+Iωxy = Grid.integrate_r(q, Iωr; dim=3)*ωprefac # (ω, pol, z)
 Ir = dropdims(sum(Iωr; dims=(1, 2)); dims=(1, 2)) # (r, z)
 
-Itxy = dropdims(Hankel.integrateR(Itr, q; dim=3); dims=3) # (t, pol, z)
+Itxy = Grid.integrate_r(q, Itr; dim=3) # (t, pol, z)
 
-Eω0 = dropdims(Hankel.onaxis(Eωk, q); dims=q.dim) # (ω, pol, z)
+Eω0 = Grid.onaxis(q, Eωk; dim=3) # (ω, pol, z)
 Et0 = FFTW.irfft(Eω0, 2*(length(grid.ω)-1), 1) # (t, pol, z)
 Et0 = Maths.hilbert(Et0)
 It0 = 0.5*PhysData.c*PhysData.ε_0*abs2.(Et0)

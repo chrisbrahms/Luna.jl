@@ -1,6 +1,5 @@
 module LinearOps
 import FFTW
-import Hankel
 import Luna: Modes, Grid, PhysData, Maths
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
 
@@ -73,11 +72,14 @@ function transverse_k2(xgrid::Grid.Free2DGrid)
     kperp2, idcs
 end
 
-function transverse_k2(q::Hankel.QDHT)
-    kperp2 = @. q.k^2
-    idcs = CartesianIndices(q.k)
+function transverse_k2(rg::Grid.RadialGrid)
+    kperp2 = Grid.kperp2(rg)
+    idcs = CartesianIndices(rg.k)
     kperp2, idcs
 end
+
+# Hankel.QDHT is deprecated as a Luna transverse grid; convert it (Grid.RadialGrid warns)
+transverse_k2(q::Grid.HankelTransform) = transverse_k2(Grid.RadialGrid(q))
 
 
 """
@@ -87,7 +89,7 @@ Low-level constructor for a constant (z-invariant) free-space linear operator.
 
 Arguments:
 - `grid`: `Grid.AbstractGrid` (`RealGrid` or `EnvGrid`)
-- `xygrid`: transverse grid (`Grid.FreeGrid`, `Grid.Free2DGrid`, or `Hankel.QDHT`)
+- `xygrid`: transverse grid (`Grid.FreeGrid`, `Grid.Free2DGrid`, or `Grid.RadialGrid`)
 - `n`: refractive-index table on `grid.ω`, with one column per polarisation
 - `β1`: inverse reference-frame velocity
 - `β0`: reference wavevector offset (typically zero for `RealGrid` and optional for `EnvGrid`)
@@ -99,7 +101,7 @@ Arguments:
 The output has shape `(Nω, Npol, N⊥...)`, where `N⊥...` matches the transverse grid.
 """
 function make_const_linop(grid::Grid.AbstractGrid,
-                          xygrid::Union{Grid.FreeGrid, Grid.Free2DGrid, Hankel.QDHT},
+                          xygrid::Grid.TransverseGrid,
                           n::AbstractVecOrMat, β1::Number, β0::Number, ω0::Number=getω0(grid))
     kperp2, idcs = transverse_k2(xygrid)
     k2 = @. (n*grid.ω/c)^2
@@ -130,7 +132,7 @@ pure time shift and keeps the phase bookkeeping of carrier-mixing responses
 (`Kerr_env_thg`, [`Luna.Nonlinear.Chi2Env`](@ref)) exact.
 """
 function make_const_linop(grid::Grid.AbstractGrid,
-                          xygrid::Union{Grid.FreeGrid, Grid.Free2DGrid, Hankel.QDHT},
+                          xygrid::Grid.TransverseGrid,
                           nfun, thg::Bool=thg_default(grid))
     checkthg(grid, thg)
     ωfirst = grid.ω[findfirst(grid.sidx)]
@@ -223,13 +225,32 @@ function make_const_linop(grid::Grid.AbstractGrid, xgrid::Grid.Free2DGrid, nfuns
     out
 end
 
+#= Deprecated entry points: a Hankel.QDHT in place of a Grid.RadialGrid. These repeat the
+   concrete arities of the methods above rather than taking `args...`, so that they cannot
+   be ambiguous with the modal or the βfun!/αfun! methods. =#
+function make_const_linop(grid::Grid.AbstractGrid, q::Grid.HankelTransform,
+                          n::AbstractVecOrMat, β1::Number, β0::Number,
+                          ω0::Number=getω0(grid))
+    make_const_linop(grid, Grid.RadialGrid(q), n, β1, β0, ω0)
+end
+
+function make_const_linop(grid::Grid.AbstractGrid, q::Grid.HankelTransform,
+                          nfun, thg::Bool=thg_default(grid))
+    make_const_linop(grid, Grid.RadialGrid(q), nfun, thg)
+end
+
+function make_linop(grid::Grid.AbstractGrid, q::Grid.HankelTransform,
+                    nfun, thg::Bool=thg_default(grid))
+    make_linop(grid, Grid.RadialGrid(q), nfun, thg)
+end
+
 """
     make_linop(grid, xygrid, nfun)
 
 Create a z-dependent free-space linear operator closure.
 
 Applies to `xygrid::Grid.FreeGrid` (full 3D), `Grid.Free2DGrid` (x-z), and
-`Hankel.QDHT` (radial symmetry).
+`Grid.RadialGrid` (radial symmetry).
 
 Returns `linop!(out, z)`, which fills `out` in-place for propagation distance `z`.
 `nfun(ω; z)` may return one or multiple refractive indices; the last branch
@@ -237,7 +258,7 @@ defines the reference-frame velocity and, for `EnvGrid` with `thg=false`, the
 reference phase subtraction at `grid.ω0`.
 """
 function make_linop(grid::Grid.AbstractGrid,
-                    xygrid::Union{Grid.FreeGrid,Grid.Free2DGrid,Hankel.QDHT},
+                    xygrid::Grid.TransverseGrid,
                     nfun, thg::Bool=thg_default(grid))
     checkthg(grid, thg)
     kperp2, idcs = transverse_k2(xygrid)

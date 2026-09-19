@@ -1,6 +1,6 @@
 #= here we test that everything runs without throwing errors for every combination of:
     1. Real and envelope grids
-    2. Radial (QDHT), 2D cartesian and 3D cartesian spatial grids
+    2. Radial (Grid.RadialGrid), 2D cartesian and 3D cartesian spatial grids
     3. (For envelope) THG on/off
     4. Constant pressure and pressure gradient
 We also check that the spatial linear operators work correctly by testing the focusing
@@ -8,7 +8,7 @@ of a Gaussian beam. (This cross-checks LinearOps vs Fields.prop!)
 =#
 using Luna
 import Luna.PhysData: wlfreq
-import Luna: Hankel, FFTW
+import Luna: FFTW
 Luna.set_fftw_mode(:estimate)
 import LinearAlgebra: norm
 import Test: @test, @testset
@@ -33,28 +33,28 @@ L = 0.15
 
 rgrid = Grid.RealGrid(λ0, (400e-9, 2000e-9), 0.2e-12)
 egrid = Grid.EnvGrid(λ0, (400e-9, 2000e-9), 0.2e-12)
-q = Hankel.QDHT(R, Nr, dim=3)
+q = Grid.RadialGrid(R, Nr)
 xygrid = Grid.FreeGrid(R, Nx, R, Ny)
 xgrid = Grid.Free2DGrid(R, Nx)
 
-getshape(grid, q::Hankel.QDHT, pol) = (length(grid.ω), pol ? 2 : 1, q.N)
+getshape(grid, q::Grid.RadialGrid, pol) = (length(grid.ω), pol ? 2 : 1, q.N)
 getshape(grid, sg::Grid.Free2DGrid, pol) = (length(grid.ω), pol ? 2 : 1, length(sg.x))
 getshape(grid, sg::Grid.FreeGrid, pol) = (length(grid.ω), pol ? 2 : 1, length(sg.x), length(sg.y))
 
 makekerr(grid::Grid.RealGrid, thg) = Nonlinear.Kerr_field(PhysData.γ3_gas(gas))
 makekerr(grid::Grid.EnvGrid, thg) = thg ? Nonlinear.Kerr_env_thg(PhysData.γ3_gas(gas), grid.ω0, grid.to) : Nonlinear.Kerr_env(PhysData.γ3_gas(gas))
 
-makeconstnorm(grid, q::Hankel.QDHT, nfunλ) = NonlinearRHS.const_norm_radial(grid, q, nfunλ)
+makeconstnorm(grid, q::Grid.RadialGrid, nfunλ) = NonlinearRHS.const_norm_radial(grid, q, nfunλ)
 makeconstnorm(grid, sg::Grid.Free2DGrid, nfunλ) = NonlinearRHS.const_norm_free2D(grid, sg, nfunλ)
 makeconstnorm(grid, sg::Grid.FreeGrid, nfunλ) = NonlinearRHS.const_norm_free(grid, sg, nfunλ)
 
-makenorm(grid, q::Hankel.QDHT, nfunω) = NonlinearRHS.norm_radial(grid, q, nfunω)
+makenorm(grid, q::Grid.RadialGrid, nfunω) = NonlinearRHS.norm_radial(grid, q, nfunω)
 makenorm(grid, sg::Grid.Free2DGrid, nfunω) = NonlinearRHS.norm_free2D(grid, sg, nfunω)
 makenorm(grid, sg::Grid.FreeGrid, nfunω) = NonlinearRHS.norm_free(grid, sg, nfunω)
 
-function testfocus(q::Hankel.QDHT, Eω, w0)
+function testfocus(q::Grid.RadialGrid, Eω, w0)
     Eωfoc = Eω[:, :, :, end]
-    Eωr = q \ Eωfoc
+    Eωr = Grid.to_rspace(q, Eωfoc)
     Ir = dropdims(sum(abs2.(Eωr); dims=(1, 2)); dims=(1, 2))
     Ir_analytical = Maths.gauss.(q.r, w0/2)
     @test Ir/norm(Ir) ≈ Ir_analytical/norm(Ir_analytical) rtol=0.01
@@ -265,7 +265,7 @@ Base.getindex(c::CountingOutput, k) = c.out[k]
    matching source taper the stepper would collapse its step to ~1/κ or produce NaN. =#
 @testset "evanescent channels" begin
     Re = 100e-6
-    qe = Hankel.QDHT(Re, 128, dim=3)
+    qe = Grid.RadialGrid(Re, 128)
     gride = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 100e-15)
     ℓe = 2e-3/Boundaries.DEFAULT_N
     nfunλ = PhysData.ref_index_fun(gas, pressure)
@@ -282,9 +282,9 @@ Base.getindex(c::CountingOutput, k) = c.out[k]
         inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy=1e-9, w0=30e-6)
         Eω, transform, FT = Luna.setup(gride, qe, z -> dens0, normfun, responses, inputs)
         if aperture
-            Eωr = qe \ Eω
+            Eωr = Grid.to_rspace(qe, Eω)
             Eωr[:, :, qe.r .> 40e-6] .= 0
-            Eω = qe * Eωr
+            Eω = Grid.to_kspace(qe, Eωr)
         end
         output = CountingOutput(Output.MemoryOutput(0, 2e-3, 3))
         Luna.run(Eω, gride, linop, transform, FT, output; zmax=2e-3)
@@ -321,7 +321,7 @@ end
     @test norm(Er - En)/norm(En) < 1e-4
 end
 ##
-#= The transverse collar: a beam diverging into the aperture of the QDHT, whose E(R) = 0
+#= The transverse collar: a beam diverging into the aperture of the radial grid, whose E(R) = 0
    wall otherwise reflects it back into the beam. With the collar the inner part of the
    profile stays close to the analytic Gaussian; without it the reflection spoils it. =#
 @testset "transverse collar" begin
@@ -342,7 +342,7 @@ end
         Eω, transform, FT = Luna.setup(gridd, q, z -> dens0, normfun, responses, inputs)
         output = Output.MemoryOutput(0, Ld, 3)
         Luna.run(Eω, gridd, linop, transform, FT, output; init_dz=0.1, boundary, zmax=Ld)
-        Eωr = q \ output["Eω"][:, :, :, end]
+        Eωr = Grid.to_rspace(q, output["Eω"][:, :, :, end])
         dropdims(sum(abs2.(Eωr); dims=(1, 2)); dims=(1, 2))
     end
     inner = q.r .< 0.5R
@@ -353,4 +353,55 @@ end
     @info "transverse collar: inner-profile error with collar $er, without $en"
     @test er < en
     @test er < 0.05
+end
+##
+#= The transverse grid is written to the output alongside the time grid, so that
+   post-processing can rebuild it without knowing how the run was set up. =#
+@testset "transverse grid in the output" begin
+    nfunλ = PhysData.ref_index_fun(gas, pressure)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    linop = LinearOps.make_const_linop(rgrid, q, nfun, true)
+    dens0 = PhysData.density(gas, pressure)
+    responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    normfun = NonlinearRHS.const_norm_radial(rgrid, q, nfun)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0)
+    Eω, transform, FT = Luna.setup(rgrid, q, z -> dens0, normfun, responses, inputs)
+    output = Output.MemoryOutput(0, rgrid.zmax, 2)
+    Luna.run(Eω, rgrid, linop, transform, FT, output; init_dz=0.1)
+    rg = Grid.RadialGrid(output["spacegrid"])
+    @test rg.R == q.R
+    @test rg.N == q.N
+    @test rg.order == q.order
+    @test rg.r == q.r
+    @test rg.Tfwd == q.Tfwd
+
+    # the Cartesian grids are described by their axes
+    Eω2, transform2, FT2 = Luna.setup(
+        rgrid, xgrid, z -> dens0,
+        NonlinearRHS.const_norm_free2D(rgrid, xgrid, nfun), responses, inputs)
+    output2 = Output.MemoryOutput(0, rgrid.zmax, 2)
+    Luna.run(Eω2, rgrid, LinearOps.make_const_linop(rgrid, xgrid, nfun, true),
+             transform2, FT2, output2; init_dz=0.1)
+    @test output2["spacegrid"]["x"] == xgrid.x
+    @test output2["spacegrid"]["kx"] == xgrid.kx
+end
+##
+#= The modified shot-noise field is transformed from k-space to real space once at setup,
+   with the same matrix the field passes through on every step. =#
+@testset "radial noise field" begin
+    nfunλ = PhysData.ref_index_fun(gas, pressure)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    normfun = NonlinearRHS.const_norm_radial(rgrid, q, nfun)
+    responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    nfω = Fields.generate_noise_field(rgrid)
+    nf = zeros(ComplexF64, (length(rgrid.ω), 1, q.N))
+    nf[rgrid.sidx, 1, :] .= nfω[rgrid.sidx] .* ones(1, q.N)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0)
+    Eω, transform, FT = Luna.setup(rgrid, q, z -> PhysData.density(gas, pressure),
+                                   normfun, responses, inputs; noise_field=nf)
+    Eωo = zeros(ComplexF64, (length(rgrid.ωo), 1, q.N))
+    Etk = zeros(Float64, (length(rgrid.to), 1, q.N))
+    NonlinearRHS.to_time!(Etk, nf, Eωo, transform.FT)
+    @test size(transform.Et_noise) == size(Etk)
+    @test transform.Et_noise ≈ Grid.to_rspace(q, Etk)
 end

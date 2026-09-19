@@ -4,7 +4,6 @@ is reasonably thick, so we observe strong temporal and spatial walk-off effects.
 =#
 using Luna
 import FFTW
-import Luna: Hankel
 import PyPlot: plt
 import NumericalIntegration: integrate
 

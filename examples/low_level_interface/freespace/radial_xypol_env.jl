@@ -1,7 +1,6 @@
 using Luna
 using HiSol
 import FFTW
-import Luna: Hankel
 import PyPlot: plt
 
 λ0 = 800e-9
@@ -16,7 +15,7 @@ R = 4*w0
 N = 2^8
 
 grid = Grid.EnvGrid(λ0, (200e-9, 4e-6), 200e-15)
-q = Hankel.QDHT(R, N, dim=3)
+q = Grid.RadialGrid(R, N)
 
 χ3 = PhysData.χ3(material)
 responses = (Nonlinear.Kerr_env(χ3),)
@@ -43,7 +42,7 @@ Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6, zmax=thickness)
 z = output["z"]
 Eωk = output["Eω"] # (ω, pol, k, z)
 
-Eωr = q \ Eωk # (ω, pol, r, z)
+Eωr = Grid.to_rspace(q, Eωk; dim=3) # (ω, pol, r, z)
 Etr = FFTW.ifft(Eωr, 1) # (t, pol, r, z)
 Iωr = abs2.(Eωr) # (ω, pol, r, z)
 Itr = abs2.(Etr) # (t, pol, r, z)

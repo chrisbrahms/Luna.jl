@@ -229,7 +229,7 @@ function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
     Eω, transform, FT
 end
 
-function doinputs_fs!(Eωk, grid, spacegrid::Union{Hankel.QDHT, Grid.FreeGrid, Grid.Free2DGrid}, FT,
+function doinputs_fs!(Eωk, grid, spacegrid::Grid.TransverseGrid, FT,
                    inputs::Tuple{Vararg{T} where T <: Fields.SpatioTemporalField})
     for field in inputs
         Eωki = field(grid, spacegrid, FT)
@@ -242,33 +242,50 @@ function doinputs_fs!(Eωk, grid, spacegrid::Union{Hankel.QDHT, Grid.FreeGrid, G
     end
 end
 
-function doinputs_fs!(Eωk, grid, spacegrid::Union{Hankel.QDHT, Grid.FreeGrid, Grid.Free2DGrid}, FT,
+function doinputs_fs!(Eωk, grid, spacegrid::Grid.TransverseGrid, FT,
                    inputs::Fields.SpatioTemporalField)
     doinputs_fs!(Eωk, grid, spacegrid, FT, (inputs,))
 end
 
-function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
+#= Radial simulations used to be set up with a Hankel.QDHT. Convert, so that scripts
+   written against the old interface keep working; Grid.RadialGrid warns once.
+
+   These take the same six concrete positional arguments as the RadialGrid methods below
+   rather than `args...`: a `setup(grid::TimeGrid, q::QDHT, args...)` shim is ambiguous with
+   the six-argument mode-averaged `setup(grid::RealGrid, densityfun, responses, inputs,
+   βfun!, aeff)`, which is exactly the call a legacy radial script makes. =#
+function setup(grid::Grid.RealGrid, q::Grid.HankelTransform,
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; noise_field)
+end
+
+function setup(grid::Grid.EnvGrid, q::Grid.HankelTransform,
+               densityfun, normfun, responses, inputs; noise_field=nothing)
+    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; noise_field)
+end
+
+function setup(grid::Grid.RealGrid, rg::Grid.RadialGrid,
                densityfun, normfun, responses, inputs; noise_field=nothing)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
     np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
-    tshape = (length(grid.t), np, length(q.r))
-    ωshape = (length(grid.ω), np, length(q.r))
+    tshape = (length(grid.t), np, rg.N)
+    ωshape = (length(grid.ω), np, rg.N)
     xt = zeros(Float64, tshape)
     FT = FFTW.plan_rfft(xt, 1, flags=settings["fftw_flag"])
     Eω = zeros(ComplexF64, ωshape)
-    Eωk = q * Eω
+    Eωk = Grid.to_kspace(rg, Eω)
     # plan FFT for xy polarisation for field creation
-    tshape_xy = (length(grid.t), 2, length(q.r))
+    tshape_xy = (length(grid.t), 2, rg.N)
     xt_xy = zeros(Float64, tshape_xy)
     FT_xy = FFTW.plan_rfft(xt_xy, 1, flags=settings["fftw_flag"])
-    doinputs_fs!(Eωk, grid, q, FT_xy, inputs)
+    doinputs_fs!(Eωk, grid, rg, FT_xy, inputs)
     oshape = tshape[2:end]
     xo = Array{Float64}(undef, length(grid.to), oshape...)
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransRadial(
-        grid, q, FTo, responses, densityfun, normfun, np > 1;
+        grid, rg, FTo, responses, densityfun, normfun, np > 1;
         noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
@@ -278,28 +295,28 @@ function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
     Eωk, transform, FT
 end
 
-function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
+function setup(grid::Grid.EnvGrid, rg::Grid.RadialGrid,
                densityfun, normfun, responses, inputs; noise_field=nothing)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
     np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
-    tshape = (length(grid.t), np, length(q.r))
-    ωshape = (length(grid.ω), np, length(q.r))
+    tshape = (length(grid.t), np, rg.N)
+    ωshape = (length(grid.ω), np, rg.N)
     xt = zeros(Float64, tshape)
     FT = FFTW.plan_fft(xt, 1, flags=settings["fftw_flag"])
     Eω = zeros(ComplexF64, ωshape)
-    Eωk = q * Eω
+    Eωk = Grid.to_kspace(rg, Eω)
     # plan FFT for xy polarisation for field creation
-    tshape_xy = (length(grid.t), 2, length(q.r))
+    tshape_xy = (length(grid.t), 2, rg.N)
     xt_xy = zeros(Float64, tshape_xy)
     FT_xy = FFTW.plan_fft(xt_xy, 1, flags=settings["fftw_flag"])
-    doinputs_fs!(Eωk, grid, q, FT_xy, inputs)
+    doinputs_fs!(Eωk, grid, rg, FT_xy, inputs)
     oshape = tshape[2:end]
     xo = Array{ComplexF64}(undef, length(grid.to), oshape...)
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransRadial(
-        grid, q, FTo, responses, densityfun, normfun, np > 1;
+        grid, rg, FTo, responses, densityfun, normfun, np > 1;
         noise_field)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
@@ -558,9 +575,11 @@ function run(Eω, grid,
     st = simtype(grid, transform, linop)
     st["boundary"] = string(boundary)
     boundary === :rate && (st["boundary_length"] = string(absorber.ℓ))
-    if !isnothing(Boundaries.spacegrid(transform))
+    sg = Boundaries.spacegrid(transform)
+    if !isnothing(sg)
         st["kcollar"] = string(kcollar)
         st["rcollar"] = string(rcollar)
+        output(Grid.to_dict(sg), group="spacegrid")
     end
     output(st, group="simulation_type")
     save_modeinfo_maybe(output, transform)

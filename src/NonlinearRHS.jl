@@ -11,7 +11,6 @@ applied to the field itself, which live in [`Boundaries`](@ref Luna.Boundaries).
 """
 module NonlinearRHS
 import FFTW
-import Hankel
 import Cubature
 import Base: show
 import LinearAlgebra: mul!, ldiv!
@@ -513,8 +512,8 @@ Transform E(ω) -> Pₙₗ(ω) for radially symmetric free-space propagation.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
 """
-struct TransRadial{TT, HTT, FTT, nT, rT, gT, dT, iT, eT, nlT}
-    QDHT::HTT # Hankel transform (space to k-space)
+struct TransRadial{TT, RGT, FTT, nT, rT, gT, dT, iT, eT, nlT}
+    rgrid::RGT # transverse grid (Grid.RadialGrid: space to k-space)
     FT::FTT # Fourier transform (time to frequency)
     normfun::nT # Function which returns normalisation factor
     resp::rT # nonlinear responses (tuple of callables)
@@ -537,16 +536,17 @@ function show(io::IO, t::TransRadial)
     grid = "grid type: $(typeof(t.grid))"
     samples = "time grid size: $(length(t.grid.t)) / $(length(t.grid.to))"
     resp = "responses: "*join([string(typeof(ri)) for ri in t.resp], "\n    ")
-    nr = "radial points: $(t.QDHT.N)"
-    R = "aperture: $(t.QDHT.R)"
+    nr = "radial points: $(t.rgrid.N)"
+    R = "aperture: $(t.rgrid.R)"
     out = join(["TransRadial", grid, samples, nr, R, resp], "\n  ")
     print(io, out)
 end
 
 """
-    TransRadial(TT, grid, HT, FT, responses, densityfun, normfun; noise_field=nothing)
+    TransRadial(TT, grid, rgrid, FT, responses, densityfun, normfun; noise_field=nothing)
 
 Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisation.
+`rgrid` is a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid).
 
 # Keyword arguments
 - `noise_field=nothing`: optional `(nω, nk)` frequency/k-space noise field for the modified
@@ -554,30 +554,41 @@ Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisat
   via inverse FFT and inverse Hankel transform, and stored as `Et_noise`.
   Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
 """
-function TransRadial(TT, grid, HT, FT, responses, densityfun, normfun, pol=false; noise_field=nothing)
+function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun, normfun,
+                     pol=false; noise_field=nothing)
     np = pol ? 2 : 1
-    Eωo = zeros(ComplexF64, (length(grid.ωo), np, HT.N))
-    Eto_r = zeros(TT, (length(grid.to), np, HT.N))
+    N = rgrid.N
+    Eωo = zeros(ComplexF64, (length(grid.ωo), np, N))
+    Eto_r = zeros(TT, (length(grid.to), np, N))
     Pto_r = similar(Eto_r)
     Eto_k = similar(Eto_r)
     Pto_k = similar(Eto_r)
     Pωo = similar(Eωo)
     idcs = CartesianIndices(size(Pto_r)[3:end])
-    Tfwd = convert(Matrix{TT}, transpose(HT.T) .* HT.scaleRK)
-    Tbwd = convert(Matrix{TT}, transpose(HT.T) ./ HT.scaleRK)
-    # Precompute time-domain noise in real space: ω→t via to_time!, then k→r via QDHT⁻¹
+    #= Our own copies of the grid's transform matrices in the type we multiply: a GEMM
+       needs both operands in the same element type (and on devices it is required). =#
+    Tfwd = convert(Matrix{TT}, rgrid.Tfwd)
+    Tbwd = convert(Matrix{TT}, rgrid.Tbwd)
+    #= Precompute time-domain noise in real space: ω→t via to_time!, then k→r. This is
+       Grid.to_rspace! done with our own Tbwd, so that the noise passes through exactly
+       the same matrix as the field does on every step. =#
     if !isnothing(noise_field)
-        Eωo_noise = zeros(ComplexF64, (length(grid.ωo), np, HT.N))
-        Et_noise = zeros(TT, (length(grid.to), np, HT.N))
+        Eωo_noise = zeros(ComplexF64, (length(grid.ωo), np, N))
+        Et_noise = zeros(TT, (length(grid.to), np, N))
         to_time!(Et_noise, noise_field, Eωo_noise, FT)
-        ldiv!(Et_noise, HT, Et_noise)
-        Et_nl = zeros(TT, (length(grid.to), np, HT.N))
+        Grid.radial_matmul!(Et_noise, Et_noise, Tbwd)
+        Et_nl = zeros(TT, (length(grid.to), np, N))
     else
         Et_noise = nothing
         Et_nl = nothing
     end
-    TransRadial(HT, FT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
+    TransRadial(rgrid, FT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
                 Tfwd, Tbwd, Et_noise, Et_nl)
+end
+
+# accept a Hankel.QDHT as before, converting it (with a deprecation warning)
+function TransRadial(TT::Type, grid, q::Grid.HankelTransform, args...; kwargs...)
+    TransRadial(TT, grid, Grid.RadialGrid(q), args...; kwargs...)
 end
 
 function TransRadial(grid::Grid.RealGrid, args...; kwargs...)
@@ -810,7 +821,8 @@ or a tuple of indices (one per polarisation). For crystal optics (`norm_free`,
 `norm_free2D` only) pass a tuple `(nfunx, nfuny)` with `nfunx(λ, δθ; z)` and `nfuny(λ; z)`,
 as for [`LinearOps.make_const_linop`](@ref).
 """
-norm_radial(grid, q::Hankel.QDHT, nfun) = FreeSpaceNorm(grid, q, nfun; constant=false)
+norm_radial(grid, rg::Grid.RadialGrid, nfun) = FreeSpaceNorm(grid, rg, nfun; constant=false)
+norm_radial(grid, q::Grid.HankelTransform, nfun) = norm_radial(grid, Grid.RadialGrid(q), nfun)
 norm_free(grid, xygrid::Grid.FreeGrid, nfun) = FreeSpaceNorm(grid, xygrid, nfun; constant=false)
 norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun) = FreeSpaceNorm(grid, xgrid, nfun; constant=false)
 
@@ -823,7 +835,8 @@ Make the normalisation factor ([`FreeSpaceNorm`](@ref)) for a `z`-independent re
 index, computed once and reused. `nfun(λ)` takes wavelength; for crystal optics pass
 `(nfunx, nfuny)` with `nfunx(λ, δθ)` and `nfuny(λ)`.
 """
-const_norm_radial(grid, q::Hankel.QDHT, nfun) = FreeSpaceNorm(grid, q, _zfun(nfun); constant=true)
+const_norm_radial(grid, rg::Grid.RadialGrid, nfun) = FreeSpaceNorm(grid, rg, _zfun(nfun); constant=true)
+const_norm_radial(grid, q::Grid.HankelTransform, nfun) = const_norm_radial(grid, Grid.RadialGrid(q), nfun)
 const_norm_free(grid, xygrid::Grid.FreeGrid, nfun) = FreeSpaceNorm(grid, xygrid, _zfun(nfun); constant=true)
 const_norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun) = FreeSpaceNorm(grid, xgrid, _zfun(nfun); constant=true)
 

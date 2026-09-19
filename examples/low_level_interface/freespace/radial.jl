@@ -1,7 +1,6 @@
 using Luna
 import Luna.PhysData: wlfreq
 import FFTW
-import Luna: Hankel
 import NumericalIntegration: integrate, SimpsonEven
 
 gas = :Ar
@@ -18,7 +17,7 @@ R = 4e-3
 N = 1024
 
 grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
-q = Hankel.QDHT(R, N, dim=3)
+q = Grid.RadialGrid(R, N)
 
 energyfun, energyfun_ω = Fields.energyfuncs(grid, q)
 
@@ -50,10 +49,10 @@ t = grid.t
 zout = output.data["z"]
 Eout = output.data["Eω"] # dimensions: (Nt, Npol, Nr, Nz)
 
-Erout = (q \ Eout)
+Erout = Grid.to_rspace(q, Eout; dim=3)
 Iωr = abs2.(Erout)
 # Iω0 = Iωr[:, 1, :]
-Er0 = dropdims(Hankel.onaxis(Eout, q), dims=(2, 3))
+Er0 = dropdims(Grid.onaxis(q, Eout; dim=3), dims=2)
 Iω0 = abs2.(Er0)
 Iω0log = log10.(Maths.normbymax(Iω0))
 Etout = FFTW.irfft(Erout, length(grid.t), 1)
@@ -76,8 +75,8 @@ zr = π*w0^2/λ0
 points = L/2 .+ [-15, 3, 21].*zr
 idcs = [argmin(abs.(zout .- point)) for point in points]
 
-Epoints = [Hankel.symmetric(Et[:, :, :, idxi], q) for idxi in idcs]
-rsym = Hankel.Rsymmetric(q);
+Epoints = [Grid.symmetric(q, Et[:, :, :, idxi]) for idxi in idcs]
+rsym = Grid.rsymmetric(q);
 ##
 import PyPlot:pygui, plt
 pygui(true)

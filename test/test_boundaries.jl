@@ -351,7 +351,7 @@ end
 @test out["prop_capillary_args"]["boundary_N"] == "5"
 end
 
-import Luna: LinearOps, NonlinearRHS, Hankel, Fields, Nonlinear
+import Luna: LinearOps, NonlinearRHS, Fields, Nonlinear
 import Luna.PhysData: wlfreq
 Luna.set_fftw_mode(:estimate)
 
@@ -359,7 +359,7 @@ Luna.set_fftw_mode(:estimate)
 Rs = 50e-6
 grid = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 0.2e-12)
 zmax = 1e-3
-q = Hankel.QDHT(Rs, 32, dim=3)
+q = Grid.RadialGrid(Rs, 32)
 xgrid = Grid.Free2DGrid(Rs, 32)
 xygrid = Grid.FreeGrid(Rs, 16, Rs, 16)
 nfunλ = PhysData.ref_index_fun(:Ar, 1)
@@ -457,7 +457,7 @@ for (sg, nfs) in ((q, NonlinearRHS.const_norm_radial(grid, q, nfunλ)),
     @test nfs.ℓ == ℓ && nfs.κmax == ratemax
     @test minimum(nfs.kwin) >= exp(-Boundaries.MAX_αℓ/2) # never zero: the norm divides by it
     @test minimum(real(b.linop)) >= -ratemax - 1.5Boundaries.MAX_αℓ/ℓ - 1e-9
-    @test b.stepfun.spatial isa (sg isa Hankel.QDHT ? Boundaries.RadialCollar : Boundaries.CartesianCollar)
+    @test b.stepfun.spatial isa (sg isa Grid.RadialGrid ? Boundaries.RadialCollar : Boundaries.CartesianCollar)
     # one accepted step through the absorber: finite, and only ever removes energy
     E1 = copy(Eω)
     e0 = sum(abs2, E1)
