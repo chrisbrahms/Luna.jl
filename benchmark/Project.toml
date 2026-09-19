@@ -1,0 +1,18 @@
+# Environment for benchmark/run.jl. Separate from Luna's own Project.toml so that
+# BenchmarkTools is not a Luna dependency. Set it up once, from the repository root, with
+#
+#   julia --project=benchmark -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+#
+# which points this environment at the working copy rather than at the registered version
+# of Luna. That call adds a [sources] entry with an absolute path; it is local to the
+# machine, so do not commit it. Manifest.toml in this directory is gitignored.
+
+[deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Luna = "30eb0fb0-5147-11e9-3356-d75b018717ce"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+
+[compat]
+BenchmarkTools = "1"
+julia = "1.9"
