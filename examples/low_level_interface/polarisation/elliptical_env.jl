@@ -17,7 +17,7 @@ nmodes = length(modes)
 grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 energyfun = Fields.energyfuncs(grid)[1]
-normfun = NonlinearRHS.norm_modal(grid.ω)
+normfun = NonlinearRHS.norm_modal(grid)
 
 function gausspulse(t)
     It = Maths.gauss(t, fwhm=τ)

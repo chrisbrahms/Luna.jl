@@ -18,7 +18,7 @@ nmodes = length(modes)
 grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 energyfun, energyfunω = Fields.energyfuncs(grid)
-normfun = NonlinearRHS.norm_modal(grid.ω)
+normfun = NonlinearRHS.norm_modal(grid)
 
 densityfun = let dens0=PhysData.density(gas, pres)
     z -> dens0
