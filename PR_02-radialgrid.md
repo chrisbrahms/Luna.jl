@@ -285,3 +285,12 @@ not run (too slow); the files above are the ones this branch touches, plus
 - `order ≠ 0` grids are constructed and transform correctly, but nothing else in Luna
   supports them yet; `onaxis` and `symmetric` throw a `DomainError` for them, as Hankel
   does. The field is the hook for Laguerre-Gauss modes later.
+- `Test.detect_ambiguities(Luna; recursive=true)` reports 41 pairs on this branch against 28
+  on `evanescent`. The 13 new ones are in `Luna.setup` and in
+  `NonlinearRHS.TransRadial`. The `setup` ones pair the six-argument `QDHT` shim with the
+  modal method, and are reachable only by a call whose second argument is a `QDHT` and
+  whose fifth is a `ModeCollection` — the same unreachable class the base branch already
+  has for `RadialGrid`, `FreeGrid` and `Free2DGrid`. The `TransRadial` ones pair the method
+  with a typed `::RadialGrid` third argument against the
+  `TransRadial(grid::RealGrid/EnvGrid, args...)` shims, and the real call has an FFT plan
+  in the third argument. None is reachable from a valid call.
