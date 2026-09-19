@@ -368,8 +368,11 @@ If `raman` is `true`, then the following options apply:
 """
 function prop_capillary(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
-    #= args[2] is `flength`: the grid no longer carries the propagation length, so it is
-       passed to Luna.run here. =#
+    #= args[2] is `flength`, the second positional argument of prop_capillary_args: the
+       grid no longer carries the propagation length, so it is passed to Luna.run here.
+       `makeoutput` builds the save grid from the named `flength`, so if the positional
+       layout ever changed the consistency check in Luna.run would raise rather than
+       silently propagate the wrong distance. =#
     Luna.run(Eω, grid, linop, transform, FT, output; zmax=args[2], status_period,
              boundary_kwargs(kwargs)...)
     output
@@ -1027,8 +1030,11 @@ Note that the current GNLSE model is single mode only.
 """
 function prop_gnlse(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_gnlse_args(args...; kwargs...)
-    #= args[2] is `flength`: the grid no longer carries the propagation length, so it is
-       passed to Luna.run here. =#
+    #= args[2] is `flength`, the second positional argument of prop_gnlse_args: the grid no
+       longer carries the propagation length, so it is passed to Luna.run here. `makeoutput`
+       builds the save grid from the named `flength`, so if the positional layout ever
+       changed the consistency check in Luna.run would raise rather than silently propagate
+       the wrong distance. =#
     Luna.run(Eω, grid, linop, transform, FT, output; zmax=args[2], status_period,
              boundary_kwargs(kwargs)...)
     output

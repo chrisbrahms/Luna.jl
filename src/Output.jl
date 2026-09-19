@@ -134,10 +134,17 @@ end
 """
     hasdata(o, key)
 
-Whether the output `o` already holds a top-level entry named `key`. Returns `false` for
-outputs which are plain callables and so cannot be queried.
+Whether the output `o` already holds a top-level entry named `key`.
+
+An output can be any callable, so this cannot always be answered. For an
+[`AbstractOutput`](@ref) which defines `haskey` -- [`MemoryOutput`](@ref) and
+[`HDF5Output`](@ref) both do -- the answer comes from `haskey`. For anything else, including
+a bare function and a wrapper which forwards the call but not `haskey`, the answer is
+`false`: nothing can be read back out of it. A caller which uses `hasdata` to avoid writing
+the same entry twice therefore has to tolerate the write happening anyway for such an
+output.
 """
-hasdata(o::MemoryOutput, key) = haskey(o, key)
+hasdata(o::AbstractOutput, key) = applicable(haskey, o, key) ? haskey(o, key) : false
 hasdata(o, key) = false
 
 function tofile(fpath, o::MemoryOutput)
@@ -318,8 +325,6 @@ function haskey(o::HDF5Output, key)
     end
 end
 
-
-hasdata(o::HDF5Output, key) = haskey(o, key)
 
 """Calling the output handler writes data to the file
     Arguments:

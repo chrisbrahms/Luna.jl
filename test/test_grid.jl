@@ -1,4 +1,4 @@
-import Test: @test, @test_throws, @test_logs, @testset
+import Test: @test, @test_throws, @test_logs, @testset, TestLogger
 import Logging
 import FFTW
 import Luna: Grid, Output, Luna
@@ -129,4 +129,89 @@ Logging.with_logger(Logging.NullLogger()) do
 end
 @test out["zmax"] == zmax
 @test out["z"][end] ≈ zmax
+
+# whatever the caller wrote, the length reaches the output as a Float64, as it did when the
+# grid carried it through float(zmax)
+outi = Output.MemoryOutput(0, 1, 3)
+Logging.with_logger(Logging.NullLogger()) do
+    Luna.run(mkEω(), grid, linop, transform, FT, outi; zmax=1)
+end
+@test outi["zmax"] === 1.0
+end
+
+#= A wrapper which forwards everything, including `haskey`: several outputs can be driven at
+   once this way and the result is still queryable, so the guards in `Luna.run` still work.
+   Defined at top level because a struct cannot be defined inside a testset. =#
+struct ForwardingOutput{oT} <: Output.AbstractOutput
+    out::oT
+end
+(w::ForwardingOutput)(args...; kwargs...) = w.out(args...; kwargs...)
+Base.getindex(w::ForwardingOutput, k) = w.out[k]
+Base.haskey(w::ForwardingOutput, k) = haskey(w.out, k)
+Output.check_cache(w::ForwardingOutput, y, t, dt) = Output.check_cache(w.out, y, t, dt)
+
+@testset "zmax in an HDF5Output" begin
+grid = Logging.with_logger(Logging.NullLogger()) do
+    Grid.EnvGrid(800e-9, (400e-9, 2e-6), 1e-12)
+end
+zmax = 0.1
+FT = FFTW.plan_fft(zeros(ComplexF64, length(grid.t)))
+linop = zeros(ComplexF64, length(grid.ω))
+transform = (nl, Eω, z) -> fill!(nl, 0)
+mkEω() = zeros(ComplexF64, length(grid.ω))
+
+dirpath = joinpath(homedir(), ".luna", "zmax_test")
+isdir(dirpath) && rm(dirpath; recursive=true)
+mkpath(dirpath)
+
+warned(logger) = any(logger.logs) do r
+    occursin("already has dataset zmax", string(r.message))
+end
+
+function run_to(output)
+    logger = TestLogger(min_level=Logging.Warn)
+    Logging.with_logger(logger) do
+        Luna.run(mkEω(), grid, linop, transform, FT, output; zmax)
+    end
+    logger
+end
+
+try
+    # the propagation length is in the file
+    fpath = joinpath(dirpath, "direct.h5")
+    out = Output.HDF5Output(fpath, 0, zmax, 3)
+    @test !warned(run_to(out))
+    @test out["zmax"] == zmax
+    @test out["z"][end] ≈ zmax
+
+    #= Resuming: the first run left a completed cache in the file, so this one picks it up
+       and must not write zmax a second time. =#
+    out2 = Output.HDF5Output(fpath, 0, zmax, 3)
+    @test Output.hasdata(out2, "zmax")
+    @test !warned(run_to(out2))
+    @test out2["zmax"] == zmax
+
+    # the same through a wrapper which forwards haskey
+    fpathw = joinpath(dirpath, "wrapped.h5")
+    w = ForwardingOutput(Output.HDF5Output(fpathw, 0, zmax, 3))
+    @test !warned(run_to(w))
+    @test w["zmax"] == zmax
+    w2 = ForwardingOutput(Output.HDF5Output(fpathw, 0, zmax, 3))
+    @test Output.hasdata(w2, "zmax")
+    @test !warned(run_to(w2))
+
+    #= A bare closure cannot be queried, so the guard cannot fire and the second run writes
+       again and warns. Documented behaviour, asserted so that it stays documented. =#
+    fpathc = joinpath(dirpath, "closure.h5")
+    oc = Output.HDF5Output(fpathc, 0, zmax, 3)
+    closure(args...; kwargs...) = oc(args...; kwargs...)
+    @test !Output.hasdata(closure, "zmax")
+    @test !warned(run_to(closure))
+    oc2 = Output.HDF5Output(fpathc, 0, zmax, 3)
+    closure2(args...; kwargs...) = oc2(args...; kwargs...)
+    @test warned(run_to(closure2))
+    @test oc2["zmax"] == zmax # written again, with the same value
+finally
+    rm(dirpath; recursive=true, force=true)
+end
 end

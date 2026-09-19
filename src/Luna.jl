@@ -447,10 +447,16 @@ Run the propagation over a distance `zmax`.
 
 # Arguments
 - `zmax::Real`: the propagation length in metres. Required: the grid no longer carries it.
-    If `output` saves on a fixed grid (`Output.GridCondition`, which is what
-    `MemoryOutput(zmin, zmax, saveN)` and `HDF5Output(path, zmin, zmax, saveN)` build),
-    `zmax` must agree with the end of that save grid. `zmax` is written to `output` as a
-    top-level entry.
+    It is converted to `Float64` and written to `output` as a top-level entry.
+
+    If `output` is an output object whose save condition is a fixed grid
+    (`Output.GridCondition`, which is what `MemoryOutput(zmin, zmax, saveN)` and
+    `HDF5Output(path, zmin, zmax, saveN)` build), `zmax` must agree with the end of that
+    save grid. That check, and the guard which stops the `zmax` entry being written twice
+    when an `HDF5Output` propagation is resumed, both need the output object itself. If
+    `output` is a closure or another wrapper around one -- the way several outputs are
+    driven at once -- neither applies: the save grid is not checked, and a resumed run warns
+    that the file already has the entry and overwrites it with the same value.
 - `max_dz::Real=zmax/2`: the largest step the solver may take.
 
 # Absorbing boundaries
@@ -504,9 +510,13 @@ function run(Eω, grid,
         "Luna.run requires the propagation length as the keyword argument zmax, e.g. "*
         "Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength). The grid no "*
         "longer stores it.")
+    #= `grid.zmax` was a Float64 field, so the length reached the absorbers, the stepper and
+       the output as a Float64 whatever the caller wrote. Keep that. =#
+    zmax = float(zmax)
     isnothing(max_dz) && (max_dz = zmax/2)
-    #= The save grid and zmax are two separate statements of the propagation length;
-       check here that they cannot drift apart. =#
+    #= The save grid and zmax are two separate statements of the propagation length; check
+       here that they cannot drift apart. Only possible when `output` is the output object
+       itself -- a closure wrapping one hides the save condition, and then this is skipped. =#
     if hasproperty(output, :save_cond) && output.save_cond isa Output.GridCondition
         zend = output.save_cond.grid[end]
         zend ≈ zmax || error(
@@ -542,7 +552,8 @@ function run(Eω, grid,
     boundary === :legacy || (Eω[.!grid.sidx, ntuple(_ -> :, ndims(Eω) - 1)...] .= 0)
 
     output(Grid.to_dict(grid), group="grid")
-    #= Written once: on a resumed HDF5 propagation it is already in the file. =#
+    #= Written once: on a resumed HDF5 propagation it is already in the file. An output
+       which cannot be queried (a closure, say) is written to again and warns. =#
     Output.hasdata(output, "zmax") || output("zmax", zmax)
     st = simtype(grid, transform, linop)
     st["boundary"] = string(boundary)
