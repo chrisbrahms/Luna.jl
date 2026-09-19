@@ -112,6 +112,11 @@ end
     include(joinpath(testdir, "test_modes.jl"))
 end
 
+@testset "Radial grid" begin
+    @info("================= test_radialgrid.jl")
+    include(joinpath(testdir, "test_radialgrid.jl"))
+end
+
 @testset "Free-space Propagation" begin
     @info("================= test_freespace.jl")
     include(joinpath(testdir, "test_freespace.jl"))

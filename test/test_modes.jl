@@ -2,7 +2,6 @@ import Test: @test, @testset, @test_throws
 using Luna
 import Luna.Capillary: besselj_zero, besselj, hquadrature
 import LinearAlgebra: norm
-import Luna: Hankel
 import Luna.PhysData: wlfreq
 import FFTW
 
@@ -90,7 +89,7 @@ end
     put in at the beginning, as well as their energy. =#
 a = 100e-6 # capillary radius
 # spatial grid, with a bigger aperture than the capillary - as we would have in a simulation
-q = Hankel.QDHT(2a, 512)
+q = Grid.RadialGrid(2a, 512)
 grid = Grid.RealGrid(1, 800e-9, (200e-9, 2000e-9), 0.5e-12)
 # First pulse
 It1 = Maths.gauss.(grid.t, fwhm=30e-15)
@@ -151,7 +150,7 @@ end
     =#
 a = 100e-6 # capillary radius
 # spatial grid, with a bigger aperture than the capillary - as we would have in a simulation
-q = Hankel.QDHT(2a, 512)
+q = Grid.RadialGrid(2a, 512)
 grid = Grid.RealGrid(1, 800e-9, (400e-9, 1000e-9), 0.5e-12)
 
 fwhm1 = 30e-15

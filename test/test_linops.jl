@@ -1,7 +1,6 @@
 import Luna: PhysData, Grid, LinearOps, Modes, Capillary
 import Test: @testset, @test
 import Luna.PhysData: wlfreq
-import Luna: Hankel
 
 R = 5e-3
 Nr = 256
@@ -13,11 +12,11 @@ pressure = 1
 @testset "free space" begin
     rgrid = Grid.RealGrid(1, 800e-9, (400e-9, 2000e-9), 0.2e-12)
     egrid = Grid.EnvGrid(1, 800e-9, (400e-9, 2000e-9), 0.2e-12)
-    q = Hankel.QDHT(R, Nr, dim=3)
+    q = Grid.RadialGrid(R, Nr)
     xygrid = Grid.FreeGrid(R, Nx, R, Ny)
     xgrid = Grid.Free2DGrid(R, Nx)
 
-    getshape(grid, q::Hankel.QDHT, pol) = (length(grid.ω), pol ? 2 : 1, q.N)
+    getshape(grid, q::Grid.RadialGrid, pol) = (length(grid.ω), pol ? 2 : 1, q.N)
     getshape(grid, sg::Grid.Free2DGrid, pol) = (length(grid.ω), pol ? 2 : 1, length(sg.x))
     getshape(grid, sg::Grid.FreeGrid, pol) = (length(grid.ω), pol ? 2 : 1, length(sg.x), length(sg.y))
 
@@ -190,7 +189,7 @@ end
 
     Rs = 50e-6
     grid = Grid.RealGrid(1e-3, 800e-9, (400e-9, 4000e-9), 0.2e-12)
-    qs = Hankel.QDHT(Rs, 64, dim=3)
+    qs = Grid.RadialGrid(Rs, 64)
     xygrids = Grid.FreeGrid(Rs, 32, Rs, 32)
     xgrids = Grid.Free2DGrid(Rs, 64)
     nfunλ = PhysData.ref_index_fun(gas, pressure)

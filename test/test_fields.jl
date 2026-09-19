@@ -3,7 +3,6 @@ using Luna
 import FFTW
 import Statistics: mean, std
 import Random: MersenneTwister
-import Luna: Hankel
 
 # note that most of the Fields.jl code is tested in many other modules
 
@@ -759,15 +758,15 @@ end
 
     grid = Grid.EnvGrid(1, λ0, (400e-9, 6e-6), 100e-15)
 
-    q = Hankel.QDHT(R, N, dim=3)
+    q = Grid.RadialGrid(R, N)
 
     xt = zeros(Float64, length(grid.t), 2, length(q.r))
     FT = FFTW.plan_fft(xt, 1, flags=FFTW.ESTIMATE)
 
     Eωk = Fields.GaussGaussField(;λ0, τfwhm, energy, w0, propz)(grid, q, FT)
 
-    r = Hankel.Rsymmetric(q)
-    Eωr = Hankel.symmetric(q \ Eωk, q)
+    r = Grid.rsymmetric(q)
+    Eωr = Grid.symmetric(q, Grid.to_rspace(q, Eωk))
 
     Iωr = abs2.(Eωr)
     Ir = dropdims(sum(Iωr; dims=(1, 2)); dims=(1, 2))
