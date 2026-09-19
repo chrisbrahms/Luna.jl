@@ -52,6 +52,46 @@ The gate uses, in order:
 2. otherwise the merge-base of `HEAD` with `ENV["LUNA_REGRESSION_BRANCH"]` (default
    `evanescent`).
 
+## Re-baselining onto a new base branch
+
+`generate.jl` takes any revision `git rev-parse` accepts — a branch name, a tag, a SHA,
+`HEAD`. It resolves it to a full SHA, makes (or reuses) a detached worktree of it under
+`../baselines/<sha[1:10]>`, copies this worktree's `Manifest.toml` and *this branch's*
+`cases.jl`, `compare.jl` and `run_cases.jl` into it, and runs `run_cases.jl` there in a
+fresh `julia -t 1` process. So the baseline is always the *old* Luna running the *new* case
+definitions. Verified for two different commits (the branch base and a later commit on the
+branch).
+
+When a branch's base moves — for example when `gpu/00-harness` is merged into `gpu/int-A`
+and the branches after it use `gpu/int-A` as their base:
+
+1. Make sure `cases.jl` still runs against the new base commit. It may not: `gpu/01-zmax`
+   moves `zmax` out of the grids and `gpu/02-radialgrid` replaces `Hankel.QDHT` with
+   `Grid.RadialGrid`, so the `Grid.RealGrid(...)`/`Grid.EnvGrid(...)` constructor calls,
+   `grid.zmax`, the `Luna.run` signature and `Hankel.QDHT(R_FREE, 32, dim=3)` in `cases.jl`
+   all have to be updated at that point. Once they are, `cases.jl` no longer runs against
+   `evanescent`, which is expected and is why the baseline commit is an argument.
+2. Generate the new baseline:
+
+   ```
+   julia --project=$PWD -t 1 test/regression/generate.jl gpu/int-A
+   ```
+
+3. Point the gate at it, either by setting `LUNA_REGRESSION_BRANCH=gpu/int-A` (the gate
+   then takes the merge-base of `HEAD` with that branch) or by naming the commit outright:
+
+   ```
+   LUNA_REGRESSION_BASE=gpu/int-A julia --project=$PWD -t 1 test/test_regression.jl
+   ```
+
+4. Record the differences of the new base against the old one before throwing the old
+   baseline away — a branch that legitimately changes a case (`gpu/02-radialgrid`'s radial
+   deltas, for instance) has to state which case moved and by how much, and that number can
+   only be measured across the re-baselining.
+
+Baselines from different commits live in different directories, so old and new can coexist
+and both gates can be run.
+
 ## The two run modes
 
 Every case runs twice.

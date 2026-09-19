@@ -18,8 +18,9 @@
    - In the `:fixed` mode the sensitivity is at rounding level (1e-15) for every case but
      two, so the tolerance is the 1e-12 floor. This is the mode that makes a difference
      attributable to the operation that produced it.
-   - In the `:adaptive` mode the largest quantity is almost always `stats/dz`, followed by
-     `stats/z`. The step-size controller's accept/reject decisions and its PI update
+   - In the `:adaptive` mode the largest quantity is `stats/dz` in eight of the fifteen
+     cases and `stats/z` in a ninth (the four free-space cases record no statistics, so
+     theirs is `Eω`). The step-size controller's accept/reject decisions and its PI update
      respond to a one-ulp change far more strongly than the field does, and the response
      compounds over the steps it takes to ramp `init_dz` up to `max_dz`. `Eω` itself is
      three to six orders of magnitude tighter than the per-case number in every adaptive
