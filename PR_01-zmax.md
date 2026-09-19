@@ -112,19 +112,38 @@ split across several processes, so the counts are per group.
 | `test_fields.jl` | passed |
 | `test_maths.jl` | passed |
 | `test_noise.jl` | passed |
+| `test_scans.jl` | passed (18+18+1+1+1+2+5+93) |
 
-`test_scans.jl` (unmodified by this branch) fails its "multi-process queue scan with error"
-testset in this working copy, but only because another agent's worktree was running the same
-test at the same time: `Scans.QueueExec` keeps its queue file in `Utils.cachedir()`, which is
-a Julia scratch space keyed by Luna's UUID and therefore shared by every worktree of the
-repository. The two runs consume the same queue, so each sees indices it did not run. The
-same file passes on the base commit when run alone, and the failure was reproduced with the
-other worktree's `test_scans.jl` process visible in `ps`. Nothing in this branch touches
-`Scans`.
+### A pre-existing `Scans.jl` bug found while running these
+
+`test_scans.jl` (unmodified by this branch) failed its "multi-process queue scan with error"
+testset for several runs in a row, with zero scan points executed, while passing on the base
+commit. The cause is not this change:
+
+- `Scans._runscan(f, scan::Scan{QueueExec})` builds the queue file name as the *relative*
+  path `qfile_$h.h5` (`Scans.jl:377-382`), so it lands in the process's working directory.
+  `QueueExec`'s docstring (`Scans.jl:59-60`) says it is stored in `Utils.cachedir()`, and the
+  test's `@test !isfile(joinpath(Utils.cachedir(), "qfile_$h.h5"))` therefore passes
+  vacuously.
+- An index is marked `1` ("in progress") before the scan function runs and only set to `2`
+  or `3` afterwards. If the process is killed in between, the file is left containing a `1`.
+  The next run finds no `0` entry, `all(qdata .> 1)` is false, so the file is not removed
+  either — the scan exits immediately having done nothing, and every subsequent run of that
+  scan name in that directory does the same. The state is unrecoverable without deleting the
+  file by hand.
+
+An earlier test run in this worktree was killed by the OS under memory pressure and left
+`qfile_5dded20e6c8f7f9e.h5` with `qdata = [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1]` in the worktree
+root. After deleting it, `test_scans.jl` passes on this branch with no failures. Not fixed
+here; it is outside this branch's scope.
+
+Note: there is a file in the same state at
+`/Users/mb140/.julia/dev/Luna/test/qfile_5dded20e6c8f7f9e.h5` in the main working copy, which
+will make `test_scans.jl` fail there until it is removed. It was not touched by this branch.
 
 Two notes on how the runs were driven: a driver that passes the test file names in `ARGS`
 makes `test_processing.jl` exit through `ArgParse` ("too many arguments"), because the
-`Scans` command-line parsing reads `ARGS`. It was run on its own instead. The same driver's
+`Scans` command-line parsing reads `ARGS`. It was run on its own instead. The
 `test_interface.jl` run was also killed once by the OS under memory pressure while several
 agents were running; it passed on the rerun.
 
