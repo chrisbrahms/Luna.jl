@@ -368,7 +368,9 @@ If `raman` is `true`, then the following options apply:
 """
 function prop_capillary(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
-    Luna.run(Eω, grid, linop, transform, FT, output; status_period,
+    #= args[2] is `flength`: the grid no longer carries the propagation length, so it is
+       passed to Luna.run here. =#
+    Luna.run(Eω, grid, linop, transform, FT, output; zmax=args[2], status_period,
              boundary_kwargs(kwargs)...)
     output
 end
@@ -389,6 +391,13 @@ function takes the same arguments as `prop_capillary` but instead or running the
 simulation and returning the output, it returns the required arguments for `Luna.run`,
 which is useful for repeated simulations in an indentical fibre with different initial
 conditions.
+
+The propagation length is not among them: run the propagation with
+
+```julia
+Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
+```
 """
 function prop_capillary_args(radius, flength, gas, pressure;
                         λlims, trange, envelope=false, thg=nothing, δt=1,
@@ -423,7 +432,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
     plasma = isnothing(plasma) ? !envelope : plasma
     thg = isnothing(thg) ? !envelope : thg
 
-    grid = makegrid(flength, λ0, λlims, trange, envelope, thg, δt)
+    grid = makegrid(λ0, λlims, trange, envelope, thg, δt)
     mode_s = makemode_s(
         modes, flength, radius, gas, pressure, temperature, model, loss, both_modes)
     check_orth(mode_s)
@@ -437,7 +446,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
                                      radial_integral_rtol, const_linop(radius, pressure);
                                      noise_field, thg)
     stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
-    output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
+    output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
@@ -498,16 +507,16 @@ end
 const_linop(radius::Number, pressure::Number) = Val(true)
 const_linop(radius, pressure) = Val(false)
 
-function makegrid(flength, λ0, λlims, trange, envelope, thg, δt)
+function makegrid(λ0, λlims, trange, envelope, thg, δt)
     if envelope
         isnothing(thg) && (thg = false)
-        Grid.EnvGrid(flength, λ0, λlims, trange; δt, thg)
+        Grid.EnvGrid(λ0, λlims, trange; δt, thg)
     else
-        Grid.RealGrid(flength, λ0, λlims, trange, δt)
+        Grid.RealGrid(λ0, λlims, trange; δt)
     end
 end
 
-makegrid(flength, λ0::Tuple, args...) = makegrid(flength, λ0[1], args...)
+makegrid(λ0::Tuple, args...) = makegrid(λ0[1], args...)
 
 function parse_mode(mode)
     ms = String(mode)
@@ -910,17 +919,17 @@ function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false}
     linop, Eω, transform, FT
 end
 
-function makeoutput(grid, saveN, stats, filepath::Nothing, scan::Nothing, scanidx, filename)
-    Output.MemoryOutput(0, grid.zmax, saveN, stats)
+function makeoutput(flength, saveN, stats, filepath::Nothing, scan::Nothing, scanidx, filename)
+    Output.MemoryOutput(0, flength, saveN, stats)
 end
 
-function makeoutput(grid, saveN, stats, filepath, scan::Nothing, scanidx, filename)
-    Output.HDF5Output(filepath, 0, grid.zmax, saveN, stats)
+function makeoutput(flength, saveN, stats, filepath, scan::Nothing, scanidx, filename)
+    Output.HDF5Output(filepath, 0, flength, saveN, stats)
 end
 
-function makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
+function makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
     isnothing(scanidx) && error("scanidx must be passed along with scan.")
-    Output.ScanHDF5Output(scan, scanidx, 0, grid.zmax, saveN, stats;
+    Output.ScanHDF5Output(scan, scanidx, 0, flength, saveN, stats;
                           fdir=filepath, fname=filename)
 end
 
@@ -1018,7 +1027,9 @@ Note that the current GNLSE model is single mode only.
 """
 function prop_gnlse(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_gnlse_args(args...; kwargs...)
-    Luna.run(Eω, grid, linop, transform, FT, output; status_period,
+    #= args[2] is `flength`: the grid no longer carries the propagation length, so it is
+       passed to Luna.run here. =#
+    Luna.run(Eω, grid, linop, transform, FT, output; zmax=args[2], status_period,
              boundary_kwargs(kwargs)...)
     output
 end
@@ -1031,6 +1042,13 @@ function takes the same arguments as `prop_gnlse` but instead or running the
 simulation and returning the output, it returns the required arguments for `Luna.run`,
 which is useful for repeated simulations in an indentical fibre with different initial
 conditions.
+
+The propagation length is not among them: run the propagation with
+
+```julia
+Eω, grid, linop, transform, FT, output = prop_gnlse_args(args...; kwargs...)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
+```
 """
 function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
                         δt=1, τfwhm=nothing, τw=nothing, ϕ=Float64[],
@@ -1048,7 +1066,7 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
     envelope = true
     thg = false
     polarisation=:linear
-    grid = makegrid(flength, λ0, λlims, trange, envelope, thg, δt)
+    grid = makegrid(λ0, λlims, trange, envelope, thg, δt)
     mode_s = SimpleFibre.SimpleMode(PhysData.wlfreq(λ0), βs; loss)
     aeff = z -> 1.0
     density = z -> 1.0
@@ -1087,7 +1105,7 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
     Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
                                    norm!, noise_field)
     stats = Stats.default(grid, Eω, mode_s, linop, transform)
-    output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
+    output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; γ, flength, βs, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
