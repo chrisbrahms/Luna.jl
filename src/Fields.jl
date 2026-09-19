@@ -6,7 +6,6 @@ import HCubature: hcubature
 import NumericalIntegration: integrate, SimpsonEven
 import Random: AbstractRNG, GLOBAL_RNG
 import Statistics: mean
-import Hankel
 import LinearAlgebra: dot, norm
 import FFTW
 import BlackBoxOptim
@@ -455,7 +454,8 @@ function make_Etr(s::SpatioTemporalField, grid::Grid.EnvGrid, spacegrid)
     sqrt.(s.Ishape(t, spacegrid.r)) .* exp.(im .* (s.ϕ .+ Δω.*t))
 end
 
-transform(q::Hankel.QDHT, FT, Etr) = q * (FT * Etr)
+transform(rg::Grid.RadialGrid, FT, Etr) = Grid.to_kspace(rg, FT * Etr)
+transform(q::Grid.HankelTransform, FT, Etr) = transform(Grid.RadialGrid(q), FT, Etr)
 transform(spacegrid::Grid.FreeGrid, FT, Etr) = FT * Etr
 transform(spacegrid::Grid.Free2DGrid, FT, Etr) = FT * Etr
 
@@ -491,12 +491,14 @@ function rotate(Etr::AbstractArray{T, 3}, θ) where T
     )
 end
 
-function prop!(Eωk, z, grid, q::Hankel.QDHT)
-    kzsq = (grid.ω/PhysData.c).^2 .- reshape(q.k.^2, (1, 1, length(q.k)))
+function prop!(Eωk, z, grid, rg::Grid.RadialGrid)
+    kzsq = (grid.ω/PhysData.c).^2 .- reshape(Grid.kperp2(rg), (1, 1, rg.N))
     kzsq[kzsq .< 0] .= 0
     kz = sqrt.(kzsq)
     @. Eωk *= exp(-1im * z * (kz - grid.ω/PhysData.c))
 end
+
+prop!(Eωk, z, grid, q::Grid.HankelTransform) = prop!(Eωk, z, grid, Grid.RadialGrid(q))
 
 function prop!(Eωk, z, grid, xygrid::Grid.FreeGrid)
     kzsq = ((grid.ω ./ PhysData.c).^2
@@ -635,25 +637,25 @@ function energyfuncs(grid::Grid.EnvGrid)
     return energy_t, energy_ω
 end
 
-function energyfuncs(grid::Grid.RealGrid, q::Hankel.QDHT)
+function energyfuncs(grid::Grid.RealGrid, rg::Grid.RadialGrid)
     function energy_t(Et)
         Eta = Maths.hilbert(Et)
         tintg = integrate(grid.t, abs2.(Eta), SimpsonEven())
-        return 2π*PhysData.c*PhysData.ε_0/2 * Hankel.integrateR(tintg, q)
+        return 2π*PhysData.c*PhysData.ε_0/2 * Grid.integrate_r(rg, tintg)
     end
 
     prefac = 2π*PhysData.c*PhysData.ε_0/2 * 2π/(grid.ω[end]^2)
     function energy_ω(Eω)
         ωintg = integrate(grid.ω, abs2.(Eω), SimpsonEven())
-        return prefac*Hankel.integrateK(ωintg, q)
+        return prefac*Grid.integrate_k(rg, ωintg)
     end
     return energy_t, energy_ω
 end
 
-function energyfuncs(grid::Grid.EnvGrid, q::Hankel.QDHT)
+function energyfuncs(grid::Grid.EnvGrid, rg::Grid.RadialGrid)
     function energy_t(Et)
         tintg = integrate(grid.t, abs2.(Et), SimpsonEven())
-        return 2π*PhysData.c*PhysData.ε_0/2 * Hankel.integrateR(tintg, q)
+        return 2π*PhysData.c*PhysData.ε_0/2 * Grid.integrate_r(rg, tintg)
     end
 
     δω = grid.ω[2] - grid.ω[1]
@@ -661,9 +663,13 @@ function energyfuncs(grid::Grid.EnvGrid, q::Hankel.QDHT)
     prefac = 2π*PhysData.c*PhysData.ε_0/2 * 2π*δω/(Δω^2)
     function energy_ω(Eω)
         ωintg = dropdims(sum(abs2.(Eω); dims=1), dims=1)
-        return prefac*Hankel.integrateK(ωintg, q)
+        return prefac*Grid.integrate_k(rg, ωintg)
     end
     return energy_t, energy_ω
+end
+
+function energyfuncs(grid::Grid.TimeGrid, q::Grid.HankelTransform)
+    energyfuncs(grid, Grid.RadialGrid(q))
 end
 
 function energyfuncs(grid::Grid.RealGrid, xygrid::Grid.FreeGrid)

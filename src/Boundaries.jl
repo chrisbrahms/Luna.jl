@@ -72,7 +72,7 @@ transverse wavevector `k⊥`.
   with `κ`, and harmless.
 - **Transverse collar** (`:rate` only). The analogue of the temporal collar: a beam
   reaching the transverse edge wraps around (FFT grids) or reflects off the `E(R) = 0`
-  wall of the QDHT. A rate over the outer part of the transverse grid ([`rprofile`](@ref))
+  wall of a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid). A rate over the outer part of the transverse grid ([`rprofile`](@ref))
   is applied as a split-step factor per accepted step ([`RadialCollar`](@ref),
   [`CartesianCollar`](@ref)), with the same first-order, collar-confined
   non-commutation error as the temporal collar. As for the temporal collar, what it removes
@@ -103,7 +103,6 @@ module Boundaries
 import ..Maths
 import ..Grid
 import ..NonlinearRHS
-import Hankel
 import LinearAlgebra: mul!, ldiv!
 import Logging
 import Printf: @sprintf
@@ -264,11 +263,11 @@ end
 """
     spacegrid(transform)
 
-The transverse grid of a free-space transform (`Hankel.QDHT`, `Grid.FreeGrid` or
+The transverse grid of a free-space transform (`Grid.RadialGrid`, `Grid.FreeGrid` or
 `Grid.Free2DGrid`), or `nothing` for a modal transform. The free-space parts of the
 boundaries are set up only when this is not `nothing`.
 """
-spacegrid(t::NonlinearRHS.TransRadial) = t.QDHT
+spacegrid(t::NonlinearRHS.TransRadial) = t.rgrid
 spacegrid(t::NonlinearRHS.TransFree) = t.xygrid
 spacegrid(t::NonlinearRHS.TransFree2D) = t.xgrid
 spacegrid(t) = nothing
@@ -284,28 +283,28 @@ end
 
 The k-space absorber profile over the transverse k axes of `spacegrid`: 1 in the interior,
 falling to 0 over the outer `collar` fraction of the largest wavevector the grid holds
-(`q.K` for a `QDHT`, the Nyquist wavevector for FFT grids). For a `FreeGrid` it is the
+(`rg.K` for a `RadialGrid`, the Nyquist wavevector for FFT grids). For a `FreeGrid` it is the
 product of the tapers along `kx` and `ky`, matching the square edge of the grid. Sized
 like the k axes, `(Nk,)` or `(Nkx, Nky)`, so that it broadcasts over a linop's trailing
 axes ([`addloss_k`](@ref)) and matches [`NonlinearRHS.FreeSpaceNorm`](@ref)'s `kwin`.
 `collar = 0` gives a profile of ones, i.e. no k-space absorber.
 """
-kprofile(q::Hankel.QDHT, collar) = Maths.planck_taper(
-    q.k, -q.K, -(1 - collar)*q.K, (1 - collar)*q.K, q.K)
+kprofile(rg::Grid.RadialGrid, collar) = Maths.planck_taper(
+    rg.k, -rg.K, -(1 - collar)*rg.K, (1 - collar)*rg.K, rg.K)
 kprofile(sg::Grid.Free2DGrid, collar) = ktaper(sg.kx, collar)
 kprofile(sg::Grid.FreeGrid, collar) = ktaper(sg.kx, collar) .* ktaper(sg.ky, collar)'
 
 """
     rprofile(spacegrid, collar)
 
-The transverse absorber profile in real space. For a `QDHT` it is a Planck taper from
+The transverse absorber profile in real space. For a `RadialGrid` it is a Planck taper from
 `(1 - collar)R` to the aperture `R`, where the transform imposes `E(R) = 0`. The Cartesian
 grids already carry the window they were built with (`window_factor` in
 [`Grid.FreeGrid`](@ref) and [`Grid.Free2DGrid`](@ref) extends the box to make room for
 it), so for those `collar` is ignored and that window is returned.
 """
-rprofile(q::Hankel.QDHT, collar) = Maths.planck_taper(
-    q.r, -q.R, -(1 - collar)*q.R, (1 - collar)*q.R, q.R)
+rprofile(rg::Grid.RadialGrid, collar) = Maths.planck_taper(
+    rg.r, -rg.R, -(1 - collar)*rg.R, (1 - collar)*rg.R, rg.R)
 rprofile(sg::Grid.Free2DGrid, collar) = copy(sg.xwin)
 rprofile(sg::Grid.FreeGrid, collar) = dropdims(sg.xywin; dims=1)
 
@@ -369,16 +368,21 @@ function evanescent(linop, transform, ℓ; kwin=nothing)
 end
 
 """
-    RadialCollar(q, αr, Eω)
+    RadialCollar(rgrid, αr, Eω)
 
 Transverse absorbing boundary for radially symmetric propagation: the power rate `αr` over
-`q.r`, applied as `exp(-αr Δz/2)` per accepted step. The QDHT imposes `E(R) = 0`, a hard
-wall which reflects whatever reaches the aperture, and the collar absorbs it first. It is
-applied to `Eω` directly (the collar is diagonal in ω) with one inverse and one forward
-Hankel transform along the last axis, into the buffer `buf` sized like `Eω`.
+`rgrid.r`, applied as `exp(-αr Δz/2)` per accepted step. The Hankel transform imposes
+`E(R) = 0`, a hard wall which reflects whatever reaches the aperture, and the collar absorbs
+it first. It is applied to `Eω` directly (the collar is diagonal in ω) with one inverse and
+one forward Hankel transform along the last axis, into the buffer `buf` sized like `Eω`.
+
+`Tfwd` and `Tbwd` are the grid's transform matrices in the element type of `Eω`, so that
+both operands of the matrix multiplication have the same element type.
 """
-struct RadialCollar{qT, bT}
-    q::qT
+struct RadialCollar{rT, mT, bT}
+    rgrid::rT
+    Tfwd::Matrix{mT}
+    Tbwd::Matrix{mT}
     αr::Vector{Float64}
     ridcs::Vector{Int} # only the collar is ever ≠ 1
     weight::Vector{Float64} # radial integration weights, to measure what is removed
@@ -388,12 +392,16 @@ struct RadialCollar{qT, bT}
     warned::Base.RefValue{Bool}
 end
 
-RadialCollar(q, αr, Eω) = RadialCollar(q, αr, findall(>(0), αr), copy(q.scaleR), similar(Eω),
-                                       Ref(0.0), Ref(0.0), Ref(false))
+function RadialCollar(rgrid::Grid.RadialGrid, αr, Eω)
+    TT = eltype(Eω)
+    RadialCollar(rgrid, convert(Matrix{TT}, rgrid.Tfwd), convert(Matrix{TT}, rgrid.Tbwd),
+                 αr, findall(>(0), αr), copy(rgrid.wr), similar(Eω),
+                 Ref(0.0), Ref(0.0), Ref(false))
+end
 
 # applied before the temporal collar, in (ω, k⊥) space
 function apply_kspace!(c::RadialCollar, Eω, Δz)
-    ldiv!(c.buf, c.q, Eω) # (ω, pol, k) -> (ω, pol, r)
+    Grid.radial_matmul!(c.buf, Eω, c.Tbwd) # (ω, pol, k) -> (ω, pol, r)
     d = ndims(c.buf)
     if c.reference[] == 0
         c.reference[] = sum(i -> c.weight[i]*sum(abs2, selectdim(c.buf, d, i)), axes(c.buf, d))
@@ -406,7 +414,7 @@ function apply_kspace!(c::RadialCollar, Eω, Δz)
         s .*= fac
     end
     c.removed[] += removed
-    mul!(Eω, c.q, c.buf)
+    Grid.radial_matmul!(Eω, c.buf, c.Tfwd)
     nothing
 end
 apply_kspace!(c, Eω, Δz) = nothing
@@ -451,8 +459,8 @@ apply_realspace!(c, Et, Δz) = nothing
 The transverse absorber functor for `spacegrid`, given the power rate `αr` over its real
 space. `grid` and `Et` size the buffer the radial collar needs.
 """
-spatialcollar(q::Hankel.QDHT, αr, grid, Et) = RadialCollar(
-    q, αr, zeros(ComplexF64, (length(grid.ω), size(Et)[2:end]...)))
+spatialcollar(rg::Grid.RadialGrid, αr, grid, Et) = RadialCollar(
+    rg, αr, zeros(ComplexF64, (length(grid.ω), size(Et)[2:end]...)))
 spatialcollar(sg::Union{Grid.Free2DGrid, Grid.FreeGrid}, αr, grid, Et) = CartesianCollar(αr)
 
 # --------------------------------------------------------------------------- application
@@ -615,7 +623,7 @@ function log_setup(grid, ℓ, collar, sg=nothing, kcollar=0, rcollar=0)
          the propagation). Temporal collar %.3g fs, %.1f%% of the time window.",
         ℓ, grid.zmax/ℓ, grid.zmax, 0.5^(grid.zmax/ℓ), w*1e15, 100*w/trange))
     isnothing(sg) && return nothing
-    rdesc = sg isa Hankel.QDHT ? @sprintf("%.1f%% of the aperture", 100rcollar) :
+    rdesc = sg isa Grid.RadialGrid ? @sprintf("%.1f%% of the aperture", 100rcollar) :
                                  "the grid's own window"
     Logging.@info(@sprintf(
         "Free-space boundaries: k-space collar %.1f%% of the largest k⊥, transverse \
