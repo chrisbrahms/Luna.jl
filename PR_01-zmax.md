@@ -73,8 +73,9 @@ frequency axes and their apodisation windows; the propagation length is an argum
   deprecated ones (warning emitted, identical grid), `to_dict`/`from_dict` round trip and
   `from_dict` with a legacy `zmax` key, `run` without `zmax` erroring, the
   `zmax`/`GridCondition` consistency check, and `output["zmax"]`.
-- 24 existing test files and 49 example files updated to the new signatures. No test uses a
-  deprecated constructor except the ones in `test_grid.jl` that test the deprecation.
+- 21 existing `test_*.jl` files plus `runtests.jl`, and 49 example files, updated to the new
+  signatures. No test uses a deprecated constructor except the ones in `test_grid.jl` that
+  test the deprecation.
 - `docs/src` needed no edit: the grid and `Luna.run` pages are `@autodocs`/`@docs` blocks, so
   they pick up the changed docstrings. This is a deviation from item 6 of the brief only in
   the sense that there was no hand-written text to change.
@@ -198,15 +199,119 @@ A first attempt showed relative differences of 5e-7 and 2e-7 in the two `prop_ca
 cases; that was the default `rng=GLOBAL_RNG` for the shot noise, not the change. With a
 fixed RNG the outputs are bit-identical.
 
+## Changes made after review round 1
+
+Review: `reviews/gpu-01-zmax-1.md`, verdict "approve with minor fixes". Every finding is
+addressed below; nothing in the review was a correctness bug in the default path, and the
+bit-identical result is unaffected (no change to any arithmetic).
+
+**Finding 1 — `zmax` not converted to `Float64`.** `Luna.run` now does `zmax = float(zmax)`
+immediately after the required-keyword check. The grid constructor used to do this, so the
+absorbers, `RK45.solve_precon`'s `tmax` and the output dataset always saw a `Float64`;
+`prop_capillary(125e-6, 1, ...)` was putting an `Int64` in the file. `test_grid.jl` asserts
+`output["zmax"] === 1.0` for `zmax=1`.
+
+**Findings 3 and 4 — `Output.hasdata` and the save-grid check skipped for wrapped outputs.**
+Kept `hasdata` and narrowed the fallback, option (a). Dropping it in favour of
+`output("zmax", zmax; force=true)` was rejected: `force=true` warns on every `HDF5Output`
+write, and the existing `output(Grid.to_dict(grid), group="grid")` avoids a warning on a
+resume only because its top-level `haskey` check does not see keys inside a group, which a
+top-level scalar cannot copy. The new definition is
+
+```julia
+hasdata(o::AbstractOutput, key) = applicable(haskey, o, key) ? haskey(o, key) : false
+hasdata(o, key) = false
+```
+
+so a wrapper which forwards `haskey` is queried like the output it wraps, and only an output
+that genuinely cannot be queried (a bare closure) falls through. The `MemoryOutput` and
+`HDF5Output` methods are gone, covered by the first. The docstring describes the fallback
+instead of one case. `Luna.run`'s docstring no longer states the save-grid check and the
+duplicate-write guard as unconditional: both need the output object itself, and a closure
+wrapping one skips them.
+
+**Finding 2 — no test for `HDF5Output` or the `hasdata` branch.** New `test_grid.jl` testset
+"zmax in an HDF5Output" (14 assertions): the entry is written and readable; a resumed run
+(second `HDF5Output` on the same file, picking up the completed cache) has
+`Output.hasdata(out, "zmax")` true, emits no "already has dataset zmax" warning and keeps
+the value; the same through a `ForwardingOutput` wrapper which forwards `haskey`; and a bare
+closure, where `hasdata` is false, does warn on the second run and rewrites the same value —
+asserted so the documented limitation stays documented.
+
+**Finding 5 — `zmax=args[2]`.** A comment at both sites in `Interface.jl` records that
+`flength` is the second positional argument of `prop_capillary_args`/`prop_gnlse_args` and
+that, because `makeoutput` builds the save grid from the named `flength`, a change to the
+positional layout would trip the `GridCondition` check in `run` rather than propagate the
+wrong distance.
+
+**Finding 6 — two examples stating the length twice.** `polarisation/elliptical.jl` and
+`elliptical_env.jl` now use a `flength` local like the other 47.
+
+**Finding 7 — PR counts.** Corrected to 21 existing `test_*.jl` files plus `runtests.jl`,
+plus the new `test_grid.jl`.
+
+**Finding 8 — forward compatibility.** Covered in "Known gaps" below.
+
+**Finding 10 — three broken examples (pre-existing).** `NonlinearRHS.norm_modal(grid.ω)` was
+corrected to `norm_modal(grid)` in `full_modal/basic_modal_full.jl`,
+`full_modal/basic_modal_full_bothpolarisations.jl` and `polarisation/elliptical_env.jl`, in
+its own commit. Running them then exposed further pre-existing breakage, fixed in a second
+commit: both `full_modal` examples used `linop` one line before defining it, and
+`elliptical_env.jl` called `Maths.gauss(t, fwhm=τ)` with a `τ` it never defines (it has
+`τfwhm`) and used `FFTW` before the `import FFTW` that sits below `Luna.run`.
+
+Result of running the three (propagation only, plotting cut off):
+
+```
+OK   low_level_interface/full_modal/basic_modal_full.jl  (425.3 s)
+FAIL low_level_interface/full_modal/basic_modal_full_bothpolarisations.jl
+     DimensionMismatch: cannot broadcast array to have fewer non-singleton dimensions
+FAIL low_level_interface/polarisation/elliptical_env.jl
+     MethodError: no method matching -(::Vector{Float64}, ::Int64)
+```
+
+Both remaining failures are pre-existing and not caused by this branch: I reconstructed the
+two scripts with the *old* grid signatures (`Grid.RealGrid(flength, λ0, ...)`,
+`Output.MemoryOutput(0, grid.zmax, ...)`, `Luna.run` without `zmax`) and only the pre-existing
+fixes applied, ran them against the base commit in
+`/Users/mb140/.julia/dev/Luna-gpu/baselines/base-02`, and got the same two errors at the same
+lines (`bothpol.jl:42`, `ellenv.jl:30`). They are real breakage in the examples — the
+`:xy; full=true` vector setup for the first, the script's own energy normalisation for the
+second — not one-line slips, so they are left alone. Those two examples have evidently never
+been run.
+
+**Finding 9 — `Scans.QueueExec`.** Already recorded above; unchanged.
+
+### Tests rerun after the fixes
+
+| file | result |
+|---|---|
+| `test_grid.jl` | 88 pass (7+22+40+5+14), 0 fail |
+| `test_output.jl` | 71 pass (14+13+36+8), 0 fail |
+| `test_interface.jl` | 301 pass (24+24+74+52+6+65+30+17+6+3), 0 fail |
+
 ## Known gaps and open questions
 
+- **Output files are backward compatible but not forward compatible.** A file written
+  before this change still loads, because the keyword constructors ignore a `zmax` key. A
+  file written on this branch cannot be loaded by a pre-branch Luna: `Grid.to_dict` no
+  longer emits `zmax`, and the old keyword constructor has `zmax` as a required keyword, so
+  `Processing.makegrid` there throws `UndefKeywordError`. Users who share `.h5` files
+  between Luna versions need to know this. In the other direction, files written before this
+  change have no top-level `zmax` entry, so any post-processing that grows to read
+  `output["zmax"]` has to tolerate its absence; nothing reads it today.
 - `prop_capillary`/`prop_gnlse` pass `zmax=args[2]` to `Luna.run`, i.e. they rely on
   `flength` being the second positional argument of `prop_capillary_args`/`prop_gnlse_args`.
   That is how the existing `args...` forwarding is written; splitting the signature to name
   `flength` explicitly would be a larger change to the interface than this branch should
-  make.
+  make. It is self-checking: `makeoutput` builds the save grid from the named `flength`, so
+  a change to the positional layout would trip the `GridCondition` check in `run` rather
+  than propagate the wrong distance silently. A comment at both sites says so.
 - `Output.hasdata` is new public API introduced only so that `run` can avoid a duplicate
-  write when an HDF5 propagation is resumed. An alternative would be `output("zmax", zmax;
-  force=true)`, which warns on `HDF5Output` and errors on `MemoryOutput`.
+  write when an HDF5 propagation is resumed. It answers from `haskey` for any
+  `AbstractOutput` that defines it and `false` for anything else, so an output that is a
+  bare closure still gets the duplicate write and the warning that goes with it. The same
+  limitation applies to the `zmax`/save-grid consistency check, which needs to see
+  `output.save_cond`. Both are stated in `Luna.run`'s docstring.
 - The deprecated constructors warn with `maxlog=1`, so a script that builds many grids sees
   the message once. They are meant to be removed one release after this change.
