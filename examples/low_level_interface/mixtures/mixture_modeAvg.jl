@@ -9,7 +9,7 @@ flength = 15e-2
 λ0 = 800e-9
 energy = 1e-6
 
-grid = Grid.RealGrid(flength, λ0, (160e-9, 3000e-9), 1e-12)
+grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 m = Capillary.MarcatiliMode(a, (gas, gas), (pres/2, pres/2), loss=false)
 aeff = let m=m
@@ -38,9 +38,9 @@ Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aef
 ppwin = Stats.peakpower(grid, Eω, (150e-9, 300e-9)) # peak power of dispersive wave
 statsfun = Stats.default(grid, Eω, m, linop, transform;
                          gas=(gas, gas), windows=((150e-9, 300e-9),), userfuns=(ppwin,))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun) # statsfun
+output = Output.MemoryOutput(0, flength, 201, statsfun) # statsfun
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 
 ##
 Plotting.pygui(true)

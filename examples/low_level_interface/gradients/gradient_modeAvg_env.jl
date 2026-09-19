@@ -10,7 +10,7 @@ energy = 1e-6
 
 L = 15e-2
 
-grid = Grid.EnvGrid(L, λ0, (160e-9, 3000e-9), 1e-12)
+grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 coren, densityfun = Capillary.gradient(gas, L, pres, 0);
 m = Capillary.MarcatiliMode(a, coren, loss=false);
@@ -31,9 +31,9 @@ inputs = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy)
 
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 statsfun = Stats.default(grid, Eω, m, linop!, transform; gas=gas, windows=((150e-9, 300e-9),))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+output = Output.MemoryOutput(0, L, 201, statsfun)
 
-Luna.run(Eω, grid, linop!, transform, FT, output)
+Luna.run(Eω, grid, linop!, transform, FT, output; zmax=L)
 
 ##
 Plotting.pygui(true)

@@ -10,7 +10,7 @@ L = 15e-2/10
 λ0 = 800e-9
 energy = 5e-6
 
-grid = Grid.RealGrid(L, λ0, (160e-9, 3000e-9), 1e-12)
+grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 modes = collect(RectModes.RectMode(a, b, gas, pres, :Ag, n=n, m=m) for m in 1:3 for n in 1:6)
 nmodes = length(modes)
@@ -31,9 +31,9 @@ Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, modes, :x; 
 
 linop = LinearOps.make_const_linop(grid, modes, λ0)
 statsfun = Stats.default(grid, Eω, modes, linop, transform; gas=gas, windows=((150e-9, 300e-9),))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+output = Output.MemoryOutput(0, L, 201, statsfun)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=L)
 
 ##
 Plotting.pygui(true)

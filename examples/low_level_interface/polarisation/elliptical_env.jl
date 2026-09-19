@@ -14,7 +14,7 @@ modes = (Capillary.MarcatiliMode(a, gas, pres, n=1, m=1, kind=:HE, ϕ=0.0),
          Capillary.MarcatiliMode(a, gas, pres, n=1, m=1, kind=:HE, ϕ=π/2))
 nmodes = length(modes)
 
-grid = Grid.EnvGrid(10e-2, λ0, (160e-9, 3000e-9), 1e-12)
+grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 energyfun = Fields.energyfuncs(grid)[1]
 normfun = NonlinearRHS.norm_modal(grid.ω)
@@ -55,10 +55,10 @@ Eω, transform, FT = Luna.setup(grid, densityfun, normfun, responses, inputs,
 Eω .= Ew
 
 statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+output = Output.MemoryOutput(0, 10e-2, 201, statsfun)
 linop = LinearOps.make_const_linop(grid, modes, λ0)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=10e-2)
 
 import FFTW
 import PyPlot:pygui, plt

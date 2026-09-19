@@ -9,7 +9,7 @@ pres = 25
 flength = 80e-2
 energy = 10e-6
 
-grid = Grid.EnvGrid(flength, λ0, (220e-9, 3000e-9), 4e-12)
+grid = Grid.EnvGrid(λ0, (220e-9, 3000e-9), 4e-12)
 
 m = Capillary.MarcatiliMode(a, gas, pres, loss=false)
 aeff = let m=m
@@ -36,8 +36,8 @@ inputs = (Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy), Fields.ShotN
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 
 statsfun = Stats.default(grid, Eω, m, linop, transform; gas=gas, windows=((150e-9, 300e-9),))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output)
+output = Output.MemoryOutput(0, flength, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 
 ##
 Plotting.pygui(true)

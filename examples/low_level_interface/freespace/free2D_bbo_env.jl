@@ -21,7 +21,7 @@ thickness = 200e-6 # BBO thickness
 R = 4*w0 # radius of the spatial window
 N = 2^7 # number of spatial points
 
-grid = Grid.EnvGrid(thickness, λ0, (250e-9, 2e-6), 120e-15; thg=true)
+grid = Grid.EnvGrid(λ0, (250e-9, 2e-6), 120e-15; thg=true)
 xgrid = Grid.Free2DGrid(R, N)
 
 θ = deg2rad(29.2) # type I phase-matching angle
@@ -47,8 +47,8 @@ inputs = Fields.GaussGaussField(;λ0, τfwhm, energy=energy/(sqrt(π/2)*w0), w0)
 Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, responses, inputs)
 
 ##
-output = Output.MemoryOutput(0, grid.zmax, 101)
-Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6)
+output = Output.MemoryOutput(0, thickness, 101)
+Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6, zmax=thickness)
 
 ##
 z = output["z"]

@@ -10,7 +10,7 @@ fr = 0.18
 λ0 = 835e-9
 energy = 568e-12
 
-grid = Grid.EnvGrid(flength, λ0, (400e-9, 1400e-9), 10e-12)
+grid = Grid.EnvGrid(λ0, (400e-9, 1400e-9), 10e-12)
 
 m = StepIndexFibre.StepIndexMode(a, accellims=(400e-9, 1400e-9, 100))
 aeff = let aeffc = Modes.Aeff(m, z=0)
@@ -27,8 +27,8 @@ inputs = (Fields.SechField(λ0=λ0, τfwhm=τfwhm, energy=energy), Fields.ShotNo
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 
 
-output = Output.MemoryOutput(0, grid.zmax, 201)
-Luna.run(Eω, grid, linop, transform, FT, output)
+output = Output.MemoryOutput(0, flength, 201)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 
 ##
 Plotting.pygui(true)

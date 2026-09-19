@@ -20,7 +20,7 @@ R = 4*w0 # radius of the spatial window
 Nx = 2^6 # number of spatial points in x
 Ny = 16 # number of spatial points in y
 
-grid = Grid.RealGrid(thickness, λ0, (250e-9, 2e-6), 120e-15)
+grid = Grid.RealGrid(λ0, (250e-9, 2e-6), 120e-15)
 xygrid = Grid.FreeGrid(R, Nx, R, Ny)
 
 θ = deg2rad(29.2) # type I phase-matching angle
@@ -45,8 +45,8 @@ inputs = Fields.GaussGaussField(;λ0, τfwhm, energy=energy, w0)
 Eω, transform, FT = Luna.setup(grid, xygrid, densityfun, normfun, responses, inputs)
 
 ##
-output = Output.MemoryOutput(0, grid.zmax, 101)
-Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6)
+output = Output.MemoryOutput(0, thickness, 101)
+Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6, zmax=thickness)
 
 ##
 z = output["z"]

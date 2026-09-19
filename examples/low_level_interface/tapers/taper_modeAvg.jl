@@ -10,7 +10,7 @@ energy = 1e-6
 
 L = 15e-2
 
-grid = Grid.RealGrid(L, λ0, (160e-9, 3000e-9), 1e-12)
+grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 a0 = a
 aL = 3a/4
@@ -40,9 +40,9 @@ inputs = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 
 statsfun = Stats.default(grid, Eω, m, linop, transform; gas=gas, windows=((150e-9, 300e-9),))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+output = Output.MemoryOutput(0, L, 201, statsfun)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=L)
 
 ##
 Plotting.pygui(true)

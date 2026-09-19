@@ -9,7 +9,7 @@ pres = 5
 flength = 0.5e-2
 energy = 1e-6
 
-grid = Grid.EnvGrid(flength, λ0, (160e-9, 3000e-9), 1e-12, thg=true)
+grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 1e-12, thg=true)
 
 m = Capillary.MarcatiliMode(a, gas, pres, loss=false)
 aeff(z) = Modes.Aeff(m, z=z)
@@ -36,9 +36,9 @@ statsfun = Stats.collect_stats(grid, Eω,
                                Stats.peakpower(grid),
                                Stats.fwhm_t(grid),
                                Stats.density(densityfun))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+output = Output.MemoryOutput(0, flength, 201, statsfun)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 
 import FFTW
 import PyPlot: pygui, plt

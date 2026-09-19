@@ -15,7 +15,7 @@ material = :SiO2
 R = 4*w0
 N = 2^8
 
-grid = Grid.EnvGrid(thickness, λ0, (200e-9, 4e-6), 200e-15)
+grid = Grid.EnvGrid(λ0, (200e-9, 4e-6), 200e-15)
 q = Hankel.QDHT(R, N, dim=3)
 
 χ3 = PhysData.χ3(material)
@@ -36,8 +36,8 @@ inputs = (Fields.GaussGaussField(;λ0, τfwhm, energy, w0),
 # inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0)
 Eω, transform, FT = Luna.setup(grid, q, densityfun, normfun, responses, inputs)
 
-output = Output.MemoryOutput(0, grid.zmax, 101)
-Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6)
+output = Output.MemoryOutput(0, thickness, 101)
+Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6, zmax=thickness)
 
 ##
 z = output["z"]

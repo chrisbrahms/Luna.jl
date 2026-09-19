@@ -17,7 +17,7 @@ L = 2
 R = 6e-3
 N = 128
 
-grid = Grid.RealGrid(L, 800e-9, (400e-9, 2000e-9), 0.2e-12)
+grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
 xygrid = Grid.FreeGrid(R, N)
 
 x = xygrid.x
@@ -41,9 +41,9 @@ inputs = Fields.GaussGaussField(λ0=λ0, τfwhm=τ, energy=energy, w0=w0)
 Eω, transform, FT = Luna.setup(grid, xygrid, densityfun, normfun, responses, inputs)
 
 # statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, grid.zmax, 21)
+output = Output.MemoryOutput(0, L, 21)
 
-Luna.run(Eω, grid, linop, transform, FT, output, max_dz=Inf, init_dz=1e-1)
+Luna.run(Eω, grid, linop, transform, FT, output, max_dz=Inf, init_dz=1e-1; zmax=L)
 
 ω = grid.ω
 t = grid.t

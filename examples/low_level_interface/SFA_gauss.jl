@@ -9,7 +9,7 @@ pygui(true)
 Ipeak = 3e18
 gas = :Ar
 
-grid = Grid.RealGrid(0, λ0, (10e-9, 1500e-9), 4*τfwhm)
+grid = Grid.RealGrid(λ0, (10e-9, 1500e-9), 4*τfwhm)
 
 It = Maths.gauss.(grid.t; fwhm=τfwhm) .* Ipeak
 Et = Tools.intensity_to_field.(It) .* cos.(grid.t .* wlfreq(λ0))

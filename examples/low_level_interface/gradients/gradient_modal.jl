@@ -17,7 +17,7 @@ modes = (
     Capillary.MarcatiliMode(a, coren, n=1, m=2, kind=:HE, ϕ=0.0, loss=false)
 )
 
-grid = Grid.RealGrid(L, λ0, (160e-9, 3000e-9), 1e-12)
+grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 energyfun, energyfunω = Fields.energyfuncs(grid)
 
@@ -33,9 +33,9 @@ Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, modes, :y; 
 
 linop = LinearOps.make_linop(grid, modes, λ0)
 statsfun = Stats.default(grid, Eω, modes, linop, transform; gas=gas, windows=((150e-9, 300e-9),))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+output = Output.MemoryOutput(0, L, 201, statsfun)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=L)
 
 Plotting.pygui(true)
 Plotting.stats(output)

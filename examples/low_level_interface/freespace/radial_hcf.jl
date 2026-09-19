@@ -18,7 +18,7 @@ L = 0.15
 R = a
 N = 32
 
-grid = Grid.RealGrid(L, λ0, (200e-9, 3000e-9), 0.6e-12)
+grid = Grid.RealGrid(λ0, (200e-9, 3000e-9), 0.6e-12)
 q = Hankel.QDHT(R, N, dim=2)
 
 energyfun, energyfun_ω = Fields.energyfuncs(grid, q)
@@ -42,9 +42,9 @@ inputs = Fields.GaussGaussField(λ0=λ0, τfwhm=τ, energy=energy, w0=w0)
 Eω, transform, FT = Luna.setup(grid, q, densityfun, normfun, responses, inputs)
 
 # statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-#output = Output.MemoryOutput(0, grid.zmax, 201, (length(grid.ω), length(q.r)))
-output = Output.MemoryOutput(0, grid.zmax, 201)
-Luna.run(Eω, grid, linop, transform, FT, output)
+#output = Output.MemoryOutput(0, L, 201, (length(grid.ω), length(q.r)))
+output = Output.MemoryOutput(0, L, 201)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=L)
 
 ω = grid.ω
 t = grid.t

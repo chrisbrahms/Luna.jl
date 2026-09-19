@@ -15,7 +15,7 @@ material = :BBO
 R = 4*w0
 N = 2^6
 
-grid = Grid.RealGrid(thickness, λ0, (300e-9, 4e-6), 500e-15)
+grid = Grid.RealGrid(λ0, (300e-9, 4e-6), 500e-15)
 q = Hankel.QDHT(R, N, dim=3)
 
 θ = deg2rad(23.3717)
@@ -40,8 +40,8 @@ inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0)
 Eω, transform, FT = Luna.setup(grid, q, densityfun, normfun, responses, inputs)
 
 ##
-output = Output.MemoryOutput(0, grid.zmax, 101)
-Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6)
+output = Output.MemoryOutput(0, thickness, 101)
+Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6, zmax=thickness)
 
 ##
 z = output["z"]

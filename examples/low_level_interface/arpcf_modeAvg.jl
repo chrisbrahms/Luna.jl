@@ -9,7 +9,7 @@ flength = 15e-2
 λ0 = 800e-9
 energy = 1e-6
 
-grid = Grid.RealGrid(flength, λ0, (160e-9, 3000e-9), 1e-12)
+grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 1e-12)
 
 m = Antiresonant.ZeisbergerMode(a, gas, pres, wallthickness=200e-9, loss=false)
 aeff = let m=m
@@ -37,9 +37,9 @@ Eω, transform, FT = Luna.setup(
     grid, densityfun, responses, inputs, βfun!, aeff)
 
 statsfun = Stats.default(grid, Eω, m, linop, transform; gas=gas, windows=((150e-9, 300e-9),))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+output = Output.MemoryOutput(0, flength, 201, statsfun)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 
 ##
 Plotting.pygui(true)

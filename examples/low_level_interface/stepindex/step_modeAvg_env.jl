@@ -11,7 +11,7 @@ fr = 0.18
 λ0 = 1030e-9
 energy = 10e-9
 
-grid = Grid.EnvGrid(flength, λ0, (980e-9, 1200e-9), 10e-12)
+grid = Grid.EnvGrid(λ0, (980e-9, 1200e-9), 10e-12)
 
 m = StepIndexFibre.StepIndexMode(a, NA, accellims=(900e-9, 1200e-9, 100))
 aeff = let aeffc=Modes.Aeff(m, z=0.0)
@@ -28,8 +28,8 @@ inputs = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=energy)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 
 statsfun = Stats.default(grid, Eω, m, linop, transform)
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output)
+output = Output.MemoryOutput(0, flength, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 
 ##
 Plotting.pygui(true)

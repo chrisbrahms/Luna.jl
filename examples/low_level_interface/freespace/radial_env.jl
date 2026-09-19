@@ -17,7 +17,7 @@ L = 0.6
 R = 4e-3
 N = 1024
 
-grid = Grid.EnvGrid(L, 800e-9, (400e-9, 2000e-9), 0.2e-12)
+grid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
 q = Hankel.QDHT(R, N, dim=3)
 
 energyfun, energyfun_ω = Fields.energyfuncs(grid, q)
@@ -37,9 +37,9 @@ inputs = Fields.GaussGaussField(λ0=λ0, τfwhm=τ, energy=energy, w0=w0, propz=
 Eω, transform, FT = Luna.setup(grid, q, densityfun, normfun, responses, inputs)
 
 # statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, grid.zmax, 201)
+output = Output.MemoryOutput(0, L, 201)
 
-Luna.run(Eω, grid, linop, transform, FT, output)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=L)
 
 ω = FFTW.fftshift(grid.ω)
 t = grid.t
