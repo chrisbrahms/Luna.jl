@@ -21,7 +21,6 @@ abstract type TimeGrid <: AbstractGrid end
 abstract type SpaceGrid <: AbstractGrid end
 
 struct RealGrid <: TimeGrid
-    zmax::Float64
     referenceλ::Float64
     t::Array{Float64, 1}
     ω::Array{Float64, 1}
@@ -34,19 +33,22 @@ struct RealGrid <: TimeGrid
 end
 
 """
-    RealGrid(zmax, referenceλ, λ_lims, trange; δt=1)
+    RealGrid(referenceλ, λ_lims, trange; δt=1)
 
 Time grid for simulations with real-valued (field-resolved) fields
 
 # Arguments
-- `zmax::Real` : Total distance to propagate
 - `referenceλ::Real` : Reference wavelength (e.g. centre wavelength of input pulse)
 - `λ_lims::Tuple{Real, Real}` : Wavelength limits of the frequency window
 - `trange::Real` : Total extent of the time window required
 - `δt::Real` : Sample spacing in time. The value actually used is either δt or the value
     required to satisfy `trange` and `λ_lims`, whichever is smaller.
+
+The propagation length is not part of the grid; it is passed to [`Luna.run`](@ref) as the
+keyword argument `zmax`.
 """
-function RealGrid(zmax, referenceλ, λ_lims, trange, δt=1)
+function RealGrid(referenceλ::Real, λ_lims::Union{Tuple, AbstractVector}, trange::Real;
+                  δt=1)
     f_lims = PhysData.c./λ_lims
     Logging.@info @sprintf("Freq limits %.2f - %.2f PHz", f_lims[2]*1e-15, f_lims[1]*1e-15)
     δto = min(1/(6*maximum(f_lims)), δt) # 6x maximum freq, or user-defined if finer
@@ -88,15 +90,32 @@ function RealGrid(zmax, referenceλ, λ_lims, trange, δt=1)
 
     Logging.@info @sprintf("Grid: samples %d / %d, ωmax %.2e / %.2e",
                            length(t), length(to), maximum(ω), maximum(ωo))
-    return RealGrid(float(zmax), referenceλ, t, ω, to, ωo, sidx, ωwindow, twindow, towindow)
+    return RealGrid(referenceλ, t, ω, to, ωo, sidx, ωwindow, twindow, towindow)
 end
 
-function RealGrid(;zmax, referenceλ, t, ω, to, ωo, sidx, ωwin, twin, towin)
-    RealGrid(zmax, referenceλ, t, ω, to, ωo, sidx, ωwin, twin, towin)
+"""
+    RealGrid(zmax, referenceλ, λ_lims, trange, δt=1)
+
+Deprecated. The propagation length `zmax` is no longer stored on the grid; pass it to
+[`Luna.run`](@ref) as the keyword argument `zmax` instead. This method drops `zmax` and
+calls `RealGrid(referenceλ, λ_lims, trange; δt)`.
+"""
+function RealGrid(zmax::Real, referenceλ::Real, λ_lims::Union{Tuple, AbstractVector},
+                  trange::Real, δt=1)
+    Logging.@warn(
+        "RealGrid(zmax, referenceλ, λ_lims, trange, δt) is deprecated: the grid no longer \
+         stores the propagation length. Use RealGrid(referenceλ, λ_lims, trange; δt) and \
+         pass zmax=$zmax to Luna.run.", maxlog=1)
+    RealGrid(referenceλ, λ_lims, trange; δt)
+end
+
+#= `zmax` is accepted and ignored so that output files written before it was removed still
+   load: `to_dict` iterates over the fields, so their `grid` group has a `zmax` entry. =#
+function RealGrid(;referenceλ, t, ω, to, ωo, sidx, ωwin, twin, towin, zmax=nothing)
+    RealGrid(referenceλ, t, ω, to, ωo, sidx, ωwin, twin, towin)
 end
 
 struct EnvGrid{T} <: TimeGrid
-    zmax::Float64
     referenceλ::Float64
     ω0::Float64
     t::Array{Float64, 1}
@@ -110,20 +129,23 @@ struct EnvGrid{T} <: TimeGrid
 end
 
 """
-    EnvGrid(zmax, referenceλ, λ_lims, trange; δt=1, thg=false)
+    EnvGrid(referenceλ, λ_lims, trange; δt=1, thg=false)
 
 Time grid for simulations with envelope (a.k.a. analytic) fields
 
 # Arguments
-- `zmax::Real` : Total distance to propagate
 - `referenceλ::Real` : Reference wavelength (e.g. centre wavelength of input pulse)
 - `λ_lims::Tuple{Real, Real}` : Wavelength limits of the frequency window
 - `trange::Real` : Total extent of the time window required
 - `δt::Real` : Sample spacing in time. The value actually used is either δt or the value
     required to satisfy `trange` and `λ_lims`, whichever is smaller.
 - `thg::Bool` : Whether the grid should include space for the third hamonic (default: false)
+
+The propagation length is not part of the grid; it is passed to [`Luna.run`](@ref) as the
+keyword argument `zmax`.
 """
-function EnvGrid(zmax, referenceλ, λ_lims, trange; δt=1, thg=false)
+function EnvGrid(referenceλ::Real, λ_lims::Union{Tuple, AbstractVector}, trange::Real;
+                 δt=1, thg=false)
     fmin = PhysData.c/maximum(λ_lims)
     fmax = PhysData.c/minimum(λ_lims)
     fmax_win = 1.1*fmax # extended frequency window to accommodate apodisation
@@ -197,11 +219,29 @@ function EnvGrid(zmax, referenceλ, λ_lims, trange; δt=1, thg=false)
     @assert all(to[zeroidx:factor:end] .≈ t[t .>= 0])
     @assert all(to[zeroidx:-factor:1] .≈ t[t .<= 0][end:-1:1])
 
-    return EnvGrid(float(zmax), referenceλ, ω0, t, ω, to, ωo, sidx, ωwindow, twindow, towindow)
+    return EnvGrid(referenceλ, ω0, t, ω, to, ωo, sidx, ωwindow, twindow, towindow)
 end
 
-function EnvGrid(;zmax, referenceλ, ω0, t, ω, to, ωo, sidx, ωwin, twin, towin)
-    EnvGrid(zmax, referenceλ, ω0, t, ω, to, ωo, sidx, ωwin, twin, towin)
+"""
+    EnvGrid(zmax, referenceλ, λ_lims, trange; δt=1, thg=false)
+
+Deprecated. The propagation length `zmax` is no longer stored on the grid; pass it to
+[`Luna.run`](@ref) as the keyword argument `zmax` instead. This method drops `zmax` and
+calls `EnvGrid(referenceλ, λ_lims, trange; δt, thg)`.
+"""
+function EnvGrid(zmax::Real, referenceλ::Real, λ_lims::Union{Tuple, AbstractVector},
+                 trange::Real; δt=1, thg=false)
+    Logging.@warn(
+        "EnvGrid(zmax, referenceλ, λ_lims, trange; δt, thg) is deprecated: the grid no \
+         longer stores the propagation length. Use EnvGrid(referenceλ, λ_lims, trange; \
+         δt, thg) and pass zmax=$zmax to Luna.run.", maxlog=1)
+    EnvGrid(referenceλ, λ_lims, trange; δt, thg)
+end
+
+#= `zmax` is accepted and ignored so that output files written before it was removed still
+   load: `to_dict` iterates over the fields, so their `grid` group has a `zmax` entry. =#
+function EnvGrid(;referenceλ, ω0, t, ω, to, ωo, sidx, ωwin, twin, towin, zmax=nothing)
+    EnvGrid(referenceλ, ω0, t, ω, to, ωo, sidx, ωwin, twin, towin)
 end
 
 struct FreeGrid <: SpaceGrid
