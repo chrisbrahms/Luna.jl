@@ -13,7 +13,7 @@ import Luna: Output
     τ = 30e-15
     λ0 = 800e-9
     energy=1e-6
-    grid = Grid.EnvGrid(5e-2, 800e-9, (160e-9, 3000e-9), 1e-12)
+    grid = Grid.EnvGrid(800e-9, (160e-9, 3000e-9), 1e-12)
     dens0 = PhysData.density(gas, pres)
     densityfun(z) = dens0
     responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
@@ -30,9 +30,9 @@ import Luna: Output
                                 Stats.peakintensity(grid, modes, components=:xy),
                                 Stats.fwhm_r(grid, modes, components=:xy),
                                 Stats.energy(grid, energyfunω))
-    output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+    output = Output.MemoryOutput(0, 5e-2, 201, statsfun)
     linop = LinearOps.make_const_linop(grid, modes, λ0)
-    Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, init_dz=1e-3)
+    Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, init_dz=1e-3, zmax=5e-2)
 
     modes = (
         Capillary.MarcatiliMode(a, gas, pres, n=1, m=1, kind=:HE, ϕ=0.0, loss=false),
@@ -48,9 +48,9 @@ import Luna: Output
                                 Stats.peakintensity(grid, modes, components=:xy),
                                 Stats.fwhm_r(grid, modes, components=:xy),
                                 Stats.energy(grid, energyfunω))
-    outputp = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
+    outputp = Output.MemoryOutput(0, 5e-2, 201, statsfun)
     linop = LinearOps.make_const_linop(grid, modes, λ0)
-    Luna.run(Eω, grid, linop, transform, FT, outputp, status_period=10, init_dz=1e-3)
+    Luna.run(Eω, grid, linop, transform, FT, outputp, status_period=10, init_dz=1e-3, zmax=5e-2)
 
     Iω = dropdims(abs2.(output.data["Eω"]), dims=2)
     Iωp = dropdims(sum(abs2.(outputp.data["Eω"]), dims=2), dims=2)

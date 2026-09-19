@@ -6,7 +6,7 @@ import FFTW
 import Luna: set_fftw_mode
 set_fftw_mode(:estimate)
 
-grid = Grid.RealGrid(1.0, 800e-9, (200e-9, 2000e-9), 40e-12)
+grid = Grid.RealGrid(800e-9, (200e-9, 2000e-9), 40e-12)
 ρ = PhysData.density(:N2, 5.0)
 h = Raman.raman_response(grid.to, :N2)
 T = collect(range(-5e-12, stop=20e-12, length=2^16))
@@ -32,7 +32,7 @@ RP!(P, E, ρ) # get polarisation induced by E
 @test isapprox(ωR[argmin(imag.(RP!.hω))], PhysData.raman_parameters(:N2).Ωv, rtol=1e-4)
 
 # same, but for envelopes
-grid = Grid.EnvGrid(1.0, 800e-9, (200e-9, 2000e-9), 40e-12)
+grid = Grid.EnvGrid(800e-9, (200e-9, 2000e-9), 40e-12)
 hv = Raman.raman_response(grid.to, :N2, rotation=false)
 RP! = Nonlinear.RamanPolarEnv(grid.to, hv)
 E = complex.(Maths.gauss.(grid.to, fwhm=20e-15))
@@ -44,7 +44,7 @@ RP!(P, E, ρ) # get polarisation induced by E
 @test isapprox(ωR[argmin(imag.(RP!.hω))], PhysData.raman_parameters(:N2).Ωv, rtol=1e-4)
 
 # same, but for hydrogen
-grid = Grid.EnvGrid(1.0, 800e-9, (200e-9, 2000e-9), 40e-12)
+grid = Grid.EnvGrid(800e-9, (200e-9, 2000e-9), 40e-12)
 hv = Raman.raman_response(grid.to, :H2, rotation=false)
 RP! = Nonlinear.RamanPolarEnv(grid.to, hv)
 E = complex.(Maths.gauss.(grid.to, fwhm=20e-15))
@@ -57,7 +57,7 @@ RP!(P, E, ρ) # get polarisation induced by E
 @test isapprox(ωR[argmin(imag.(RP!.hω))], PhysData.raman_parameters(:H2).Ωv, rtol=1e-4)
 
 # same, but for hydrogen rotation
-grid = Grid.EnvGrid(1.0, 800e-9, (200e-9, 2000e-9), 40e-12)
+grid = Grid.EnvGrid(800e-9, (200e-9, 2000e-9), 40e-12)
 hv = Raman.raman_response(grid.to, :H2, vibration=false)
 RP! = Nonlinear.RamanPolarEnv(grid.to, hv)
 E = complex.(Maths.gauss.(grid.to, fwhm=20e-15))

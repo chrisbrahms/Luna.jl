@@ -34,7 +34,7 @@ L = 5e-2
 halfpres = PhysData.pressure(:Ar, PhysData.density(:Ar, pres)/2)
 
 # Common setup
-grid = Grid.RealGrid(L, λ0, (160e-9, 3000e-9), 0.5e-12)
+grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 0.5e-12)
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=1e-6)
 
 # Single gas
@@ -48,8 +48,8 @@ responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
 linop, βfun!, β1, αfun = LinearOps.make_const_linop(grid, m, λ0)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 statsfun = Stats.default(grid, Eω, m, linop, transform; gas=gas)
-output_single = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_single)
+output_single = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_single; zmax=L)
 
 # Mixture
 m = Capillary.MarcatiliMode(a, (gas, gas), (halfpres, halfpres); loss=false)
@@ -65,8 +65,8 @@ responses = (
 linop, βfun!, β1, αfun = LinearOps.make_const_linop(grid, m, λ0)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 statsfun = Stats.default(grid, Eω, m, linop, transform; gas=(gas, gas))
-output_mix = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_mix)
+output_mix = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_mix; zmax=L)
 
 
 @test all(output_mix.data["Eω"][grid.sidx, :] .== output_single.data["Eω"][grid.sidx, :])

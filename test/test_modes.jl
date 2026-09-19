@@ -91,7 +91,7 @@ end
 a = 100e-6 # capillary radius
 # spatial grid, with a bigger aperture than the capillary - as we would have in a simulation
 q = Hankel.QDHT(2a, 512)
-grid = Grid.RealGrid(1, 800e-9, (200e-9, 2000e-9), 0.5e-12)
+grid = Grid.RealGrid(800e-9, (200e-9, 2000e-9), 0.5e-12)
 # First pulse
 It1 = Maths.gauss.(grid.t, fwhm=30e-15)
 Et1 = @. sqrt(It1)*cos(2π*PhysData.c/800e-9*grid.t)
@@ -152,7 +152,7 @@ end
 a = 100e-6 # capillary radius
 # spatial grid, with a bigger aperture than the capillary - as we would have in a simulation
 q = Hankel.QDHT(2a, 512)
-grid = Grid.RealGrid(1, 800e-9, (400e-9, 1000e-9), 0.5e-12)
+grid = Grid.RealGrid(800e-9, (400e-9, 1000e-9), 0.5e-12)
 
 fwhm1 = 30e-15
 τ1 = -5e-15
@@ -189,7 +189,7 @@ energy2 = ert(Etr2)
 
 modes = (Capillary.MarcatiliMode(a, :HeB, 1.0, model=:reduced, m=1),
          Capillary.MarcatiliMode(a, :HeB, 1.0, model=:reduced, m=2))
-newgrid = Grid.RealGrid(1, 800e-9, (160e-9, 3000e-9), 1e-12)
+newgrid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 1e-12)
 
 Eωm = Modes.overlap(modes, newgrid, grid, q.r, Eωr)
 
@@ -334,7 +334,7 @@ gas = :Ar
 pressure = 1.5
 τ = 30e-15
 λ0 = 800e-9
-grid = Grid.RealGrid(5e-2, 800e-9, (160e-9, 3000e-9), 1e-12)
+grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 1e-12)
 modes = (
          Capillary.MarcatiliMode(a, gas, pressure, n=1, m=1, kind=:HE, ϕ=0.0, loss=false),
          Capillary.MarcatiliMode(a, gas, pressure, n=1, m=4, kind=:HE, ϕ=0.0, loss=false),
@@ -351,8 +351,8 @@ Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs,
                             modes, :y; full=false)
 linop = LinearOps.make_const_linop(grid, modes, λ0)
 statsfun = Stats.default(grid, Eω, modes, linop, transform)
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output, status_period=10)
+output = Output.MemoryOutput(0, 5e-2, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, zmax=5e-2)
 
 modesr = Processing.makemodes(output)
 

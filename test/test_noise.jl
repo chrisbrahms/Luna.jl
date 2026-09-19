@@ -14,7 +14,7 @@ const noise_kwargs = (λ0=800e-9, τfwhm=10e-15, energy=1e-12,
 
 @testset "generate_noise_field" begin
     @testset "RealGrid" begin
-        grid = Grid.RealGrid(0.1, 800e-9, (200e-9, 4e-6), 400e-15)
+        grid = Grid.RealGrid(800e-9, (200e-9, 4e-6), 400e-15)
         nf = Fields.generate_noise_field(grid)
         @test size(nf) == size(grid.ω)
         @test eltype(nf) == ComplexF64
@@ -31,7 +31,7 @@ const noise_kwargs = (λ0=800e-9, τfwhm=10e-15, energy=1e-12,
         @test nf1 == nf3
     end
     @testset "EnvGrid" begin
-        grid = Grid.EnvGrid(0.1, 800e-9, (200e-9, 4e-6), 400e-15)
+        grid = Grid.EnvGrid(800e-9, (200e-9, 4e-6), 400e-15)
         nf = Fields.generate_noise_field(grid)
         @test size(nf) == size(grid.ω)
         @test eltype(nf) == ComplexF64
@@ -43,20 +43,20 @@ const noise_kwargs = (λ0=800e-9, τfwhm=10e-15, energy=1e-12,
         # Chen & Wise Eq. A19: |A_noise(ω)| = √(hν·Δν)
         # generate_noise_field and ShotNoise use the same formula, so their
         # amplitudes must be identical (phases differ only by RNG seed).
-        grid_r = Grid.RealGrid(0.1, 800e-9, (200e-9, 4e-6), 400e-15)
+        grid_r = Grid.RealGrid(800e-9, (200e-9, 4e-6), 400e-15)
         sn = Fields.ShotNoise(Random.MersenneTwister(42))
         snf = sn(grid_r)
         nf = Fields.generate_noise_field(grid_r; rng=Random.MersenneTwister(42))
         @test abs.(nf) ≈ abs.(snf)
 
-        grid_e = Grid.EnvGrid(0.1, 800e-9, (200e-9, 4e-6), 400e-15)
+        grid_e = Grid.EnvGrid(800e-9, (200e-9, 4e-6), 400e-15)
         sn_e = Fields.ShotNoise(Random.MersenneTwister(99))
         snf_e = sn_e(grid_e)
         nf_e = Fields.generate_noise_field(grid_e; rng=Random.MersenneTwister(99))
         @test abs.(nf_e) ≈ abs.(snf_e)
     end
     @testset "Multimode RealGrid" begin
-        grid = Grid.RealGrid(0.1, 800e-9, (200e-9, 4e-6), 400e-15)
+        grid = Grid.RealGrid(800e-9, (200e-9, 4e-6), 400e-15)
         nm = 3
         nf = Fields.generate_noise_field(grid; nmodes=nm)
         # Shape: (nω, nmodes)
@@ -80,7 +80,7 @@ const noise_kwargs = (λ0=800e-9, τfwhm=10e-15, energy=1e-12,
         @test ndims(nf1) == 1
     end
     @testset "Multimode EnvGrid" begin
-        grid = Grid.EnvGrid(0.1, 800e-9, (200e-9, 4e-6), 400e-15)
+        grid = Grid.EnvGrid(800e-9, (200e-9, 4e-6), 400e-15)
         nm = 3
         nf = Fields.generate_noise_field(grid; nmodes=nm)
         @test size(nf) == (length(grid.ω), nm)

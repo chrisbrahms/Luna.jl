@@ -13,8 +13,9 @@ import Random: MersenneTwister
    fixed profile once per accepted step, so the answer depended on rtol. =#
 
 @testset "profiles and rates" begin
-grid = Grid.RealGrid(0.3, 800e-9, (150e-9, 4e-6), 1e-12)
-ℓ = 0.3/20
+grid = Grid.RealGrid(800e-9, (150e-9, 4e-6), 1e-12)
+zmax = 0.3
+ℓ = zmax/20
 
 α = Boundaries.rate(grid.ωwin, ℓ)
 @test all(isfinite, α)
@@ -37,7 +38,7 @@ end
 
 # ωwin is exactly zero outside the simulation band, so the hard mask is grid.sidx
 @test (grid.ωwin .> 0) == grid.sidx
-@test all(Boundaries.spectral_rate(grid)[.!grid.sidx] .== 0)
+@test all(Boundaries.spectral_rate(grid, zmax)[.!grid.sidx] .== 0)
 end
 
 @testset "temporal collar is never degenerate" begin
@@ -46,22 +47,22 @@ end
    no temporal absorber at all. tprofile guarantees a collar while never being weaker than
    grid.twin. =#
 for (zmax, trange) in ((0.3, 1e-12), (0.3, 0.6825e-12), (1.0, 250e-15), (4e-5, 1e-12))
-    for grid in (Grid.RealGrid(zmax, 800e-9, (150e-9, 4e-6), trange),
-                 Grid.EnvGrid(zmax, 800e-9, (150e-9, 4e-6), trange))
+    for grid in (Grid.RealGrid(800e-9, (150e-9, 4e-6), trange),
+                 Grid.EnvGrid(800e-9, (150e-9, 4e-6), trange))
         W = Boundaries.tprofile(grid)
         @test all(W .<= grid.twin .+ 1e-15) # never weaker than the historical profile
         @test count(0 .< W .< 1) > 0.03*length(grid.t) # and never degenerate
-        @test all(isfinite, Boundaries.temporal_rate(grid))
+        @test all(isfinite, Boundaries.temporal_rate(grid, zmax))
     end
 end
 # a wider natural collar is kept as-is
-grid = Grid.RealGrid(0.3, 800e-9, (150e-9, 4e-6), 1e-12)
+grid = Grid.RealGrid(800e-9, (150e-9, 4e-6), 1e-12)
 @test Boundaries.tprofile(grid; collar=0) == grid.twin
 end
 
 @testset "addloss" begin
-grid = Grid.RealGrid(0.3, 800e-9, (150e-9, 4e-6), 1e-12)
-α = Boundaries.spectral_rate(grid)
+grid = Grid.RealGrid(800e-9, (150e-9, 4e-6), 1e-12)
+α = Boundaries.spectral_rate(grid, 0.3)
 Nω = length(grid.ω)
 # ω is axis 1 for every linop shape Luna uses
 for sz in ((Nω,), (Nω, 4), (Nω, 8), (Nω, 8, 6))
@@ -85,8 +86,8 @@ end
 @testset "propagator applies the rate exactly" begin
 #= The spectral absorber rides the interaction-picture propagator, so exp(-α Δz) must be
    applied exactly for whatever sub-interval the stepper chooses. =#
-grid = Grid.RealGrid(0.3, 800e-9, (150e-9, 4e-6), 1e-12)
-α = Boundaries.spectral_rate(grid)
+grid = Grid.RealGrid(800e-9, (150e-9, 4e-6), 1e-12)
+α = Boundaries.spectral_rate(grid, 0.3)
 linop = Boundaries.addloss(zeros(ComplexF64, length(grid.ω)), α)
 y = ones(ComplexF64, length(grid.ω))
 prop! = RK45.make_prop!(linop, y)
@@ -113,9 +114,10 @@ end
    exp(-α_t L/2) as the steps get smaller rather than matching it exactly. That is a
    splitting error of the same order as the temporal splitting itself, and — unlike the
    historical scheme — it converges. =#
-grid = Grid.EnvGrid(0.2, 800e-9, (400e-9, 2e-6), 1e-12)
+grid = Grid.EnvGrid(800e-9, (400e-9, 2e-6), 1e-12)
+zmax = 0.2
 FT = FFTW.plan_fft(zeros(ComplexF64, length(grid.t)))
-αt = Boundaries.temporal_rate(grid)
+αt = Boundaries.temporal_rate(grid, zmax)
 mask = float.(grid.sidx) # the band limit Luna.run applies once, at the start
 # deliberately wide, so that the field actually overlaps the absorber collar
 Et0 = Maths.gauss.(grid.t, fwhm=0.5*(maximum(grid.t) - minimum(grid.t))) .+ 0im
@@ -123,18 +125,18 @@ Eω0 = (FT*Et0) .* mask
 
 function bare_run(; kwargs...)
     Eω = copy(Eω0)
-    out = Output.MemoryOutput(0, grid.zmax, 3)
+    out = Output.MemoryOutput(0, zmax, 3)
     Logging.with_logger(Logging.NullLogger()) do
         Luna.run(Eω, grid, zeros(ComplexF64, length(grid.ω)),
-                 (nl, Eω, z) -> fill!(nl, 0), FT, out; kwargs...)
+                 (nl, Eω, z) -> fill!(nl, 0), FT, out; zmax, kwargs...)
     end
     out["Eω"][:, end]
 end
 reldiff(a, b) = sqrt(sum(abs2, a .- b))/sqrt(sum(abs2, b))
 
-expected = (FT*((FT \ Eω0) .* exp.(-αt.*grid.zmax./2))) .* mask
+expected = (FT*((FT \ Eω0) .* exp.(-αt.*zmax./2))) .* mask
 coarse = reldiff(bare_run(init_dz=1e-3), expected)                      # 20 steps
-fine = reldiff(bare_run(init_dz=1e-5, max_dz=grid.zmax/500), expected)  # 500 steps
+fine = reldiff(bare_run(init_dz=1e-5, max_dz=zmax/500), expected)  # 500 steps
 @test coarse < 1e-3
 @test fine < 10*coarse/25 # converges at least first order in the step size
 
@@ -151,22 +153,23 @@ end
 #= boundary=:legacy must be an exact reproduction of the pre-change behaviour, so that
    published results stay reproducible. Compare against the historical stepfun driven
    straight through RK45, with no other part of `run` involved. =#
-grid = Grid.EnvGrid(0.2, 800e-9, (400e-9, 2e-6), 1e-12)
+grid = Grid.EnvGrid(800e-9, (400e-9, 2e-6), 1e-12)
+zmax = 0.2
 FT = FFTW.plan_fft(zeros(ComplexF64, length(grid.t)))
 Et0 = Maths.gauss.(grid.t, fwhm=0.5*(maximum(grid.t) - minimum(grid.t))) .+ 0im
 Eω0 = FT*Et0
 linop = -im.*(1e4.*(grid.ω .- grid.ω0).^2) # some dispersion, so the steps do something
 transform = (nl, Eω, z) -> fill!(nl, 0)
-maxdz = grid.zmax/50 # force ~50 window applications, so bit-identity is a real statement
+maxdz = zmax/50 # force ~50 window applications, so bit-identity is a real statement
 
 Eωa = copy(Eω0)
-outa = Output.MemoryOutput(0, grid.zmax, 3)
+outa = Output.MemoryOutput(0, zmax, 3)
 Logging.with_logger(Logging.NullLogger()) do
-    Luna.run(Eωa, grid, linop, transform, FT, outa; boundary=:legacy, max_dz=maxdz)
+    Luna.run(Eωa, grid, linop, transform, FT, outa; zmax, boundary=:legacy, max_dz=maxdz)
 end
 
 Eωb = copy(Eω0)
-outb = Output.MemoryOutput(0, grid.zmax, 3)
+outb = Output.MemoryOutput(0, zmax, 3)
 Et = FT \ Eωb
 function historical_stepfun(Eω, z, dz, interpolant)
     Eω .*= grid.ωwin
@@ -176,7 +179,7 @@ function historical_stepfun(Eω, z, dz, interpolant)
     outb(Eω, z, dz, interpolant)
 end
 Logging.with_logger(Logging.NullLogger()) do
-    RK45.solve_precon(transform, linop, Eωb, 0.0, 1e-4, grid.zmax;
+    RK45.solve_precon(transform, linop, Eωb, 0.0, 1e-4, zmax;
                       stepfun=historical_stepfun, max_dt=maxdz, min_dt=0,
                       rtol=1e-6, atol=1e-10, safety=0.9, norm=RK45.weaknorm,
                       status_period=1)
@@ -194,7 +197,7 @@ function arm(boundary, rtol)
         125e-6, 0.15, :He, 3.0; λ0=800e-9, energy=300e-6, τfwhm=10e-15,
         λlims=(120e-9, 4e-6), trange=1e-12, saveN=3, plasma=false, boundary,
         PPT_options=Dict(:cache => false))
-    Luna.run(Eω, grid, linop, transform, FT, output; rtol, boundary)
+    Luna.run(Eω, grid, linop, transform, FT, output; zmax=0.15, rtol, boundary)
     #= Compare only inside the flat part of the window: interpolated saves reconstruct the
        out-of-band part from the stepper's stages, which is rtol-dependent by construction
        and is not what this test is about. =#
@@ -230,7 +233,7 @@ function walkoff_arm(boundary; max_dz=ZMAX/2, rtol=1e-6)
         50e-6, ZMAX, :Ar, 0.4; λ0=800e-9, energy=29e-6, τfwhm=10e-15,
         λlims=(150e-9, 4e-6), trange=100e-15, saveN=51, plasma=false, boundary,
         rng=MersenneTwister(1234))
-    Luna.run(Eω, grid, linop, transform, FT, output; rtol, boundary, max_dz)
+    Luna.run(Eω, grid, linop, transform, FT, output; zmax=ZMAX, rtol, boundary, max_dz)
     output
 end
 
@@ -304,7 +307,7 @@ function warnings_from(; trange, flength)
             50e-6, flength, :Ar, 0.4; λ0=800e-9, energy=29e-6, τfwhm=10e-15,
             λlims=(150e-9, 4e-6), trange, saveN=11, plasma=false,
             rng=MersenneTwister(1234))
-        Luna.run(Eω, grid, linop, transform, FT, output)
+        Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
     end
     lg.msgs
 end
@@ -318,23 +321,24 @@ warned = warnings_from(trange=100e-15, flength=ZMAX)
 end
 
 @testset "run interface" begin
-grid = Grid.EnvGrid(0.1, 800e-9, (400e-9, 2e-6), 1e-12)
+grid = Grid.EnvGrid(800e-9, (400e-9, 2e-6), 1e-12)
+zmax = 0.1
 
 @test_throws ErrorException Logging.with_logger(Logging.NullLogger()) do
     FT = FFTW.plan_fft(zeros(ComplexF64, length(grid.t)))
     Luna.run(zeros(ComplexF64, length(grid.ω)), grid,
              zeros(ComplexF64, length(grid.ω)), (nl, Eω, z) -> fill!(nl, 0), FT,
-             Output.MemoryOutput(0, grid.zmax, 3); boundary=:nonsense)
+             Output.MemoryOutput(0, zmax, 3); zmax, boundary=:nonsense)
 end
 
 #= A non-positive reference length is silently destructive rather than merely useless -- it
    NaNs the whole grid or turns the absorber into a gain -- so reject it at the one place
    every call site goes through. =#
-@test Boundaries.reflength(grid, 20, nothing) == grid.zmax/20
-@test Boundaries.reflength(grid, 20, 0.05) == 0.05
+@test Boundaries.reflength(zmax, 20, nothing) == zmax/20
+@test Boundaries.reflength(zmax, 20, 0.05) == 0.05
 for bad in (0, -1, Inf, NaN)
-    @test_throws ErrorException Boundaries.reflength(grid, bad, nothing)
-    @test_throws ErrorException Boundaries.reflength(grid, 20, bad)
+    @test_throws ErrorException Boundaries.reflength(zmax, bad, nothing)
+    @test_throws ErrorException Boundaries.reflength(zmax, 20, bad)
 end
 
 # the chosen mode is recorded, so a saved run can be reproduced
@@ -353,14 +357,15 @@ Luna.set_fftw_mode(:estimate)
 
 @testset "free space" begin
 Rs = 50e-6
-grid = Grid.RealGrid(1e-3, 800e-9, (400e-9, 4000e-9), 0.2e-12)
+grid = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 0.2e-12)
+zmax = 1e-3
 q = Hankel.QDHT(Rs, 32, dim=3)
 xgrid = Grid.Free2DGrid(Rs, 32)
 xygrid = Grid.FreeGrid(Rs, 16, Rs, 16)
 nfunλ = PhysData.ref_index_fun(:Ar, 1)
 nfun = (λ; z=0.0) -> nfunλ(λ)
 nfunω = (ω; z) -> nfun(wlfreq(ω); z)
-ℓ = grid.zmax/20
+ℓ = zmax/20
 ratemax = Boundaries.MAX_αℓ/(2ℓ)
 
 # profiles: sized like the k axes, 1 in the interior, tapering to 0 at the edge
@@ -447,7 +452,7 @@ for (sg, nfs) in ((q, NonlinearRHS.const_norm_radial(grid, q, nfunλ)),
     @test Boundaries.spacegrid(transform) === sg
     Et = FT \ Eω
     lin = LinearOps.make_const_linop(grid, sg, nfun, true)
-    b = Boundaries.setup(:rate, grid, transform, lin, Et, FT, dummy, 0.0, grid.zmax/2, 1e-4)
+    b = Boundaries.setup(:rate, grid, transform, lin, Et, FT, dummy, 0.0, zmax, zmax/2, 1e-4)
     @test b.max_dz == ℓ
     @test nfs.ℓ == ℓ && nfs.κmax == ratemax
     @test minimum(nfs.kwin) >= exp(-Boundaries.MAX_αℓ/2) # never zero: the norm divides by it
@@ -460,18 +465,18 @@ for (sg, nfs) in ((q, NonlinearRHS.const_norm_radial(grid, q, nfunλ)),
     @test all(isfinite, E1)
     @test sum(abs2, E1) <= e0
     # without absorbers the evanescent clamp and taper are still applied, over max_dz
-    b2 = Boundaries.setup(:none, grid, transform, lin, Et, FT, dummy, 0.0, grid.zmax/2, 1e-4)
+    b2 = Boundaries.setup(:none, grid, transform, lin, Et, FT, dummy, 0.0, zmax, zmax/2, 1e-4)
     @test b2.stepfun isa Boundaries.NoAbsorber
-    @test nfs.ℓ == grid.zmax/2
-    @test minimum(real(b2.linop)) ≈ max(minimum(real(lin)), -Boundaries.MAX_αℓ/grid.zmax)
+    @test nfs.ℓ == zmax/2
+    @test minimum(real(b2.linop)) ≈ max(minimum(real(lin)), -Boundaries.MAX_αℓ/zmax)
     @test all(nfs.kwin .== 1)
 end
 # a modal transform is untouched
-cgrid = Grid.RealGrid(0.3, 800e-9, (150e-9, 4e-6), 1e-12)
+cgrid = Grid.RealGrid(800e-9, (150e-9, 4e-6), 1e-12)
 Eω, cgrid, linop, transform, FT, output = prop_capillary_args(125e-6, 0.3, :He, 1.0;
     λ0=800e-9, energy=1e-9, τfwhm=10e-15, λlims=(150e-9, 4e-6), trange=1e-12, saveN=11)
 @test isnothing(Boundaries.spacegrid(transform))
-b = Boundaries.setup(:rate, cgrid, transform, linop, FT \ Eω, FT, dummy, 0.0, 0.15, 1e-4)
+b = Boundaries.setup(:rate, cgrid, transform, linop, FT \ Eω, FT, dummy, 0.0, 0.3, 0.15, 1e-4)
 @test isnothing(b.stepfun.spatial)
-@test b.linop == Boundaries.addloss(linop, Boundaries.spectral_rate(cgrid))
+@test b.linop == Boundaries.addloss(linop, Boundaries.spectral_rate(cgrid, 0.3))
 end

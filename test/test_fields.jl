@@ -18,7 +18,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕ = [0.0, 0.0]
-    grid = Grid.RealGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -44,7 +44,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕ = [0.0, 0.0]
-    grid = Grid.EnvGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -72,7 +72,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕ = [0.0, 0.0]
-    grid = Grid.RealGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -92,7 +92,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕ = [0.0, 0.0]
-    grid = Grid.EnvGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -114,7 +114,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕ = [0.0, 0.0]
-    grid = Grid.RealGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -136,7 +136,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕ = [0.0, 0.0]
-    grid = Grid.EnvGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -163,7 +163,7 @@ end
     # elements of ϕ are [CEP, group delay, GDD, TOD, ...]
     # so [0.0, τ0] is a delay by τ0
     ϕ = [0.0, τ0]
-    grid = Grid.RealGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -188,7 +188,7 @@ end
     # elements of ϕ are [CEP, group delay, GDD, TOD, ...]
     # so [0.0, τ0] is a delay by τ0
     ϕ = [0.0, τ0]
-    grid = Grid.EnvGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -216,7 +216,7 @@ end
     # elements of ϕ are [CEP, group delay, GDD, TOD, ...]
     # so [0.0, τ0] is a delay by τ0
     ϕ = [0.0, τ0]
-    grid = Grid.RealGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -241,7 +241,7 @@ end
     # elements of ϕ are [CEP, group delay, GDD, TOD, ...]
     # so [0.0, τ0] is a delay by τ0
     ϕ = [0.0, τ0]
-    grid = Grid.EnvGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -265,7 +265,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕCEO = 0.0
-    grid = Grid.RealGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -287,7 +287,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     ϕCEO = 0.0
-    grid = Grid.EnvGrid(1.0, λ0, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 10e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -311,7 +311,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     τ0 = 0.0
-    grid = Grid.RealGrid(1.0, λ0, (100e-9, 3000e-9), 1e-12)
+    grid = Grid.RealGrid(λ0, (100e-9, 3000e-9), 1e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -339,7 +339,7 @@ end
     λ0 = 800e-9
     energy = 1e-6
     τ0 = 0.0
-    grid = Grid.EnvGrid(1.0, λ0, (100e-9, 3000e-9), 1e-12)
+    grid = Grid.EnvGrid(λ0, (100e-9, 3000e-9), 1e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -374,7 +374,7 @@ end
     λ0 = 1064e-9
     Pavg = 20.0
     Δλ = 4e-9
-    grid = Grid.EnvGrid(1.0, λ0, (980e-9, 1160e-9), 500e-12)
+    grid = Grid.EnvGrid(λ0, (980e-9, 1160e-9), 500e-12)
     energy_t = Fields.energyfuncs(grid)[1]
     x = Array{ComplexF64}(undef, length(grid.t))
     FT = FFTW.plan_fft(x, 1)
@@ -410,7 +410,7 @@ end
 @testset "Propagation" begin
     λ0 = 800e-9
     τfwhm = 2.5e-15
-    grid = Grid.RealGrid(1, λ0, (400e-9, 1200e-9), 500e-15)
+    grid = Grid.RealGrid(λ0, (400e-9, 1200e-9), 500e-15)
     input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -494,7 +494,7 @@ end
 
     λ0 = 1030e-9
     τfwhm = 15e-15
-    grid = Grid.RealGrid(1, λ0, (400e-9, 1500e-9), 2e-12)
+    grid = Grid.RealGrid(λ0, (400e-9, 1500e-9), 2e-12)
     input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -518,7 +518,7 @@ end
     # Strong chirped mirrors: longer pulses
     λ0 = 1030e-9
     τfwhm = 50e-15
-    grid = Grid.RealGrid(1, λ0, (400e-9, 1500e-9), 2e-12)
+    grid = Grid.RealGrid(λ0, (400e-9, 1500e-9), 2e-12)
     input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -541,7 +541,7 @@ end
     # check (back-)propagation for all gases with a large grid
     λ0 = 800e-9
     τfwhm = 2.5e-15
-    grid = Grid.RealGrid(1, λ0, (70e-9, 4e-6), 500e-15)
+    grid = Grid.RealGrid(λ0, (70e-9, 4e-6), 500e-15)
     input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
@@ -566,7 +566,7 @@ end
 # Short pulse with 100 fs^2
 λ0 = 800e-9
 τfwhm = 10e-15
-grid = Grid.RealGrid(1, λ0, (400e-9, 1200e-9), 500e-15)
+grid = Grid.RealGrid(λ0, (400e-9, 1200e-9), 500e-15)
 x = Array{Float64}(undef, length(grid.t))
 FT = FFTW.plan_rfft(x, 1)
 input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
@@ -581,7 +581,7 @@ Etcomp = FT \ Eωcomp
 # Long pulse with 40000 fs^2 (stretches 220 fs to ~5 ps)
 λ0 = 1030e-9
 τfwhm = 220e-15
-grid = Grid.RealGrid(1, λ0, (980e-9, 1080e-9), 20e-12)
+grid = Grid.RealGrid(λ0, (980e-9, 1080e-9), 20e-12)
 x = Array{Float64}(undef, length(grid.t))
 FT = FFTW.plan_rfft(x, 1)
 input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
@@ -596,7 +596,7 @@ Etcomp = FT \ Eωcomp
 # Short pulse with GDD and TOD
 λ0 = 800e-9
 τfwhm = 10e-15
-grid = Grid.RealGrid(1, λ0, (400e-9, 1200e-9), 500e-15)
+grid = Grid.RealGrid(λ0, (400e-9, 1200e-9), 500e-15)
 x = Array{Float64}(undef, length(grid.t))
 FT = FFTW.plan_rfft(x, 1)
 input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
@@ -611,7 +611,7 @@ Etcomp = FT \ Eωcomp
 # Material insertion
 λ0 = 800e-9
 τfwhm = 10e-15
-grid = Grid.RealGrid(1, λ0, (400e-9, 1200e-9), 500e-15)
+grid = Grid.RealGrid(λ0, (400e-9, 1200e-9), 500e-15)
 x = Array{Float64}(undef, length(grid.t))
 FT = FFTW.plan_rfft(x, 1)
 input = Fields.GaussField(λ0=λ0, τfwhm=τfwhm, energy=1e-6)
@@ -687,7 +687,7 @@ end
     If = Maths.gauss.(f, σf; x0=f0)
     ϕ = @. -2π*τ0*(f-f0) # Fourier transform in the maths convention here--pos. delay = neg. slope
     dat = [f If ϕ]
-    grid = Grid.RealGrid(1, λ0, λlims, trange)
+    grid = Grid.RealGrid(λ0, λlims, trange)
     FT = FFTW.plan_rfft(copy(grid.t), 1)
     field = mktempdir() do td
         tf = joinpath(td, tempname())
@@ -707,7 +707,7 @@ end
     τfwhm = 3e-15
     λ0 = 800e-9
     energy = 1e-6
-    grid = Grid.RealGrid(1.0, λ0, (100e-9, 3000e-9), 500e-15)
+    grid = Grid.RealGrid(λ0, (100e-9, 3000e-9), 500e-15)
     δt = grid.t[2] - grid.t[1]
     ϕCEO = δt*PhysData.wlfreq(λ0)
     energy_t = Fields.energyfuncs(grid)[1]
@@ -757,7 +757,7 @@ end
     R = 4w1
     N = 1024
 
-    grid = Grid.EnvGrid(1, λ0, (400e-9, 6e-6), 100e-15)
+    grid = Grid.EnvGrid(λ0, (400e-9, 6e-6), 100e-15)
 
     q = Hankel.QDHT(R, N, dim=3)
 
@@ -789,7 +789,7 @@ end
 
     R = 2w1
     N = 256
-    grid = Grid.EnvGrid(1, λ0, (400e-9, 6e-6), 100e-15)
+    grid = Grid.EnvGrid(λ0, (400e-9, 6e-6), 100e-15)
     xygrid = Grid.FreeGrid(R, N)
 
     xr = Array{ComplexF64}(undef, length(grid.t), 2, length(xygrid.x), length(xygrid.y))

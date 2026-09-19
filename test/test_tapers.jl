@@ -11,7 +11,7 @@ pres = 5
 τ = 30e-15
 λ0 = 800e-9
 L = 10e-2
-grid = Grid.RealGrid(L, 800e-9, (160e-9, 3000e-9), 0.5e-12)
+grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 0.5e-12)
 
 a0 = a
 aL = 3a/4
@@ -32,8 +32,8 @@ linop, βfun! = LinearOps.make_linop(grid, m, λ0)
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=600e-9)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output, status_period=10)
+output = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, zmax=L)
 abs2.(output["Eω"])
 end
 
@@ -47,8 +47,8 @@ inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=600e-9)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs,
                                modes, :y, full=false)
 statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output, status_period=10)
+output = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, zmax=L)
 abs2.(dropdims(output["Eω"], dims=2))
 end
 
@@ -63,7 +63,7 @@ pres = 5
 τ = 30e-15
 λ0 = 800e-9
 L = 5e-2
-grid = Grid.RealGrid(L, 800e-9, (160e-9, 3000e-9), 0.5e-12)
+grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 0.5e-12)
 
 afun = let a=a
     z -> a
@@ -82,8 +82,8 @@ linop, βfun! = LinearOps.make_linop(grid, m, λ0)
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=1e-6)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output, status_period=10)
+output = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, zmax=L)
 abs2.(output["Eω"])
 end
 
@@ -95,8 +95,8 @@ inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=1e-6)
 linop, βfun!, frame_vel, αfun = LinearOps.make_const_linop(grid, m, λ0)
 Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
 statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
-output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output, status_period=10)
+output = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, zmax=L)
 abs2.(output["Eω"])
 end
 

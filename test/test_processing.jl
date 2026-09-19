@@ -12,9 +12,9 @@ energy = 1e-3
 ω0 = wlfreq(λ0)
 
 
-rg = Grid.RealGrid(1, λ0, (200e-9, 3000e-9), 0.5e-12)
+rg = Grid.RealGrid(λ0, (200e-9, 3000e-9), 0.5e-12)
 rFT = FFTW.plan_rfft(similar(rg.t), flags=settings["fftw_flag"])
-eg = Grid.EnvGrid(1, λ0, (200e-9, 3000e-9), 0.5e-12)
+eg = Grid.EnvGrid(λ0, (200e-9, 3000e-9), 0.5e-12)
 eFT = FFTW.plan_fft(similar(eg.t), flags=settings["fftw_flag"])
 
 itr = ((rg, rFT), (eg, eFT))
@@ -45,7 +45,7 @@ end
 ω0 = wlfreq(λ0)
 
 # field
-grid = Grid.RealGrid(1, λ0, (200e-9, 3000e-9), 0.5e-12)
+grid = Grid.RealGrid(λ0, (200e-9, 3000e-9), 0.5e-12)
 Et = zero(grid.t)
 It = Maths.gauss.(grid.t, fwhm=20e-15, x0=5e-15)
 @. Et += sqrt(It)*cos(grid.t*ω0)
@@ -75,7 +75,7 @@ Eω = FFTW.rfft(Et, 1)
 @test isapprox(Processing.arrivaltime(grid, Eω, bandpass=(300e-9, 500e-9))[2], 5e-15, rtol=1e-8)
 
 # envelope
-grid = Grid.EnvGrid(1, λ0, (200e-9, 3000e-9), 0.5e-12)
+grid = Grid.EnvGrid(λ0, (200e-9, 3000e-9), 0.5e-12)
 Et = complex(zero(grid.t))
 It = Maths.gauss.(grid.t, fwhm=20e-15, x0=5e-15)
 @. Et += sqrt(It)
@@ -107,7 +107,7 @@ end
 
 @testset "specres" begin
 # field grid
-grid = Grid.RealGrid(1.0, 800e-9, (160e-9, 3000e-9), 30e-12)
+grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 30e-12)
 Eω = (Maths.gauss.(grid.ω, fwhm=2π*PhysData.c/800e-9^2*2e-9, x0=PhysData.wlfreq(grid.referenceλ))
       .+ Maths.gauss.(grid.ω, fwhm=2π*PhysData.c/367e-9^2*20e-9, x0=PhysData.wlfreq(367e-9))
       .+ Maths.gauss.(grid.ω, fwhm=2π*PhysData.c/2000e-9^2*3e-9, x0=PhysData.wlfreq(2000e-9)))
@@ -129,7 +129,7 @@ for res in (1e12, 5e12, 10e12)
     @test isapprox(Maths.fwhm(Fg, Pf), res, rtol=1e-2)
 end
 # envelope grid
-grid = Grid.EnvGrid(1.0, 800e-9, (160e-9, 3000e-9), 30e-12)
+grid = Grid.EnvGrid(800e-9, (160e-9, 3000e-9), 30e-12)
 Eω = (Maths.gauss.(grid.ω, fwhm=2π*PhysData.c/800e-9^2*2e-9, x0=PhysData.wlfreq(grid.referenceλ))
       .+ Maths.gauss.(grid.ω, fwhm=2π*PhysData.c/367e-9^2*20e-9, x0=PhysData.wlfreq(367e-9))
       .+ Maths.gauss.(grid.ω, fwhm=2π*PhysData.c/2000e-9^2*3e-9, x0=PhysData.wlfreq(2000e-9)))
@@ -153,7 +153,7 @@ end
 end
 
 @testset "intensity autocorrelation" begin
-    grid = Grid.RealGrid(1.0, 800e-9, (160e-9, 3000e-9), 1e-12)
+    grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 1e-12)
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)
     input = Fields.GaussField(λ0=800e-9, τfwhm=30e-15, energy=1e-6)
@@ -171,7 +171,7 @@ end
 end
 
 @testset "field autocorrelation" begin
-    grid = Grid.EnvGrid(1.0, 800e-9, (160e-9, 3000e-9), 1e-12)
+    grid = Grid.EnvGrid(800e-9, (160e-9, 3000e-9), 1e-12)
     Δω = 2π*PhysData.c/800e-9^2*10e-9
     Eω = sqrt.(Maths.gauss.(grid.ω, Δω, x0=PhysData.wlfreq(grid.referenceλ)))
     x = Array{Float64}(undef, length(grid.t))
@@ -180,7 +180,7 @@ end
     τc = Processing.coherence_time(grid, Et)
     # Gaussian spectrum with natural width Δω has coherence time of 2*sqrt(log(2))/Δω (analytic)
     @test isapprox(τc, 2*sqrt(log(2))/Δω, rtol=6e-6)
-    grid = Grid.RealGrid(1.0, 800e-9, (160e-9, 3000e-9), 1e-12)
+    grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 1e-12)
     Δω = 2π*PhysData.c/800e-9^2*10e-9
     Eω = sqrt.(Maths.gauss.(grid.ω, Δω, x0=PhysData.wlfreq(grid.referenceλ)))
     x = Array{Float64}(undef, length(grid.t))
@@ -193,7 +193,7 @@ end
 
 @testset "AutoWindow" begin
     λ0 = 800e-9 
-    grid = Grid.RealGrid(1, λ0, (100e-9, 3000e-9), 0.5e-12)
+    grid = Grid.RealGrid(λ0, (100e-9, 3000e-9), 0.5e-12)
     FT = FFTW.plan_rfft(similar(grid.t), flags=settings["fftw_flag"])
     Eω1 = Fields.GaussField(λ0=λ0, τfwhm=10e-15, energy=100e-6)(grid, FT)
     Eω2 = Fields.GaussField(λ0=500e-9, τfwhm=30e-15, energy=100e-6)(grid, FT)

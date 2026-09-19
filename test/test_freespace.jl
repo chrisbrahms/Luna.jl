@@ -31,8 +31,8 @@ energy = 1e-12
 # 0.15 m rather than 0.3 m so that the input beam stays clear of the collars, see R above
 L = 0.15
 
-rgrid = Grid.RealGrid(L, λ0, (400e-9, 2000e-9), 0.2e-12)
-egrid = Grid.EnvGrid(L, λ0, (400e-9, 2000e-9), 0.2e-12)
+rgrid = Grid.RealGrid(λ0, (400e-9, 2000e-9), 0.2e-12)
+egrid = Grid.EnvGrid(λ0, (400e-9, 2000e-9), 0.2e-12)
 q = Hankel.QDHT(R, Nr, dim=3)
 xygrid = Grid.FreeGrid(R, Nx, R, Ny)
 xgrid = Grid.Free2DGrid(R, Nx)
@@ -97,8 +97,8 @@ function runprop_const(grid, sg, thg, pol)
     inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0, propz=-L)
 
     Eω, transform, FT = Luna.setup(grid, sg, densityfun, normfun, responses, inputs)
-    output = Output.MemoryOutput(0, grid.zmax, 11)
-    Luna.run(Eω, grid, linop, transform, FT, output; init_dz=0.1)
+    output = Output.MemoryOutput(0, L, 11)
+    Luna.run(Eω, grid, linop, transform, FT, output; init_dz=0.1, zmax=L)
     output["Eω"]
 end
 
@@ -121,8 +121,8 @@ function runprop_grad(grid, sg, thg, pol)
     inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0, propz=-L)
 
     Eω, transform, FT = Luna.setup(grid, sg, densityfun, normfun, responses, inputs)
-    output = Output.MemoryOutput(0, grid.zmax, 11)
-    Luna.run(Eω, grid, linop, transform, FT, output; init_dz=0.1)
+    output = Output.MemoryOutput(0, L, 11)
+    Luna.run(Eω, grid, linop, transform, FT, output; init_dz=0.1, zmax=L)
     output["Eω"]
 end
 
@@ -179,15 +179,15 @@ x polarisation (extraordinary axis).
         inputs = Fields.GaussGaussField(;λ0=λ0_bbo, τfwhm=τfwhm_bbo,
                                          energy=energy_bbo/(sqrt(π/2)*w0_bbo), w0=w0_bbo)
         Eω, transform, FT = Luna.setup(grid, bboxgrid, densityfun, normfun, responses, inputs)
-        output = Output.MemoryOutput(0, grid.zmax, 5)
-        Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6)
+        output = Output.MemoryOutput(0, thickness, 5)
+        Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6, zmax=thickness)
         eω = Fields.energyfuncs(grid, bboxgrid)[2]
         Eωk = output["Eω"] # (ω, pol, k, z)
         dropdims(mapslices(eω, Eωk; dims=(1, 3)); dims=(1, 3)) # energy: (pol, z)
     end
 
-    rgrid_bbo = Grid.RealGrid(thickness, λ0_bbo, (250e-9, 2e-6), 120e-15)
-    egrid_bbo = Grid.EnvGrid(thickness, λ0_bbo, (250e-9, 2e-6), 120e-15; thg=true)
+    rgrid_bbo = Grid.RealGrid(λ0_bbo, (250e-9, 2e-6), 120e-15)
+    egrid_bbo = Grid.EnvGrid(λ0_bbo, (250e-9, 2e-6), 120e-15; thg=true)
 
     energy_r = runshg(rgrid_bbo)
     energy_e = runshg(egrid_bbo)
@@ -216,8 +216,8 @@ operators: a frame which subtracts a constant carrier phase adds a spurious phas
     pr_thg = 2
     Lthg = 1e-3
 
-    rgridt = Grid.RealGrid(Lthg, λ0thg, (220e-9, 2000e-9), 100e-15)
-    egridt = Grid.EnvGrid(Lthg, λ0thg, (220e-9, 2000e-9), 100e-15; thg=true)
+    rgridt = Grid.RealGrid(λ0thg, (220e-9, 2000e-9), 100e-15)
+    egridt = Grid.EnvGrid(λ0thg, (220e-9, 2000e-9), 100e-15; thg=true)
 
     makethg(grid::Grid.RealGrid) = Nonlinear.Kerr_field(PhysData.γ3_gas(gas))
     makethg(grid::Grid.EnvGrid) = Nonlinear.Kerr_env_thg(PhysData.γ3_gas(gas), grid.ω0, grid.to)
@@ -231,8 +231,8 @@ operators: a frame which subtracts a constant carrier phase adds a spurious phas
         normfun = NonlinearRHS.const_norm_radial(grid, q, nfun)
         inputs = Fields.GaussGaussField(;λ0=λ0thg, τfwhm=20e-15, energy=1e-6, w0=100e-6)
         Eω, transform, FT = Luna.setup(grid, q, z -> dens0, normfun, responses, inputs)
-        output = Output.MemoryOutput(0, grid.zmax, 3)
-        Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-5)
+        output = Output.MemoryOutput(0, Lthg, 3)
+        Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-5, zmax=Lthg)
         eω = Fields.energyfuncs(grid, q)[2]
         Eωk = output["Eω"][:, 1, :, end] # (ω, k)
         thgband = @. 2.9ω0 < grid.ω < 3.1ω0
@@ -266,8 +266,8 @@ Base.getindex(c::CountingOutput, k) = c.out[k]
 @testset "evanescent channels" begin
     Re = 100e-6
     qe = Hankel.QDHT(Re, 128, dim=3)
-    gride = Grid.RealGrid(2e-3, 800e-9, (400e-9, 4000e-9), 100e-15)
-    ℓe = gride.zmax/Boundaries.DEFAULT_N
+    gride = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 100e-15)
+    ℓe = 2e-3/Boundaries.DEFAULT_N
     nfunλ = PhysData.ref_index_fun(gas, pressure)
     nfun = (λ; z=0.0) -> nfunλ(λ)
     ωs = gride.ω[gride.sidx]
@@ -286,8 +286,8 @@ Base.getindex(c::CountingOutput, k) = c.out[k]
             Eωr[:, :, qe.r .> 40e-6] .= 0
             Eω = qe * Eωr
         end
-        output = CountingOutput(Output.MemoryOutput(0, gride.zmax, 3))
-        Luna.run(Eω, gride, linop, transform, FT, output)
+        output = CountingOutput(Output.MemoryOutput(0, 2e-3, 3))
+        Luna.run(Eω, gride, linop, transform, FT, output; zmax=2e-3)
         output.n, output["Eω"][:, 1, :, end]
     end
     nsmooth, Es = runedge(false)
@@ -312,8 +312,8 @@ end
         normfun = NonlinearRHS.const_norm_radial(rgrid, q, nfun)
         inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0, propz=-L)
         Eω, transform, FT = Luna.setup(rgrid, q, z -> dens0, normfun, responses, inputs)
-        output = Output.MemoryOutput(0, rgrid.zmax, 3)
-        Luna.run(Eω, rgrid, linop, transform, FT, output; init_dz=0.1, boundary)
+        output = Output.MemoryOutput(0, L, 3)
+        Luna.run(Eω, rgrid, linop, transform, FT, output; init_dz=0.1, boundary, zmax=L)
         output["Eω"][:, 1, :, end]
     end
     Er = runfocus(:rate)
@@ -327,7 +327,7 @@ end
 @testset "transverse collar" begin
     Ld = 0.1
     w0d = 30e-6
-    gridd = Grid.RealGrid(Ld, λ0, (400e-9, 2000e-9), 0.2e-12)
+    gridd = Grid.RealGrid(λ0, (400e-9, 2000e-9), 0.2e-12)
     zR = π*w0d^2/λ0
     wL = w0d*sqrt(1 + (Ld/zR)^2)
     @test wL > 0.8R # the beam really does reach the wall
@@ -340,8 +340,8 @@ end
         normfun = NonlinearRHS.const_norm_radial(gridd, q, nfun)
         inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0=w0d)
         Eω, transform, FT = Luna.setup(gridd, q, z -> dens0, normfun, responses, inputs)
-        output = Output.MemoryOutput(0, gridd.zmax, 3)
-        Luna.run(Eω, gridd, linop, transform, FT, output; init_dz=0.1, boundary)
+        output = Output.MemoryOutput(0, Ld, 3)
+        Luna.run(Eω, gridd, linop, transform, FT, output; init_dz=0.1, boundary, zmax=Ld)
         Eωr = q \ output["Eω"][:, :, :, end]
         dropdims(sum(abs2.(Eωr); dims=(1, 2)); dims=(1, 2))
     end

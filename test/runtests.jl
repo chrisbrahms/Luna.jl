@@ -18,6 +18,11 @@ end
     include(joinpath(testdir, "test_physdata.jl"))
 end
 
+@testset "Grid" begin
+    @info("================= test_grid.jl")
+    include(joinpath(testdir, "test_grid.jl"))
+end
+
 @testset "Capillary" begin
     @info("================= test_capillary.jl")
     include(joinpath(testdir, "test_capillary.jl"))

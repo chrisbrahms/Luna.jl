@@ -305,7 +305,7 @@ end
 end
 
 @testset "findpeaks" begin
-    grid = Grid.RealGrid(1.0, 800e-9, (160e-9, 3000e-9), 10e-12)
+    grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 10e-12)
     dt = grid.t[2] - grid.t[1]
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1)

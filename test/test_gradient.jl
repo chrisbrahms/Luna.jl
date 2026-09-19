@@ -28,7 +28,7 @@ pres = 5
 L = 5e-2
 
 # Common setup
-grid = Grid.RealGrid(L, λ0, (160e-9, 3000e-9), 0.5e-12)
+grid = Grid.RealGrid(λ0, (160e-9, 3000e-9), 0.5e-12)
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=1e-6)
 responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
 
@@ -44,8 +44,8 @@ Eω, transform, FT = Luna.setup(
 statsfun = Stats.collect_stats(grid, Eω,
                                Stats.ω0(grid),
                                Stats.energy(grid, energyfunω))
-output_const = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_const, status_period=10)
+output_const = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_const, status_period=10, zmax=L)
 
 # Gradient
 coren, densityfun = Capillary.gradient(gas, L, pres, pres)
@@ -58,8 +58,8 @@ Eω, transform, FT = Luna.setup(
 statsfun = Stats.collect_stats(grid, Eω,
                                Stats.ω0(grid),
                                Stats.energy(grid, energyfunω))
-output_grad = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_grad, status_period=10)
+output_grad = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_grad, status_period=10, zmax=L)
 
 # Gradient array
 coren, densityfun = Capillary.gradient(gas, [0,L], [pres, pres]);
@@ -72,8 +72,8 @@ Eω, transform, FT = Luna.setup(
 statsfun = Stats.collect_stats(grid, Eω,
                                Stats.ω0(grid),
                                Stats.energy(grid, energyfunω))
-output_grad_array = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_grad_array, status_period=10)
+output_grad_array = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_grad_array, status_period=10, zmax=L)
 
 @test all(output_grad.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])
 @test all(output_grad_array.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])
@@ -88,7 +88,7 @@ pres = 5
 L = 5e-2
 
 # Common setup
-grid = Grid.EnvGrid(L, λ0, (160e-9, 3000e-9), 0.5e-12)
+grid = Grid.EnvGrid(λ0, (160e-9, 3000e-9), 0.5e-12)
 inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=1e-6)
 responses = (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
 
@@ -103,8 +103,8 @@ Eω, transform, FT = Luna.setup(grid, dens, responses, inputs, βfun!, aeff)
 statsfun = Stats.collect_stats(grid, Eω,
                                Stats.ω0(grid),
                                Stats.energy(grid, energyfunω))
-output_const = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_const, status_period=10)
+output_const = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_const, status_period=10, zmax=L)
 
 # Gradient
 coren, densityfun = Capillary.gradient(gas, L, pres, pres)
@@ -117,8 +117,8 @@ Eω, transform, FT = Luna.setup(
 statsfun = Stats.collect_stats(grid, Eω,
                                Stats.ω0(grid),
                                Stats.energy(grid, energyfunω))
-output_grad = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_grad, status_period=10)
+output_grad = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_grad, status_period=10, zmax=L)
 
 # Gradient array
 coren, densityfun = Capillary.gradient(gas, [0,L], [pres, pres]);
@@ -131,8 +131,8 @@ Eω, transform, FT = Luna.setup(
 statsfun = Stats.collect_stats(grid, Eω,
                                Stats.ω0(grid),
                                Stats.energy(grid, energyfunω))
-output_grad_array = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-Luna.run(Eω, grid, linop, transform, FT, output_grad_array, status_period=10)
+output_grad_array = Output.MemoryOutput(0, L, 201, statsfun)
+Luna.run(Eω, grid, linop, transform, FT, output_grad_array, status_period=10, zmax=L)
 
 @test all(output_grad.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])
 @test all(output_grad_array.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])

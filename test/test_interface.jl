@@ -213,7 +213,7 @@ end
     gpc = Pulses.GaussPulse(;polarisation=:circular, p...)
     pulse = Pulses.GaussBeamPulse(0.64*a, gpl)
     Eω, grid, linop, transform, FT, o = Interface.prop_capillary_args(args...; pulses=pulse, modes=Nmodes, kwargs...)
-    Luna.run(Eω, grid, linop, transform, FT, o)
+    Luna.run(Eω, grid, linop, transform, FT, o; zmax=args[2])
     @testset for m in 1:Nmodes
         @test Processing.energy(o)[m, 1] ≈ p.energy * gauss_overlaps[m]
     end

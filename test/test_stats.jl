@@ -19,7 +19,7 @@ import FunctionZeros: besselj_zero
     pres = 5
     τ = 30e-15
     λ0 = 800e-9
-    grid = Grid.RealGrid(15e-2, 800e-9, (160e-9, 3000e-9), 1e-12)
+    grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 1e-12)
     m = Capillary.MarcatiliMode(a, gas, pres, loss=false)
     aeff(z) = Modes.Aeff(m, z=z)
     energyfun, energyfunω = Fields.energyfuncs(grid)
@@ -33,8 +33,8 @@ import FunctionZeros: besselj_zero
         grid, densityfun, responses, inputs, βfun!, aeff)
 
     statsfun = Stats.default(grid, Eω, m, linop, transform; gas=gas, onaxis=true)
-    output = Output.MemoryOutput(0, grid.zmax, 201, statsfun)
-    Luna.run(Eω, grid, linop, transform, FT, output, status_period=5)
+    output = Output.MemoryOutput(0, 15e-2, 201, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, output, status_period=5, zmax=15e-2)
 
     @test all(output["stats"]["peakintensity"] .≈ output["stats"]["peakpower"]/norm)
 end

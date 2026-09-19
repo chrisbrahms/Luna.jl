@@ -11,8 +11,8 @@ gas = :Ar
 pressure = 1
 
 @testset "free space" begin
-    rgrid = Grid.RealGrid(1, 800e-9, (400e-9, 2000e-9), 0.2e-12)
-    egrid = Grid.EnvGrid(1, 800e-9, (400e-9, 2000e-9), 0.2e-12)
+    rgrid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
+    egrid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
     q = Hankel.QDHT(R, Nr, dim=3)
     xygrid = Grid.FreeGrid(R, Nx, R, Ny)
     xgrid = Grid.Free2DGrid(R, Nx)
@@ -52,8 +52,8 @@ pressure = 1
 end
 
 @testset "free space birefringent (tuple nfuns)" begin
-    rgrid = Grid.RealGrid(1, 800e-9, (400e-9, 2000e-9), 0.2e-12)
-    egrid = Grid.EnvGrid(1, 800e-9, (400e-9, 2000e-9), 0.2e-12)
+    rgrid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
+    egrid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
     xygrid = Grid.FreeGrid(R, Nx, R, Ny)
     xgrid = Grid.Free2DGrid(R, Nx)
 
@@ -101,7 +101,7 @@ end
 
     # real birefringent crystal on an envelope grid
     θ = deg2rad(29.2)
-    bbogrid = Grid.EnvGrid(200e-6, 800e-9, (250e-9, 2e-6), 120e-15; thg=true)
+    bbogrid = Grid.EnvGrid(800e-9, (250e-9, 2e-6), 120e-15; thg=true)
     bboxgrid = Grid.Free2DGrid(80e-6, 32)
     nfuns = PhysData.ref_index_fun_xy(:BBO, θ)
     linop = LinearOps.make_const_linop(bbogrid, bboxgrid, nfuns)
@@ -114,7 +114,7 @@ end
 @testset "equivalence for fast z-dependent linops" begin
 a = 125e-6
 L = 1
-grid = Grid.RealGrid(L, 800e-9, (400e-9, 2000e-9), 0.5e-12)
+grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 0.5e-12)
 coren, densityfun = Capillary.gradient(gas, L, pressure, 0)
 m = Capillary.MarcatiliMode(a, coren)
 dm = Modes.delegated(m) # delegated mode tricks make_linop into using the generic version
@@ -138,7 +138,7 @@ a = 125e-6
 L = 1
 # NO THG
 thg = false
-grid = Grid.EnvGrid(L, 800e-9, (400e-9, 2000e-9), 0.5e-12; thg=thg)
+grid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 0.5e-12; thg=thg)
 coren, densityfun = Capillary.gradient(gas, L, pressure, 0)
 m = Capillary.MarcatiliMode(a, coren)
 dm = Modes.delegated(m) # delegated mode tricks make_linop into using the generic version...
@@ -159,7 +159,7 @@ for zi in range(0, L, length=10)
 end
 # WITH THG
 thg = true
-grid = Grid.EnvGrid(L, 800e-9, (400e-9, 2000e-9), 0.5e-12; thg=thg)
+grid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 0.5e-12; thg=thg)
 coren, densityfun = Capillary.gradient(gas, L, pressure, 0)
 m = Capillary.MarcatiliMode(a, coren)
 dm = Modes.delegated(m) # delegated mode tricks make_linop into using the generic version...
@@ -189,7 +189,7 @@ end
     @test LinearOps.βz(0.0) == 0
 
     Rs = 50e-6
-    grid = Grid.RealGrid(1e-3, 800e-9, (400e-9, 4000e-9), 0.2e-12)
+    grid = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 0.2e-12)
     qs = Hankel.QDHT(Rs, 64, dim=3)
     xygrids = Grid.FreeGrid(Rs, 32, Rs, 32)
     xgrids = Grid.Free2DGrid(Rs, 64)

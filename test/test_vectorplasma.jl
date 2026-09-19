@@ -11,7 +11,7 @@ import Test: @test, @testset, @test_throws
     τfwhm = 30e-15
     λ0 = 1500e-9
     energy = 1.7e-6
-    grid = Grid.RealGrid(flength, λ0, (600e-9, 3000e-9), 1e-12)
+    grid = Grid.RealGrid(λ0, (600e-9, 3000e-9), 1e-12)
     energyfun, energyfunω = Fields.energyfuncs(grid)
     dens0 = PhysData.density(gas, pres)
     densityfun(z) = dens0
@@ -31,8 +31,8 @@ import Test: @test, @testset, @test_throws
                                 :y; full=false)
     linop = LinearOps.make_const_linop(grid, modes, λ0)
     statsfun = Stats.default(grid, Eω, modes, linop, transform; gas=gas)
-    outscalar = Output.MemoryOutput(0, grid.zmax, 2, statsfun)
-    Luna.run(Eω, grid, linop, transform, FT, outscalar)
+    outscalar = Output.MemoryOutput(0, flength, 2, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, outscalar; zmax=flength)
     # vector linear 0 degrees
     plasma = Nonlinear.PlasmaCumtrapz(grid.to, Array{Float64}(undef, length(grid.to), 2),
                                       ionrate, ionpot)
@@ -40,8 +40,8 @@ import Test: @test, @testset, @test_throws
              plasma)
     Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, modes,
                                    :xy; full=false)
-    outvector = Output.MemoryOutput(0, grid.zmax, 2, statsfun)
-    Luna.run(Eω, grid, linop, transform, FT, outvector)
+    outvector = Output.MemoryOutput(0, flength, 2, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, outvector; zmax=flength)
 
     Iωs = abs2.(outscalar.data["Eω"][:,1,1])
     Iωv = abs2.(outvector.data["Eω"][:,1,1])
@@ -58,8 +58,8 @@ import Test: @test, @testset, @test_throws
                                    :xy; full=false)
     linop = LinearOps.make_const_linop(grid, modes, λ0)
     statsfun = Stats.default(grid, Eω, modes, linop, transform; gas=gas)
-    outvector45 = Output.MemoryOutput(0, grid.zmax, 2, statsfun)
-    Luna.run(Eω, grid, linop, transform, FT, outvector45)
+    outvector45 = Output.MemoryOutput(0, flength, 2, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, outvector45; zmax=flength)
     Iωv45 = abs2.(outvector45.data["Eω"][:,1,1]) .+ abs2.(outvector45.data["Eω"][:,2,1])
     @test Iωs ≈ Iωv45
 end

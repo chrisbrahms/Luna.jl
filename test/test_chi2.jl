@@ -80,7 +80,7 @@ end
 
 @testset "Chi2Field generates second harmonic" begin
 	λ0 = 800e-9
-	grid = Grid.RealGrid(1.0, λ0, (200e-9, 1600e-9), 4e-12)
+	grid = Grid.RealGrid(λ0, (200e-9, 1600e-9), 4e-12)
 	input = Fields.GaussField(λ0=λ0, τfwhm=800e-15, power=1.0)
 	Et = 1e10 .* Fields.make_Et(input, grid)
 	N = length(Et)
@@ -235,7 +235,7 @@ end
 
 @testset "Chi2Env generates second harmonic" begin
 	λ0 = 800e-9
-	grid = Grid.EnvGrid(1.0, λ0, (200e-9, 1600e-9), 4e-12; thg=true)
+	grid = Grid.EnvGrid(λ0, (200e-9, 1600e-9), 4e-12; thg=true)
 	A = 1e10 .* sqrt.(Maths.gauss.(grid.to; fwhm=800e-15))
 	N = length(A)
 

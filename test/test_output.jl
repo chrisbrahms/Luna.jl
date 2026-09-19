@@ -111,7 +111,7 @@ fpath_comp = joinpath(dirpath, "test_comp.h5")
     pres = 5
     τ = 30e-15
     λ0 = 800e-9
-    grid = Grid.RealGrid(5e-2, 800e-9, (160e-9, 3000e-9), 1e-12)
+    grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 1e-12)
     m = Capillary.MarcatiliMode(a, gas, pres, loss=false)
     aeff = let m=m
         z -> Modes.Aeff(m, z=z)
@@ -129,10 +129,10 @@ fpath_comp = joinpath(dirpath, "test_comp.h5")
     statsfun = Stats.collect_stats(grid, Eω,
                                    Stats.ω0(grid),
                                    Stats.energy(grid, energyfunω))
-    hdf5 = Output.HDF5Output(fpath, 0, grid.zmax, 51, statsfun)
-    hdf5c = Output.HDF5Output(fpath_comp, 0, grid.zmax, 51, statsfun,
+    hdf5 = Output.HDF5Output(fpath, 0, 5e-2, 51, statsfun)
+    hdf5c = Output.HDF5Output(fpath_comp, 0, 5e-2, 51, statsfun,
                               compression=true)
-    mem = Output.MemoryOutput(0, grid.zmax, 51, statsfun)
+    mem = Output.MemoryOutput(0, 5e-2, 51, statsfun)
     function outfun(args...; kwargs...)
         hdf5(args...; kwargs...)
         hdf5c(args...; kwargs...)
@@ -142,7 +142,7 @@ fpath_comp = joinpath(dirpath, "test_comp.h5")
         o(Dict("λ0" => λ0))
         o("τ", τ)
     end
-    Luna.run(Eω, grid, linop, transform, FT, outfun, status_period=10)
+    Luna.run(Eω, grid, linop, transform, FT, outfun, status_period=10, zmax=5e-2)
     HDF5.h5open(hdf5.fpath, "r") do file
         @test read(file["λ0"]) == mem.data["λ0"]
         Eω = reinterpret(ComplexF64, read(file["Eω"]))
@@ -210,7 +210,7 @@ fpath = joinpath(homedir(), ".luna", "output_test", "test.h5")
     pres = 5
     τ = 30e-15
     λ0 = 800e-9
-    grid = Grid.RealGrid(5e-2, 800e-9, (160e-9, 3000e-9), 1e-12)
+    grid = Grid.RealGrid(800e-9, (160e-9, 3000e-9), 1e-12)
     m = Capillary.MarcatiliMode(a, gas, pres, loss=false)
     aeff(z) = Modes.Aeff(m, z=z)
     energyfun, energyfunω = Fields.energyfuncs(grid)
@@ -226,7 +226,7 @@ fpath = joinpath(homedir(), ".luna", "output_test", "test.h5")
     statsfun = Stats.collect_stats(grid, Eω,
                                    Stats.ω0(grid),
                                    Stats.energy(grid, energyfunω))
-    output = Output.HDF5Output(fpath, 0, grid.zmax, 51, statsfun)
+    output = Output.HDF5Output(fpath, 0, 5e-2, 51, statsfun)
     function stepfun(Eω, z, dz, interpolant)
         output(Eω, z, dz, interpolant)
         if z > 3e-2
@@ -235,7 +235,7 @@ fpath = joinpath(homedir(), ".luna", "output_test", "test.h5")
     end
     stepfun(args...; kwargs...) = output(args...; kwargs...)
     try
-        Luna.run(Eω, grid, linop, transform, FT, stepfun, status_period=10, z0=0.0)
+        Luna.run(Eω, grid, linop, transform, FT, stepfun, status_period=10, z0=0.0, zmax=5e-2)
     catch
     end
 
@@ -246,8 +246,8 @@ fpath = joinpath(homedir(), ".luna", "output_test", "test.h5")
     statsfun = Stats.collect_stats(grid, Eω,
                                    Stats.ω0(grid),
                                    Stats.energy(grid, energyfunω))
-    output = Output.HDF5Output(fpath, 0, grid.zmax, 51, statsfun)
-    Luna.run(Eω, grid, linop, transform, FT, output, status_period=5)
+    output = Output.HDF5Output(fpath, 0, 5e-2, 51, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, output, status_period=5, zmax=5e-2)
 
     # Run from scratch with MemoryOutput
     inputs = Fields.GaussField(λ0=λ0, τfwhm=τ, energy=1e-6)
@@ -256,8 +256,8 @@ fpath = joinpath(homedir(), ".luna", "output_test", "test.h5")
     statsfun = Stats.collect_stats(grid, Eω,
                                    Stats.ω0(grid),
                                    Stats.energy(grid, energyfunω))
-    mem = Output.MemoryOutput(0, grid.zmax, 51, statsfun)
-    Luna.run(Eω, grid, linop, transform, FT, mem, status_period=5)
+    mem = Output.MemoryOutput(0, 5e-2, 51, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, mem, status_period=5, zmax=5e-2)
 
     idx1 = findfirst(grid.ωwin .!= 1)
     idx2 = findlast(grid.ωwin .== 1)
