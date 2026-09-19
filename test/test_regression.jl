@@ -92,7 +92,7 @@ worstoverall = 0.0
             continue
         end
         new = rundict(runcase(case, mode))
-        diffs = compare(baseline[string(mode)], new)
+        diffs = compare(baseline[string(mode)], new; skip=skipstats(mode))
         w = RegressionCompare.worst(diffs)
         global worstoverall = max(worstoverall, isfinite(w.value) ? w.value : Inf)
         @printf("%-24s %-9s %12.3e %12.1e  %s%s\n", case.name, mode, w.value, tol, w.what,

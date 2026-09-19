@@ -10,7 +10,7 @@ module RegressionCompare
 using Luna
 import Luna: Output, Utils
 
-export saverun, loadcase, rundict, compare, Difference
+export saverun, loadcase, rundict, compare, skipstats, Difference
 
 """
     rundict(output)
@@ -94,12 +94,43 @@ end
 normdiff(ref::Number, new::Number) = normdiff([ref], [new])
 
 """
-    compare(ref::AbstractDict, new::AbstractDict)
+    STEP_STATS
+
+The statistics that record the step sequence rather than the field: `dz`, the size of each
+accepted step, and `z`, its running sum. `Stats.zdz!` writes both at every accepted step.
+
+They are not `rundict`'s top-level `"z"`, which is the save grid and is fixed by
+`Output.GridCondition` — that one is compared in every mode and must be exact.
+"""
+const STEP_STATS = ("z", "dz")
+
+"""
+    skipstats(mode)
+
+The statistics left out of the comparison in run `mode`.
+
+In the `:fixed` mode nothing is left out: the step sequence is imposed, so `z` and `dz` must
+match exactly and are a useful check that they were in fact imposed.
+
+In the `:adaptive` mode [`STEP_STATS`](@ref) is left out. The step-size controller's
+accept/reject decision and its PI update respond to a change in the last bits of the error
+estimate far more strongly than the field does, and the response compounds over the steps it
+takes to ramp `init_dz` up to `max_dz`; including `dz` would set the case's tolerance three
+to six orders of magnitude above what `Eω` needs and make the adaptive run no constraint at
+all. The field and the physical statistics are still compared, so a real change still shows
+up — through its effect on the result rather than on the bookkeeping.
+"""
+skipstats(mode::Symbol) = mode === :adaptive ? STEP_STATS : ()
+
+"""
+    compare(ref::AbstractDict, new::AbstractDict; skip=())
 
 Compare two run dictionaries (as produced by [`rundict`](@ref) or read back from HDF5) and
 return a `Vector{Difference}`, one entry for `Eω`, one for `z` and one per statistic.
+
+`skip` names statistics to leave out; pass [`skipstats(mode)`](@ref).
 """
-function compare(ref::AbstractDict, new::AbstractDict)
+function compare(ref::AbstractDict, new::AbstractDict; skip=())
     out = Difference[]
     for key in ("Eω", "z")
         v, note = normdiff(ref[key], new[key])
@@ -108,6 +139,7 @@ function compare(ref::AbstractDict, new::AbstractDict)
     rstats = ref["stats"]
     nstats = new["stats"]
     for key in sort(collect(keys(rstats)))
+        key in skip && continue
         if !haskey(nstats, key)
             push!(out, Difference("stats/" * key, Inf, "missing from the new run"))
             continue
@@ -116,6 +148,7 @@ function compare(ref::AbstractDict, new::AbstractDict)
         push!(out, Difference("stats/" * key, v, note))
     end
     for key in sort(collect(keys(nstats)))
+        key in skip && continue
         haskey(rstats, key) || push!(out, Difference("stats/" * key, Inf,
                                                      "not in the baseline"))
     end

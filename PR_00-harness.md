@@ -104,8 +104,10 @@ committed (`*.h5` is gitignored).
 
 Loads the baseline for `ENV["LUNA_REGRESSION_BASE"]`, or for the merge-base of `HEAD` with
 `evanescent`, runs every case in both modes with the same settings, and asserts
-`maximum(abs, Δ)/maximum(abs, baseline) <= tol` for `Eω`, for `z` and for every statistic,
-per case and per mode. It prints the table of observed maxima whether it passes or not. It
+`maximum(abs, Δ)/maximum(abs, baseline) <= tol` for `Eω`, for the save positions `z` and
+for every compared statistic, per case and per mode. In the `:adaptive` mode `stats/z` and
+`stats/dz` are not compared (see "What is compared in which mode"); in the `:fixed` mode
+everything is. It prints the table of observed maxima whether it passes or not. It
 is deliberately not in `runtests.jl`: it needs a baseline that does not exist on a fresh
 checkout.
 
@@ -122,14 +124,14 @@ operator, and one fixed-step propagation through `Luna.run`.
 | --- | --- | --- |
 | What | Result |
 | --- | --- |
-| `test/test_regression.jl` | **326 pass, 0 fail** (run twice). Every case, both modes, difference exactly `0.000e+00`. 69 s |
+| `test/test_regression.jl` | **304 pass, 0 fail**. Every case, both modes, difference exactly `0.000e+00`. 66 s |
 | `test/test_output.jl` | pass, 22.4 s |
 | `test/test_interface.jl` | pass, 268.6 s |
 | `test/test_freespace.jl` | pass, 313.9 s |
 | every other `test/test_*.jl` | all 33 files exit 0; table under "Per-file test timings" |
 | `test/regression/generate.jl fdf8dbe3` | baseline written, 15 cases × 2 modes |
 | `test/regression/generate.jl HEAD` | baseline written from a second, unrelated commit — see "Re-baselining" |
-| `LUNA_REGRESSION_BASE=211ab5ed test/test_regression.jl` | **326 pass, 0 fail**, all `0.000e+00` against that second baseline |
+| `LUNA_REGRESSION_BASE=211ab5ed test/test_regression.jl` | **304 pass, 0 fail**, all `0.000e+00` against that second baseline |
 | `test/regression/sensitivity.jl` | table below |
 | `benchmark/run.jl` | table below |
 | `include("docs/make.jl")` | fails, identically to the base commit — see "Known gaps" 5 |
@@ -187,27 +189,27 @@ bounds and repeatable only to some tens of percent.
 
 ### Regression gate against `fdf8dbe3`
 
-Every case, both modes: `0.000e+00`, in each of two runs. Largest difference over all cases
-and modes: `0.000e+00`. Per-case deltas, `fixed`/`adaptive`, against the tolerance now in
+Every case, both modes: `0.000e+00`, in every run. Largest difference over all cases and
+modes: `0.000e+00`. Per-case deltas, `:fixed`/`:adaptive`, against the tolerances in
 `tolerances.jl`:
 
 | Case | `:fixed` Δ | tol | `:adaptive` Δ | tol |
 | --- | --- | --- | --- | --- |
-| `modeavg_field_kerr` | 0 | 1.0e-12 | 0 | 8.2e-04 |
-| `modeavg_field_plasma` | 0 | 2.5e-12 | 0 | 1.2e-05 |
-| `modeavg_field_raman` | 0 | 1.0e-12 | 0 | 1.6e-06 |
-| `modeavg_field_mixture` | 0 | 1.0e-12 | 0 | 1.4e-08 |
-| `modeavg_env_kerr` | 0 | 1.0e-12 | 0 | 7.3e-01 |
-| `modeavg_env_raman` | 0 | 1.0e-12 | 0 | 5.9e-01 |
-| `gnlse_sech` | 0 | 1.0e-12 | 0 | 2.8e-08 |
+| `modeavg_field_kerr` | 0 | 1.0e-12 | 0 | 5.9e-07 |
+| `modeavg_field_plasma` | 0 | 2.5e-12 | 0 | 7.3e-06 |
+| `modeavg_field_raman` | 0 | 1.0e-12 | 0 | 2.4e-09 |
+| `modeavg_field_mixture` | 0 | 1.0e-12 | 0 | 1.5e-10 |
+| `modeavg_env_kerr` | 0 | 1.0e-12 | 0 | 5.3e-04 |
+| `modeavg_env_raman` | 0 | 1.0e-12 | 0 | 4.2e-04 |
+| `gnlse_sech` | 0 | 1.0e-12 | 0 | 1.6e-09 |
 | `multimode_field_plasma` | 0 | 2.9e-07 | 0 | 7.7e-06 |
 | `radial_field_kerr` | 0 | 1.0e-12 | 0 | 1.2e-08 |
 | `radial_env_kerr` | 0 | 1.0e-12 | 0 | 8.2e-09 |
 | `free3d_env_kerr` | 0 | 1.0e-12 | 0 | 1.0e-12 |
 | `free2d_field_chi2` | 0 | 1.0e-12 | 0 | 7.4e-12 |
 | `gradient_field_kerr` | 0 | 1.0e-12 | 0 | 1.6e-04 |
-| `taper_field_kerr` | 0 | 1.0e-12 | 0 | 3.3e-04 |
-| `modeavg_field_legacy` | 0 | 1.0e-12 | 0 | 5.0e-06 |
+| `taper_field_kerr` | 0 | 1.0e-12 | 0 | 3.1e-05 |
+| `modeavg_field_legacy` | 0 | 1.0e-12 | 0 | 7.8e-08 |
 
 Exact zero, not "below tolerance", is a stronger statement than the brief asks for and it
 also confirms that the baseline generator reproduces the run environment exactly: the
@@ -218,27 +220,62 @@ branch head): 326/326, all `0.000e+00`.
 ### One-ulp sensitivity
 
 Initial `Eω` multiplied by `1 + eps()`; the number is the gate's metric maximised over
-`Eω`, `z` and every statistic.
+`Eω`, the save positions `z` and every compared statistic — which in the `:adaptive` mode
+excludes `stats/z` and `stats/dz`, see "What is compared in which mode" below.
 
 | Case | `:fixed` | driven by | `:adaptive` | driven by |
 | --- | --- | --- | --- | --- |
-| `modeavg_field_kerr` | 1.59e-15 | `peakpower` | 8.23e-06 | `dz` |
-| `modeavg_field_plasma` | 2.50e-14 | `peak_ionisation_rate` | 1.22e-07 | `dz` |
-| `modeavg_field_raman` | 1.59e-15 | `peakpower` | 1.62e-08 | `dz` |
-| `modeavg_field_mixture` | 1.32e-15 | `Eω` | 1.38e-10 | `dz` |
-| `modeavg_env_kerr` | 1.09e-15 | `peakintensity` | 7.28e-03 | `dz` |
-| `modeavg_env_raman` | 1.87e-15 | `peakintensity` | 5.89e-03 | `dz` |
-| `gnlse_sech` | 2.11e-15 | `peakintensity` | 2.81e-10 | `dz` |
+| `modeavg_field_kerr` | 1.59e-15 | `peakpower` | 5.89e-09 | `peakintensity` |
+| `modeavg_field_plasma` | 2.50e-14 | `peak_ionisation_rate` | 7.29e-08 | `peak_ionisation_rate` |
+| `modeavg_field_raman` | 1.59e-15 | `peakpower` | 2.38e-11 | `peakintensity` |
+| `modeavg_field_mixture` | 1.32e-15 | `Eω` | 1.48e-12 | `peakpower` |
+| `modeavg_env_kerr` | 1.09e-15 | `peakintensity` | 5.34e-06 | `peakpower` |
+| `modeavg_env_raman` | 1.87e-15 | `peakintensity` | 4.24e-06 | `peakintensity` |
+| `gnlse_sech` | 2.11e-15 | `peakintensity` | 1.64e-11 | `peakintensity` |
 | `multimode_field_plasma` | 2.95e-09 | `transverse_integral_error_rel` | 7.74e-08 | `peak_ionisation_rate` |
 | `radial_field_kerr` | 2.05e-15 | `Eω` | 1.24e-10 | `Eω` |
 | `radial_env_kerr` | 2.25e-15 | `Eω` | 8.18e-11 | `Eω` |
 | `free3d_env_kerr` | 9.30e-16 | `Eω` | 1.25e-15 | `Eω` |
 | `free2d_field_chi2` | 8.48e-16 | `Eω` | 7.37e-14 | `Eω` |
 | `gradient_field_kerr` | 1.59e-15 | `peakpower` | 1.61e-06 | `zdw` |
-| `taper_field_kerr` | 1.27e-15 | `Eω` | 3.30e-06 | `dz` |
-| `modeavg_field_legacy` | 1.87e-15 | `peakintensity` | 5.02e-08 | `z` |
+| `taper_field_kerr` | 1.27e-15 | `Eω` | 3.06e-07 | `zdw` |
+| `modeavg_field_legacy` | 1.87e-15 | `peakintensity` | 7.77e-10 | `peakpower` |
 
 Tolerances in `tolerances.jl` are 100× these, floored at 1e-12.
+
+### What is compared in which mode
+
+`RegressionCompare.skipstats(mode)` decides. In the `:fixed` mode nothing is excluded: the
+step sequence is imposed, so `stats/z` and `stats/dz` must match exactly, and checking them
+also confirms that it really was imposed.
+
+In the `:adaptive` mode `stats/z` and `stats/dz` (`RegressionCompare.STEP_STATS`) are
+excluded. They record the step sequence, not the field. The controller's accept/reject
+decision and its PI update respond to a one-ulp change far more strongly than the field
+does, and the response compounds over the steps it takes to ramp `init_dz` up to `max_dz`.
+With them in, the `:adaptive` sensitivity was set by `dz` in eight of the fifteen cases and
+by `z` in a ninth, and the resulting tolerances were 7.3e-01 for `modeavg_env_kerr` and
+5.9e-01 for `modeavg_env_raman` — no constraint on anything, applied to `Eω` as well.
+Excluding them drops the loosest adaptive tolerance by a factor of about 1400, to 5.3e-04,
+and leaves the numbers set by `Eω` and the physical statistics:
+
+| | before | after |
+| --- | --- | --- |
+| loosest adaptive tolerance | 7.3e-01 (`modeavg_env_kerr`) | 5.3e-04 (`modeavg_env_kerr`) |
+| next loosest | 5.9e-01 (`modeavg_env_raman`) | 4.2e-04 (`modeavg_env_raman`) |
+| median adaptive tolerance | 1.6e-06 | 6.0e-08 |
+| assertions in the gate | 326 | 304 |
+
+`rundict`'s top-level `"z"` is a different thing — the save grid, fixed by
+`Output.GridCondition` — and is compared in both modes. Nothing is excluded from what the
+baseline *stores*, so the choice can be revisited without regenerating anything.
+
+The two loosest adaptive cases, `gradient_field_kerr` (1.6e-04) and `taper_field_kerr`
+(3.1e-05), are now set by `stats/zdw` and, for the gradient, `stats/density` and
+`stats/pressure`. Those are properties of the medium at whatever z the stepper landed on,
+so they inherit part of the step sequence's sensitivity indirectly, but they are not
+step-sequence records and would catch a real change in the density or taper function, so
+they stay in. `Eω` in those two cases is 2.6e-09 and 8.6e-09.
 
 Cases above 1e-12 in the `:fixed` mode, as the brief asks:
 
@@ -367,13 +404,14 @@ platform- or FFTW-build-dependent, so it is worth re-checking on the Linux CI ru
    statistics is a change to `Stats.jl` and out of scope here; it would strengthen the gate
    and is worth a separate issue.
 
-2. **The adaptive-mode tolerances are effectively no gate for two cases.** Following the
-   brief literally (one tolerance per case per mode, 100× the measured sensitivity), the
-   adaptive tolerance for `modeavg_env_kerr` is 0.73 and for `modeavg_env_raman` 0.59,
-   because `stats/dz` responds that strongly to one ulp. Applied to `Eω` as well, that is
-   no constraint at all. The `:fixed` mode is the real gate, as GPU_PLAN.md §4.11 intends,
-   and the gate prints the full table so a reviewer sees a case that moves from 0 to 1e-9
-   even when it "passes". See "Open questions".
+2. **The `:adaptive` mode does not compare `stats/z` and `stats/dz`.** This is a deviation
+   from the brief, made deliberately and on instruction. With them in, the rule "one
+   tolerance per case per mode, 100× the measured sensitivity" produced adaptive tolerances
+   of 0.73 and 0.59 for the two envelope Kerr cases, which constrained nothing. They are
+   still compared, and must be exact, in the `:fixed` mode. See "What is compared in which
+   mode". The residual looseness is `stats/zdw`/`density`/`pressure` in the gradient and
+   taper cases, which are medium properties sampled at the step positions; they are kept
+   because they would catch a real change in the density or taper function.
 
 3. **`Luna.prop_capillary_args` does not exist** under that name: the `*_args` functions
    live in `Luna.Interface` and are not re-exported (only `prop_capillary` and `prop_gnlse`
@@ -410,17 +448,12 @@ platform- or FFTW-build-dependent, so it is worth re-checking on the Linux CI ru
 
 ## Open questions
 
-- **Per-quantity tolerances.** The single per-(case, mode) tolerance is what the brief
-  specifies, but in the adaptive mode it is set by the step-size controller and then
-  applied to `Eω` too. A `Dict` keyed by case, mode *and* quantity (or simply a separate,
-  much tighter tolerance for `Eω`/`z` from the one for the per-step statistics) would make
-  the adaptive run a real check for about ten more lines in `tolerances.jl` and
-  `test_regression.jl`. I have not done it because it deviates from the brief; say the word
-  and it is a small change.
-- **Whether to keep `stats/dz` and `stats/z` in the comparison at all.** They are the
-  quantities that make the adaptive mode noisy, and they carry no physics. Dropping them
-  from the metric in `:adaptive` (but keeping them in `:fixed`, where they must be exact)
-  is the other way to make the adaptive tolerance meaningful.
+- **Per-quantity tolerances.** Still one tolerance per (case, mode), as the brief
+  specifies. Excluding the step diagnostics from the `:adaptive` comparison has made that
+  good enough — the loosest tolerance is 5.3e-04 and the median 6.0e-08 — so a `Dict`
+  keyed by quantity as well is no longer needed. It would still be the way to tighten
+  `gradient_field_kerr` and `taper_field_kerr`, whose numbers are set by `stats/zdw` rather
+  than by the field.
 - **Re-baselining.** `gpu/int-A` has to re-baseline for `gpu/01-zmax`'s changed signatures.
   `generate.jl` takes the commit as an argument and `cases.jl` is copied from the branch
   under test, so the mechanism is there, but `cases.jl` itself will need its `Luna.run` and

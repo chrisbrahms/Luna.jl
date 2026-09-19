@@ -48,7 +48,7 @@ for case in RegressionCases.CASES
     for mode in RegressionCases.MODES
         ref = rundict(runcase(case, mode))
         new = rundict(runcase(case, mode; perturb=eps()))
-        diffs = sort(compare(ref, new); by=d -> -d.value)
+        diffs = sort(compare(ref, new; skip=skipstats(mode)); by=d -> -d.value)
         results[case.name][mode] = isempty(diffs) ? 0.0 : diffs[1].value
         top = join([@sprintf("%s %.2e", d.what, d.value)
                     for d in diffs[1:min(NREPORT, length(diffs))]], ", ")

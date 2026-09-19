@@ -107,9 +107,30 @@ Every case runs twice.
 ## The metric
 
 Per saved quantity: `maximum(abs, new - baseline) / maximum(abs, baseline)`, over `Eω` at
-all saves, `z`, and every statistic. Elementwise relative differences are meaningless in
-the window tapers and outside `grid.sidx`, where the field is orders of magnitude below its
-peak. The reported number per case and mode is the largest over all quantities.
+all saves, the save positions `z`, and every compared statistic. Elementwise relative
+differences are meaningless in the window tapers and outside `grid.sidx`, where the field
+is orders of magnitude below its peak. The reported number per case and mode is the largest
+over all compared quantities.
+
+### What is compared in which mode
+
+`RegressionCompare.skipstats(mode)` decides. In the `:fixed` mode nothing is excluded: the
+step sequence is imposed, so `stats/z` and `stats/dz` must match exactly, and checking them
+also confirms that it really was imposed.
+
+In the `:adaptive` mode `stats/z` and `stats/dz` (`RegressionCompare.STEP_STATS`) are
+excluded. They record the step sequence, not the field, and the step-size controller's
+accept/reject decision and its PI update respond to a one-ulp change far more strongly than
+the field does — the response compounds over the steps it takes to ramp `init_dz` up to
+`max_dz`. With them in the comparison the tolerance for `modeavg_env_kerr` came out at
+0.73, which is no constraint on anything; with them out the adaptive tolerances are set by
+`Eω` and the physical statistics, and the loosest is 5.3e-04.
+
+`rundict`'s top-level `"z"` is a different thing — the save grid, fixed by
+`Output.GridCondition` — and is compared in both modes.
+
+Nothing is excluded from what the baseline *stores*: the HDF5 files always contain `z` and
+`dz`, so this choice can be revisited without regenerating anything.
 
 ## Determinism requirements
 
@@ -142,11 +163,14 @@ which runs each case twice, once with the initial `Eω` multiplied by `1 + eps()
 prints the per-quantity breakdown and a `TOLERANCES` literal to paste into
 `tolerances.jl`.
 
+`sensitivity.jl` uses the same comparison the gate does, exclusions included, so its output
+can be pasted into `tolerances.jl` unchanged.
+
 In the `:fixed` mode the sensitivity is at rounding level for all but two cases. In the
-`:adaptive` mode it is set by `stats/dz`: the step-size controller responds to a one-ulp
-change far more strongly than the field does, so the adaptive tolerances are loose and the
-adaptive run is closer to a crash test than to a gate. The reasons for the two `:fixed`
-cases above 1e-12 are in the header comment of `tolerances.jl`.
+`:adaptive` mode it is set by `Eω` and the physical statistics, mostly `peakpower`,
+`peakintensity` and `energy`, and ranges from 1e-14 to 5.3e-06. The reasons for the two
+`:fixed` cases above 1e-12, and for the two loosest adaptive cases, are in the header
+comment of `tolerances.jl`.
 
 Read the table `test/test_regression.jl` prints, not only its pass/fail: a case that moves
 from 0 to 1e-9 in the `:fixed` mode is a real change even if it is inside the tolerance.
