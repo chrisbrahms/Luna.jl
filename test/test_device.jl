@@ -1785,7 +1785,14 @@ end
     @test !Stats.device_capable(sfu)
     @test length(Stats.host_statistics(sfu)) == 1
     @test !Luna.stats_device_capable(Output.MemoryOutput(0, 1.0, 2, sfu))
-    @test haskey(sfu(Eu, 0.1, 1e-4), "mine")
+    #= A set which is not device-capable is built for the host copy `ScaledOutput` will
+       hand it, not for the device state it was constructed from: its buffers and its
+       plan are host ones, and it is called with a host array. JLArrays interprets its
+       kernels on the host, so a mixed host/device broadcast would pass here silently and
+       fail on real hardware -- hence the structural check as well as the call. =#
+    @test sfu.Et isa Array
+    @test !Utils.isdevice(sfu.Et)
+    @test haskey(sfu(Array(Eu), 0.1, 1e-4), "mine")
 
     #= The multimode default set: `fwhm_r`, `mode_reconstruction_error` and, for more
        than one mode, the on-axis peak intensity keep their algorithms on the host, and
@@ -1834,6 +1841,7 @@ end
     out2 = Output.MemoryOutput(0, 1.0, 2, sfu)
     so2 = Luna.ScaledOutput(out2, Eu, 1.0)
     @test !so2.devstats
+    @test sfu.Et isa Array # built for the host copy it is about to be handed
     fill!(so2.ybuf, 7)
     @test_logs (:warn, r"have no device form") match_mode=:any begin
         so2(Eu, 0.0, 0.05, _ -> Eu)

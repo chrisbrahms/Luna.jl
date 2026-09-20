@@ -949,6 +949,11 @@ statistics see it. [`default`](@ref) takes it from the transform.
 
 The inverse transform which produces `Et` is done once per call, and only when at least
 one of `funcs` reads it ([`needs_time`](@ref)).
+
+If any of `funcs` has no device form ([`device_capable`](@ref)) and `Eω` is a device
+array, everything is built for the *host* instead, because that is what the set will be
+called with: `Luna.ScaledOutput` copies the state down and unscales it for a set which
+cannot run where the state lives.
 """
 struct StatsCollector{F, B, A}
     funcs::F
@@ -965,12 +970,22 @@ function collect_stats(grid, Eω, funcs...; Eref=1.0)
         funcs = (funcs..., zdz!)
     end
     ctx = StatsContext(grid, Eω, Eref)
-    funcs = map(f -> prepare(f, ctx), funcs)
-    Et, analytic! = plan_analytic(grid, Eω)
-    StatsCollector(funcs, Et, analytic!,
-                   any(needs_time, funcs),
-                   all(device_capable, funcs),
-                   String[statlabel(f) for f in funcs if !device_capable(f)])
+    prepped = map(f -> prepare(f, ctx), funcs)
+    capable = all(device_capable, prepped)
+    #= A set which is not device-capable is never *called* with the device state:
+       `Luna.ScaledOutput` sees that (through `Luna.stats_device_capable`) and hands it a
+       host copy in physical units instead. Everything then has to be built for the host,
+       or the buffers and the plan would be on the device while the field is not -- which
+       JLArrays tolerates silently and real hardware does not. The scaling goes with it:
+       the copy is already unscaled. =#
+    if !capable && Utils.isdevice(Eω)
+        ctx = StatsContext(grid, Luna.tohost(Eω), 1.0)
+        prepped = map(f -> prepare(f, ctx), funcs)
+    end
+    Et, analytic! = plan_analytic(grid, ctx.proto)
+    StatsCollector(prepped, Et, analytic!,
+                   any(needs_time, prepped), capable,
+                   String[statlabel(f) for f in prepped if !device_capable(f)])
 end
 
 function (c::StatsCollector)(Eω, z, dz)
