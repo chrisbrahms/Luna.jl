@@ -1,5 +1,6 @@
-import Test: @test, @testset
-import Luna: Fields, Grid, Maths, Nonlinear, PhysData
+import Test: @test, @testset, @test_throws
+import Luna
+import Luna: Fields, Grid, Maths, Nonlinear, NonlinearRHS, PhysData
 import Luna.PhysData: ε_0
 import FFTW
 
@@ -262,4 +263,67 @@ end
 	# the DFG term produces optical rectification for a single-colour input
 	@test rectification > 1e8 * max(fundamental, eps())
 	@test maximum(abs.(out[:, 1])) < 1e-15
+end
+
+#= The χ⁽²⁾ responses are `VectorPointwise`: `NonlinearRHS.Et_to_Pt!` evaluates them as two
+   fused broadcasts over the whole `(nt, npol, ncols)` block rather than column by column.
+   This checks that the block path is the columnwise one, that a one-component block is
+   refused, and that `coefficients` carries one power of `E_ref` (degree 2 in the field),
+   which is what makes a reduced-precision run come out in physical units. =#
+@testset "Chi2 response protocol" begin
+	χ2 = PhysData.χ2(:BBO)
+	θ = deg2rad(29.2)
+	ϕ = deg2rad(30)
+	nt, ncols = 32, 3
+	to = collect(range(0, 1e-13, length=nt))
+	ω0 = PhysData.wlfreq(800e-9)
+	for (c, T) in ((Nonlinear.Chi2Field(θ, ϕ, χ2), Float64),
+				   (Nonlinear.Chi2Env(θ, ϕ, χ2, ω0, to), ComplexF64))
+		@test Nonlinear.kind(c) isa Nonlinear.VectorPointwise
+		@test Nonlinear.kind(c, Val(2)) isa Nonlinear.VectorPointwise
+		@test Nonlinear.device_capable(c)
+
+		E = randn(T, nt, 2, ncols)
+		P = zeros(T, nt, 2, ncols)
+		NonlinearRHS.Et_to_Pt!(P, E, (c,), 1.0)
+		Pref = zeros(T, nt, 2, ncols)
+		for i in 1:ncols
+			c(view(Pref, :, :, i), view(E, :, :, i), 1.0)
+		end
+		@test maximum(abs, P .- Pref) == 0
+
+		# a one-component block has no second polarisation component to couple to
+		@test_throws ErrorException NonlinearRHS.Et_to_Pt!(zeros(T, nt), randn(T, nt),
+														   (c,), 1.0)
+		# the density is ignored
+		@test Nonlinear.coefficients(c, 2.0, Luna.UNIT_SCALING) ==
+			  Nonlinear.coefficients(c, 1.0, Luna.UNIT_SCALING) == ε_0
+
+		#= Quadratic in the field: with the state e = E/Eref and the buffer p =
+		   P/(Pref*Eref), the same physical answer must come back multiplied by Pref*Eref.
+		   A cubic `polscale` would be out by a factor of Eref. =#
+		Eref, Pref_ = 4.0, ε_0
+		sc = Luna.UnitScaling(Eref, Pref_)
+		Ps = zeros(T, nt, 2, ncols)
+		NonlinearRHS.Et_to_Pt!(Ps, E./Eref, (c,), 1.0; scaling=sc)
+		@test maximum(abs, Ps.*(Pref_*Eref) .- P)/maximum(abs, P) < 1e-14
+
+		# `rescale` converts the crystal matrices, and the carrier phase where there is one
+		r32 = Nonlinear.rescale(c, Luna.DeviceSpec(Array, Float32), Luna.UNIT_SCALING)
+		@test eltype(r32.χ2) === Float32
+		@test eltype(r32.χ2_toLab) === Float32
+		@test eltype(r32.toCrystal) === Float32
+		@test eltype(r32.toLab) === Float32
+		if c isa Nonlinear.Chi2Env
+			@test eltype(r32.C) === ComplexF32
+			@test Nonlinear.resident_arrays(r32) === (r32.C,)
+		else
+			@test Nonlinear.resident_arrays(r32) === ()
+		end
+	end
+
+	# the carrier phase has to match the time axis of the block
+	ce = Nonlinear.Chi2Env(θ, ϕ, χ2, ω0, to)
+	@test_throws ErrorException NonlinearRHS.Et_to_Pt!(zeros(ComplexF64, nt+1, 2),
+													   randn(ComplexF64, nt+1, 2), (ce,), 1.0)
 end

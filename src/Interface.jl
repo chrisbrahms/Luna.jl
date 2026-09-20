@@ -370,8 +370,8 @@ If `raman` is `true`, then the following options apply:
     i.e. `Luna.settings["device"]` as the user set it (`:cpu` if nothing was set and
     nothing loaded, `:auto` once a GPU package has been `using`d), only when the
     propagation is mode-averaged (`modes` a single mode) *and* every nonlinear response it
-    was built with is device-capable (`Nonlinear.device_capable`; true for the Kerr,
-    plasma and Raman responses, false for a response Luna has not given a kernel and for
+    was built with is device-capable (`Nonlinear.device_capable`; true for the Kerr
+    responses including the no-THG one, the plasma, Raman and χ⁽²⁾ responses, false for
     anything user-written). Otherwise it stays on
     the CPU, whatever `Luna.settings["device"]` says, exactly as before this keyword
     existed -- loading a GPU package must never turn a working default call into an
@@ -510,8 +510,8 @@ function prop_capillary_args(radius, flength, gas, pressure;
        loaded GPU package exactly as the low-level interface does -- only when the
        propagation is mode-averaged (`mode_s` a single mode, the only geometry with a
        device path at all) *and* every response it was built with is device-capable
-       (`Nonlinear.device_capable`, true for the Kerr, plasma and Raman responses).
-       Otherwise it resolves to the CPU regardless of
+       (`Nonlinear.device_capable`, true for the Kerr, plasma, Raman and χ⁽²⁾
+       responses). Otherwise it resolves to the CPU regardless of
        `Luna.settings["device"]`, exactly as gpu/10 hardcoded, so that loading a GPU
        package does not turn a silent, working default call -- multimode, or
        field-resolved with plasma on by default -- into an error: only an *explicit*

@@ -133,7 +133,10 @@ round 1".)
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-the χ⁽²⁾ responses, and the radial, free-space and multimode transforms.
+the radial, free-space and multimode transforms. Every nonlinear response Luna ships
+has a device kernel: the Kerr responses, the χ⁽²⁾ responses, the plasma response and the
+Raman responses. The χ⁽²⁾ responses are only used by the free-space transforms, which are
+not device-capable yet, so a χ⁽²⁾ propagation still runs on the host as a whole.
 `Luna.setup` refuses a device or a reduced precision for the *transforms*, through the
 residency checks each of them makes, rather than running them wrongly. A *response* is
 not refused: it falls back to the host copy described under "An ad hoc response on a
@@ -173,8 +176,8 @@ quickly.
 
 Because of that, the *simple* interface refuses instead of falling back: an explicit
 `device` or `precision` request to `prop_capillary` with a response that has no device
-kernel of its own (the χ⁽²⁾ responses, and anything you wrote yourself) is an error
-naming `device=:cpu`. A
+kernel of its own -- which now means a response you wrote yourself, since every
+response Luna ships has one -- is an error naming `device=:cpu`. A
 call which does not mention `device` or `precision` is never affected — it stays on the
 CPU as it always did. Use the low-level interface (`Luna.setup`/`Luna.run`) if you really
 want the host fallback.

@@ -129,6 +129,28 @@ usercubic(s) = let s = s
     (out, E, ρ) -> (out .+= (ρ*s) .* E.^3)
 end
 
+#= A user-written *two-component* columnwise response: a toy χ⁽²⁾ crystal, written the way
+   a user would write one -- a loop with scalar indexing, in physical SI units. Nothing
+   about it can run on a device array, so it is the χ⁽²⁾ case of the hackability fallback.
+   Type-I-like: the two fundamental components drive the orthogonal one. =#
+userchi2(d) = let d = d
+    (out, E, ρ) -> begin
+        for i in axes(E, 1)
+            @inbounds out[i, 1] += d*2*E[i, 1]*E[i, 2]
+            @inbounds out[i, 2] += d*(E[i, 1]^2 - E[i, 2]^2)
+        end
+        out
+    end
+end
+
+#= A χ⁽²⁾ response matching the element type of a block: real field or complex envelope.
+   The field form has no time axis, so it ignores `_nt`; the two share a signature so that
+   a caller can build either from the block's element type alone. =#
+makechi2(::Type{Float64}, θ, ϕ, _nt) = Nonlinear.Chi2Field(θ, ϕ, PhysData.χ2(:BBO))
+makechi2(::Type{ComplexF64}, θ, ϕ, nt) = Nonlinear.Chi2Env(
+    θ, ϕ, PhysData.χ2(:BBO), PhysData.wlfreq(800e-9),
+    collect(range(0, 1e-13, length=nt)))
+
 @testset "backend trait" begin
     host = zeros(ComplexF64, 4, 3, 2)
     dev = DummyGPUArray(host)
@@ -1524,6 +1546,74 @@ end
     plain, _ = ramancase(HostSpec(); raman=false)
     @test maximum(abs, href["Eω"][:, end] .- plain["Eω"][:, end])/
           maximum(abs, plain["Eω"][:, end]) > 1e-3
+end
+
+#= The χ⁽²⁾ responses on a device block. The free-space transforms which use them are
+   host-only until Group E, so this is the block path -- one fused pair of component
+   broadcasts over an `(nt, 2, ncols)` array -- rather than a propagation. The second
+   response in the tuple makes sure the χ⁽²⁾ terms fuse with the vector Kerr ones rather
+   than being evaluated on their own. =#
+@testset "χ⁽²⁾ responses on JLArray" begin
+    nt, ncols = 64, 3
+    θ, ϕ = deg2rad(29.2), deg2rad(30)
+    γ3 = PhysData.γ3_gas(:He)
+    for (T, kerr) in ((Float64, Nonlinear.Kerr_field(γ3)),
+                      (ComplexF64, Nonlinear.Kerr_env(γ3)))
+        c = makechi2(T, θ, ϕ, nt)
+        for resps in ((c,), (c, kerr))
+            Eh = randn(T, nt, 2, ncols)
+            Ph = zeros(T, nt, 2, ncols)
+            NonlinearRHS.Et_to_Pt!(Ph, Eh, resps, 1.0)
+            rd = map(r -> Nonlinear.rescale(r, JLSpec, UNIT_SCALING), resps)
+            Ed = Luna.todevice(JLSpec, Eh)
+            Pd = Luna.alloc(JLSpec, T, (nt, 2, ncols))
+            NonlinearRHS.Et_to_Pt!(Pd, Ed, rd, 1.0)
+            @test Pd isa JLArray
+            @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-10
+        end
+        # the carrier phase of the envelope response is moved by `rescale`
+        rc = Nonlinear.rescale(c, JLSpec, UNIT_SCALING)
+        if c isa Nonlinear.Chi2Env
+            @test rc.C isa JLArray
+            @test Nonlinear.resident_arrays(rc) === (rc.C,)
+        end
+        @test Luna.assert_resident(JLSpec, Nonlinear.resident_arrays(rc)...) === nothing
+    end
+end
+
+#= The χ⁽²⁾ case of the hackability fallback: a two-component response a user wrote as a
+   closure with scalar indexing, applied to a JLArray block through `HostResponse`,
+   alongside a χ⁽²⁾ response which does have a kernel. =#
+@testset "a user χ⁽²⁾ closure through HostResponse on JLArray" begin
+    nt, ncols = 64, 2
+    #= `d` is of the order of ε₀χ⁽²⁾ for BBO, so that the closure and the response with a
+       kernel contribute comparably and the comparison is not dominated by one of them. =#
+    cw = userchi2(1e-23)
+    c = Nonlinear.Chi2Field(deg2rad(29.2), deg2rad(30), PhysData.χ2(:BBO))
+    # the columnwise contract is one call per column, which is what `idcs` is for
+    idcs = CartesianIndices((ncols,))
+    Eh = randn(Float64, nt, 2, ncols)
+    Ph = zeros(Float64, nt, 2, ncols)
+    NonlinearRHS.Et_to_Pt!(Ph, Eh, (c, cw), 1.0, idcs)
+
+    Ed = Luna.todevice(JLSpec, Eh)
+    # the one-time log line says the response is running on the host
+    hr = @test_logs (:info,) match_mode=:any Nonlinear.rescale(cw, JLSpec, UNIT_SCALING, Ed)
+    @test hr isa Nonlinear.HostResponse
+    @test Nonlinear.kind(hr) isa Nonlinear.Batched
+    @test hr.resp === cw
+    Pd = Luna.alloc(JLSpec, Float64, (nt, 2, ncols))
+    NonlinearRHS.Et_to_Pt!(Pd, Ed, (Nonlinear.rescale(c, JLSpec, UNIT_SCALING), hr), 1.0,
+                           idcs)
+    @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-10
+
+    # the closure really contributes
+    Pc = zeros(Float64, nt, 2, ncols)
+    NonlinearRHS.Et_to_Pt!(Pc, Eh, (c,), 1.0, idcs)
+    @test maximum(abs, Pc .- Ph)/maximum(abs, Ph) > 1e-2
+
+    # unwrapped, it is refused on a device block
+    @test_throws ErrorException NonlinearRHS.Et_to_Pt!(Pd, Ed, (cw,), 1.0)
 end
 
 #= The hackability fallback: a user-written columnwise closure, which knows nothing about

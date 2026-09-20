@@ -132,7 +132,7 @@ the columnwise loop's range.
 | kind | what the dispatcher does | what the response supplies | examples |
 | --- | --- | --- | --- |
 | [`Nonlinear.Pointwise`](@ref) | fuses it into one broadcast over the whole block with the other pointwise responses, no buffer | [`pointwise_kernel`](@ref Luna.Nonlinear.pointwise_kernel) (a `T -> T`), or [`pointwise_expr`](@ref Luna.Nonlinear.pointwise_expr) if it carries per-sample arrays | `KerrField`, `KerrEnv` (scalar field), `KerrEnvTHG` |
-| [`Nonlinear.VectorPointwise`](@ref) | two broadcasts, one per polarisation component, each fused across the group | [`vector_kernel`](@ref Luna.Nonlinear.vector_kernel) (an `(ex, ey) -> SVector{2}`), or [`vector_expr`](@ref Luna.Nonlinear.vector_expr) | `KerrField`, `KerrEnv` (two-component field) |
+| [`Nonlinear.VectorPointwise`](@ref) | two broadcasts, one per polarisation component, each fused across the group | [`vector_kernel`](@ref Luna.Nonlinear.vector_kernel) (an `(ex, ey) -> SVector{2}`), or [`vector_expr`](@ref Luna.Nonlinear.vector_expr) | `KerrField`, `KerrEnv` (two-component field), `Chi2Field`, `Chi2Env` |
 | [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block, through [`batched!`](@ref Luna.Nonlinear.batched!), which also hands it the unit scaling | [`batched!`](@ref Luna.Nonlinear.batched!) (or just the call operator, if its coefficients already carry the scaling), plus its own full-size buffers in the run's array type | `HostResponse`, `PlasmaCumtrapz`, `RamanPolarField`/`RamanPolarEnv`, `KerrFieldNoTHG` |
 | [`Nonlinear.Columnwise`](@ref) | calls it once per column, on the host; refused on a device array | nothing — the default, so any callable works | anything user-written |
 
@@ -219,12 +219,58 @@ For the two-component Kerr forms this is the same arithmetic, and the same numbe
 passes, as the pair of broadcasts they were already written as. It is not free in general:
 because each output component is materialised by its own broadcast over the *same*
 `vector_expr`, a genuinely coupled response evaluates its shared intermediates twice. For
-a χ⁽²⁾ response that is the lab-to-crystal rotation, the contracted field products and the
-3×6 contraction — once per column today, twice per sample after `gpu/15`. Dead-code
-elimination removes the unused component of the returned `SVector`, not the work the two
-components share. That is the price of the layout; a response for which it matters can
-override `vector_expr` to compute the shared part in a form the compiler can hoist, or ask
-for a batched kind instead.
+the χ⁽²⁾ responses that is the lab-to-crystal rotation and the contracted field products,
+which are evaluated once per output component. Dead-code elimination removes the unused
+component of the returned `SVector`, and with it the row of the 3×6 contraction which
+produced it, but not the work the two components share. That is the price of the layout;
+a response for which it matters can override `vector_expr` to compute the shared part in
+a form the compiler can hoist, or ask for a batched kind instead.
+
+### The χ⁽²⁾ responses
+
+[`Nonlinear.Chi2Field`](@ref) and [`Nonlinear.Chi2Env`](@ref) are the vector-pointwise
+form in its intended shape, and the reason the kind exists. At one time sample the
+response rotates the two lab-frame components into the crystal frame, forms the six
+contracted second-order products, contracts them with the 3×6 tensor and rotates the
+result back — a chain of small dense products which couples the components and nothing
+else.
+
+Everything it contracts with is an `isbits` static matrix: `SMatrix{3, 6, T}` for the
+tensor, `Rotations.RotMatrix3{T}` for the two rotations, never an `MArray`. Static
+matrices travel inside the closure a broadcast compiles, so the responses need no buffer
+and carry no host array apart from `Chi2Env`'s carrier phase, which is a second broadcast
+argument (as [`KerrEnvTHG`](@ref Luna.Nonlinear.KerrEnvTHG)'s is) and is listed in
+`resident_arrays`. The four work vectors the old implementation allocated at construction
+and wrote into per time sample are gone.
+
+`coefficients` is `ε₀·polscale(scaling, 2)`: the responses are quadratic in the field, so
+they carry one power of `E_ref`, against the Kerr responses' two. The density is ignored,
+as it always was — a χ⁽²⁾ crystal is not a gas.
+
+Both declare `kind` as `VectorPointwise()` *unconditionally* rather than only for
+`Val(2)`. They have no one-component form, and a `Val{2}`-only declaration would leave
+`kind(r)` at `Columnwise()` and with it `device_capable(r)` false. The scalar case is
+therefore refused by the `Val(1)` check in `NonlinearRHS._scalarexpr` rather than
+silently taken down the elementwise path.
+
+`rescale` converts the crystal matrices to the run's real type and moves the carrier
+phase. The kernel converts the matrices again, from whatever type the response holds to
+`real(eltype(E))`. That is 27 host scalars per component broadcast, so 54 per right-hand
+side — the two-broadcast layout doubles this as it doubles the shared arithmetic — and
+the identity on a response `rescale` has already converted. It is there so that a kernel
+built from a response which never went through `rescale` still carries no `Float64`
+(rule 3 above), which is what a low-level caller assembling `Et_to_Pt!` by hand does.
+
+**The guarantee is partial, and covers the matrices only.** An unrescaled `Chi2Field` is
+entirely `isbits`, so it compiles and runs on a device. An unrescaled `Chi2Env` does not:
+its carrier phase is still a host `Vector{ComplexF64}`, it enters the broadcast as a
+host array, and Metal refuses to compile the kernel. That failure is loud and immediate,
+not a silently wrong answer, but `Chi2Env` does need `rescale` — which is what
+`resident_arrays` and the transform's residency assertion are for.
+
+The χ⁽²⁾ transforms themselves — the free-space ones — are host-only until Group E, so the
+responses are exercised on a device block directly (`test_device.jl`, `test_metal.jl`)
+rather than through a propagation.
 
 ## The host fallback
 
