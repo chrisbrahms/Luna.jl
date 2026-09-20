@@ -123,14 +123,17 @@ What is new is a trait, [`Nonlinear.kind`](@ref Luna.Nonlinear.kind), which says
 [`NonlinearRHS.Et_to_Pt!`](@ref Luna.NonlinearRHS.Et_to_Pt!) evaluates it. `Et_to_Pt!`
 walks the response list in order, takes the longest run of pointwise responses at a time
 and evaluates it as one broadcast, and applies everything else one response at a time.
-The first group written assigns into `Pt`; the rest accumulate, so the sequence of
-additions each element sees is the one the per-response loop produced.
+The first group written assigns into `Pt`; every later group folds `Pt` in as the leading
+term of its own sum, so the sequence of additions each element sees is exactly the one the
+per-response loop produced. Where a transform passes `idcs`, it must cover every column of
+the block: the pointwise and batched paths act on the whole block and ignore it, and it is
+the columnwise loop's range.
 
 | kind | what the dispatcher does | what the response supplies | examples |
 | --- | --- | --- | --- |
 | [`Nonlinear.Pointwise`](@ref) | fuses it into one broadcast over the whole block with the other pointwise responses, no buffer | [`pointwise_kernel`](@ref Luna.Nonlinear.pointwise_kernel) (a `T -> T`), or [`pointwise_expr`](@ref Luna.Nonlinear.pointwise_expr) if it carries per-sample arrays | `KerrField`, `KerrEnv` (scalar field), `KerrEnvTHG` |
 | [`Nonlinear.VectorPointwise`](@ref) | two broadcasts, one per polarisation component, each fused across the group | [`vector_kernel`](@ref Luna.Nonlinear.vector_kernel) (an `(ex, ey) -> SVector{2}`), or [`vector_expr`](@ref Luna.Nonlinear.vector_expr) | `KerrField`, `KerrEnv` (two-component field) |
-| [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block | the call operator, plus its own full-size buffers in the run's array type | `HostResponse`; `PlasmaCumtrapz`, `RamanPolar*` after Group D |
+| [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block, through [`batched!`](@ref Luna.Nonlinear.batched!), which also hands it the unit scaling | [`batched!`](@ref Luna.Nonlinear.batched!) (or just the call operator, if its coefficients already carry the scaling), plus its own full-size buffers in the run's array type | `HostResponse`; `PlasmaCumtrapz`, `RamanPolar*` after Group D |
 | [`Nonlinear.Columnwise`](@ref) | calls it once per column, on the host; refused on a device array | nothing — the default, so any callable works | anything user-written |
 
 Three functions carry the units and the precision:
@@ -143,12 +146,32 @@ Three functions carry the units and the precision:
   itself.
 - the kernel converts that scalar exactly once, with [`Luna.scalar`](@ref)`(E, c)`, so
   nothing reachable from a device kernel is a `Float64`.
-- [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale)`(r, spec, scaling)` converts the
-  *arrays* a response carries (a carrier phase, a tabulated coefficient) to the run's
-  array type and precision, and is also where a columnwise response is wrapped for a
-  device run. A response whose coefficients are all scalars needs no method: the fallback
-  passes it through when [`resident_arrays`](@ref Luna.Nonlinear.resident_arrays) is
-  empty, and errors only when there is an array and no rule for moving it.
+- [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale) converts the *arrays* a response
+  carries (a carrier phase, a tabulated coefficient) to the run's array type and
+  precision, allocates whatever depends on the shape of the block, and is where a
+  columnwise response is wrapped for a device run. A transform calls the **four**-argument
+  form, `rescale(r, spec, scaling, Et)`, where `Et` is a prototype of the field block:
+  `size(Et)` is `(nt, npol, ncols...)`, `eltype(Et)` says whether the field is real or
+  complex and in what precision, and `similar(Et)` allocates a buffer of the run's array
+  type. A [`Batched`](@ref Luna.Nonlinear.Batched) response implements that form, so that
+  its buffers exist at construction and the transform's residency assertion can see them
+  (rule 4 above). Everything else implements the three-argument form, which the
+  four-argument fallback delegates to.
+
+  **Which kinds may skip it.** A [`Pointwise`](@ref Luna.Nonlinear.Pointwise) or
+  [`VectorPointwise`](@ref Luna.Nonlinear.VectorPointwise) response whose coefficients are
+  all scalars needs no method at all: the fallback passes it through when
+  [`resident_arrays`](@ref Luna.Nonlinear.resident_arrays) is empty, because
+  `coefficients` is called per right-hand side with the run's scaling. A
+  [`Batched`](@ref Luna.Nonlinear.Batched) response may **not**: it is handed the block,
+  the density and the units and nothing else, so the fallback refuses it unless the run is
+  unscaled and on the host. A response which carries an array and has no method is an
+  error either way.
+
+  The fallbacks also check, once per setup, that every non-`isbits` array field of a
+  device-kind response is one `resident_arrays` names, and say which field is missing if
+  not. A `StaticArrays` or `Rotations` matrix is `isbits`, travels inside the struct and
+  is exempt.
 
 **The response struct itself never enters a kernel.** Only the scalars the kernel captured
 and the arrays `rescale` converted do. That is why `KerrField` keeps its physical
@@ -181,8 +204,18 @@ output. Luna's buffers are `(nt, npol, ncols)` — the polarisation index is the
 would mean a transpose and a buffer. The kernel contract is kept (the response returns an
 `SVector{2}` of the two lab-frame components); the dispatcher materialises it into the two
 output component views with one broadcast each, both fused across the whole pointwise
-group. For the two-component Kerr forms this is the same arithmetic, and the same number
-of passes, as the pair of broadcasts they were written as before.
+group.
+
+For the two-component Kerr forms this is the same arithmetic, and the same number of
+passes, as the pair of broadcasts they were already written as. It is not free in general:
+because each output component is materialised by its own broadcast over the *same*
+`vector_expr`, a genuinely coupled response evaluates its shared intermediates twice. For
+a χ⁽²⁾ response that is the lab-to-crystal rotation, the contracted field products and the
+3×6 contraction — once per column today, twice per sample after `gpu/15`. Dead-code
+elimination removes the unused component of the returned `SVector`, not the work the two
+components share. That is the price of the layout; a response for which it matters can
+override `vector_expr` to compute the shared part in a form the compiler can hoist, or ask
+for a batched kind instead.
 
 ## The host fallback
 
@@ -204,10 +237,13 @@ right-hand side it
 3. multiplies by `1/(P_ref E_ref)` into the staging buffer and copies it back up, then
    adds it to the output.
 
-Five host-sized buffers and two copies per right-hand side, allocated on the first call
-(the block shape is not known at `rescale` time) and read back through a function barrier
-so the per-element code is still compiled for concrete types. The staging buffer exists
-because `copyto!` between a host array and a device array does not convert the precision.
+Four buffers and two copies per right-hand side: `Eh` and `Ph` on the host in physical
+`Float64`/`ComplexF64`, `stage` on the host in the run's element type, and `Pd` in the
+run's array type. A scaled host run needs only the first two and leaves the others
+`nothing`. The staging buffer exists because `copyto!` between a host array and a device
+array does not convert the precision. All of them are allocated by the constructor, from
+the block prototype `rescale` is given, so the per-call code is fully typed and `Pd` is
+covered by the transform's residency assertion.
 
 The simple interface deliberately does not use it: `prop_capillary` refuses an explicit
 `device`/`precision` request whose responses are not all

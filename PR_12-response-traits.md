@@ -43,7 +43,7 @@ a GPU run"; nothing implemented that.
 | --- | --- | --- |
 | `Pointwise()` | fuses it into one broadcast over the whole block with the other pointwise responses, no buffer | `pointwise_kernel` (a `T -> T`), or `pointwise_expr` if it carries per-sample arrays |
 | `VectorPointwise()` | two broadcasts, one per polarisation component, each fused across the group | `vector_kernel` (an `(ex, ey) -> SVector{2}`), or `vector_expr` |
-| `Batched()` | calls it once with the whole `(nt, npol, ncols)` block | the call operator, plus its own full-size buffers in the run's array type |
+| `Batched()` | calls it once with the whole `(nt, npol, ncols)` block through `Nonlinear.batched!(r, out, E, ρ, scaling)` | `batched!`, or just the call operator if its coefficients already carry the scaling, plus its own full-size buffers in the run's array type |
 | `Columnwise()` | calls it once per column, on the host; refused on a device array | nothing — the default, so any callable `(out, E, ρ)` works |
 
 `kind(r, npol)` (with `npol` a `Val`) is the kind for a block with that many polarisation
@@ -91,11 +91,11 @@ it
 3. multiplies by `1/(P_ref E_ref)` into the staging buffer, copies that back up and adds it
    to the output.
 
-Buffers are allocated on the first call, because `rescale` sees the spec and the scaling
-but not the block shape, and are read back through a function barrier so the per-element
-code is still compiled for concrete types. The separate staging buffer in the run's element
-type exists because `copyto!` between a host array and a device array does not convert the
-precision (`copyto!(::MtlArray{Float32}, ::Array{Float64})` is not a conversion).
+All four buffers are allocated by the constructor from the block prototype `rescale` is
+given, so the per-call code is fully typed and the device one is covered by the transform's
+residency assertion. The separate staging buffer in the run's element type exists because
+`copyto!` between a host array and a device array does not convert the precision
+(`copyto!(::MtlArray{Float32}, ::Array{Float64})` is not a conversion).
 
 It is correct and slow, deliberately: two host copies and a host evaluation per right-hand
 side, which on a GPU also serialises the step.
@@ -397,13 +397,11 @@ block; everything new in `Nonlinear.jl` is picked up by that module's `@autodocs
 - **Only the mode-averaged transform passes a `scaling` to `Et_to_Pt!`.** The radial,
   free-space and multimode transforms are still host `Float64` only, so they pass the
   identity. They will need the keyword when they gain a device path (Group E).
-- **`HostResponse` is not fast and is not meant to be.** It holds five host-sized buffers
-  and does two copies and a host evaluation per right-hand side. Group D replaces the
+- **`HostResponse` is not fast and is not meant to be.** It holds four buffers (three on
+  the host, one on the device) and does two copies and a host evaluation per right-hand
+  side. Group D replaces the
   responses which matter (plasma, Raman, χ⁽²⁾) with real kernels; the fallback stays for
   whatever a user writes.
-- **`HostResponse` allocates its buffers on the first call**, from untyped fields read
-  through a function barrier. `rescale` does not know the block shape, and adding it to the
-  signature would change every response's `rescale` method for the benefit of one type.
 - **No batched response other than `HostResponse` exists yet**, so the `Batched` contract is
   exercised only through it. Group D is what tests it properly.
 - **`Chi2Field`/`Chi2Env`, `PlasmaCumtrapz` and the Raman responses are untouched** and
@@ -424,11 +422,127 @@ block; everything new in `Nonlinear.jl` is picked up by that module's `@autodocs
    `gpu/10`'s arrangement, where `rescale` folds the scaling into the response's constants
    and `coefficients` only adds the density — one fewer argument to thread, one more place
    where a power of `E_ref` appears.
-3. `rescale`'s new default for a device kind with no arrays (pass through when
-   `resident_arrays` is empty). It removes boilerplate for every scalar-coefficient
-   response, but it means a response which carries an array and forgets to list it in
-   `resident_arrays` is passed through silently rather than refused. The transform's
-   residency assertion does not catch that either, for the same reason.
+3. ~~`rescale`'s new default for a device kind with no arrays.~~ Answered by review round
+   1, finding 7, and fixed below: the pass-through now checks structurally that every
+   non-`isbits` array field is one `resident_arrays` names, and it is restricted to the
+   pointwise kinds.
 4. The `@info` line per wrapped response fires at transform construction. For a scan that
    is once per point; `Logging.@info` with a `maxlog` was not used because the wrapping is
    genuinely per-run information. Is once per `Luna.setup` the right frequency?
+
+## Changes after review round 1
+
+The review's verdict was "approve with minor fixes", with findings 1, 2 and 6 named as
+contracts the three Group D branches build on and which therefore had to land before they
+are cut. All eleven actionable findings are in. The regression gate is still exactly
+`0.000e+00` on all 21 cases against `gpu/int-A`.
+
+### 1 (major) — a `Batched` response never received the unit scaling
+
+`_apply_unfused!` handed a batched response only `(Pt, Et, ρ)`, and `rescale`'s
+pass-through told its author not to write a method — so a batched response would have run
+physical-unit coefficients against a scaled state, silently. Both halves are fixed, as the
+review's "either/or" suggested, because the two are complementary:
+
+- `_apply_unfused!(..., ::Batched, r, ρ, scaling, ...)` now calls a new hook,
+  `Nonlinear.batched!(r, out, E, ρ, scaling)`, whose default is `r(out, E, ρ)`. A batched
+  response can therefore combine its coefficients with `E_ref`/`P_ref` per call, exactly as
+  a pointwise one does through `coefficients`.
+- `_rescale_fallback` no longer passes a `Batched` response through: it errors unless
+  `isunity(scaling) && !isdevicespec(spec)`, with a message saying a batched response needs
+  a `rescale` method which combines its coefficients with the scaling and allocates its
+  buffers. The "needs no method" rule is now stated for the pointwise kinds only, in
+  `device_model.md` and in the `rescale` docstring.
+
+Tested with `CubeBatched` in `test_device.jl`: the same response gives the same physical
+answer unscaled and in a `Float32` run with `Eref = 1024`, `Pref = ε₀` (1e-5 relative,
+which is `Float32`); and `NaiveBatched`, which has no `rescale` method, is refused in a
+scaled run and passed through on an unscaled host one.
+
+### 2 (minor) — `_fusedbroadcast!` for `Val(1)` did not dispatch on the kind
+
+A response which declares `kind(::R) = VectorPointwise()` unconditionally — the natural way
+to write a two-component-only χ⁽²⁾ response — took the scalar path silently. The `Val(1)`
+branch now dispatches through `_scalarexpr(r, kind(r, Val(1)), ...)` exactly as the
+`Val(2)` branch does, and the `VectorPointwise` method errors naming the response and the
+two declarations it should make instead. Tested with `VectorOnly`.
+
+### 3 (minor) — the association of a non-first pointwise group
+
+`_materialise!` now takes the tuple of expressions rather than their sum, and for a group
+which is not the first folds `dest` in as the **leading** term: `((dest + t₁) + t₂) + …`,
+which is the per-response loop's sequence exactly. The review measured 1.1e-16 for
+`(columnwise, pointwise, pointwise)`; that case is now bit-exact, and is a test. The
+invariant is claimed unqualified in the `Et_to_Pt!` docstring, `device_model.md` and this
+PR, and is now true.
+
+### 4 (minor) — `idcs` is ignored by the fused and batched paths
+
+Documented rather than derived, as the simpler of the two: the `Et_to_Pt!` docstring now
+says `idcs` **must cover every column of the block**, why (the other paths act on the whole
+block, so a subset would leave stale data), and that every transform which passes one
+builds it as `CartesianIndices(size(Pt)[3:end])`. `device_model.md` repeats it.
+
+### 5 (minor) — the scaled-run guard was on the legacy path only
+
+`_refuse_columnwise(Pt, r, scaling)` replaces `_refuse_on_device` and refuses both
+departures from the columnwise contract in one place: a device block, and a scaled state.
+Both are tested on the tuple path.
+
+### 6 (minor) — `rescale` had no block shape
+
+`rescale` gains a four-argument form. **Deviation from the review's wording:** the fourth
+argument is `Et`, a *prototype of the block*, not `dims`. The shape alone is not enough —
+`HostResponse` has to know whether the field is real or complex to pick `Float64` or
+`ComplexF64` for its host buffers, and a batched response wants `similar(Et)` to allocate
+in the run's array type — and neither follows from `dims` and `spec` together. The
+prototype gives the shape, the element type and the array type in one argument.
+
+The generic four-argument form delegates to the three-argument one for every kind but
+`Columnwise`, whose wrapper is built there because a columnwise response by definition has
+no `rescale` method of its own. `TransModeAvg` passes its `Eto`. A batched response
+implements the four-argument form; everything else the three-argument one.
+
+`HostResponse` is now a fully typed struct whose four buffers are allocated by its
+constructor: the `Any` fields, the first-call allocation and the function barrier are gone,
+and `resident_arrays(h) = (h.Pd,)` puts its device buffer under the transform's residency
+assertion.
+
+### 7 (minor) — the pass-through hid an *unlisted* array
+
+`_check_listed_arrays(r, k)` runs once per `setup` for every device-kind response reaching
+a fallback and errors, naming the field, when a non-`isbits` `AbstractArray` field is not
+one `resident_arrays` returns. `isbits` static arrays (a `StaticArrays` matrix, a
+`Rotations` matrix) travel inside the struct and are exempt, which matters for `gpu/15`.
+Tested both ways with `UnlistedPointwise`.
+
+### 8-11 (nits)
+
+- `Nonlinear.isfused` was dead code and is deleted; `_splitfused`'s `Union` is now the
+  single place which decides which kinds fuse, and says so.
+- `test_interface.jl` gains the `precision=Float32`-with-plasma error path (it asserts the
+  message names `device=:cpu` and `PlasmaCumtrapz` and *not* `IonRatePPTAccel`), the
+  `device=`-with-plasma path, and that the same call with neither keyword still runs at
+  `Float64`. The message now uses `nameof(typeof(r))`.
+- The `HostResponse` buffer count is corrected to four (three host, one device) in
+  `device_model.md` and above.
+- The deviation-1 note in `device_model.md` now says that a genuinely coupled response
+  evaluates its shared intermediates twice, once per component broadcast, names what that
+  means for `gpu/15`'s `Chi2Field`, and says dead-code elimination removes the unused
+  `SVector` component but not the shared work.
+
+### 12 (report only) — attribution trailer
+
+The four commits of round 1 carry `Co-Authored-By: Claude Opus 5 (1M context)`; the
+round-2 commits carry COMMON.md's `Co-Authored-By: Claude Fable 5.1`, at the coordinator's
+instruction, so the convention is the project's from here on. The session line is the same
+throughout. History is not rewritten.
+
+### Re-run after the changes
+
+| | |
+|---|---|
+| regression gate, `LUNA_REGRESSION_BRANCH=gpu/int-A` | **460 pass, 0 fail**, every case `0.000e+00` (1m38) |
+| `test_device.jl` (JLArrays env) | **263 pass, 0 fail** (18 testsets), up from 240 |
+| `test_metal.jl` (M1 Pro, hardware) | **194 pass, 0 fail** (12 testsets), up from 191 |
+| `test_interface.jl` | **323 pass, 0 fail** (11 testsets), up from 317 |
