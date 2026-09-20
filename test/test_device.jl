@@ -968,6 +968,22 @@ end
     P1 = zeros(RAMAN_NT); R1(P1, E, RAMAN_ρ)
     @test vec(P2) == P1
 
+    #= A gas mixture: the responses are a tuple of tuples and each is paired with its
+       own density, which for a batched response means its own kernel cache. The two
+       together must be the two applied one at a time. =#
+    ρ1, ρ2 = RAMAN_ρ, 0.4*RAMAN_ρ
+    mix = ((Nonlinear.RamanPolarField(RAMAN_T, ramanresp()),),
+           (Nonlinear.RamanPolarField(RAMAN_T, ramanresp()),))
+    Pmix = zeros(RAMAN_NT)
+    NonlinearRHS.Et_to_Pt!(Pmix, E, mix, [ρ1, ρ2])
+    Psep = zeros(RAMAN_NT)
+    for (r, ρi) in ((Nonlinear.RamanPolarField(RAMAN_T, ramanresp()), ρ1),
+                    (Nonlinear.RamanPolarField(RAMAN_T, ramanresp()), ρ2))
+        r(Psep, E, ρi)
+    end
+    @test maximum(abs, Pmix) > 0
+    @test Pmix == Psep
+
     # A time grid other than the one the response function is tabulated on
     err = try
         Nonlinear.rescale(R, HostSpec(), UNIT_SCALING, zeros(RAMAN_NT÷2))

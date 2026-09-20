@@ -215,13 +215,17 @@ samples) with a 20 fs pulse at 1e10 V/m, nitrogen at 1 bar:
 
 | testset | assertions |
 | --- | ---: |
-| **the Raman and no-THG responses** (new, host) | 41 |
+| **the Raman and no-THG responses** (new, host) | 43 |
 | **Raman and the no-THG Kerr on JLArray** (new) | 46 |
 | **Raman propagation on JLArray** (new) | 8 |
 | **Raman in Float32 on the CPU** (new) | 13 |
 | the other 25 testsets (unchanged) | 482 |
 
-**590 pass, 0 fail** (29 testsets), up from 471 on `gpu/13-plasma`.
+plus, in the host testset, a gas mixture (a tuple of tuples, each response with its own
+density and its own kernel cache) against the two responses applied one at a time, which
+is exact.
+
+**592 pass, 0 fail** (29 testsets), up from 471 on `gpu/13-plasma`.
 
 The host testset checks exact equality where it should be exact (`AnalyticSignal` against
 `Maths.plan_hilbert`; the `(nt, 1)` block against the one-dimensional one; the cached
@@ -309,6 +313,12 @@ analytic signal is `O(1)` in scaled units (1.16 for this pulse) and its coeffici
 | `test_kerr.jl` | pass (2 bare `@test`s) |
 | `test_gnlse.jl` | 4 pass |
 | `test_interface.jl` | **334 pass**, 0 fail (11 testsets), up from 329 |
+| `test_mixtures.jl` | 2049 pass |
+| `test_polarisation.jl` / `_env` / `_field` | 15 / 4 / 8 pass |
+| `test_vectorplasma.jl` | 2 pass |
+| `test_chi2.jl` | 16 pass |
+| `test_multimode.jl` | 6 pass |
+| `test_freespace.jl` | 77 pass |
 
 ### Documentation build
 
