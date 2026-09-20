@@ -221,6 +221,15 @@ the cost per step is a pair of transforms whatever the geometry rather than a pa
 column. The Raman response function itself is host scalar code and is evaluated only
 when the density changes -- once, for a run at constant pressure.
 
+**A pressure gradient is the bad case on a device.** With `pressure=(pin, pout)` the
+density changes at every right-hand side, so every right-hand side pays a host
+oscillator sum, a host FFT over the doubled time grid and a host-to-device copy. That
+costs 0.32 ms at 16384 samples and 1.45 ms at 65536 against a Metal Raman right-hand side
+of around 0.48 ms, so a differentially pumped capillary in a molecular gas runs two to
+four times slower than the constant-pressure device run and gives back most of what the
+GPU buys. Use `device=:cpu` for that configuration until the response function itself is
+a kernel.
+
 In single precision the Raman coefficients need care: the response function is around
 1e-45 in SI units, far below what `Float32` can represent, and Luna splits the
 coefficient so that no factor a kernel sees is subnormal. The developer guide has the

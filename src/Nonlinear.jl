@@ -583,8 +583,14 @@ here, so the per-call code allocates nothing and a transform's
 batched responses use: whole-block, no scalar indexing, and no slice assignment (the
 factors 1, 2 and 0 are a vector the kernel broadcasts against), so it compiles for a
 device (GPU_PLAN.md §4.2). The `1/N` of the inverse transform is folded into that vector
-rather than applied as a separate pass, which is exact because Luna's time grids are
-powers of two; the result is bit-identical to `Maths.plan_hilbert`'s.
+rather than applied as a separate pass.
+
+!!! note "Bit-identity holds for an even-length grid"
+    The filter is exactly `Maths.plan_hilbert!`'s for any length, but the folded `1/N` is
+    exact only when `N` is a power of two, which is what `Grid.RealGrid`/`Grid.EnvGrid`
+    always produce. For an odd or otherwise non-power-of-two `size(Et, 1)` — which only a
+    caller building `Kerr_field_nothg(γ3, n)` by hand can reach — the result differs from
+    `Maths.plan_hilbert`'s at rounding level instead.
 """
 struct AnalyticSignal{FTt, IFTt, Mt, Bt}
     FT::FTt # complex forward plan along the time axis
@@ -644,7 +650,9 @@ grid. See [`KerrField`](@ref) for `γ3`.
 [`Batched`](@ref): removing THG needs the analytic signal of the whole column, so this is
 not a pointwise response. It owns an [`AnalyticSignal`](@ref) sized for the field block,
 which a transform replaces with one for the block it will actually pass by calling
-[`rescale`](@ref).
+[`rescale`](@ref). That transform is bit-identical to `Maths.plan_hilbert`'s for an
+even-length `n`, which is every grid `Grid.RealGrid` produces; see
+[`AnalyticSignal`](@ref).
 """
 struct KerrFieldNoTHG{T, At}
     γ3::T
@@ -1286,6 +1294,16 @@ The response function itself is evaluated on the host, in `Float64`, by the call
 and transformed there; only the result is converted to the run's precision and array
 type. That happens **only when the density changes**, so a run at constant pressure
 evaluates it once (it used to be evaluated at every right-hand side).
+
+!!! warning "`r` must depend on nothing but `ρ`"
+    The cache is keyed on the density and on the unit scaling, so `r(h, ρ)` has to be a
+    pure function of `ρ`: called twice with the same density it must fill `h` with the
+    same values. Both response functions Luna ships
+    (`Raman.CombinedRamanResponse` and `Raman.RamanRespIntermediateBroadening`) are: each
+    fills its output before accumulating and reads nothing but `ρ`. One which depends on
+    anything else — `z` through a closure, a temperature a `stepfun` changes — used to be
+    re-evaluated at every right-hand side and now is not, silently. Such a response
+    function belongs in a response of its own.
 
 # Fields
 - `r`: the Raman response function, as given. Host, `Float64`.

@@ -162,11 +162,15 @@ function has been cached.
 - **Two buffers were removed rather than reused for something else**: `Pω` became `Eω2`
   in place (nothing reads `Eω2` after the product) and `Pout` disappeared.
 
-**What did move, and it is not in the gate:** a block with more than one column. FFTW
-picks a different algorithm for a transform batched over columns than for a single column,
-so a multimode, radial or free-space Raman run differs from the per-column version at
-**1.6e-15** relative (three columns, 2^19 samples). No regression case has Raman in one of
-those geometries. The same applies to `Kerr_field_nothg`.
+**A block with more than one column** is a separate question, and it is not in the gate.
+Under the settings COMMON.md mandates — `:estimate` planning, FFTW wisdom off — a
+three-column block is **bit-identical** to three separate per-column calls, at 4096 and at
+524288 samples (measured both ways; review round 1 measured the same). The 1.6e-15 an
+earlier draft of this document reported came from a run which loaded the shared FFTW
+wisdom file, where FFTW chose a different algorithm for the batched transform: it is a
+property of the FFTW configuration, not of this code, and it is not reproducible
+run-to-run because that file is shared mutable state. No regression case has Raman in a
+multi-column geometry, so nothing in the gate depends on either answer.
 
 ## Tests
 
@@ -213,17 +217,17 @@ samples) with a 20 fs pulse at 1e10 V/m, nitrogen at 1 bar:
 | `RamanPolarEnv` | 0 | yes |
 | `Kerr_field_nothg` | 0 | yes |
 | second call, response function cached | 0 | yes |
-| a three-column block against its columns one at a time | 1.6e-15 | no (batched FFT plan) |
+| a three-column block against its columns one at a time | 0 | yes, with `:estimate` and wisdom off (see below) |
 
 ### `test/test_device.jl`
 
 | testset | assertions |
 | --- | ---: |
-| **the Raman and no-THG responses** (new, host) | 43 |
-| **Raman and the no-THG Kerr on JLArray** (new) | 46 |
+| **the Raman and no-THG responses** (new, host) | 44 |
+| **Raman and the no-THG Kerr on JLArray** (new) | 56 |
 | **Raman propagation on JLArray** (new) | 8 |
 | **Raman in Float32 on the CPU** (new) | 13 |
-| the other 25 testsets (unchanged) | 482 |
+| the other 25 testsets (unchanged) | 471 |
 
 plus, in the host testset, a gas mixture (a tuple of tuples, each response with its own
 density and its own kernel cache) against the two responses applied one at a time, which
@@ -280,9 +284,18 @@ peak on the same field, so these are not comparisons of the wrong response.
 
 ### The scaling audit
 
-Every gas whose Raman response Luna can build, at 0.1, 1 and 10 bar, 20 fs at 800 nm with
-a peak field of 1e10 V/m, `E_ref = 2^33`, `P_ref = ε₀`. `UF` marks a value below the
-smallest normal `Float32` (1.2e-38). Full table in `docs/src/developer/device_model.md`.
+Every gas whose Raman response Luna can build — every gas `Interface.jl` turns Raman on
+for by default, plus fused silica — at 0.1, 1 and 10 bar, 20 fs at 800 nm with a peak
+field of 1e10 V/m, `E_ref = 2^33`, `P_ref = ε₀`. `UF` marks a value below the smallest
+normal `Float32` (1.2e-38).
+
+`max |h(ω)|` is an unnormalised DFT sum over the doubled grid, so it depends on the grid:
+the field rows are on the `grid.to` of `Grid.RealGrid(800e-9, (300e-9, 2000e-9),
+400e-15)` (4096 samples, `δt` = 1.668e-16 s) and the envelope rows on the matching
+`Grid.EnvGrid` (1024 samples, `δt` = 6.901e-16 s). The SiO₂ row uses
+`Raman.raman_response(t, :SiO2, scale)` with `scale = 0.18 ε₀ χ₃(SiO₂)` = 3.202e-34, the
+size `prop_gnlse` supplies. Full table, with the envelope rows for every gas, in
+`docs/src/developer/device_model.md`.
 
 | gas | kind | max \|h(ω)\| unsplit | split | max \|h(ω)\| split | scalar | max \|product\| |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -291,6 +304,8 @@ smallest normal `Float32` (1.2e-38). Full table in `docs/src/developer/device_mo
 | D₂ | field | 1.1e-45 `UF` | 2^-100 | 1.4e-15 | 1.1e-15 | 2.5e-29 |
 | CH₄ | field | 2.4e-45 `UF` | 2^-99 | 1.5e-15 | 2.2e-15 | 1.9e-30 |
 | CH₄ | envelope | 5.9e-46 `UF` | 2^-101 | 1.5e-15 | 2.3e-15 | **4.6e-31** |
+| SF₆ | field | 9.9e-46 `UF` | 2^-100 | 1.3e-15 | 1.1e-15 | 5.5e-29 |
+| N₂O | field | 5.7e-45 `UF` | 2^-99 | 3.6e-15 | 2.2e-15 | 6.9e-28 |
 | SiO₂ | field | 2.7e-18 | 2^-54 | 4.8e-02 | 7.7e-02 | 2.4e-01 |
 
 Two things to read off: the unsplit response function is `UF` for **every** gas, so
@@ -394,14 +409,24 @@ pressure gradient changes `ρ` every call and pays the update as it always did.
   straightforward but is not in this brief.
 - **Vector Raman is still not implemented**, as before; the error now comes from
   `rescale`, at setup, as well as from the call.
-- **A multi-column Raman run moves at 1.6e-15** relative to the per-column version (see
-  above). Nothing in the regression matrix covers it; a Group E branch which puts the
-  radial or multimode transforms on a device should add a case.
+- **A multi-column Raman run is bit-identical to the per-column one under the project's
+  own FFTW settings** (`:estimate`, wisdom off), but not necessarily under others: with
+  wisdom loaded FFTW may pick a different algorithm for the batched transform, and a
+  difference of order 1e-15 appears. Nothing in the regression matrix covers a
+  multi-column Raman run at all — every Raman example and every Raman gate case is
+  mode-averaged — so a Group E branch which puts the radial or multimode transforms on a
+  device needs a **new** case, not a repointed one.
 - **O₂ has no usable Raman parameters.** Both `τ2r` and `τ2v` are `TODO` in
   `PhysData.raman_parameters(:O2)`, so `Raman.raman_response(t, :O2)` raises a
   `FieldError` on this branch and on every branch before it. The brief asks for O₂ in the
   audit; it is not possible. Not fixed here: it is a physical-data question, not a device
   one.
+- **The buffers now scale with the column count.** A batched `RamanPolar*` allocates two
+  `(2nt × ncols)` real buffers and one `(nt+1) × ncols` complex one, where the per-column
+  version allocated one column's worth. That is inherent to the batched contract and is
+  the same as `PlasmaCumtrapz`, but the numbers are worth having in advance: a radial
+  Raman run at `nt = 8192` with 256 radial points is about 100 MB per Raman response,
+  against about 0.4 MB before. Group E should budget for it.
 - **`Maths.plan_hilbert` is untouched.** `AnalyticSignal` duplicates its mathematics for
   the batched, device case; the host version is still used by `Processing`, `Stats` and
   `Fields`, which are host-only. Merging them means giving `plan_hilbert` the filter-vector

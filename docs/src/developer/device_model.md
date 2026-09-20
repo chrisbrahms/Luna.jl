@@ -178,6 +178,15 @@ and the arrays `rescale` converted do. That is why `KerrField` keeps its physica
 `Float64` `γ3` on a Metal run and the Metal tests check the *kernel's* element type rather
 than the struct's.
 
+It is also why a response which holds an FFT plan — [`Nonlinear.RamanPolarField`](@ref
+Luna.Nonlinear.RamanPolarField), [`Nonlinear.KerrFieldNoTHG`](@ref
+Luna.Nonlinear.KerrFieldNoTHG) — is moved by [`rescale`](@ref Luna.Nonlinear.rescale) and
+**not** by an `Adapt.adapt_structure` rule. `rescale` constructs the response for the
+target array type, which includes planning its transforms there; `Adapt` cannot replan,
+so an `Adapt` rule over such a struct would produce plans that did not match their
+buffers. A response whose only device-side state is an array (`KerrEnvTHG`'s carrier
+phase) has an `Adapt` rule as well, because there the two agree.
+
 A new scalar pointwise response is therefore three short methods (this is
 `SquareResponse` in `test/test_device.jl`):
 
@@ -523,9 +532,18 @@ applying it before the transform would cost the frequency-domain buffer five ord
 
 ### Dynamic range in `Float32`
 
-Every gas whose Raman response Luna can build, at 0.1, 1 and 10 bar, with a 20 fs pulse
-at 800 nm of peak field 1e10 V/m (a few tens of µJ in a 75 µm capillary), `E_ref = 2^33`
-and `P_ref = ε₀`. `UF` marks a quantity below the smallest normal `Float32` (1.2e-38).
+Every gas whose Raman response Luna can build — which is every gas `Interface.jl` turns
+Raman on for by default, plus fused silica — at 0.1, 1 and 10 bar, with a 20 fs pulse at
+800 nm of peak field 1e10 V/m (a few tens of µJ in a 75 µm capillary), `E_ref = 2^33` and
+`P_ref = ε₀`. `UF` marks a quantity below the smallest normal `Float32` (1.2e-38).
+
+`max |h(ω)|` is an unnormalised DFT sum over the doubled grid, so it depends on the number
+of samples and on `δt`: the field rows are on the `grid.to` of
+`Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)` (4096 samples, `δt` = 1.668e-16 s) and
+the envelope rows on that of the matching `Grid.EnvGrid` (1024 samples, `δt` =
+6.901e-16 s). The SiO₂ row uses the `scale` argument of
+[`Raman.raman_response`](@ref Luna.Raman.raman_response), `0.18 ε₀ χ₃(SiO₂)` = 3.202e-34,
+which is the size `prop_gnlse` supplies from `fr` and `n₂`.
 
 | gas | kind | max \|h(t)\| | max \|h(ω)\| | split 2^m | max \|h(ω)\|/2^m | scalar | max \|product\| |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -534,14 +552,20 @@ and `P_ref = ε₀`. `UF` marks a quantity below the smallest normal `Float32` (
 | N₂ | field | 6.9e-49 | 3.5e-46 `UF` | 2^-101 | 9.0e-16 | 5.5e-16 | 4.3e-29 |
 | N₂ | envelope | 6.9e-49 | 8.5e-47 `UF` | 2^-103 | 8.7e-16 | 5.7e-16 | 1.0e-29 |
 | D₂ | field | 1.0e-48 | 1.1e-45 `UF` | 2^-100 | 1.4e-15 | 1.1e-15 | 2.5e-29 |
+| D₂ | envelope | 1.0e-48 | 2.6e-46 `UF` | 2^-102 | 1.3e-15 | 1.1e-15 | 6.8e-30 |
 | CH₄ | field | 1.5e-48 | 2.4e-45 `UF` | 2^-99 | 1.5e-15 | 2.2e-15 | 1.9e-30 |
 | CH₄ | envelope | 1.5e-48 | 5.9e-46 `UF` | 2^-101 | 1.5e-15 | 2.3e-15 | 4.6e-31 |
+| SF₆ | field | 6.1e-49 | 9.9e-46 `UF` | 2^-100 | 1.3e-15 | 1.1e-15 | 5.5e-29 |
+| SF₆ | envelope | 6.1e-49 | 2.5e-46 `UF` | 2^-102 | 1.3e-15 | 1.1e-15 | 1.4e-29 |
+| N₂O | field | 4.0e-48 | 5.7e-45 `UF` | 2^-99 | 3.6e-15 | 2.2e-15 | 6.9e-28 |
+| N₂O | envelope | 4.0e-48 | 1.4e-45 `UF` | 2^-101 | 3.5e-15 | 2.3e-15 | 1.7e-28 |
 | SiO₂ | field | 1.4e-20 | 2.7e-18 | 2^-54 | 4.8e-02 | 7.7e-02 | 2.4e-01 |
 
-The pressure changes the response function only through the dephasing time, so the rows
-at 0.1 and 10 bar are within a few per cent of the ones shown and are left out; the
-density enters at the end, on the output scalar. The transformed driving term is 87 (a
-field) or 21 (an envelope) in these units, and the largest output is 9e-6.
+O₂ is missing because its Raman parameters are incomplete (below). The pressure changes
+the response function only through the dephasing time, so the rows at 0.1 and 10 bar are
+within a few per cent of the ones shown and are left out; the density enters at the end,
+on the output scalar. The transformed driving term is 87 (a field) or 21 (an envelope) in
+these units, and the largest output is 1.0e-5.
 
 Two things to read off. The unsplit response function is `UF` for **every** gas — without
 the split a `Float32` Raman run gives exactly zero. And the worst case after the split,
