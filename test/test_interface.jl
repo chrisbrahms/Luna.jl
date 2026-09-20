@@ -502,6 +502,31 @@ end
     ograd = prop_capillary(125e-6, 1e-2, :He, (1.0, 0.0); kwargs...)
     @test size(ograd["Eω"]) == size(oref["Eω"])
 
+    #= A response with no device kernel (plasma, Raman) is refused for an explicit
+       `device` *or* `precision` request, naming the fix. Review round 1 of
+       gpu/12-response-traits, finding 9: the `precision`-only path was untested, and
+       without it `precision=Float32` would now run plasma through
+       `Nonlinear.HostResponse` at every step instead of erroring. =#
+    plasmakw = (λ0=800e-9, energy=100e-9, τfwhm=10e-15, trange=400e-15,
+                λlims=(300e-9, 2000e-9), shotnoise=false, plasma=true, raman=false,
+                saveN=3)
+    err = try
+        prop_capillary(args...; plasmakw..., precision=Float32)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("device=:cpu", err.msg)
+    @test occursin("PlasmaCumtrapz", err.msg)
+    # the message names the type, not its several hundred characters of parameters
+    @test !occursin("IonRatePPTAccel", err.msg)
+    @test_throws ErrorException prop_capillary(args...; plasmakw...,
+                                               device=DeviceSpec(Array, Float32))
+    # ... and the same call with neither keyword is unaffected
+    oplasma = prop_capillary(args...; plasmakw...)
+    @test eltype(oplasma["Eω"]) === ComplexF64
+
     # multimode/radial propagation is not device-capable: refused, not silently ignored
     @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
                                                device=DeviceSpec(Array, Float32))

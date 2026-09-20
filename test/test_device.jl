@@ -71,6 +71,57 @@ end
 Nonlinear.kind(::BadPointwise) = Nonlinear.Pointwise()
 Nonlinear.resident_arrays(r::BadPointwise) = (r.C,)
 
+#= The same mistake one step earlier: a device kind carrying an array which
+   `resident_arrays` does not list at all, so nothing would convert it and nothing would
+   check it. The structural check in `rescale` has to name the field. =#
+struct UnlistedPointwise{V}
+    C::V
+end
+Nonlinear.kind(::UnlistedPointwise) = Nonlinear.Pointwise()
+
+#= A response which only makes sense for a two-component field, which is how a χ⁽²⁾
+   response is written. Declaring `VectorPointwise()` unconditionally must be caught on a
+   one-component block rather than silently taken down the scalar path. =#
+struct VectorOnly{T}
+    c::T
+end
+Nonlinear.kind(::VectorOnly) = Nonlinear.VectorPointwise()
+Nonlinear.vector_kernel(r::VectorOnly, E, ρ, scaling) =
+    (fac = Luna.scalar(E, ρ*r.c*Luna.polscale(scaling, 2));
+     (ex, ey) -> Nonlinear.SVector(fac*ex*ey, fac*ey*ex))
+
+#= A batched response: called once with the whole block, owning a full-size buffer in the
+   run's array type. It implements the four-argument `rescale` (which is where the buffer
+   is allocated) and `batched!` (which is where its coefficient meets the unit scaling) --
+   the contract Group D's plasma and Raman responses follow. =#
+struct CubeBatched{T, V}
+    c::T
+    buf::V
+end
+CubeBatched(c, n::Integer) = CubeBatched(c, zeros(n))
+Nonlinear.kind(::CubeBatched) = Nonlinear.Batched()
+Nonlinear.resident_arrays(r::CubeBatched) = (r.buf,)
+Nonlinear.coefficients(r::CubeBatched, ρ, scaling) = ρ*r.c*Luna.polscale(scaling, 3)
+Nonlinear.rescale(r::CubeBatched, spec, scaling, Et) =
+    CubeBatched(r.c, fill!(similar(Et), zero(eltype(Et))))
+function Nonlinear.batched!(r::CubeBatched, out, E, ρ, scaling)
+    fac = Luna.scalar(E, Nonlinear.coefficients(r, ρ, scaling))
+    @. r.buf = fac*E^3
+    @. out += r.buf
+    out
+end
+# The columnwise contract, in physical units, for a host Float64 run.
+(r::CubeBatched)(out, E, ρ) = Nonlinear.batched!(r, out, E, ρ, UNIT_SCALING)
+
+#= The same response written by someone who took "a response whose coefficients are all
+   scalars needs no `rescale` method" to apply to a batched one. It does not: nothing
+   would give it the scaling. =#
+struct NaiveBatched{T}
+    c::T
+end
+Nonlinear.kind(::NaiveBatched) = Nonlinear.Batched()
+(r::NaiveBatched)(out, E, ρ) = (@. out += (ρ*r.c)*E^3)
+
 #= A user-written columnwise response: a plain closure over the contract Luna has always
    had, with no knowledge of devices, precision or units. On a device run this is what
    `Nonlinear.HostResponse` has to make work. =#
@@ -369,10 +420,75 @@ end
     @test Pl == Puref || Pl == Pu # same terms, one order or the other
     @test_throws ErrorException NonlinearRHS.Et_to_Pt!(Pl, E, Any[kf], ρ; scaling=sc)
 
+    #= Review round 1, finding 3: a pointwise group which is *not* the first one folds
+       the destination in as its leading term, so the additions associate exactly as the
+       per-response loop did. Before that fix this differed at 1.1e-16. =#
+    kf2 = Nonlinear.Kerr_field(2γ3)
+    Pa = zeros(n)
+    Paref = zeros(n)
+    NonlinearRHS.Et_to_Pt!(Pa, E, (cw, kf, kf2), ρ)
+    cw(Paref, E, ρ)
+    kf(Paref, E, ρ)
+    kf2(Paref, E, ρ)
+    @test Pa == Paref
+    fill!(Paref, 0)
+    NonlinearRHS.Et_to_Pt!(Pa, E, (cw, kf, sq, kf2), ρ)
+    cw(Paref, E, ρ); kf(Paref, E, ρ); sq(Paref, E, ρ); kf2(Paref, E, ρ)
+    @test Pa == Paref
+
+    #= Review round 1, finding 1: a batched response is called through `batched!` with
+       the run's scaling, so the same response gives the physical answer scaled or not. =#
+    cb = CubeBatched(PhysData.ε_0*γ3, n)
+    Pb = zeros(n)
+    Pbref = zeros(n)
+    NonlinearRHS.Et_to_Pt!(Pb, E, (cb,), ρ)
+    cb(Pbref, E, ρ)
+    @test Pb == Pbref
+    cbs = Nonlinear.rescale(cb, DeviceSpec(Array, Float32), sc, zeros(Float32, n))
+    @test cbs.buf isa Vector{Float32} # allocated at construction, in the run's type
+    @test Nonlinear.resident_arrays(cbs) === (cbs.buf,)
+    Pb32 = zeros(Float32, n)
+    NonlinearRHS.Et_to_Pt!(Pb32, Float32.(E ./ sc.Eref), (cbs,), ρ; scaling=sc)
+    @test maximum(abs, Float64.(Pb32) .* (sc.Pref*sc.Eref) .- Pbref)/
+          maximum(abs, Pbref) < 1e-5
+
+    #= ... and one without a `rescale` method is refused rather than run in physical
+       units against a scaled state. =#
+    @test_throws ErrorException Nonlinear.rescale(
+        NaiveBatched(1e-40), DeviceSpec(Array, Float32), sc)
+    # A host run with the identity scaling is the one case where it is harmless
+    @test Nonlinear.rescale(NaiveBatched(1e-40), DeviceSpec(Array, Float32),
+                            UNIT_SCALING) isa NaiveBatched
+
+    #= Review round 1, finding 2: a response which reports `VectorPointwise()` for a
+       one-component block is caught, not silently evaluated as if it were elementwise. =#
+    @test_throws ErrorException NonlinearRHS.Et_to_Pt!(zeros(n), E, (VectorOnly(1e-40),), ρ)
+
+    #= Review round 1, finding 5: a columnwise response in a scaled run is refused on the
+       tuple path, as it already was on the legacy path. =#
+    @test_throws ErrorException NonlinearRHS.Et_to_Pt!(zeros(n), E, (cw,), ρ; scaling=sc)
+    @test_throws ErrorException NonlinearRHS.Et_to_Pt!(zeros(n), E, (kf, cw), ρ; scaling=sc)
+
+    #= Review round 1, finding 7: an array a device-kind response carries but does not
+       list is refused at `rescale` time, naming the field. =#
+    err = try
+        Nonlinear.rescale(UnlistedPointwise(zeros(4)), DeviceSpec(Array, Float32),
+                          UNIT_SCALING)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("`C::", err.msg)
+    # An `isbits` static array travels inside the struct and is exempt
+    @test Nonlinear.rescale(UnlistedPointwise(Nonlinear.SVector(1.0, 2.0)),
+                            DeviceSpec(Array, Float32), UNIT_SCALING) isa UnlistedPointwise
+
     # The dispatch is resolved at compile time, so it costs nothing per step
     @test (@inferred NonlinearRHS.Et_to_Pt!(P, E, (kf, sq), ρ)) isa AbstractArray
     @test (@inferred NonlinearRHS.Et_to_Pt!(Pv, Ev, (kf, sq), ρ)) isa AbstractArray
     @test (@inferred NonlinearRHS.Et_to_Pt!(Pu, E, (kf, cw), ρ)) isa AbstractArray
+    @test (@inferred NonlinearRHS.Et_to_Pt!(Pb, E, (cb, kf), ρ)) isa AbstractArray
 end
 
 @testset "FFT planner dispatch" begin
@@ -802,14 +918,30 @@ end
     @test NonlinearRHS.check_norm(
         rightunits, s32, Luna.UnitScaling(1024.0, PhysData.ε_0)) === nothing
     #= A columnwise response is no longer refused: it is wrapped in a `HostResponse`,
-       which is batched and runs it on the host (gpu/12). =#
-    wrapped = Nonlinear.rescale(usercubic(1e-52), DeviceSpec(Array, Float32), UNIT_SCALING)
+       which is batched and runs it on the host (gpu/12). The wrapper needs the shape of
+       the block, so it comes from the four-argument `rescale`. =#
+    wrapped = Nonlinear.rescale(usercubic(1e-52), DeviceSpec(Array, Float32),
+                                UNIT_SCALING, zeros(Float32, 16))
     @test wrapped isa Nonlinear.HostResponse
     @test Nonlinear.kind(wrapped) isa Nonlinear.Batched
     @test Nonlinear.device_capable(wrapped)
+    # Every buffer exists at construction; a host run needs only the two Float64 ones
+    @test wrapped.Eh isa Vector{Float64}
+    @test wrapped.Ph isa Vector{Float64}
+    @test isnothing(wrapped.stage)
+    @test isnothing(wrapped.Pd)
+    dwrapped = Nonlinear.rescale(usercubic(1e-52), JLSpec, UNIT_SCALING,
+                                 Luna.alloc(JLSpec, Float64, (16,)))
+    @test dwrapped.stage isa Vector{Float64}
+    @test dwrapped.Pd isa JLArray{Float64, 1}
+    @test Nonlinear.resident_arrays(dwrapped) === (dwrapped.Pd,)
+    # The three-argument form has no shape, and says so instead of guessing
+    @test_throws ErrorException Nonlinear.rescale(
+        usercubic(1e-52), DeviceSpec(Array, Float32), UNIT_SCALING)
     # ... and it says so, once, at setup
     @test_logs (:info,) match_mode=:any Nonlinear.rescale(
-        usercubic(1e-52), JLSpec, Luna.UnitScaling(1024.0, PhysData.ε_0))
+        usercubic(1e-52), JLSpec, Luna.UnitScaling(1024.0, PhysData.ε_0),
+        Luna.alloc(JLSpec, Float64, (16,)))
     #= What is still refused is a response which declares a device kind but has no
        `rescale` method: it claims a kernel whose arrays nothing has converted. =#
     @test_throws ErrorException Nonlinear.rescale(

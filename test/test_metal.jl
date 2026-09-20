@@ -499,7 +499,8 @@ end
           maximum(abs, plain["Eω"][:, end]) > 1e-6
 
     # It says so, once, at setup
-    @test_logs (:info,) match_mode=:any Nonlinear.rescale(cw, MetalSpec, UNIT_SCALING)
+    @test_logs (:info,) match_mode=:any Nonlinear.rescale(
+        cw, MetalSpec, UNIT_SCALING, Luna.alloc(MetalSpec, Float32, (16,)))
 end
 
 @testset "prop_capillary on Metal" begin
@@ -607,8 +608,13 @@ end
     #= A columnwise response is wrapped in a `HostResponse` rather than refused
        (gpu/12); what is refused is one which claims a device kernel for arrays nothing
        has converted. =#
-    @test Nonlinear.rescale((out, E, ρ) -> nothing, MetalSpec, UNIT_SCALING) isa
-          Nonlinear.HostResponse
+    wrapped = Nonlinear.rescale((out, E, ρ) -> nothing, MetalSpec, UNIT_SCALING,
+                                Luna.alloc(MetalSpec, Float32, (16,)))
+    @test wrapped isa Nonlinear.HostResponse
+    # Its buffers exist at construction, the device one on the device
+    @test wrapped.Eh isa Vector{Float64}
+    @test wrapped.stage isa Vector{Float32}
+    @test wrapped.Pd isa MtlArray{Float32, 1}
     # An unwrapped columnwise response applied to a device array is refused, not run
     Pd = Luna.alloc(MetalSpec, Float32, (16,))
     Ed = Luna.todevice(MetalSpec, randn(16))
