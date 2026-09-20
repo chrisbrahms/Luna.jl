@@ -246,10 +246,18 @@ silently taken down the elementwise path.
 
 `rescale` converts the crystal matrices to the run's real type and moves the carrier
 phase. The kernel converts the matrices again, from whatever type the response holds to
-`real(eltype(E))`. That is 27 host scalars once per right-hand side and the identity on a
-response `rescale` has already converted; it is there so that a kernel built from a
-response which never went through `rescale` still carries no `Float64` (rule 3 above),
-which is what a low-level caller assembling `Et_to_Pt!` by hand does.
+`real(eltype(E))`. That is 27 host scalars per component broadcast, so 54 per right-hand
+side — the two-broadcast layout doubles this as it doubles the shared arithmetic — and
+the identity on a response `rescale` has already converted. It is there so that a kernel
+built from a response which never went through `rescale` still carries no `Float64`
+(rule 3 above), which is what a low-level caller assembling `Et_to_Pt!` by hand does.
+
+**The guarantee is partial, and covers the matrices only.** An unrescaled `Chi2Field` is
+entirely `isbits`, so it compiles and runs on a device. An unrescaled `Chi2Env` does not:
+its carrier phase is still a host `Vector{ComplexF64}`, it enters the broadcast as a
+host array, and Metal refuses to compile the kernel. That failure is loud and immediate,
+not a silently wrong answer, but `Chi2Env` does need `rescale` — which is what
+`resident_arrays` and the transform's residency assertion are for.
 
 The χ⁽²⁾ transforms themselves — the free-space ones — are host-only until Group E, so the
 responses are exercised on a device block directly (`test_device.jl`, `test_metal.jl`)

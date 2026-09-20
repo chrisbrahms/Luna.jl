@@ -129,10 +129,18 @@ faster. It is not taken here.
    `gpu/12`'s structural check exempts `isbits` static matrices, so a `Chi2Field` would
    pass through `rescale` untouched and hand a `Float64` `SMatrix` to a Metal kernel. The
    `rescale` methods therefore convert them. The kernel converts again — 27 host scalars
-   per right-hand side, the identity on a rescaled response — so that a low-level caller
-   who assembles `Et_to_Pt!` by hand without `rescale` still gets a `Float32` kernel. It is
-   belt and braces on purpose; GPU_PLAN.md §4.2 rule 3 is the rule a stray `Float64`
-   breaks, and a device kernel is where it breaks loudly.
+   per component broadcast, so **54 per right-hand side**, since the `Val{2}` dispatcher
+   builds the expression once per output component; the identity on a rescaled response —
+   so that a low-level caller who assembles `Et_to_Pt!` by hand without `rescale` still
+   gets a `Float32` kernel. It is belt and braces on purpose; GPU_PLAN.md §4.2 rule 3 is
+   the rule a stray `Float64` breaks, and a device kernel is where it breaks loudly.
+
+   **The guarantee is partial and covers the matrices only.** An unrescaled `Chi2Field` is
+   entirely `isbits` and runs on Metal (verified: relative difference 0.0 against the host
+   `Float32` path). An unrescaled `Chi2Env` does not and cannot: its carrier phase is a
+   host `Vector{ComplexF64}` which enters the broadcast as a host array and fails Metal
+   kernel compilation. That is loud rather than silently wrong, but `Chi2Env` needs
+   `rescale`, which is what `resident_arrays` and the residency assertion are for.
 3. **The two χ⁽²⁾ regression cases are not bit-identical.** See below. The brief asks to
    prefer an association which keeps them identical "if that costs nothing"; it costs FMA.
 
@@ -346,26 +354,42 @@ branch does and none from this branch.
    `kind(::Chi2Field, ::Val{2})` as the brief literally says and to override
    `device_capable` separately, which puts the two back in a position to drift apart —
    which is the thing `gpu/12` derived `device_capable` to prevent.
-2. The double conversion of the crystal matrices (deviation 2). It is 27 host scalars per
-   right-hand side against a class of error which only shows up on real hardware. Is the
-   `rescale` conversion alone enough, given that `gpu/12`'s structural check deliberately
-   exempts `isbits` static matrices and so cannot catch a missing one?
-3. `field_products!`/`env_products!` are kept with their signatures and now delegate to
-   the kernel's expression. They are documented, so they are public; but nothing in Luna
-   calls them any more except `test_chi2.jl`. Keep, or deprecate?
-4. The χ⁽²⁾ regression movement is 4.8e-14 against a 7.4e-12 tolerance and is FMA, not
-   association. Is that acceptable, or should the contraction be written out to keep the
-   two cases bit-identical at the cost of FMA?
+2. The double conversion of the crystal matrices (deviation 2). It is 54 host scalars per
+   right-hand side against a class of error which only shows up on real hardware, and
+   review round 1 established that it buys a *partial* guarantee: `Chi2Field` runs
+   unrescaled, `Chi2Env` cannot. Is the `rescale` conversion alone enough, given that
+   `gpu/12`'s structural check deliberately exempts `isbits` static matrices and so cannot
+   catch a missing one?
+3. ~~`field_products!`/`env_products!`: keep, or deprecate?~~ **Decided by review round 1,
+   finding 4: keep them, unchanged.** They are the only readable statement of the
+   contracted-notation column order `[xx, yy, zz, yz, xz, xy]` that a user assembling
+   their own `χ2` matrix needs, they have a test, and they now delegate to the same
+   expression the kernel uses, so the two cannot drift. Their docstrings now say they
+   return `Enl`/`Anl` (the base returned the value of the last assignment; nothing in Luna
+   read it). `SVector{3}(Ec)` and `Enl .=` also make an over-long argument an error where
+   the base silently used its first three or six elements — tightening to the length
+   contract the docstrings already stated.
+4. ~~Is the χ⁽²⁾ regression movement acceptable?~~ **Decided by review round 1: yes, the FMA
+   movement is accepted.** The reviewer reproduced it independently: the branch's result
+   is bit-identical (0 of 4096 elements differing, max absolute difference exactly 0.0) to
+   an explicit `muladd` chain written in the base's association and summation order, so
+   only the FMA contraction is new, which GPU_PLAN.md §4.2 rule 2 allows.
 
 ## Conflicts to expect at `gpu/int-D`
 
-`docs/src/gpu.md` lists "plasma, Raman and χ⁽²⁾" in two places; this branch removes χ⁽²⁾
-from both, and `gpu/13-plasma` and `gpu/14-raman` will remove their own from the same two
-sentences. Textual conflict, trivial to resolve. `src/Nonlinear.jl` is touched by all
-three branches but in three disjoint regions (the χ⁽²⁾ section is between `KerrEnvTHG` and
-`PlasmaCumtrapz`). `test_device.jl` and `test_metal.jl` each gain testsets at different
-points in the file; `test_device.jl`'s top-of-file helper responses are the one place all
-three add lines close together.
+Line numbers are this branch's.
+
+| site | what |
+| --- | --- |
+| `docs/src/gpu.md:133-136`, `:176` | the two "which responses are host-only" sentences. This branch removes χ⁽²⁾ from both; `gpu/13-plasma` and `gpu/14-raman` will remove their own from the same two sentences. |
+| `docs/src/developer/device_model.md:135` vs `:136` | the kind table. This branch rewrites the `VectorPointwise` row (line 135); plasma and Raman must both rewrite the `Batched` row (line 136), which is adjacent, so it conflicts under the default three-line context. |
+| `docs/src/developer/device_model.md:200-265` | the "price of the layout" paragraph and the new "The χ⁽²⁾ responses" section; plasma and Raman are likely to add sibling sections here. |
+| `src/Nonlinear.jl:642-904` | the whole χ⁽²⁾ section. Disjoint from plasma (`PlasmaCumtrapz` begins immediately after `env_products!`) and from Raman, but the boundary at the end of `env_products!` is within three lines of the plasma docstring, so a trivial edge conflict is likely. |
+| `test/test_device.jl:131-152`, `:826-892` | the `userchi2`/`makechi2` helpers immediately after `usercubic` — the one place all three branches add lines together — and the two new testsets. |
+| `test/test_metal.jl:60-72`, `:483-545` | the `userchi2` helper and the two new testsets. |
+
+`gpu/int-D` should also remove `import LinearAlgebra: mul!, ldiv!` and `MArray` from
+`src/Nonlinear.jl:8,10` if no Group D branch has reintroduced a user (see "Known gaps").
 
 ## Attribution
 
@@ -374,3 +398,40 @@ specifies and what `PR_12-response-traits.md` (§12 of its review round 2) recor
 project's convention from that point on. The model which wrote them is Claude Opus 5
 (1M context); this session's harness specifies that name instead. The session line is the
 same either way.
+
+## Changes after review round 1
+
+Verdict: **approve with minor fixes**, all of them documentation
+(`scratchpad/reviews/gpu-15-chi2-1.md`). The reviewer reproduced the regression gate
+against both baselines, `test_chi2.jl`, `test_device.jl` and `test_metal.jl` with the same
+counts as above, and independently confirmed the FMA finding and the `n = 2` unit scaling.
+One commit; no behavioural change.
+
+1. **(minor) The kernel-side conversion figure was half the true one.** `_fusedbroadcast!`
+   for `Val{2}` builds the expression once per output component, so `_chi2mats` runs twice
+   per right-hand side: **54 host scalars, not 27**. Corrected in `device_model.md` and in
+   deviation 2 above. The doubling is the same one the two-broadcast layout imposes on the
+   shared arithmetic, so the two figures now agree.
+2. **(minor) The "no `Float64` without `rescale`" guarantee was stated for both responses
+   and holds for `Chi2Field` only.** The reviewer ran the case on Metal: an unrescaled
+   `Chi2Field` works, an unrescaled `Chi2Env` fails kernel compilation, because its carrier
+   phase is a host `Vector{ComplexF64}` and `_chi2mats` cannot reach it. Both
+   `device_model.md` and deviation 2 now say the conversion covers the crystal matrices of
+   both responses and that `Chi2Env` still requires `rescale`, and that the failure is loud
+   rather than silent.
+3. **(minor) The conflict list omitted `device_model.md`.** The kind table is the sharpest
+   site: this branch rewrites the `VectorPointwise` row and plasma and Raman must both
+   rewrite the adjacent `Batched` row. The list above is now the reviewer's full one, with
+   line numbers.
+4. **(nit) `field_products!`/`env_products!` return `Enl`/`Anl`**, which the base did not
+   (it returned the value of the last assignment). The docstrings now say so. Open
+   question 3 is closed the way the reviewer recommends: keep them, unchanged.
+5. **(nit) `Interface.jl`'s `device` docstring and the comment in `prop_capillary` said
+   `device_capable` is true "for the Kerr responses so far".** The χ⁽²⁾ responses are now
+   device-capable too. Nothing changes in practice — `prop_capillary` never builds one —
+   but the sentences were stale. One phrase each.
+6. **(nit) `makechi2(::Type{Float64}, θ, ϕ, nt)` ignored `nt`.** Renamed `_nt`, with a
+   comment saying the two methods share a signature on purpose.
+7. **(nit, report only) The unused `mul!`/`ldiv!`/`MArray` imports stay.** The reviewer
+   agrees this is the right call for this branch and that `gpu/int-D` should remove them;
+   that is now said in the conflict list as well as in "Known gaps".

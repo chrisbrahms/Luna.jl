@@ -143,8 +143,10 @@ userchi2(d) = let d = d
     end
 end
 
-"A χ⁽²⁾ response matching the element type of a block: real field or complex envelope."
-makechi2(::Type{Float64}, θ, ϕ, nt) = Nonlinear.Chi2Field(θ, ϕ, PhysData.χ2(:BBO))
+#= A χ⁽²⁾ response matching the element type of a block: real field or complex envelope.
+   The field form has no time axis, so it ignores `_nt`; the two share a signature so that
+   a caller can build either from the block's element type alone. =#
+makechi2(::Type{Float64}, θ, ϕ, _nt) = Nonlinear.Chi2Field(θ, ϕ, PhysData.χ2(:BBO))
 makechi2(::Type{ComplexF64}, θ, ϕ, nt) = Nonlinear.Chi2Env(
     θ, ϕ, PhysData.χ2(:BBO), PhysData.wlfreq(800e-9),
     collect(range(0, 1e-13, length=nt)))

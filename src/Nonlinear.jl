@@ -764,8 +764,8 @@ The output ordering is
 column order `[xx, yy, zz, yz, xz, xy]` used by [`Chi2Field`](@ref).
 
 Both `Enl` and `Ec` are mutated/read in place and are expected to have length 6
-and 3, respectively. This is the out-of-place expression the kernel uses, written into a
-vector; it is not what the response itself calls.
+and 3, respectively. Returns `Enl`. This is the out-of-place expression the kernel uses,
+written into a vector; it is not what the response itself calls.
 """
 field_products!(Enl, Ec) = (Enl .= _field_products(SVector{3}(Ec)); Enl)
 
@@ -898,8 +898,8 @@ The output ordering is `[xx, yy, zz, yz, xz, xy]` with mixed terms multiplied by
 matching the 3x6 `χ2` tensor column order used by [`Chi2Env`](@ref).
 
 Both `Anl` and `Ac` are mutated/read in place and are expected to have length 6
-and 3, respectively. This is the out-of-place expression the kernel uses, written into a
-vector; it is not what the response itself calls.
+and 3, respectively. Returns `Anl`. This is the out-of-place expression the kernel uses,
+written into a vector; it is not what the response itself calls.
 """
 env_products!(Anl, Ac, cp, cm) = (Anl .= _env_products(SVector{3}(Ac), cp, cm); Anl)
 
