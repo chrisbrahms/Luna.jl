@@ -44,6 +44,21 @@ for anything which does not run on a device at all.
 """
 resident_arrays(r) = ()
 
+"""
+    device_capable(response) -> Bool
+
+Whether `response` has a [`rescale`](@ref) method and can therefore run on a device or in
+reduced precision. `false` by default -- true for a response only once it has actually
+been given a `rescale` method, never by inspecting whether one merely looks safe.
+
+`Interface.jl` uses this to decide, for an *unspecified* `device` request, whether a
+mode-averaged `prop_capillary` call can follow `Luna.settings["device"]` (every response
+it built is device-capable) or must stay on the CPU regardless of the global setting (at
+least one is not, e.g. plasma or Raman) -- so that loading a GPU package does not turn a
+default, field-resolved `prop_capillary` call into an error.
+"""
+device_capable(r) = false
+
 #= The Kerr responses are structs rather than closures so that they can be parametric in
    the real element type (nothing reachable from a Metal kernel may hold a Float64), carry
    an `Adapt` rule for their arrays, and take a `rescale` method. The constructors
@@ -75,6 +90,7 @@ end
 
 rescale(k::KerrField, spec, scaling) =
     KerrField(convert(Luna.realtype(spec), k.γ3*scaling.Eref^2/scaling.Pref))
+device_capable(::KerrField) = true
 
 function KerrScalar!(out, E, fac)
     @. out += fac*E^3
@@ -130,6 +146,7 @@ end
 
 rescale(k::KerrEnv, spec, scaling) =
     KerrEnv(convert(Luna.realtype(spec), k.γ3*scaling.Eref^2/scaling.Pref))
+device_capable(::KerrEnv) = true
 
 "`fac` includes the factor 3/4; see [`KerrEnv`](@ref)."
 function KerrScalarEnv!(out, E, fac)
@@ -178,6 +195,7 @@ rescale(k::KerrEnvTHG, spec, scaling) = KerrEnvTHG(
 Adapt.adapt_structure(to, k::KerrEnvTHG) = KerrEnvTHG(k.γ3, Adapt.adapt(to, k.C))
 
 resident_arrays(k::KerrEnvTHG) = (k.C,)
+device_capable(::KerrEnvTHG) = true
 
 struct Chi2Field{χT}
     χ2::χT

@@ -366,25 +366,35 @@ If `raman` is `true`, then the following options apply:
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
 - `device`: where to run: `:cpu`, `:auto`, `:metal`, `:cuda` or a [`Luna.DeviceSpec`](@ref).
-    `nothing` (the default) means "not specified": for mode-averaged propagation with
-    Kerr responses (`modes` a single mode, no plasma, no Raman, no χ⁽²⁾ -- the only case
-    that can actually run on a device) it becomes `Luna.device_request()`, i.e.
-    `Luna.settings["device"]` as the user set it (`:cpu` if nothing was set and nothing
-    loaded, `:auto` once a GPU package has been `using`d); for anything else it stays on
+    `nothing` (the default) means "not specified": it becomes `Luna.device_request()`,
+    i.e. `Luna.settings["device"]` as the user set it (`:cpu` if nothing was set and
+    nothing loaded, `:auto` once a GPU package has been `using`d), only when the
+    propagation is mode-averaged (`modes` a single mode) *and* every nonlinear response it
+    was built with is device-capable (`Nonlinear.device_capable`; true for the Kerr
+    responses so far, false for plasma, Raman and anything else). Otherwise it stays on
     the CPU, whatever `Luna.settings["device"]` says, exactly as before this keyword
-    existed. An *explicit* `device`/`precision` request which cannot be honoured
-    (multimode and radial propagation, and [`prop_gnlse`](@ref)) errors naming the
-    limitation, rather than being silently narrowed to the CPU or failing with an
-    unrelated `MethodError`. See the "Running on a GPU" page (`docs/src/gpu.md`).
+    existed -- loading a GPU package must never turn a working default call into an
+    error. An *explicit* `device`/`precision` request which cannot be honoured (multimode
+    and radial propagation, a response with no `Nonlinear.rescale` method such as plasma
+    or Raman, and [`prop_gnlse`](@ref)) errors naming the fix (`device=:cpu` or
+    `Luna.set_device(:cpu)`), rather than being silently narrowed to the CPU or failing
+    with an unrelated `MethodError`. See the "Running on a GPU" page (`docs/src/gpu.md`).
 - `precision`: `Float32` to run in reduced precision (on the CPU or on a device),
     `Float64` for double, `nothing` (default) for whatever `device` resolves to
     normally (`Float64` on the CPU, `Float32` on Metal). A `Float32` run is scaled (see
     [`Luna.UnitScaling`](@ref)); the output is unscaled automatically and saved as
-    `ComplexF32`.
-- `stats_period::Integer=1`: collect the default statistics every `stats_period`-th
-    accepted step instead of every step (see [`Output.PeriodicStats`](@ref)). Per-step
-    statistics on a device copy the field to the host, so this is worth raising there;
-    see the warning `Luna.run` gives once per propagation when it does so.
+    `ComplexF32`. `precision` alone does not select the CPU: if a GPU package is loaded
+    and `device` is left at its default, `precision=Float32` runs on the GPU (whatever
+    `Luna.settings["device"]` resolves to) in that precision, not on the CPU. Pass
+    `device=:cpu` (or call `Luna.set_device(:cpu)`) to force the host.
+- `stats_period::Real=1`: collect the default statistics less often than every accepted
+    step (see [`Output.PeriodicStats`](@ref) and [`Output.maybe_periodic`](@ref)). An
+    integer (the default, `1`) collects every `stats_period`-th accepted step; a
+    non-integer value collects every time the propagation distance has advanced by at
+    least `stats_period` metres. Per-step statistics on a device copy the field to the
+    host on every step whose statistics will actually be computed (skipped on the others
+    when `stats_period != 1`), so this is worth raising there; see the warning
+    `Luna.run` gives once per propagation when a device copy is needed.
 """
 function prop_capillary(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
@@ -422,6 +432,24 @@ Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...
 Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
 ```
 """
+#= Error, naming the fix, when an *explicit* `device`/`precision` request cannot be
+   honoured because `resp` (mode-averaged only; multimode/radial go through `_cpu_only!`
+   instead) contains a response with no `Nonlinear.rescale` method (plasma, Raman, ...).
+   Does nothing for the CPU/Float64 default, whatever `resp` contains -- that combination
+   always works, `rescale`'s own fallback passes an unscaled response through unchanged.
+   Without this, the same situation fails deep inside `Nonlinear.rescale` with a message
+   that does not mention `device=:cpu`. =#
+function _check_responses_device_capable!(device, precision, resp)
+    spec = Luna.withprecision(Luna.resolve_device(device), precision)
+    (Luna.arraytype(spec) === Array && Luna.realtype(spec) === Float64) && return nothing
+    bad = unique(string.(typeof.(Iterators.filter(!Nonlinear.device_capable, resp))))
+    isempty(bad) && return nothing
+    error("this propagation includes a response with no `Nonlinear.rescale` method "*
+          "($(join(bad, ", "))), so it cannot run on a device or in reduced precision "*
+          "yet. Pass device=:cpu (or call Luna.set_device(:cpu)) to run on the CPU "*
+          "instead, or remove the response (e.g. plasma=false, raman=false) for a "*
+          "device-capable Kerr-only run.")
+end
 function prop_capillary_args(radius, flength, gas, pressure;
                         λlims, trange, envelope=false, thg=nothing, δt=1,
                         λ0, τfwhm=nothing, τw=nothing, ϕ=Float64[],
@@ -466,17 +494,23 @@ function prop_capillary_args(radius, flength, gas, pressure;
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
     inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
-    #= `device=nothing` means "not specified". For mode-averaged propagation (`mode_s`
-       a single mode, the only device-capable case) that resolves to
-       `Luna.device_request()`, i.e. `Luna.settings["device"]` as the user set it -- so an
-       untouched call follows a loaded GPU package exactly as the low-level interface
-       does. For anything else (multimode, radial) it resolves to the CPU regardless of
+    #= `device=nothing` means "not specified". It resolves to `Luna.device_request()`,
+       i.e. `Luna.settings["device"]` as the user set it -- so an untouched call follows a
+       loaded GPU package exactly as the low-level interface does -- only when the
+       propagation is mode-averaged (`mode_s` a single mode, the only geometry with a
+       device path at all) *and* every response it was built with is device-capable
+       (`Nonlinear.device_capable`, true only for the Kerr structs so far: plasma and
+       Raman are not). Otherwise it resolves to the CPU regardless of
        `Luna.settings["device"]`, exactly as gpu/10 hardcoded, so that loading a GPU
-       package does not turn a silent, working multimode run into an error: only an
-       *explicit* `device`/`precision` request reaches `_cpu_only!`'s check. =#
+       package does not turn a silent, working default call -- multimode, or
+       field-resolved with plasma on by default -- into an error: only an *explicit*
+       `device`/`precision` request reaches `_cpu_only!`'s check (multimode/radial) or
+       `_check_responses_device_capable!`'s (mode-averaged with a non-Kerr response). =#
     devicereq = if !isnothing(device)
+        mode_s isa Modes.AbstractMode &&
+            _check_responses_device_capable!(device, precision, resp)
         device
-    elseif mode_s isa Modes.AbstractMode
+    elseif mode_s isa Modes.AbstractMode && all(Nonlinear.device_capable, resp)
         Luna.device_request()
     else
         Luna.HostSpec()
@@ -496,7 +530,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
        *template* is all construction needs. =#
     stats = Stats.default(grid, Luna.isdevice(Eω) ? Luna.tohost(Eω) : Eω, mode_s, linop,
                           transform; gas=gas, stats_kwargs...)
-    stats_period > 1 && (stats = Output.PeriodicStats(stats, stats_period))
+    stats = Output.maybe_periodic(stats, stats_period)
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
@@ -1108,8 +1142,10 @@ Note that the current GNLSE model is single mode only.
     `prop_gnlse` is not device- or reduced-precision-capable (its normalisation is built
     before the unit scaling is known); anything other than the default `Luna.HostSpec()`
     in `Float64` errors.
-- `stats_period::Integer=1`: collect the default statistics every `stats_period`-th
-    accepted step instead of every step (see [`Output.PeriodicStats`](@ref)).
+- `stats_period::Real=1`: collect the default statistics less often than every accepted
+    step: an integer (default `1`) every `stats_period`-th accepted step, a non-integer
+    value every `stats_period` metres of propagation (see [`Output.PeriodicStats`](@ref)
+    and [`Output.maybe_periodic`](@ref)).
 """
 function prop_gnlse(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_gnlse_args(args...; kwargs...)
@@ -1210,7 +1246,7 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
     Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
                                    norm!, noise_field, device=Luna.HostSpec())
     stats = Stats.default(grid, Eω, mode_s, linop, transform)
-    stats_period > 1 && (stats = Output.PeriodicStats(stats, stats_period))
+    stats = Output.maybe_periodic(stats, stats_period)
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; γ, flength, βs, λlims, trange, envelope, thg, δt,
