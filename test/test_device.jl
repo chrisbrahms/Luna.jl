@@ -1174,6 +1174,90 @@ function gradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9
     out, transform
 end
 
+#= The difference between two radial runs, normalised per save by the largest `|Eω|` in
+   that save -- the metric the regression gate uses. An elementwise relative difference is
+   meaningless in the k-channels the evanescent taper has emptied and outside the
+   simulation band, where the field is fifteen orders below its peak and what is left is
+   numerical dust. =#
+function radialdiff(a, b)
+    A, B = a["Eω"], b["Eω"]
+    size(A) == size(B) || return Inf
+    worst = 0.0
+    for isave in axes(A, ndims(A))
+        h = selectdim(A, ndims(A), isave)
+        d = selectdim(B, ndims(B), isave)
+        m = maximum(abs, h)
+        m == 0 && continue
+        worst = max(worst, maximum(abs, d .- h)/m)
+    end
+    worst
+end
+
+#= A small radially symmetric free-space propagation: the transverse grid is a
+   `Grid.RadialGrid`, so the right-hand side is two Hankel GEMMs around the response
+   protocol, and `boundary=:rate` adds the k-space absorber, the evanescent clamp with its
+   matching source taper, and `Boundaries.RadialCollar`. Fixed steps, so two runs differ
+   only in their arithmetic; `boundary_N` is small enough that the absorber's reference
+   length does not cap `max_dz` and undo that. =#
+function radialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3, λ0=800e-9,
+                    R=1e-3, N=24, w0=200e-6, plasma=false, raman=false,
+                    precision=nothing, boundary=:rate)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (400e-9, 2000e-9), 100e-15) :
+        Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
+    rg = Grid.RadialGrid(R, N)
+    nfunλ = PhysData.ref_index_fun(gas, pres)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    linop = LinearOps.make_const_linop(grid, rg, nfun)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = GT === Grid.RealGrid ?
+        Any[Nonlinear.Kerr_field(PhysData.γ3_gas(gas))] :
+        Any[Nonlinear.Kerr_env(PhysData.γ3_gas(gas))]
+    if plasma
+        push!(resp, Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)), tablerate(),
+                                             PhysData.ionisation_potential(gas)))
+    end
+    if raman
+        rr = Raman.raman_response(grid.to, gas)
+        push!(resp, GT === Grid.RealGrid ? Nonlinear.RamanPolarField(grid.to, rr) :
+                                           Nonlinear.RamanPolarEnv(grid.to, rr))
+    end
+    normfun = NonlinearRHS.const_norm_radial(grid, rg, nfun)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
+    Eω, transform, FT = Luna.setup(grid, rg, dens, normfun, Tuple(resp), inputs;
+                                   device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/8
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, boundary_N=4, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= The Hankel step is one GEMM on the block reshaped to `(nto*npol, nr)` rather than one
+   `mul!` per polarisation component on a view. For one component the reshaped operand is
+   the same matrix with the same leading dimension, so the two are bit-identical; for two
+   they agree to rounding. This is the CPU half of the check -- the device half is in the
+   JLArray and Metal files, where the view form does not reach the accelerated GEMM. =#
+@testset "the Hankel step as one GEMM" begin
+    rg = Grid.RadialGrid(1e-3, 12)
+    for np in (1, 2), TT in (Float64, ComplexF64)
+        A = rand(TT, 32, np, rg.N)
+        Tm = convert(Matrix{TT}, rg.Tfwd)
+        one_gemm = similar(A)
+        Grid.radial_matmul!(one_gemm, A, Tm)
+        per_view = similar(A)
+        for ip in 1:np
+            mul!(view(per_view, :, ip, :), view(A, :, ip, :), Tm)
+        end
+        if np == 1
+            @test one_gemm == per_view
+        else
+            @test maximum(abs, one_gemm .- per_view)/maximum(abs, per_view) < 1e-14
+        end
+    end
+end
+
 @testset "constβ is checked, not trusted" begin
     grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
     coren, densityfun = Capillary.gradient(:Ar, 1e-2, 1.0, 0.0)
@@ -1546,6 +1630,100 @@ end
     plain, _ = ramancase(HostSpec(); raman=false)
     @test maximum(abs, href["Eω"][:, end] .- plain["Eω"][:, end])/
           maximum(abs, plain["Eω"][:, end]) > 1e-3
+end
+
+#= The Hankel step on a device array: the reshaped single GEMM `Grid.radial_matmul!`
+   makes, against the same product on the host. `allowscalar(false)` is in force, so this
+   also asserts that nothing in the reshape-and-multiply path indexes element by element.
+   JLArrays provides both a `reshape` which stays a `JLArray` and a generic `mul!`, so no
+   shim is needed here; Metal's accelerated GEMM is checked in `test_metal.jl`. =#
+@testset "the Hankel GEMM on JLArray" begin
+    rg = Grid.RadialGrid(1e-3, 12)
+    for np in (1, 2), TT in (Float64, ComplexF64)
+        A = rand(TT, 32, np, rg.N)
+        Tm = convert(Matrix{TT}, rg.Tfwd)
+        href = similar(A)
+        Grid.radial_matmul!(href, A, Tm)
+        dA = JLArray(A)
+        dT = JLArray(Tm)
+        dout = similar(dA)
+        Grid.radial_matmul!(dout, dA, dT)
+        @test reshape(dout, :, rg.N) isa JLArray{TT, 2}
+        @test maximum(abs, Array(dout) .- href)/maximum(abs, href) < 1e-14
+        # out === A allocates a copy on any array type, and gives the same answer
+        Grid.radial_matmul!(dA, dA, dT)
+        @test maximum(abs, Array(dA) .- href)/maximum(abs, href) < 1e-14
+    end
+end
+
+#= Radial free-space propagation end to end on a device, with `boundary=:rate` so that
+   `Boundaries.RadialCollar`, the k-space absorber and the evanescent source taper are all
+   exercised. Field-resolved and envelope, Kerr alone, Kerr+plasma and Kerr+Raman: the
+   three response kinds a radial run can carry. =#
+@testset "radial propagation on JLArray" begin
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        href, htr = radialcase(GT, HostSpec())
+        dref, dtr = radialcase(GT, JLSpec)
+
+        # the transform, its mirrors and its Hankel matrices really are on the device
+        @test dtr.Eto_r isa JLArray{GT === Grid.RealGrid ? Float64 : ComplexF64, 3}
+        @test dtr.Eto_k isa JLArray
+        @test dtr.Pto_k isa JLArray
+        @test dtr.Eωo isa JLArray{ComplexF64, 3}
+        @test dtr.Tfwd isa JLArray{eltype(dtr.Eto_r), 2}
+        @test dtr.Tbwd isa JLArray{eltype(dtr.Eto_r), 2}
+        @test dtr.prefac isa JLArray{ComplexF64, 1}
+        @test dtr.gv.towin isa JLArray
+        # ... and the normalisation was retargeted by `Luna.setup`
+        @test dtr.normfun.out isa JLArray{ComplexF64, 3}
+        @test dtr.normfun.kperp2m isa JLArray
+        @test dtr.normfun.kwinm isa JLArray
+        @test dtr.normfun.sidxm isa JLArray{Bool}
+        # ... while the host transform still aliases the grid's own vectors
+        @test htr.gv.ω === htr.grid.ω
+        @test htr.normfun.out isa Array{ComplexF64, 3}
+
+        @test size(dref["Eω"]) == size(href["Eω"])
+        @test dref["z"] ≈ href["z"]
+        @test radialdiff(href, dref) < 1e-10
+    end
+end
+
+@testset "radial plasma and Raman on JLArray" begin
+    #= A tighter grid and a smaller waist than the Kerr cases, so that the peak field is
+       above 1e10 V/m and argon actually ionises: a plasma case which ionises nothing
+       would compare two Kerr-only runs and say nothing about the plasma kernel. =#
+    pkw = (R=250e-6, N=24, w0=50e-6, energy=100e-6, plasma=true)
+    href, htr = radialcase(Grid.RealGrid, HostSpec(); pkw...)
+    dref, dtr = radialcase(Grid.RealGrid, JLSpec; pkw...)
+    @test dtr.resp[2] isa Nonlinear.PlasmaCumtrapz
+    @test dtr.resp[2].J isa JLArray
+    @test size(dtr.resp[2].J) == size(dtr.Eto_r) # sized for the whole block, not a column
+    @test dtr.resp[2].ratedev.spline.x isa JLArray
+    # the case really ionises, so the plasma kernel is what is being compared
+    @test maximum(Array(htr.resp[2].fraction)) > 1e-6
+    @test radialdiff(href, dref) < 1e-10
+
+    #= Multi-column Raman: the batched response holds `(2nt, npol, ncols)` buffers and does
+       one pair of FFTs over the whole block, which no other test in this file exercises
+       (every Raman case elsewhere has a single column). =#
+    hr, htr2 = radialcase(Grid.RealGrid, HostSpec(); gas=:N2, energy=50e-6, raman=true)
+    dr, dtr2 = radialcase(Grid.RealGrid, JLSpec; gas=:N2, energy=50e-6, raman=true)
+    @test dtr2.resp[2] isa Nonlinear.RamanPolarField
+    @test dtr2.resp[2].E2 isa JLArray
+    @test size(dtr2.resp[2].E2, 3) == size(dtr2.Eto_r, 3)
+    @test radialdiff(hr, dr) < 1e-10
+    # the Raman response contributes: this is not a comparison of two Kerr-only runs
+    plain, _ = radialcase(Grid.RealGrid, HostSpec(); gas=:N2, energy=50e-6, raman=false)
+    @test maximum(abs, hr["Eω"] .- plain["Eω"])/maximum(abs, plain["Eω"]) > 1e-6
+end
+
+@testset "radial envelope Raman on JLArray" begin
+    hr, _ = radialcase(Grid.EnvGrid, HostSpec(); gas=:N2, energy=50e-6, raman=true)
+    dr, dtr = radialcase(Grid.EnvGrid, JLSpec; gas=:N2, energy=50e-6, raman=true)
+    @test dtr.resp[2] isa Nonlinear.RamanPolarEnv
+    @test dtr.resp[2].hω isa JLArray
+    @test radialdiff(hr, dr) < 1e-10
 end
 
 #= The χ⁽²⁾ responses on a device block. The free-space transforms which use them are
