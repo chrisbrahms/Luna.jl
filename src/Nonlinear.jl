@@ -1089,12 +1089,19 @@ end
 #= The ionisation-loss term, as one `ifelse` broadcast rather than the branch of a loop.
    Both arms are evaluated, so the division happens where the field is zero too; `ifelse`
    is a select, not a branch, so the infinity it produces there is discarded rather than
-   propagated. =#
+   propagated.
+
+   The guard is on the denominator, which for a two-component field is `Em^2` and not
+   `Em`. In the wings of a pulse `Em` is many orders below the peak -- `exp(-50)` is
+   1e-22 -- and its square underflows in Float32 where `Em` itself does not. A device
+   flushes that subnormal to zero, and since the rate there is zero too the term becomes
+   `0/0`, one NaN of which poisons the whole column through the scans which follow. In
+   Float64 the two conditions differ only below 1e-162 V/m, which is not a field. =#
 _plasma_loss!(J, E, ::Nothing, rate, fraction, closs) =
     @. J += ifelse(abs(E) > 0, closs*rate*(1-fraction)/E, zero(E))
 
 function _plasma_loss!(J, E, Em, rate, fraction, closs)
-    @. J += ifelse(Em > 0, closs*rate*(1-fraction)/Em^2*E, zero(E))
+    @. J += ifelse(Em^2 > 0, closs*rate*(1-fraction)/Em^2*E, zero(E))
 end
 
 "Raman polarisation response type"
