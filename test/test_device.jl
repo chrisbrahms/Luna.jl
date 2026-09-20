@@ -503,6 +503,55 @@ end
     end
 end
 
+#= Review round 1, finding 3: `stats_period` has to actually skip the device-to-host copy
+   on a step whose statistics `PeriodicStats` is going to discard, not only skip the
+   statistics arithmetic. `ScaledOutput.ybuf` is the buffer that copy lands in, and it is
+   never touched except by `_tohost_unscale!`, so a step which does not fire leaves it
+   bit-for-bit as the previous fire left it -- constructing `ScaledOutput` directly (as
+   `Luna.run` does internally) makes that directly observable, without needing to
+   instrument `copyto!` or time anything. =#
+@testset "stats_period skips the device-to-host copy" begin
+    calls = Ref(0)
+    statsfun(y, t, dt) = (calls[] += 1; Dict("s" => sum(abs2, y)))
+    periodic = Output.maybe_periodic(statsfun, 3) # fires on the 1st, 4th, 7th call
+    out = Output.MemoryOutput(0, 1.0, 2, periodic)
+    y1 = JLArray(ComplexF32[1, 2, 3])
+    so = Luna.ScaledOutput(out, y1, 1.0)
+
+    so(y1, 0.0, 0.1, _ -> y1) # call 1: fires
+    @test calls[] == 1
+    snap = copy(Array(so.ybuf))
+    @test snap == ComplexF32[1, 2, 3]
+
+    # calls 2 and 3 do not fire: ybuf must be untouched, whatever y they are given
+    so(JLArray(ComplexF32[9, 9, 9]), 0.1, 0.1, _ -> y1)
+    @test calls[] == 1
+    @test Array(so.ybuf) == snap
+    so(JLArray(ComplexF32[8, 8, 8]), 0.2, 0.1, _ -> y1)
+    @test calls[] == 1
+    @test Array(so.ybuf) == snap
+
+    # call 4 fires again: ybuf now reflects it
+    y4 = JLArray(ComplexF32[7, 7, 7])
+    so(y4, 0.3, 0.1, _ -> y4)
+    @test calls[] == 2
+    @test Array(so.ybuf) == ComplexF32[7, 7, 7]
+
+    # the one-time host-statistics warning still fires exactly once, on the first copy
+    calls2 = Ref(0)
+    statsfun2(y, t, dt) = (calls2[] += 1; Dict("s" => 0.0))
+    out2 = Output.MemoryOutput(0, 1.0, 2, Output.maybe_periodic(statsfun2, 5))
+    so2 = Luna.ScaledOutput(out2, y1, 1.0)
+    @test_logs (:warn, r"Per-step statistics run on the host") match_mode=:any begin
+        so2(y1, 0.0, 0.1, _ -> y1) # call 1: fires, first device copy -> warns
+    end
+    @test_logs begin # calls 2-4 do not fire and do not copy, so no repeat warning either
+        for t in (0.1, 0.2, 0.3)
+            so2(JLArray(ComplexF32[1, 1, 1]), t, 0.1, _ -> y1)
+        end
+    end
+end
+
 @testset "a device run refuses host-only machinery" begin
     grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
     m = Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false)

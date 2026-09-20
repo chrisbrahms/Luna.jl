@@ -548,21 +548,27 @@ end
    for the new wrapper type. =#
 
 """
-    needs_host_y(o) -> Bool
+    needs_host_y(o, t) -> Bool
 
-Whether the output handler `o` inspects the *per-step* solution `y` (as opposed to only
-the interpolated values it requests through `yfun`), and therefore needs it on the host,
-in physical units, every accepted step.
+Whether the output handler `o` is, *on the step about to be reported at coordinate `t`*,
+going to inspect the per-step solution `y` (as opposed to only the interpolated values it
+requests through `yfun`), and therefore needs it on the host, in physical units.
 
-True whenever `o`'s statistics function is not `Output.nostats`:
+True whenever `o`'s statistics function is not `Output.nostats` and, if it is an
+[`Output.PeriodicStats`](@ref), will actually fire this step ([`Output.willfire`](@ref)):
 [`Stats.collect_stats`](@ref Luna.Stats.collect_stats) does a full inverse FFT and host
-reductions, so a device run has to copy the state down regardless of whether this step
-saves anything. [`ScaledOutput`](@ref) warns once when this forces a device-to-host copy.
-Conservatively `true` for an output whose statistics function cannot be inspected.
+reductions, so a device run has to copy the state down on every step whose statistics are
+really computed -- but not on a step `PeriodicStats` is going to skip, which is the whole
+point of `stats_period` on a device. [`ScaledOutput`](@ref) warns once when this forces a
+device-to-host copy. Conservatively `true` for an output whose statistics function cannot
+be inspected this way.
 """
-needs_host_y(o) = true
-needs_host_y(o::Output.MemoryOutput) = o.statsfun !== Output.nostats
-needs_host_y(o::Output.HDF5Output) = o.statsfun !== Output.nostats
+needs_host_y(o, t) = true
+needs_host_y(o::Output.MemoryOutput, t) = _stats_will_run(o.statsfun, t)
+needs_host_y(o::Output.HDF5Output, t) = _stats_will_run(o.statsfun, t)
+
+_stats_will_run(f, t) = f !== Output.nostats
+_stats_will_run(p::Output.PeriodicStats, t) = Output.willfire(p, t)
 
 """
     needs_host_cache(o) -> Bool
@@ -586,7 +592,8 @@ run, host or device); `Output.jl` itself never sees a device array or a scaled o
 Two reusable host buffers, in `y`'s element type (so a `Float32` run saves `Float32`):
 
 - `ybuf` holds the unscaled, host copy of the per-step `y`, used for statistics and for an
-  `HDF5Output`'s resume cache. Only filled when [`needs_host_y`](@ref) or
+  `HDF5Output`'s resume cache. Only filled when [`needs_host_y`](@ref) (re-evaluated every
+  step, so `Output.PeriodicStats` skips the copy on a step it is not going to fire on) or
   ([`needs_host_cache`](@ref) and [`Output.willsave`](@ref)) says it is needed this step
   -- so a device run with `Output.nostats` and no HDF5 cache never pays for it, and an
   `HDF5Output` with caching pays only on a save step.
@@ -604,7 +611,6 @@ never modified, only these two buffers.
 mutable struct ScaledOutput{O, A<:AbstractArray}
     o::O
     Eref::Float64
-    needy::Bool         # `o`'s statistics need the host `y` every step
     needcache::Bool     # `o` is an HDF5Output with a resumable cache
     ybuf::A
     ibuf::A
@@ -613,7 +619,7 @@ end
 
 function ScaledOutput(o, y::AbstractArray, Eref::Real)
     A = Array{eltype(y), ndims(y)}
-    ScaledOutput{typeof(o), A}(o, Float64(Eref), needs_host_y(o), needs_host_cache(o),
+    ScaledOutput{typeof(o), A}(o, Float64(Eref), needs_host_cache(o),
                                A(undef, size(y)), A(undef, size(y)), Ref(false))
 end
 
@@ -641,12 +647,13 @@ function _warn_host_stats!(so::ScaledOutput, y)
 end
 
 function (so::ScaledOutput)(y, t, dt, yfun)
+    needy = needs_host_y(so.o, t)
     needcache = so.needcache && Output.willsave(so.o, y, t, dt)
-    if so.needy || needcache
+    if needy || needcache
         yh = _tohost_unscale!(so.ybuf, y, so.Eref)
-        so.needy && _warn_host_stats!(so, y)
+        needy && _warn_host_stats!(so, y)
     else
-        yh = y # nothing inspects it: pass the state through untouched, no copy
+        yh = y # nothing inspects it this step: pass the state through untouched, no copy
     end
     so.o(yh, t, dt, ts -> _tohost_unscale!(so.ibuf, yfun(ts), so.Eref))
 end

@@ -311,7 +311,45 @@ end
     @test [isnothing(r) for r in results] == [false, true, true, false, true, true, false]
     # `calls` only increments when `f` actually runs, i.e. on the 1st, 4th and 7th call
     @test [r["n"] for r in results if !isnothing(r)] == [1, 2, 3]
+
+    # willfire predicts the next call correctly, without mutating or running it
+    p2 = Output.PeriodicStats(f, 3)
+    fires = Bool[]
+    for _ in 1:7
+        push!(fires, Output.willfire(p2, 0.0))
+        p2(nothing, 0.0, 0.0)
+    end
+    @test fires == [true, false, false, true, false, false, true]
+
+    # validation: an integer step count must be >= 1
     @test_throws ArgumentError Output.PeriodicStats(f, 0)
+    @test_throws ArgumentError Output.PeriodicStats(f, -3)
+    # a non-integer (distance) period must be > 0
+    @test_throws ArgumentError Output.PeriodicStats(f, 0.0)
+    @test_throws ArgumentError Output.PeriodicStats(f, -2.5)
+
+    # the "every Δz" form: fires when the propagation coordinate has advanced by period
+    calls2 = Ref(0)
+    g(y, t, dt) = (calls2[] += 1; Dict("z" => t))
+    pd = Output.PeriodicStats(g, 0.5) # non-integer -> distance mode, every 0.5 m
+    zs = [0.0, 0.2, 0.5, 0.6, 1.0, 1.1, 1.4]
+    rd = [pd(nothing, z, 0.0) for z in zs]
+    # fires at z=0.0 (first call), 0.5 (>= 0.5 since last fire) and 1.0 (>= 0.5 since 0.5);
+    # 1.4 is only 0.4 past the fire at 1.0, so it does not fire
+    @test [isnothing(r) for r in rd] == [false, true, false, true, false, true, true]
+    @test [r["z"] for r in rd if !isnothing(r)] == [0.0, 0.5, 1.0]
+    @test Output.willfire(pd, 1.49) == false
+    @test Output.willfire(pd, 1.5) == true
+
+    # maybe_periodic: the trivial integer 1 is not wrapped at all (zero overhead), a
+    # non-trivial value is, and an invalid value is refused either way
+    @test Output.maybe_periodic(f, 1) === f
+    @test Output.maybe_periodic(f, 1.0) === f
+    @test Output.maybe_periodic(f, 2) isa Output.PeriodicStats
+    @test Output.maybe_periodic(f, 0.3) isa Output.PeriodicStats
+    @test_throws ArgumentError Output.maybe_periodic(f, 0)
+    @test_throws ArgumentError Output.maybe_periodic(f, -1.0)
+    @test_throws ArgumentError Output.maybe_periodic(f, "3")
 
     # MemoryOutput/HDF5Output skip a `nothing` statistics result instead of erroring
     o = Output.MemoryOutput(0, 1.0, 4, Output.PeriodicStats((y, t, dt) -> Dict("s" => t), 2))

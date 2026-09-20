@@ -601,33 +601,82 @@ willsave(o::HDF5Output{<:GridCondition}, y, t, dt) = first(o.save_cond(y, t, dt,
 """
     PeriodicStats(statsfun, period)
 
-Wrap a statistics function so that it is evaluated only on the first call and then every
-`period`-th call thereafter (i.e. every `period`-th accepted step of the propagation),
-returning `nothing` on the calls in between. `nothing` means "no statistics this step",
-which [`MemoryOutput`](@ref) and [`HDF5Output`](@ref) both already treat as such, so the
-recorded arrays are simply shorter than the number of accepted steps.
+Wrap a statistics function so that it is evaluated only on the first call and then
+periodically thereafter, returning `nothing` on the calls in between. `nothing` means "no
+statistics this step", which [`MemoryOutput`](@ref) and [`HDF5Output`](@ref) both already
+treat as such, so the recorded arrays are simply shorter than the number of accepted
+steps.
+
+Two forms of `period`, matching `prop_capillary`'s/`prop_gnlse`'s `stats_period`:
+
+- An `Integer` (or an integer-valued `Real`, e.g. `5.0`) `>= 1`: fire every `period`-th
+  *accepted step*.
+- A non-integer `Real` `> 0`: fire every time the propagation coordinate `t` (`z`, in
+  metres) has advanced by at least `period` since the last fire -- "every `Δz`". The
+  first call always fires either way.
 
 Use this when the per-step statistics are a noticeable fraction of the cost of a step --
 in particular on a device, where the whole state has to be copied to the host for them
-(see `Luna.ScaledOutput`) -- or with an expensive user-defined statistic. `prop_capillary`
-and `prop_gnlse` expose it as the `stats_period` keyword.
+(see `Luna.ScaledOutput`, which also skips that copy on a step this predicts will not
+fire, via [`willfire`](@ref)) -- or with an expensive user-defined statistic.
 """
 mutable struct PeriodicStats{S}
     f::S
-    period::Int
-    n::Int
+    period::Float64   # a step count (bystep) or a distance in m (!bystep)
+    bystep::Bool
+    n::Int            # steps seen so far, for the step-count form
+    lastfire::Float64 # t of the last fire, for the distance form
 end
 
-function PeriodicStats(f, period::Integer)
-    period >= 1 || throw(ArgumentError("stats_period must be >= 1, got $period"))
-    PeriodicStats(f, Int(period), 0)
+function PeriodicStats(f, period::Real)
+    if isinteger(period)
+        period >= 1 || throw(ArgumentError(
+            "an integer stats_period must be >= 1 (a step count), got $period"))
+        PeriodicStats(f, Float64(period), true, 0, -Inf)
+    else
+        period > 0 || throw(ArgumentError(
+            "a non-integer stats_period must be > 0 (a distance in m), got $period"))
+        PeriodicStats(f, Float64(period), false, 0, -Inf)
+    end
 end
+
+"""
+    willfire(p::PeriodicStats, t) -> Bool
+
+Whether calling `p(y, t, dt)` right now would actually run the wrapped statistics
+function, without running it or mutating `p`'s state. Used by `Luna.ScaledOutput` to skip
+the device-to-host copy `p`'s eventual call would otherwise force on a step which is
+going to return `nothing` anyway.
+"""
+willfire(p::PeriodicStats, t) = p.bystep ? (p.n % Int(p.period) == 0) :
+                                          (t - p.lastfire >= p.period)
 
 function (p::PeriodicStats)(y, t, dt)
-    p.n += 1
-    (p.n - 1) % p.period == 0 || return nothing
+    if p.bystep
+        p.n += 1
+        (p.n - 1) % Int(p.period) == 0 || return nothing
+    else
+        t - p.lastfire >= p.period || return nothing
+        p.lastfire = t
+    end
     p.f(y, t, dt)
 end
+
+"""
+    maybe_periodic(statsfun, period)
+
+Wrap `statsfun` in [`PeriodicStats`](@ref) unless `period` is exactly the integer `1`
+(every accepted step, the default, for which wrapping would add a call frame for no
+effect), validating `period` either way. `prop_capillary`'s/`prop_gnlse`'s `stats_period`
+keyword is passed straight through to this.
+"""
+maybe_periodic(f, period::Integer) = period == 1 ? f : PeriodicStats(f, period)
+function maybe_periodic(f, period::Real)
+    isinteger(period) && isone(period) ? f : PeriodicStats(f, period)
+end
+maybe_periodic(f, period) = throw(ArgumentError(
+    "stats_period must be a Real (an integer step count or a distance in m), got a "*
+    "$(typeof(period))"))
 
 """
     ScanHDF5Output(scan, scanidx, args...; fname=nothing, fdir=nothing, kwargs...)
