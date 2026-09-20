@@ -197,6 +197,17 @@ kernel cannot raise one, so it returns the table's last value instead. The host 
 keeps the error, which now comes from a check on the largest field in the block rather
 than from every element.
 
+**A weak plasma can vanish in single precision.** The plasma polarisation is built from
+three cumulative integrals, and for a light gas at a moderate intensity the result is
+small enough that the whole buffer is subnormal in `Float32`, which a GPU flushes to
+zero. Helium at around 1e14 W/cm² is the case in Luna's usual range: there the plasma
+term is about 2.6e-7 of the Kerr term — the size of a single `Float32` rounding of the
+Kerr term itself — and `precision=Float32` or a Metal run drops it entirely. Use
+`Float64` (`device=:cpu`, or CUDA, which runs in double precision) if a contribution that
+small matters. At intensities where plasma actually shapes the pulse it is many orders
+above the subnormal range and this does not arise. The developer guide has the full
+dynamic-range audit.
+
 ### `stats_period`
 
 ```julia

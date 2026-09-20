@@ -510,6 +510,17 @@ adkrate() = Ionisation.IonRateADK(:Ar)
    axis is uniform, and this takes milliseconds where pre-calculating a real PPT table
    takes minutes. The values are an ADK rate, which is beside the point: what is under
    test is the spline lookup. =#
+#= A rate somebody wrote: an `AbstractIonRate` subtype with the scalar and array forms
+   the documentation asks for and nothing else. It has no kernel, so it must take
+   `ionrate!`'s fallback path on the host and be refused, by name, anywhere else.
+   Review round 1, finding 1: dispatching that fallback on `AbstractIonRate` rather than
+   on capability broke this and `Ionisation.IonRatePPT` on the plain CPU path. =#
+struct UserRate <: Ionisation.AbstractIonRate
+    scale::Float64
+end
+(r::UserRate)(E) = r.scale*abs(E)^4
+(r::UserRate)(out::AbstractArray, E::AbstractArray) = (out .= r.(E))
+
 function tablerate()
     E = collect(range(1e9, 3e11, length=1024))
     Ionisation.IonRatePPTAccel(E, adkrate().(E))
@@ -741,6 +752,109 @@ end
     Nonlinear.batched!(p32, out32, E32, PLASMA_ρ, sc)
     @test maximum(abs, Float64.(out32) .- outs)/maximum(abs, outs) < 1e-4
     @test all(isfinite, out32)
+end
+
+#= A rate with no device kernel still has to work exactly as it did on the host, inside
+   the plasma response, and be refused by name anywhere else. Review round 1, finding 1.
+   `IonRatePPT` is the case which matters: it is exported, documented, and the branch's
+   own user page tells the reader to run it on the CPU. =#
+@testset "a rate with no device kernel" begin
+    δt = PLASMA_T[2] - PLASMA_T[1]
+    E = plasmafield()
+    ppt = Ionisation.IonRatePPT(:Ar, 800e-9)
+    user = UserRate(1e-30)
+    for ir in (ppt, user)
+        @test !Ionisation.device_capable(ir)
+        #= The host, physical-unit path: the same values the rate's own array form gives,
+           which is what the response did before it was batched. =#
+        out = similar(E)
+        Ionisation.ionrate!(out, ir, E)
+        ref = similar(E); ir(ref, E)
+        @test out == ref
+
+        p = Nonlinear.PlasmaCumtrapz(PLASMA_T, E, ir, PLASMA_IP)
+        P = zeros(PLASMA_NT)
+        p(P, E, PLASMA_ρ)
+        @test all(isfinite, P)
+        @test maximum(abs, P) > 0
+        # ... and it is the physics, not just something finite
+        @test maximum(abs, P .- refplasma(E, ir, PLASMA_IP, δt, PLASMA_ρ))/
+              maximum(abs, refplasma(E, ir, PLASMA_IP, δt, PLASMA_ρ)) < 1e-11
+
+        #= A scaled or device run is refused, by name, rather than attempted. =#
+        err = try
+            Ionisation.ionrate!(similar(E), ir, E ./ 1024, 1024.0)
+            nothing
+        catch e; e end
+        @test err isa ErrorException
+        @test occursin(string(nameof(typeof(ir))), err.msg)
+        @test occursin("device=:cpu", err.msg)
+        @test_throws ErrorException Ionisation.device_rate(ir, DeviceSpec(Array, Float32))
+    end
+
+    #= A cached rate whose table is not uniform falls into the same class -- and its
+       array call operator must not recurse back into `ionrate!`. =#
+    Enu = [1e9, 2e9, 4e9, 8e9, 1.6e10, 3.2e10]
+    nonuniform = Ionisation.IonRatePPTAccel(Enu, adkrate().(Enu))
+    @test !Ionisation.device_capable(nonuniform)
+    Eb = fill(5e9, 16)
+    o1 = similar(Eb); Ionisation.ionrate!(o1, nonuniform, Eb)
+    @test o1 == nonuniform.(Eb)
+end
+
+#= A batched response cannot be applied by the legacy per-response loop, which is what a
+   response collection that is not a `Tuple` takes: for a transform with several columns
+   the loop hands over one column at a time, while the response's buffers are sized for
+   the block. Review round 1, finding 2. =#
+@testset "a batched response needs a tuple collection" begin
+    E = plasmafield()
+    p = Nonlinear.PlasmaCumtrapz(PLASMA_T, E, adkrate(), PLASMA_IP)
+    ncols = 3
+    E3 = zeros(PLASMA_NT, 1, ncols)
+    for i in 1:ncols; E3[:, 1, i] .= (0.5 + i/8) .* E; end
+    P3 = zeros(PLASMA_NT, 1, ncols)
+    idcs = CartesianIndices((ncols,))
+    pr = Nonlinear.rescale(p, HostSpec(), UNIT_SCALING, E3)
+
+    err = try
+        NonlinearRHS.Et_to_Pt!(P3, E3, [pr], PLASMA_ρ, idcs)
+        nothing
+    catch e; e end
+    @test err isa ErrorException
+    @test occursin("PlasmaCumtrapz", err.msg)
+    @test occursin("Tuple", err.msg)
+    # ... and the same responses as a tuple work
+    NonlinearRHS.Et_to_Pt!(P3, E3, (pr,), PLASMA_ρ, idcs)
+    @test maximum(abs, P3) > 0
+
+    #= The transforms convert for themselves, so a `Vector` of responses containing the
+       plasma response runs. This is the configuration which broke: `TransRadial` passes
+       `idcs`, so the legacy loop would have handed over one column. =#
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    rgrid = Grid.RadialGrid(1e-3, 8)
+    FT = Utils.plan_ft(zeros(length(grid.to), 1, rgrid.N), 1)
+    dens = z -> PLASMA_ρ
+    nrm = (Pωo, z) -> nothing # the normalisation is not what is under test here
+    plas = Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)), adkrate(), PLASMA_IP)
+    resps = Any[Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)), plas]
+    trv = NonlinearRHS.TransRadial(grid, rgrid, FT, resps, dens, nrm)
+    trt = NonlinearRHS.TransRadial(grid, rgrid, FT, Tuple(resps), dens, nrm)
+    @test trv.resp isa Tuple
+    @test trv.resp[2] isa Nonlinear.PlasmaCumtrapz
+    @test size(trv.resp[2].J) == size(trv.Eto_r)
+    #= The transform's own buffers and column indices, without the transforms either
+       side of the response: what broke was the response's contract with `Et_to_Pt!`. =#
+    tg = grid.to
+    Eg = @. 6e10*exp(-tg^2/(2*(10e-15/1.66)^2))*cos(2π*PhysData.c/800e-9*tg)
+    for (i, x) in enumerate(range(0, 0.9, length=rgrid.N))
+        trv.Eto_r[:, 1, i] .= (1 - x) .* Eg
+    end
+    copyto!(trt.Eto_r, trv.Eto_r)
+    NonlinearRHS.Et_to_Pt!(trv.Pto_r, trv.Eto_r, trv.resp, PLASMA_ρ, trv.idcs)
+    NonlinearRHS.Et_to_Pt!(trt.Pto_r, trt.Eto_r, trt.resp, PLASMA_ρ, trt.idcs)
+    @test all(isfinite, trv.Pto_r)
+    @test maximum(abs, trv.Pto_r) > 0
+    @test trv.Pto_r == trt.Pto_r
 end
 
 @testset "FFT planner dispatch" begin

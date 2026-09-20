@@ -354,9 +354,10 @@ operations every array type provides ([`accumulate!`](@ref Base.accumulate!) and
 broadcast). `cumtrapz!` is the same integral as a serial loop, which no device
 can run; this is the form Luna's per-step code uses (GPU_PLAN.md §4.2 rule 2).
 
-`out` and `y` must not alias. Columns are independent, so the result does not depend on
-how many of them are passed at once — a caller may split the array along its trailing
-dimensions and get the same answer in each column.
+`out` and `y` must not alias, and this is checked: `accumulate!` would overwrite `y`
+before the correction reads it and produce silent garbage. Columns are independent, so
+the result does not depend on how many of them are passed at once — a caller may split
+the array along its trailing dimensions and get the same answer in each column.
 
 The **summation order differs** from `cumtrapz!`: this accumulates `y` and corrects,
 where `cumtrapz!` accumulates the trapezoid increments. The two agree to rounding level,
@@ -365,6 +366,9 @@ not bit for bit. On a device the scan is a parallel prefix sum, which differs ag
 function cumtrapz_scan!(out, y, δt)
     axes(out) == axes(y) || throw(DimensionMismatch(
         "cumtrapz_scan!: out has axes $(axes(out)), y has axes $(axes(y))"))
+    out === y && throw(ArgumentError(
+        "cumtrapz_scan!: out and y must not alias; the correction broadcast reads y "*
+        "after the scan has written out"))
     accumulate!(+, out, y; dims=1)
     y1 = _firstalong1(y)
     h = convert(real(eltype(out)), δt)

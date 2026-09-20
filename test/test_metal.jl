@@ -707,18 +707,36 @@ end
     @test maximum(abs, p64["Eω"][:, end] .- nop64["Eω"][:, end]) /
           maximum(abs, nop64["Eω"][:, end]) > 1e-2
 
-    #= ... and through the simple interface, with a real (PPT) rate, which is what a
-       user gets from `prop_capillary(...; plasma=true)`. =#
-    plkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
-            trange=400e-15, saveN=5, plasma=true, raman=false, shotnoise=false)
-    ph32 = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; plkw...,
-                               device=DeviceSpec(Array, Float32))
-    pdm2 = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; plkw..., device=MetalSpec)
+    #= ... and through the simple interface, with a real cached PPT rate, which is what
+       a user gets from `prop_capillary(...; plasma=true)`. Argon at 0.1 bar and 300 µJ,
+       which ionises about 1 % of the gas: review round 1, finding 8 -- the first version
+       of this used the regression matrix's helium parameters, where the rate is exactly
+       zero, so the spline kernel was only ever exercised at zero. Built through
+       `prop_capillary_args` so that the steps can be fixed, which `prop_capillary`
+       itself has no keyword for. =#
+    plkw = (; λ0=800e-9, energy=300e-6, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
+            trange=400e-15, saveN=3, plasma=true, raman=false, shotnoise=false)
+    function ppt_prop(spec)
+        Eω, grid, linop, tr, FT, o = Luna.Interface.prop_capillary_args(
+            125e-6, 1e-2, :Ar, 0.1; plkw..., device=spec)
+        h = 1e-2/20
+        Luna.run(Eω, grid, linop, tr, FT, o;
+                 zmax=1e-2, init_dz=h, min_dz=h, max_dz=h, status_period=1e6)
+        o, tr
+    end
+    ph32, ptr32 = ppt_prop(DeviceSpec(Array, Float32))
+    pdm2, ptrm = ppt_prop(MetalSpec)
+    @test ptrm.resp[2].ratedev isa Ionisation.IonRatePPTAccel
+    @test ptrm.resp[2].ratedev.spline.x isa MtlArray{Float32}
     @test eltype(pdm2["Eω"]) === ComplexF32
     for idx in axes(ph32["Eω"], 2)
         @test maximum(abs, pdm2["Eω"][:, idx] .- ph32["Eω"][:, idx]) /
               maximum(abs, ph32["Eω"][:, idx]) < 1e-4
     end
+    #= The cached rate really fires: the electron density is a fraction of a percent of
+       the gas, not zero. `Stats` computes it on the host from the saved field, so this
+       is the device run's own output. =#
+    @test maximum(pdm2["stats"]["electrondensity"])/PhysData.density(:Ar, 0.1) > 1e-3
 
     # `:auto` (what loading Metal sets) resolves to the same device as the explicit spec
     old = get(Luna.settings, "device", nothing)

@@ -993,9 +993,17 @@ function rescale(p::PlasmaCumtrapz, spec, scaling, Et)
                    p.δt, p.preionfrac, scaling)
 end
 
-#= Below this many elements the block is not worth the task overhead; above it, one task
-   per column. A column costs an ionisation-rate evaluation and three prefix scans over
-   the time axis, so the grain is large even for one column. =#
+"""
+    PLASMA_THREAD_MINLEN
+
+The number of elements below which [`PlasmaCumtrapz`](@ref) does not share a block's
+columns out over threads, because the task overhead would not be worth it. Above it there
+is one task per column: a column costs an ionisation-rate evaluation and three prefix
+scans over the time axis, so the grain is large even for one column (GPU_PLAN.md §4.9).
+
+A block with a single column — every mode-averaged and modal transform — is never
+threaded whatever its length.
+"""
 const PLASMA_THREAD_MINLEN = 1 << 14
 
 "Whether to share this block's columns out over threads."
@@ -1020,10 +1028,18 @@ function _plasma_run!(p::PlasmaCumtrapz, out, Et, c)
         "are $(join(size(p.J), "x")). A batched response is handed the whole block, so "*
         "its buffers have to match it: call "*
         "`Nonlinear.rescale(response, spec, scaling, Et)` with a prototype of the block "*
-        "(every transform does this at construction).")
+        "(every transform does this at construction). A batched response also needs the "*
+        "responses to be a `Tuple`: a collection which is not one is applied one column "*
+        "at a time.")
     _npol(Et) in (1, 2) || error(
         "PlasmaCumtrapz: a field block has one or two polarisation components along "*
         "dimension 2, not $(_npol(Et)).")
+    #= The magnitude of a two-component field, and the range check on whatever drives the
+       rate, are done here on the whole block rather than per column: the check is a
+       reduction, so it costs the same either way, and doing it here keeps its error in
+       the calling task instead of wrapping it in a `TaskFailedException`. =#
+    _fieldmagnitude!(p.Em, Et)
+    Luna.Ionisation.check_field_range(p.ratedev, _ratearg(Et, p.Em), c[1])
     if _plasma_threaded(Et)
         nc = _ncols(Et)
         #= Host arrays only, so the reshapes are free. Each task gets one column of
@@ -1058,7 +1074,9 @@ _col(::Nothing, i) = nothing
    polarisation axis and broadcast against both components. =#
 function _plasma_block!(out, E, rate, fraction, Em, J, P, ratefunc, δt, preionfrac, c)
     Eref, cphase, closs, cout = c
-    _ratefield!(rate, Em, E, ratefunc, Eref)
+    #= `Em` is already filled and the range already checked, by `_plasma_run!` on the
+       whole block. =#
+    Luna.Ionisation.ionrate!(rate, ratefunc, _ratearg(E, Em), Eref; check=false)
     Maths.cumtrapz_scan!(fraction, rate, δt)
     pf = Luna.scalar(E, preionfrac)
     @. fraction = pf + 1 - exp(-fraction)
@@ -1072,18 +1090,18 @@ function _plasma_block!(out, E, rate, fraction, Em, J, P, ratefunc, δt, preionf
     out
 end
 
-# Scalar field: the rate is a function of the field itself.
-_ratefield!(rate, ::Nothing, E, ratefunc, Eref) =
-    Luna.Ionisation.ionrate!(rate, ratefunc, E, Eref)
+#= What drives the ionisation: the field itself for one polarisation component, its
+   magnitude for two. See C Tailliez et al 2020 New J. Phys. 22 103038. =#
+_ratearg(E, ::Nothing) = E
+_ratearg(E, Em) = Em
 
-#= Two-component field: the magnitude of the field drives the ionisation, and the plasma
-   polarisation is then solved component by component. See C Tailliez et al 2020 New J.
-   Phys. 22 103038. =#
-function _ratefield!(rate, Em, E, ratefunc, Eref)
+_fieldmagnitude!(::Nothing, E) = nothing
+
+function _fieldmagnitude!(Em, E)
     Ex = view(E, :, 1:1, ntuple(_ -> Colon(), ndims(E)-2)...)
     Ey = view(E, :, 2:2, ntuple(_ -> Colon(), ndims(E)-2)...)
     @. Em = hypot(Ex, Ey)
-    Luna.Ionisation.ionrate!(rate, ratefunc, Em, Eref)
+    Em
 end
 
 #= The ionisation-loss term, as one `ifelse` broadcast rather than the branch of a loop.

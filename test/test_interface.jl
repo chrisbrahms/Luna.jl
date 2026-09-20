@@ -506,28 +506,34 @@ end
        `precision` request, naming the fix. Review round 1 of gpu/12-response-traits,
        finding 9: the `precision`-only path was untested, and without it
        `precision=Float32` would run the response through `Nonlinear.HostResponse` at
-       every step instead of erroring. Raman is the case since gpu/13-plasma gave the
-       plasma response a kernel; it gets one of its own in gpu/14-raman. =#
-    ramankw = (λ0=800e-9, energy=100e-9, τfwhm=10e-15, trange=400e-15,
-               λlims=(300e-9, 2000e-9), shotnoise=false, plasma=false, raman=true,
-               saveN=3)
-    ramanargs = (args[1], args[2], :N2, 0.5)
-    err = try
-        prop_capillary(ramanargs...; ramankw..., precision=Float32)
-        nothing
-    catch e
-        e
+       every step instead of erroring.
+
+       Tested against the check itself rather than through `prop_capillary`. Review
+       round 1 of gpu/13-plasma, finding 3: plasma has a kernel now and Raman gets one
+       in gpu/14, after which no response `prop_capillary` can build is columnwise, so
+       there would be nothing left to point a call-level test at. A user closure is
+       columnwise by definition and stays that way. =#
+    usercw = (out, E, ρ) -> (out .+= (ρ*1e-52) .* E.^3)
+    resp_nokernel = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)), usercw)
+    for (dev, prec) in ((Luna.HostSpec(), Float32),      # precision=Float32 alone
+                        (DeviceSpec(Array, Float32), nothing), # device= alone
+                        (DeviceSpec(Array, Float32), Float32)) # both
+        err = try
+            Interface._check_responses_device_capable!(dev, prec, resp_nokernel)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("device=:cpu", err.msg)
     end
-    @test err isa ErrorException
-    @test occursin("device=:cpu", err.msg)
-    @test occursin("RamanPolarField", err.msg)
-    # the message names the type, not its several hundred characters of parameters
-    @test !occursin("FFTW", err.msg)
-    @test_throws ErrorException prop_capillary(ramanargs...; ramankw...,
-                                               device=DeviceSpec(Array, Float32))
-    # ... and the same call with neither keyword is unaffected
-    oraman = prop_capillary(ramanargs...; ramankw...)
-    @test eltype(oraman["Eω"]) === ComplexF64
+    # ... and the same responses at the default device and precision are not refused
+    @test Interface._check_responses_device_capable!(Luna.HostSpec(), nothing,
+                                                     resp_nokernel) === nothing
+    # ... nor is a device request whose responses all have kernels
+    @test Interface._check_responses_device_capable!(
+        DeviceSpec(Array, Float32), nothing,
+        (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)) === nothing
 
     #= Plasma is device-capable since gpu/13-plasma, so the default field-resolved
        response set of a non-Raman gas -- Kerr and plasma -- now follows an explicit

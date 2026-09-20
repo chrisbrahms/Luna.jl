@@ -143,12 +143,16 @@ So the gate's `0.000e+00` on those four cases is real but says nothing about thi
 The number that does is this, measured by running the same propagation on this branch and
 on the base commit in the same environment, 20 fixed steps over 2 cm, 125 µm core, 10 fs:
 
-| case | peak electron density [m⁻³] | max rel. difference in `Eω` |
-| --- | ---: | ---: |
-| Ar 1 bar, 300 µJ, PPT | 9.3e22 | 4.3e-15 |
-| Ar 1 bar, 300 µJ, ADK | 4.0e22 | 1.7e-15 |
-| Ar 1 bar, 300 µJ, PPT, elliptical (vector plasma) | 7.6e23 | 2.8e-15 |
-| He 1 bar, 800 µJ, PPT | 2.9e21 | 9.0e-16 |
+| case | peak electron density [m⁻³] | `Eω`, global | `Eω`, per save |
+| --- | ---: | ---: | ---: |
+| Ar 1 bar, 300 µJ, PPT | 9.263792418965712e22 | 2.56e-15 | 3.03e-15 |
+| Ar 1 bar, 300 µJ, ADK | 3.962828910370468e22 | 1.31e-15 | 1.50e-15 |
+| Ar 1 bar, 300 µJ, PPT, elliptical (vector plasma) | 7.578097369373387e23 | 2.81e-15 | — |
+| He 1 bar, 800 µJ, PPT | 2.874216387522913e21 | 7.68e-16 | 7.74e-16 |
+
+Measured with **`set_fftw_wisdom(false)`**, as the gate is (see "review round 1, finding
+11" below: the first version of this table was measured with the shared wisdom file
+enabled, which changes the plans and moves these numbers by up to 1.7x).
 
 0.1 to 3 per cent of the gas is ionised in those, and the difference is the scan's
 summation order, three orders of magnitude inside the gate's 1e-12 tolerance. The
@@ -344,9 +348,127 @@ to in code spans rather than with `@ref`.
 - **A gas mixture with plasma on a device** is not tested. `rescale_responses` now
   reaches the inner responses of a mixture, which it did not before, but the mixture's
   own `Et_to_Pt!` path on a device has no test.
-- **Memory.** The response's two block-sized buffers are block-sized, not column-sized,
-  so a 3-D free-space run with plasma holds two more arrays the size of the oversampled
-  field than it did (and one fewer per column). Chunking the host path would bound that;
-  it is not done here.
+- **Memory.** All four buffers are now sized for the block where they used to be sized
+  for one column: `J` and `P` at the full block size, and `rate` and `fraction` at the
+  block size with a singleton polarisation axis (so the full block for a scalar field,
+  half of it for a two-component one). For a `(nto, 1, Nx, Ny)` free-space run that is
+  four more block-sized `Float64` arrays than before, not two — the figure the Group E
+  chunking decision should be taken against. Chunking the host path would bound it; it
+  is not done here. (The count *per column* is one lower than before, since `phase` is
+  gone.)
 - **`preionfrac`** is carried through unchanged and is exercised only by
   `test_ionisation.jl`'s existing case.
+
+
+## Changes after review round 1
+
+The review's verdict was "request changes", on one blocker and two majors. All eleven
+findings are addressed. **The regression gate is still exactly `0.000e+00` on all 21
+cases**, in both modes and both classes, against `7d72431c`.
+
+### 1 (blocker) — `ionrate!` dispatched on the type, not on capability
+
+`ionrate!(out, ir::AbstractIonRate, E, Eref)` called `ratekernel`, which only
+`IonRateADK` and `IonRatePPTAccel` have. Every other `AbstractIonRate` — including
+Luna's own exported, documented `Ionisation.IonRatePPT`, and anything a user writes —
+died with a `MethodError` inside `PlasmaCumtrapz` **on the plain host `Float64` path**,
+which is a behaviour change with default settings and the exact opposite of what this
+branch's own user page promises. Nothing exercised it.
+
+`ionrate!` now dispatches on `device_capable(ir)`, as the review sketched: a rate with a
+kernel takes the broadcast, anything else is called as `ir(out, E)` when `Eref == 1` and
+`E` is a host array and refused, by name, otherwise. `IonRateADK`'s and
+`IonRatePPTAccel`'s array call operators are back to `out .= ir.(E)` rather than
+delegating to `ionrate!`, because the fallback calls them and a delegating one would
+recurse — which is exactly what a cached rate on a non-uniform table would have done.
+
+Tested in `test_device.jl`, "a rate with no device kernel": a direct `IonRatePPT`, a
+`UserRate <: AbstractIonRate` written the way the documentation asks, and an
+`IonRatePPTAccel` on a non-uniform table, each through `ionrate!` and inside a
+`PlasmaCumtrapz` against the serial reference, plus the named refusal for a scaled run
+and for `device_rate`.
+
+### 2 (major) — a non-`Tuple` collection with a batched response
+
+Fixed at both ends, as the review suggested:
+
+- `TransModal`, `TransRadial`, `TransFree` and `TransFree2D` now `Tuple(...)` their
+  responses at the `rescale_responses` call, as `TransModeAvg` already did;
+- `Et_to_Pt!`'s legacy path refuses a `Batched` response (`_refuse_batched_legacy`,
+  which also walks a mixture's inner tuples) with a message that says a batched response
+  needs a `Tuple` collection, instead of letting it fail later as a shape mismatch. The
+  response's own size-mismatch error also now names the tuple requirement.
+
+Tested with a `Vector` of responses containing the plasma response through
+`TransRadial`: the transform converts, the buffers come out block-sized, and the
+polarisation is identical to the same responses passed as a tuple; the bare `Et_to_Pt!`
+with a `Vector` and `idcs` raises the new message.
+
+### 3 (major) — the interface refusal test pointed at Raman
+
+`gpu/14-raman` makes Raman device-capable, after which no response `prop_capillary` can
+build is columnwise and there is nothing left for a call-level test to point at. The test
+now calls `Interface._check_responses_device_capable!` directly with a tuple containing a
+user closure — columnwise by definition and staying that way — for `precision` alone,
+`device` alone and both, asserting the message names `device=:cpu`, plus the two
+not-refused cases. **`gpu/int-D` note:** there is no longer a `prop_capillary`-level
+refusal test, because there is no longer a `prop_capillary` call which should be refused.
+
+### 4 (minor) — the four `rescale_responses` call sites hard-coded the host
+
+`TransModal`, `TransRadial`, `TransFree` and `TransFree2D` take `spec=HostSpec()` and
+`scaling=UNIT_SCALING` keyword arguments, used at that call, with a comment saying Group
+E changes the caller and not the line. The rest of each transform is still host-only and
+`Luna.setup` still refuses a device for them.
+
+### 5 (minor) — the memory note undercounted
+
+Corrected to four block-sized buffers (`J` and `P` at full size, `rate` and `fraction`
+with a singleton polarisation axis), from one per column before.
+
+### 6 (minor) — the `Emax` error came out of a `@threads` loop
+
+`_check_field_range` is now `Ionisation.check_field_range`, documented and public, and
+`_plasma_run!` calls it once on the whole block — together with the field magnitude for a
+two-component field, which it now also computes once for the block — before the threading
+decision. `ionrate!` takes `check=false` for a caller which has already made the check.
+The error keeps its type in the threaded case.
+
+### 7 (minor) — the `Float32` limitation was not on the user page
+
+`docs/src/gpu.md`, "Ionisation rates on a device", now says that a weak plasma can vanish
+in single precision, names helium at ~1e14 W/cm² and the 2.6e-7 ratio, and says to use
+`Float64` if a contribution that small matters.
+
+### 8 (minor) — the Metal `prop_capillary` plasma test did not ionise
+
+It now runs argon at 0.1 bar and 300 µJ through `prop_capillary_args` with fixed steps
+(which `prop_capillary` has no keyword for), and asserts that the electron density is
+more than 0.1 % of the gas — so the real cached PPT spline kernel is exercised at a rate
+that is not zero — as well as that the device response holds an `IonRatePPTAccel` with
+its knots on the GPU.
+
+### 9-10 (nits)
+
+`PLASMA_THREAD_MINLEN` has a docstring; `cumtrapz_scan!` checks `out !== y` rather than
+only documenting it.
+
+### 11 (nit) — the Ar PPT row did not reproduce
+
+It was measured with the shared FFTW wisdom file enabled, which changes the plans and so
+the rounding. With `set_fftw_wisdom(false)` — the gate's configuration — the row is
+**2.56e-15 global, 3.03e-15 per save**, which is the review's 2.6e-15 / 3.0e-15 exactly;
+the elliptical row is 2.81e-15 either way, which is why only one row disagreed. The table
+above is re-measured with wisdom disabled and says so. With wisdom enabled the same
+script reproduces the original 4.35e-15 bit for bit across runs, so neither number was
+noise in the measurement — they are two different sets of FFT plans.
+
+### Re-run after the changes
+
+| | |
+|---|---|
+| regression gate, `LUNA_REGRESSION_BASE=7d72431c` | **460 pass, 0 fail**, every case `0.000e+00` (1m36) |
+| `test_device.jl`, `-t 1` and `-t 4` | **471 pass, 0 fail** (25 testsets), up from 441 |
+| `test_metal.jl` (M1 Pro, hardware) | **261 pass, 0 fail** (13 testsets) |
+| `test_ionisation.jl` | **25 pass, 0 fail** |
+| `test_interface.jl` | **329 pass, 0 fail** (11 testsets) |

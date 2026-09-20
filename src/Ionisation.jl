@@ -95,8 +95,12 @@ function (ir::IonRateADK)(E)
     end
 end
 
+#= The historical array form: a broadcast of the scalar rate, which is the same kernel
+   body `ratekernel` wraps. It stays separate from `ionrate!` because `ionrate!`'s
+   fallback calls this form for a rate with no kernel, and a rate whose array form
+   delegated back to `ionrate!` would recurse. =#
 function (ir::IonRateADK)(out::AbstractArray, E::AbstractArray)
-    ionrate!(out, ir, E)
+    out .= ir.(E)
 end
 
 """
@@ -447,8 +451,9 @@ end
     exp(Maths.spline_eval(ir.spline, min(aE, ir.Emax)))
 end
 
+# See the note on `(::IonRateADK)(out, E)`.
 function (ir::IonRatePPTAccel)(out::AbstractArray, E::AbstractArray)
-    ionrate!(out, ir, E)
+    out .= ir.(E)
 end
 
 #=================================================#
@@ -481,38 +486,57 @@ end
 """
     ionrate!(out, ir, E, Eref=1)
 
-Ionisation rate of every element of the field array `E`, placed into `out`, as one
-broadcast of [`ratekernel`](@ref) — on the host, on a GPU, at any shape.
+Ionisation rate of every element of the field array `E`, placed into `out`.
 
 `E` holds `E_phys/Eref` (see [`Luna.UnitScaling`](@ref)); `Eref` defaults to `1`, i.e.
 physical units. `out` and `E` must have the same shape.
 
-A rate which is not an `AbstractIonRate` — a user-supplied `rate!(out, E)` — is
-called as it always was, which needs host arrays in physical units.
+**Which path it takes is decided by [`device_capable`](@ref), not by the type.** A rate
+with a kernel is one broadcast of [`ratekernel`](@ref), on the host, on a GPU, at any
+shape. Anything else — the direct [`IonRatePPT`](@ref), a cached rate on a non-uniform
+table, a rate somebody wrote — is called as `ir(out, E)`, which is what it always was and
+which needs host arrays in physical units; a device or a scaled run is refused with a
+message naming the alternatives.
+
+`check=false` skips the range check for a caller which has already made it on the whole
+block (see [`check_field_range`](@ref)). The check is what raises the error for a field
+above a cached rate's table, so skipping it without making it elsewhere would leave the
+rate saturating silently.
 """
-function ionrate!(out, ir::AbstractIonRate, E, Eref=1)
-    _check_field_range(ir, E, Eref)
-    f = ratekernel(ir, Luna.scalar(out, Eref))
-    out .= f.(E)
+function ionrate!(out, ir, E, Eref=1; check=true)
+    if device_capable(ir)
+        check && check_field_range(ir, E, Eref)
+        f = ratekernel(ir, Luna.scalar(out, Eref))
+        out .= f.(E)
+    else
+        (Eref == 1 && !Utils.isdevice(E)) || error(
+            "the ionisation rate $(nameof(typeof(ir))) has no device kernel, so it can "*
+            "only be evaluated on host arrays in physical units. Use "*
+            "`Ionisation.IonRateADK` or a cached PPT rate (`IonRatePPTCached`) on a "*
+            "device or in reduced precision, or run on the CPU with `device=:cpu`.")
+        ir(out, E)
+    end
     out
 end
 
-function ionrate!(out, ir, E, Eref=1)
-    (Eref == 1 && !Utils.isdevice(E)) || error(
-        "the ionisation rate $(typeof(ir)) is a plain callable, so it can only be "*
-        "evaluated on host arrays in physical units. Use `Ionisation.IonRateADK` or a "*
-        "cached PPT rate (`IonRatePPTCached`) on a device or in reduced precision.")
-    ir(out, E)
-    out
-end
+"""
+    check_field_range(ir, E, Eref)
 
-#= Only the cached PPT rate has an upper limit. The check is one reduction per call
-   instead of a branch per element, and it keeps today's error for the host path;
-   a device kernel cannot throw, so there the rate saturates at the table's last value
-   (`_pptaccel`). =#
-_check_field_range(ir::AbstractIonRate, E, Eref) = nothing
+Raise if any element of `Eref*E` is outside the range the rate `ir` can be evaluated
+over. Only a cached PPT rate has one: its spline is built on a table which stops at twice
+the barrier-suppression field.
 
-function _check_field_range(ir::IonRatePPTAccel, E, Eref)
+This is one reduction over the whole array rather than a branch per element, so a caller
+which splits an array into columns makes the check once, on the whole thing, and passes
+`check=false` to [`ionrate!`](@ref) — both so that the reduction happens once and so that
+the error is raised from the calling task rather than from inside a `@threads` loop.
+
+A no-op on a device array: a device kernel cannot raise, and there the rate saturates at
+the table's last value instead (see [`IonRatePPTAccel`](@ref)).
+"""
+check_field_range(ir, E, Eref) = nothing
+
+function check_field_range(ir::IonRatePPTAccel, E, Eref)
     Utils.isdevice(E) && return nothing
     m = maximum(abs, E)*Eref
     m > ir.Emax && error(
