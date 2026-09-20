@@ -16,6 +16,10 @@ makedocs(
         ],
         "The simple interface" => "interface.md",
         "Parameter scans" => "scans.md",
+        "Running on a GPU" => "gpu.md",
+        "Developer documentation" => [
+            "The device and precision model" => "developer/device_model.md"
+        ],
         "Modules" => [
             "$(split(fi, ".")[1]).jl" => "modules/$fi" for fi in readdir(modulesdir)
         ],

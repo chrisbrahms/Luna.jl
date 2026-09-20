@@ -22,3 +22,44 @@ Luna.set_fftw_mode
 Luna.set_fftw_threads
 Luna.set_fftw_wisdom
 ```
+
+## Devices and precision
+
+Where a propagation runs and in what units. See [Running on a GPU](../gpu.md) for the
+user-facing description and
+[The device and precision model](../developer/device_model.md) for the internals.
+
+```@docs
+Luna.DeviceSpec
+Luna.device
+Luna.set_device
+Luna.register_device!
+Luna.DeviceHooks
+Luna.device_functional
+Luna.device_synchronize
+Luna.device_reclaim
+Luna.device_memory_status
+Luna.alloc
+Luna.todevice
+Luna.tohost
+Luna.scalar
+Luna.upload_like
+Luna.mask_like
+Luna.assert_resident
+Luna.UnitScaling
+Luna.unitscaling
+Luna.GridVectors
+Luna.gridvectors
+Luna.HostMirror
+Luna.upload!
+Luna.log_device
+Luna.setup
+```
+
+```@docs
+Utils.Backend
+Utils.backend
+Utils.plan_ft
+Utils.plan_ift
+Utils.iplan
+```

@@ -113,6 +113,14 @@ _functional(h::DeviceHooks) = Base.invokelatest(h.functional)::Bool
 devicenames() = sort!(collect(keys(DEVICES)))
 
 """
+    device_functional(name) -> Bool
+
+Whether the GPU registered under `name` (see [`register_device!`](@ref)) is registered at
+all and usable in this process.
+"""
+device_functional(name::Symbol) = haskey(DEVICES, name) && _functional(DEVICES[name])
+
+"""
     Luna.device() -> DeviceSpec
 
 The [`DeviceSpec`](@ref) the next run will use, resolved from `Luna.settings["device"]`.
