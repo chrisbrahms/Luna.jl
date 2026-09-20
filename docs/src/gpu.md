@@ -4,18 +4,18 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! warning "Work in progress: mode-averaged propagation with Kerr and plasma"
-    This page describes what the device model does as of `gpu/13-plasma`.
+!!! warning "Work in progress: mode-averaged propagation"
+    This page describes what the device model does as of `gpu/14-raman`.
     `prop_capillary` and `prop_gnlse` take `device` and `precision` keywords (below), and
-    for mode-averaged propagation (`modes` a single mode) with the Kerr and plasma
-    responses -- which is what `prop_capillary` builds by default for a field-resolved
-    run in a non-Raman gas -- it runs end to end on a device, including the absorbing
-    boundaries (`boundary=:rate`, the default) and the default per-step statistics.
-    Anything else -- multimode and radial propagation, `prop_gnlse`, and the Raman and
-    χ⁽²⁾ responses -- is still host code; `Luna.setup`/`Luna.run` refuse a device or a
+    for mode-averaged propagation (`modes` a single mode) with the Kerr, plasma and
+    Raman responses -- which is everything `prop_capillary` builds by default, in any gas
+    -- it runs end to end on a device, including the absorbing boundaries
+    (`boundary=:rate`, the default) and the default per-step statistics.
+    Anything else -- multimode and radial propagation, `prop_gnlse`, and the χ⁽²⁾
+    responses -- is still host code; `Luna.setup`/`Luna.run` refuse a device or a
     reduced precision for a *transform* rather than running it wrongly, and fall back to
     the host for a *response* (or, for the simple interface, error with a message naming
-    the actual limitation). Free space and multimode propagation, and the other
+    the actual limitation). Free space and multimode propagation, and the remaining
     nonlinear responses, follow in later branches; the page is completed in
     `gpu/32-docs`.
 
@@ -133,7 +133,7 @@ round 1".)
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-the Raman and χ⁽²⁾ responses, and the radial, free-space and multimode transforms.
+the χ⁽²⁾ responses, and the radial, free-space and multimode transforms.
 `Luna.setup` refuses a device or a reduced precision for the *transforms*, through the
 residency checks each of them makes, rather than running them wrongly. A *response* is
 not refused: it falls back to the host copy described under "An ad hoc response on a
@@ -173,7 +173,8 @@ quickly.
 
 Because of that, the *simple* interface refuses instead of falling back: an explicit
 `device` or `precision` request to `prop_capillary` with a response that has no device
-kernel of its own (Raman and χ⁽²⁾ at the moment) is an error naming `device=:cpu`. A
+kernel of its own (the χ⁽²⁾ responses, and anything you wrote yourself) is an error
+naming `device=:cpu`. A
 call which does not mention `device` or `precision` is never affected — it stays on the
 CPU as it always did. Use the low-level interface (`Luna.setup`/`Luna.run`) if you really
 want the host fallback.
@@ -207,6 +208,23 @@ Kerr term itself — and `precision=Float32` or a Metal run drops it entirely. U
 small matters. At intensities where plasma actually shapes the pulse it is many orders
 above the subnormal range and this does not arise. The developer guide has the full
 dynamic-range audit.
+
+### Raman on a device
+
+A molecular gas runs on a device with no keywords of its own: the Raman polarisation
+(`raman=true`, which `prop_capillary` sets by default for a gas that has one) is a
+device-capable response like the Kerr and plasma ones. So is the no-THG Kerr response
+`thg=false` selects for a field-resolved run.
+
+Both do their work with FFTs along the time axis, batched over the transverse grid, so
+the cost per step is a pair of transforms whatever the geometry rather than a pair per
+column. The Raman response function itself is host scalar code and is evaluated only
+when the density changes -- once, for a run at constant pressure.
+
+In single precision the Raman coefficients need care: the response function is around
+1e-45 in SI units, far below what `Float32` can represent, and Luna splits the
+coefficient so that no factor a kernel sees is subnormal. The developer guide has the
+audit; there is nothing to set.
 
 ### `stats_period`
 

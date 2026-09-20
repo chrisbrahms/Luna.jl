@@ -549,6 +549,26 @@ end
     @test maximum(abs, oplasma32["Eω"][:, end] .- oplasma["Eω"][:, end])/
           maximum(abs, oplasma["Eω"][:, end]) < 1e-4
 
+    #= Raman is device-capable since gpu/14-raman, so the other response
+       `prop_capillary` builds by default -- a molecular gas -- follows an explicit
+       request too, and so does the no-THG Kerr response `thg=false` selects. =#
+    ramankw = (λ0=800e-9, energy=100e-9, τfwhm=10e-15, trange=400e-15,
+               λlims=(300e-9, 2000e-9), shotnoise=false, plasma=false, raman=true,
+               saveN=3)
+    oraman = prop_capillary(125e-6, 1e-2, :N2, 1.0; ramankw...)
+    @test eltype(oraman["Eω"]) === ComplexF64
+    oraman32 = prop_capillary(125e-6, 1e-2, :N2, 1.0; ramankw..., precision=Float32)
+    @test eltype(oraman32["Eω"]) === ComplexF32
+    @test maximum(abs, oraman32["Eω"][:, end] .- oraman["Eω"][:, end])/
+          maximum(abs, oraman["Eω"][:, end]) < 1e-4
+
+    nothgkw = (ramankw..., raman=false, thg=false)
+    onothg = prop_capillary(125e-6, 1e-2, :He, 1.0; nothgkw...)
+    onothg32 = prop_capillary(125e-6, 1e-2, :He, 1.0; nothgkw..., precision=Float32)
+    @test eltype(onothg32["Eω"]) === ComplexF32
+    @test maximum(abs, onothg32["Eω"][:, end] .- onothg["Eω"][:, end])/
+          maximum(abs, onothg["Eω"][:, end]) < 1e-4
+
     # multimode/radial propagation is not device-capable: refused, not silently ignored
     @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
                                                device=DeviceSpec(Array, Float32))

@@ -133,7 +133,7 @@ the columnwise loop's range.
 | --- | --- | --- | --- |
 | [`Nonlinear.Pointwise`](@ref) | fuses it into one broadcast over the whole block with the other pointwise responses, no buffer | [`pointwise_kernel`](@ref Luna.Nonlinear.pointwise_kernel) (a `T -> T`), or [`pointwise_expr`](@ref Luna.Nonlinear.pointwise_expr) if it carries per-sample arrays | `KerrField`, `KerrEnv` (scalar field), `KerrEnvTHG` |
 | [`Nonlinear.VectorPointwise`](@ref) | two broadcasts, one per polarisation component, each fused across the group | [`vector_kernel`](@ref Luna.Nonlinear.vector_kernel) (an `(ex, ey) -> SVector{2}`), or [`vector_expr`](@ref Luna.Nonlinear.vector_expr) | `KerrField`, `KerrEnv` (two-component field) |
-| [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block, through [`batched!`](@ref Luna.Nonlinear.batched!), which also hands it the unit scaling | [`batched!`](@ref Luna.Nonlinear.batched!) (or just the call operator, if its coefficients already carry the scaling), plus its own full-size buffers in the run's array type | `HostResponse`, `PlasmaCumtrapz`; `RamanPolar*` after `gpu/14` |
+| [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block, through [`batched!`](@ref Luna.Nonlinear.batched!), which also hands it the unit scaling | [`batched!`](@ref Luna.Nonlinear.batched!) (or just the call operator, if its coefficients already carry the scaling), plus its own full-size buffers in the run's array type | `HostResponse`, `PlasmaCumtrapz`, `RamanPolarField`/`RamanPolarEnv`, `KerrFieldNoTHG` |
 | [`Nonlinear.Columnwise`](@ref) | calls it once per column, on the host; refused on a device array | nothing — the default, so any callable works | anything user-written |
 
 Three functions carry the units and the precision:
@@ -464,6 +464,118 @@ A rate with no kernel — the direct [`Ionisation.IonRatePPT`](@ref), whose seri
 summation and `BigFloat` fallback are host code, a table which ended up on a
 `Maths.FastFinder`, or a user's callable — is refused by
 `device_rate` with a message naming the alternatives and `device=:cpu`.
+
+## The Raman polarisation
+
+[`Nonlinear.RamanPolarField`](@ref) and [`Nonlinear.RamanPolarEnv`](@ref) are
+[`Batched`](@ref Luna.Nonlinear.Batched) for the same reason the plasma response is: the
+convolution of the driving term with the Raman response function is a transform of the
+whole column, not an operation on one sample. Per right-hand side each is
+
+1. one broadcast for the driving term (`E²`, or `½|A|²` for an envelope and for
+   `thg=false`, where `A` is the analytic signal);
+2. one forward FFT along the time axis, over a **doubled** time grid — the driving term
+   occupies the first half and the second is zero padding, which makes the
+   multiplication in the frequency domain the full linear convolution rather than a
+   circular one;
+3. one broadcast for the product with the frequency-domain response function;
+4. one inverse FFT;
+5. one broadcast to multiply by the density and the field and accumulate into the output.
+
+Both transforms are **batched over the block's columns**: one pair of FFTs per
+right-hand side whatever the geometry, rather than the three per column the response used
+to do. The plans are made by [`Utils.plan_ft`](@ref Luna.Utils.plan_ft) on the buffer
+itself, so they are FFTW plans on the host and the backend's own on a device, and the
+inverse plan is held unnormalised with its `1/N` folded into a scalar (below).
+
+**The response function is host scalar code.** `r(h, ρ)` sums a few dozen damped
+oscillators into a `Float64` host vector; that is not a kernel and does not need to be.
+What changed is how often it runs: it used to be evaluated, and transformed, at *every*
+right-hand side, and it is now keyed on the density, so a run at constant pressure
+evaluates it once and a pressure gradient pays what it always did. Only the transformed
+result crosses to the device, through a host staging buffer in the run's precision
+(`copyto!` between a host and a device array does not convert).
+
+### Splitting the coefficient (`_splitscale`)
+
+The Raman constants are the smallest numbers in Luna. `K` in
+[`Raman.RamanRespVibrational`](@ref Luna.Raman.RamanRespVibrational) is
+`(4πε₀)²(dα/dQ)²/(4μΩ)`, around 1e-48 in SI units, and the frequency-domain response
+function is around 1e-45. The scalar it is multiplied by — the time step, the unit
+scaling and the power of two below — is around 1e-15. Their product is a perfectly
+ordinary number, but **in `Float32` neither factor exists on its own**: 1e-45 is below
+the smallest subnormal and a device flushes it to zero.
+
+`_splitscale` divides the frequency-domain response function by a power of two chosen so
+that the two factors land on either side of the square root of their product, i.e. it
+splits the smallness evenly between them and gives each the widest margin against
+underflow it can have. For the gases in the table below the exponent is between −54 and
+−103.
+
+Dividing by a power of two and multiplying by it again is exact, and an FFT of a
+power-of-two-scaled input is the scaled FFT of that input, so **this changes no `Float64`
+value**: the default CPU path is bit-for-bit what it was.
+
+The `1/N` of the inverse transform goes on the *density*, at the end, rather than into
+the frequency-domain scalar. Both are exact, but `N` is 2^18 or so for a typical grid and
+applying it before the transform would cost the frequency-domain buffer five orders of
+`Float32` headroom for nothing.
+
+### Dynamic range in `Float32`
+
+Every gas whose Raman response Luna can build, at 0.1, 1 and 10 bar, with a 20 fs pulse
+at 800 nm of peak field 1e10 V/m (a few tens of µJ in a 75 µm capillary), `E_ref = 2^33`
+and `P_ref = ε₀`. `UF` marks a quantity below the smallest normal `Float32` (1.2e-38).
+
+| gas | kind | max \|h(t)\| | max \|h(ω)\| | split 2^m | max \|h(ω)\|/2^m | scalar | max \|product\| |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| H₂ | field | 1.3e-48 | 1.4e-45 `UF` | 2^-100 | 1.7e-15 | 1.1e-15 | 4.7e-29 |
+| H₂ | envelope | 1.3e-48 | 3.5e-46 `UF` | 2^-102 | 1.8e-15 | 1.1e-15 | 1.1e-29 |
+| N₂ | field | 6.9e-49 | 3.5e-46 `UF` | 2^-101 | 9.0e-16 | 5.5e-16 | 4.3e-29 |
+| N₂ | envelope | 6.9e-49 | 8.5e-47 `UF` | 2^-103 | 8.7e-16 | 5.7e-16 | 1.0e-29 |
+| D₂ | field | 1.0e-48 | 1.1e-45 `UF` | 2^-100 | 1.4e-15 | 1.1e-15 | 2.5e-29 |
+| CH₄ | field | 1.5e-48 | 2.4e-45 `UF` | 2^-99 | 1.5e-15 | 2.2e-15 | 1.9e-30 |
+| CH₄ | envelope | 1.5e-48 | 5.9e-46 `UF` | 2^-101 | 1.5e-15 | 2.3e-15 | 4.6e-31 |
+| SiO₂ | field | 1.4e-20 | 2.7e-18 | 2^-54 | 4.8e-02 | 7.7e-02 | 2.4e-01 |
+
+The pressure changes the response function only through the dephasing time, so the rows
+at 0.1 and 10 bar are within a few per cent of the ones shown and are left out; the
+density enters at the end, on the output scalar. The transformed driving term is 87 (a
+field) or 21 (an envelope) in these units, and the largest output is 9e-6.
+
+Two things to read off. The unsplit response function is `UF` for **every** gas — without
+the split a `Float32` Raman run gives exactly zero. And the worst case after the split,
+CH₄ as an envelope, still has seven orders of headroom.
+
+The last column scales as `E_ref²`, because the response is cubic in the field and the
+driving term is `O(1)` by construction. At peak fields below about 1e8 V/m it approaches
+the subnormal threshold — at which point the Raman polarisation, and every other
+nonlinearity, is negligible anyway. `Luna.unitscaling` takes `E_ref` from the peak of the
+input field, so the ratio in the table is what a run actually sees.
+
+O₂ is missing because its Raman parameters are incomplete in
+`PhysData.raman_parameters`: both the rotational and the vibrational linewidth are
+`TODO`, so `Raman.raman_response(t, :O2)` raises a `FieldError` on any branch.
+
+## The no-THG Kerr response
+
+`Kerr_field_nothg(γ3, n)` builds a
+[`Nonlinear.KerrFieldNoTHG`](@ref) rather than the closure it used to. Removing the
+third-harmonic term means replacing `E³` with `|A|²E`, where `A` is the analytic signal
+of the whole column, so this too is [`Batched`](@ref Luna.Nonlinear.Batched) rather than
+pointwise. Its coefficient is the ordinary cubic one.
+
+[`Nonlinear.AnalyticSignal`](@ref) is the whole-block form of `Maths.plan_hilbert`: one
+complex FFT along the time axis, one broadcast against a filter vector, one inverse FFT.
+The host version keeps the mean, doubles the positive frequencies and zeroes the negative
+ones with three slice assignments; the filter vector is the same three factors, which is
+what makes it a kernel. The `1/N` of the inverse transform is folded into that vector, so
+there is no separate normalisation pass. Folding is exact — Luna's time grids are powers
+of two — and multiplying by an exact zero instead of assigning one differs only in the
+sign of a zero, so the analytic signal is **bit-identical** to `Maths.plan_hilbert`'s and
+so is the `Float64` propagation.
+
+`RamanPolarField(t, r; thg=false)` uses the same transform for its driving term.
 
 ## The output and statistics boundary
 

@@ -959,6 +959,15 @@ end
         @test maximum(abs, P3[:, 1, i] .- Pc)/maximum(abs, Pc) < 1e-12
     end
 
+    #= `(nt, 1)`, the block a modal transform passes: the same answer as the
+       one-dimensional block, not a reshape away from it. =#
+    R2 = Nonlinear.rescale(Nonlinear.RamanPolarField(RAMAN_T, ramanresp()),
+                           HostSpec(), UNIT_SCALING, reshape(E, :, 1))
+    P2 = zeros(RAMAN_NT, 1); R2(P2, reshape(E, :, 1), RAMAN_ρ)
+    R1 = Nonlinear.RamanPolarField(RAMAN_T, ramanresp())
+    P1 = zeros(RAMAN_NT); R1(P1, E, RAMAN_ρ)
+    @test vec(P2) == P1
+
     # A time grid other than the one the response function is tabulated on
     err = try
         Nonlinear.rescale(R, HostSpec(), UNIT_SCALING, zeros(RAMAN_NT÷2))
@@ -1434,7 +1443,13 @@ end
               () -> Nonlinear.RamanPolarField(RAMAN_T, ramanresp(); thg=false), E),
              ("envelope", () -> Nonlinear.RamanPolarEnv(RAMAN_T, ramanresp()), Ee),
              ("several columns",
-              () -> Nonlinear.RamanPolarField(RAMAN_T, ramanresp()), E3))
+              () -> Nonlinear.RamanPolarField(RAMAN_T, ramanresp()), E3),
+             #= `(nt, 1)`: the block a modal transform passes, one spatial point at a
+                time. The response used to reshape it away; now its buffers are that
+                shape. =#
+             ("one column, two-dimensional",
+              () -> Nonlinear.RamanPolarField(RAMAN_T, ramanresp()),
+              reshape(ramanfield(), :, 1)))
     for (nm, make, Eh) in cases
         Rh = Nonlinear.rescale(make(), HostSpec(), UNIT_SCALING, Eh)
         Ph = zeros(eltype(Eh), size(Eh)); Rh(Ph, Eh, RAMAN_ρ)

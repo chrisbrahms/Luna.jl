@@ -23,7 +23,7 @@
 =#
 using Luna
 import Luna: RK45, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear, Output,
-             PhysData, Utils, DeviceSpec, HostSpec, Ionisation
+             PhysData, Utils, DeviceSpec, HostSpec, Ionisation, Raman
 import LinearAlgebra
 import BenchmarkTools: @benchmarkable, run as brun, minimum as bminimum
 import Printf: @printf, @sprintf
@@ -44,6 +44,9 @@ const NSTEPS = 20
 const TRANGES = (400e-15, 1600e-15, 6400e-15)
 
 const GAS = :He
+
+"The gas the Raman rows use; `GAS` has no Raman response."
+const RAMANGAS = :N2
 const PRES = 1.0
 const λ0 = 800e-9
 const FLENGTH = 1e-2
@@ -61,29 +64,34 @@ function tablerate(gas)
 end
 
 """
-    prepare(spec, trange; plasma=false)
+    prepare(spec, trange; plasma=false, raman=false, gas=GAS)
 
 Set up the mode-averaged propagation on `spec` and return everything the timings need.
 `boundary=:none`. With `plasma=true` the response set is Kerr *and*
 `Nonlinear.PlasmaCumtrapz` on a tabulated rate, which is what `prop_capillary` builds by
-default for a field-resolved run in a non-Raman gas.
+default for a field-resolved run in a non-Raman gas; with `raman=true` it is Kerr and
+`Nonlinear.RamanPolarField`, which is what it builds for a molecular one.
 """
-function prepare(spec, trange; plasma=false)
+function prepare(spec, trange; plasma=false, raman=false, gas=GAS)
     quiet() do
         grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), trange)
-        m = Capillary.MarcatiliMode(75e-6, GAS, PRES, loss=false)
+        m = Capillary.MarcatiliMode(75e-6, gas, PRES, loss=false)
         aeff(z) = Modes.Aeff(m, z=z)
         #= The density is constant here, and `PhysData.density` goes through CoolProp,
            which costs ~85 us a call -- more than the whole right-hand side. The simple
            interface precomputes it the same way. =#
-        ρ = PhysData.density(GAS, PRES)
+        ρ = PhysData.density(gas, PRES)
         dens = z -> ρ
-        resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(GAS)),)
+        resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
         if plasma
             resp = (resp...,
                     Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)),
-                                             tablerate(GAS),
-                                             PhysData.ionisation_potential(GAS)))
+                                             tablerate(gas),
+                                             PhysData.ionisation_potential(gas)))
+        end
+        if raman
+            resp = (resp..., Nonlinear.RamanPolarField(grid.to,
+                                                       Raman.raman_response(grid.to, gas)))
         end
         linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
         inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
@@ -104,15 +112,15 @@ end
    the launch, not the kernel. `device_synchronize` is a no-op on the CPU. =#
 sync(spec) = Luna.device_synchronize(spec)
 
-function rhstime(spec, trange; plasma=false)
-    Eω, _, transform, _, _ = prepare(spec, trange; plasma)
+function rhstime(spec, trange; kwargs...)
+    Eω, _, transform, _, _ = prepare(spec, trange; kwargs...)
     nl = similar(Eω)
     b = @benchmarkable (($transform)($nl, $Eω, 0.0); sync($spec)) seconds=BUDGET
     (length(Eω), bminimum(brun(b)).time/1e9)
 end
 
-function steptime(spec, trange; plasma=false)
-    Eω, linop, transform, _, _ = prepare(spec, trange; plasma)
+function steptime(spec, trange; kwargs...)
+    Eω, linop, transform, _, _ = prepare(spec, trange; kwargs...)
     dz = FLENGTH/NSTEPS
     b = @benchmarkable (RK45.step!(s); sync($spec)) setup=(
             s = RK45.PreconStepper($transform, $linop, $Eω, 0.0, $dz;
@@ -121,9 +129,9 @@ function steptime(spec, trange; plasma=false)
     bminimum(brun(b)).time/1e9
 end
 
-function proptime(spec, trange; samples=3, plasma=false)
+function proptime(spec, trange; samples=3, kwargs...)
     minimum(1:samples) do _
-        Eω, linop, transform, grid, FT = prepare(spec, trange; plasma)
+        Eω, linop, transform, grid, FT = prepare(spec, trange; kwargs...)
         out = Output.MemoryOutput(0, FLENGTH, 3, Output.nostats)
         output = Utils.isdevice(Eω) ? ToHost(out) : out
         dz = FLENGTH/NSTEPS
@@ -152,15 +160,17 @@ end
         GAS, PRES, FLENGTH, NSTEPS)
 @printf("%d Julia threads, 1 FFTW thread, 1 BLAS thread, :estimate, no wisdom\n",
         Threads.nthreads())
-for plasma in (false, true)
-    @printf("\nresponses: %s\n\n", plasma ? "Kerr + plasma (tabulated rate)" : "Kerr")
+for (label, rkw) in (("Kerr", (;)),
+                     ("Kerr + plasma (tabulated rate)", (; plasma=true)),
+                     ("Kerr + Raman ($RAMANGAS)", (; raman=true, gas=RAMANGAS)))
+    @printf("\nresponses: %s\n\n", label)
     @printf("%-14s %8s %10s %12s %12s %12s\n",
             "device", "trange", "state", "rhs", "step", "prop")
     @printf("%s\n", "-"^72)
     for trange in TRANGES, (name, spec) in specs
-        n, tr = rhstime(spec, trange; plasma)
-        ts = steptime(spec, trange; plasma)
-        tp = proptime(spec, trange; plasma)
+        n, tr = rhstime(spec, trange; rkw...)
+        ts = steptime(spec, trange; rkw...)
+        tp = proptime(spec, trange; rkw...)
         @printf("%-14s %6.0f fs %10d %12s %12s %12s\n",
                 name, trange*1e15, n, fmttime(tr), fmttime(ts), fmttime(tp))
         flush(stdout)
@@ -188,6 +198,35 @@ let nt = 1<<11, ionpot = PhysData.ionisation_potential(GAS), ir = tablerate(GAS)
         p = Nonlinear.rescale(p0, spec, sc, Ed)
         out = Luna.alloc(spec, Luna.realtype(spec), size(Ed))
         b = @benchmarkable (Nonlinear.batched!($p, $out, $Ed, $ρ, $sc); sync($spec)
+                            ) seconds=BUDGET
+        @printf("%-14s %10d %12s\n", name, ncols, fmttime(bminimum(brun(b)).time/1e9))
+        flush(stdout)
+    end
+end
+
+#= The Raman response on its own, over a block of transverse columns: what the batched
+   FFT plans buy over the per-column ones this response used to make. The response
+   function is evaluated once here, at the first call, and cached on the density, which
+   is what a constant-pressure propagation sees too. =#
+@printf("\nRaman response alone (%s), %d-sample block of columns\n\n",
+        RAMANGAS, 1<<11)
+@printf("%-14s %10s %12s\n", "device", "columns", "batched!")
+@printf("%s\n", "-"^40)
+let nt = 1<<11, ρ = PhysData.density(RAMANGAS, PRES)
+    t = collect(range(-60e-15, 60e-15, length=nt))
+    E = @. 1e10*exp(-t^2/(2*(10e-15/1.66)^2))*cos(2π*PhysData.c/800e-9*t)
+    for (name, spec) in specs, ncols in (1, 16, 128)
+        Eh = repeat(reshape(E, nt, 1, 1), 1, 1, ncols)
+        sc = Luna.realtype(spec) === Float64 ? Luna.UNIT_SCALING :
+             Luna.unitscaling(Luna.realtype(spec), Eh, PhysData.ε_0)
+        Ed = Luna.todevice(spec, Eh ./ sc.Eref)
+        R = quiet() do
+            Nonlinear.rescale(
+                Nonlinear.RamanPolarField(t, Raman.raman_response(t, RAMANGAS)),
+                spec, sc, Ed)
+        end
+        out = Luna.alloc(spec, Luna.realtype(spec), size(Ed))
+        b = @benchmarkable (Nonlinear.batched!($R, $out, $Ed, $ρ, $sc); sync($spec)
                             ) seconds=BUDGET
         @printf("%-14s %10d %12s\n", name, ncols, fmttime(bminimum(brun(b)).time/1e9))
         flush(stdout)
