@@ -39,9 +39,17 @@ function MemoryOutput(save_cond, yname, tname, statsfun=nostats, script=nothing)
     MemoryOutput(save_cond, yname, tname, 0, data, statsfun)
 end
 
+"""
+    initialise(o::MemoryOutput, y)
+
+Allocate the storage for the solution array, with element type `eltype(y)`. A `Float32`
+propagation (reduced precision, on the CPU or on a device) is therefore saved as
+`Float32`/`ComplexF32`; `y` is always a host array by the time it reaches here (see
+[`Luna.ScaledOutput`](@ref)), so `Output` itself needs no notion of a device.
+"""
 function initialise(o::MemoryOutput, y)
     dims = init_dims(size(y), o.save_cond)
-    o.data[o.yname] = Array{ComplexF64}(undef, dims)
+    o.data[o.yname] = Array{eltype(y)}(undef, dims)
     o.data[o.tname] = Array{Float64}(undef, (dims[end],))
 end
 
@@ -64,7 +72,8 @@ haskey(o::MemoryOutput, key) = haskey(o.data, key)
 """
 function (o::MemoryOutput)(y, t, dt, yfun)
     save, ts = o.save_cond(y, t, dt, o.saved)
-    append_stats!(o, o.statsfun(y, t, dt))
+    st = o.statsfun(y, t, dt)
+    isnothing(st) || append_stats!(o, st) # `nothing`: no statistics this step (PeriodicStats)
     !haskey(o.data, o.yname) && initialise(o, y)
     while save
         s = size(o.data[o.yname])
@@ -188,7 +197,8 @@ function HDF5Output(fpath, save_cond, yname, tname, statsfun, compression,
         HDF5.h5open(fpath, "cw") do file
             if HDF5.haskey(file["meta"], "cache")
                 saved = read(file["meta"]["cache"]["saved"])
-                chash = hash((sort(keys(file["stats"])), size(file[yname])[1:end-1]))
+                chash = hash((sort(keys(file["stats"])), size(file[yname])[1:end-1],
+                              eltype(file[yname])))
             else
                 error("cached HDF5Output created, file exists, but has no cache")
             end
@@ -228,6 +238,12 @@ function HDF5Output(fpath::AbstractString)
     HDF5Output(fpath, 0, 0, 1; readonly=true)
 end
 
+"""
+    initialise(o::HDF5Output, y)
+
+Create the solution dataset, with element type `eltype(y)` (see the `MemoryOutput` method
+of the same name). `y` is always a host array here.
+"""
 function initialise(o::HDF5Output, y)
     ydims = size(y)
     idims = init_dims(ydims, o.save_cond)
@@ -239,16 +255,19 @@ function initialise(o::HDF5Output, y)
     maxdims = Tuple(mdims)
     HDF5.h5open(o.fpath, "r+") do file
         if o.compression
-            HDF5.create_dataset(file, o.yname, HDF5.datatype(ComplexF64), (dims, maxdims),
+            HDF5.create_dataset(file, o.yname, HDF5.datatype(eltype(y)), (dims, maxdims),
                           chunk=chdims, blosc=3)
         else
-            HDF5.create_dataset(file, o.yname, HDF5.datatype(ComplexF64), (dims, maxdims),
+            HDF5.create_dataset(file, o.yname, HDF5.datatype(eltype(y)), (dims, maxdims),
                           chunk=chdims)
         end
         HDF5.create_dataset(file, o.tname, HDF5.datatype(Float64), ((dims[end],), (-1,)),
                       chunk=(1,))
         statsnames = sort(collect(keys(o.stats_tmp[end])))
-        o.cachehash = hash((statsnames, size(y)))
+        #= eltype(y) is part of the hash: resuming a Float32 propagation against a
+           Float64 cache (or vice versa) is a different run, not a continuation, even if
+           the statistics and the shape happen to agree. =#
+        o.cachehash = hash((statsnames, size(y), eltype(y)))
         file["meta"]["cachehash"] = o.cachehash
         if o.cache
             file["meta"]["cache"]["t"] = typemin(0.0)
@@ -337,14 +356,20 @@ end
 function (o::HDF5Output)(y, t, dt, yfun)
     o.readonly && error("Cannot add data to read-only output!")
     save, ts = o.save_cond(y, t, dt, o.saved)
-    push!(o.stats_tmp, o.statsfun(y, t, dt))
+    st = o.statsfun(y, t, dt)
+    isnothing(st) || push!(o.stats_tmp, st) # `nothing`: no statistics this step (PeriodicStats)
     if save
         HDF5.h5open(o.fpath, "r+") do file
             !HDF5.haskey(file, o.yname) && initialise(o, y)
-            statsnames = sort(collect(keys(o.stats_tmp[end])))
-            cachehash = hash((statsnames, size(y)))
-            cachehash == o.cachehash || error(
-                "the hash for this propagation does not agree with cache in file")
+            #= `stats_tmp` can be empty here if `stats_period` is coarser than the save
+               interval: the cachehash check then has nothing to compare and is skipped,
+               since the field it would check (which statistics exist) has not changed. =#
+            if !isempty(o.stats_tmp)
+                statsnames = sort(collect(keys(o.stats_tmp[end])))
+                cachehash = hash((statsnames, size(y), eltype(y)))
+                cachehash == o.cachehash || error(
+                    "the hash for this propagation does not agree with cache in file")
+            end
             while save
                 s = collect(size(file[o.yname]))
                 idcs = fill(:, length(s)-1)
@@ -375,6 +400,7 @@ function (o::HDF5Output)(y, t, dt, yfun)
 end
 
 function append_stats!(parent, a::Array{Dict{String,Any},1})
+    isempty(a) && return nothing # PeriodicStats can leave nothing collected since the last save
     N = length(a)
     names = HDF5.keys(parent)
     for (k, v) in pairs(a[1])
@@ -549,6 +575,58 @@ end
 
 function nostats(args...)
     return Dict{String, Any}()
+end
+
+"""
+    willsave(o, y, t, dt) -> Bool
+
+Whether calling `o(y, t, dt, yfun)` right now would save at least one data point,
+without actually saving anything. `y` is accepted for symmetry with the call operator but
+unused by every built-in save condition: a [`GridCondition`](@ref) decides purely from
+`t` and the number of points already saved.
+
+Falls back to the conservative `true` for an output whose save condition cannot be
+inspected this way (a bare function, or a `save_cond` other than `GridCondition`, which
+may be stateful and must not be evaluated speculatively -- see [`every_nth`](@ref)).
+
+Used by `Luna.ScaledOutput` to decide, once per accepted step and before any
+device-to-host copy, whether an `HDF5Output`'s cache write needs the unscaled host `y`
+this step. Per-step statistics need that copy regardless of whether this step saves, so
+`willsave` only changes the cost of the cache write, never of the statistics.
+"""
+willsave(o, y, t, dt) = true
+willsave(o::MemoryOutput{<:GridCondition}, y, t, dt) = first(o.save_cond(y, t, dt, o.saved))
+willsave(o::HDF5Output{<:GridCondition}, y, t, dt) = first(o.save_cond(y, t, dt, o.saved))
+
+"""
+    PeriodicStats(statsfun, period)
+
+Wrap a statistics function so that it is evaluated only on the first call and then every
+`period`-th call thereafter (i.e. every `period`-th accepted step of the propagation),
+returning `nothing` on the calls in between. `nothing` means "no statistics this step",
+which [`MemoryOutput`](@ref) and [`HDF5Output`](@ref) both already treat as such, so the
+recorded arrays are simply shorter than the number of accepted steps.
+
+Use this when the per-step statistics are a noticeable fraction of the cost of a step --
+in particular on a device, where the whole state has to be copied to the host for them
+(see `Luna.ScaledOutput`) -- or with an expensive user-defined statistic. `prop_capillary`
+and `prop_gnlse` expose it as the `stats_period` keyword.
+"""
+mutable struct PeriodicStats{S}
+    f::S
+    period::Int
+    n::Int
+end
+
+function PeriodicStats(f, period::Integer)
+    period >= 1 || throw(ArgumentError("stats_period must be >= 1, got $period"))
+    PeriodicStats(f, Int(period), 0)
+end
+
+function (p::PeriodicStats)(y, t, dt)
+    p.n += 1
+    (p.n - 1) % p.period == 0 || return nothing
+    p.f(y, t, dt)
 end
 
 """
