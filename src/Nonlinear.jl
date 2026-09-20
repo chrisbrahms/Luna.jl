@@ -67,7 +67,7 @@ struct VectorPointwise <: ResponseKind end
 
 The response is called once per right-hand side with the whole `(nt, npol, ncols)` block
 as `resp!(out, E, ρ)`, accumulating into `out`. It owns whatever full-size buffers it
-needs, in the array type and precision of the run.
+needs, in the array type and precision of the run. [`HostResponse`](@ref) is one.
 """
 struct Batched <: ResponseKind end
 
@@ -79,7 +79,9 @@ once per column of the block, accumulating into `out`, with host arrays in physi
 units and `Float64`. Any callable `(out, E, ρ)` works, which is what makes an ad hoc
 response possible.
 
-A columnwise response cannot run on a device or in reduced precision as it stands.
+A columnwise response cannot run on a device or in reduced precision as it stands; on
+such a run [`rescale`](@ref) wraps it in a [`HostResponse`](@ref), which copies the block
+to the host and back at every right-hand side.
 """
 struct Columnwise <: ResponseKind end
 
@@ -198,8 +200,9 @@ and the arrays this function converted.
 
 The fallback passes the response through unchanged for an unscaled `Float64` run on host
 arrays — which is every run on the default CPU path, so an ad hoc response written as a
-closure keeps working — and otherwise errors for a [`Columnwise`](@ref)
-response, which cannot run in those units as it stands. A response which declares a device kind
+closure keeps working — and otherwise wraps a [`Columnwise`](@ref) response in a
+[`HostResponse`](@ref),
+which runs it on the host. A response which declares a device kind
 ([`Pointwise`](@ref), [`VectorPointwise`](@ref), [`Batched`](@ref)) is passed through
 unchanged if it carries no arrays ([`resident_arrays`](@ref) is empty), which is every
 response whose coefficients are scalars; one which does carry an array and has no
@@ -213,10 +216,7 @@ function rescale(r, spec, scaling)
     _rescale_fallback(kind(r), r, spec, scaling)
 end
 
-_rescale_fallback(::Columnwise, r, spec, scaling) = error(
-    "the nonlinear response $(typeof(r)) is evaluated column by column on the host, so "*
-    "it cannot be used in a reduced-precision or device run. On the default CPU path "*
-    "(Float64, unscaled) any callable `resp!(out, E, ρ)` works.")
+_rescale_fallback(::Columnwise, r, spec, scaling) = HostResponse(r, spec, scaling)
 
 #= A response with a device kernel and no arrays of its own -- which is every response
    whose coefficients are scalars -- needs no conversion: `coefficients` combines them in
@@ -250,7 +250,9 @@ resident_arrays(r) = ()
 Whether `response` has a kernel of its own which runs in the array type and precision of
 the run, i.e. whether its [`kind`](@ref) is anything but [`Columnwise`](@ref).
 
-A columnwise response cannot run on a device as it stands.
+A columnwise response still *works* on a device, through the [`HostResponse`](@ref)
+fallback, but at the cost of a device-to-host copy of the whole block at every right-hand
+side. `device_capable` is therefore about performance, not possibility.
 
 `Interface.jl` uses it to decide, for an *unspecified* `device` request, whether a
 mode-averaged `prop_capillary` call can follow `Luna.settings["device"]` (every response
@@ -260,6 +262,105 @@ default, field-resolved `prop_capillary` call into a slow one.
 """
 device_capable(r) = !(kind(r) isa Columnwise)
 
+#=================================================#
+#=============  THE HOST FALLBACK  ===============#
+#=================================================#
+
+"""
+    HostResponse(response, spec, scaling)
+
+A [`Columnwise`](@ref) response made to work in a run whose state is not host `Float64`:
+a [`Batched`](@ref) wrapper which, at every right-hand side, copies the whole field block
+to a host `Float64`/`ComplexF64` buffer in physical SI units, calls `response` on it
+column by column exactly as the host path does, converts the result back into the units
+and precision of the run, and adds it to the output.
+
+This is the fallback which keeps Luna hackable (GPU_PLAN.md §3): a user-written
+`resp!(out, E, ρ)` closure, and every response which has not yet been given a device
+kernel, works on a GPU or in `Float32` without being rewritten. It is correct and slow —
+two host copies and a host evaluation of the response per right-hand side, which on a GPU
+also serialises the step — and [`rescale`](@ref) logs one line per wrapped response at
+setup saying so.
+
+Constructed by [`rescale`](@ref); there is no reason to build one directly.
+"""
+mutable struct HostResponse{R}
+    resp::R
+    Eref::Float64 # the field the state is measured in
+    invfac::Float64 # 1/(Pref*Eref): the polarisation the buffer is measured in
+    #= Allocated on the first call, when the block shape is known: `rescale` sees the
+       device spec and the scaling but not the grid. Untyped, and read through a function
+       barrier, so that the per-call code is still compiled for concrete types. =#
+    stage::Any # host buffer in the run's element type (device runs only)
+    Eh::Any # host field buffer, physical units, Float64/ComplexF64
+    Ph::Any # host polarisation buffer, physical units
+    Pd::Any # buffer in the run's array type and element type
+end
+
+function HostResponse(resp, spec, scaling)
+    Logging.@info(
+        "The nonlinear response $(typeof(resp)) runs on the host: the field block is "*
+        "copied to the host in physical units at every right-hand side, the response "*
+        "evaluated column by column in Float64, and the result copied back. Correct but "*
+        "slow; give it a `Nonlinear.kind`/kernel to run it in place.")
+    HostResponse(resp, scaling.Eref, 1/(scaling.Pref*scaling.Eref),
+                 nothing, nothing, nothing, nothing)
+end
+
+kind(::HostResponse) = Batched()
+
+"The element type a host copy of a block of element type `T` is held in."
+_hosteltype(::Type{T}) where {T<:Real} = Float64
+_hosteltype(::Type{Complex{T}}) where {T<:Real} = ComplexF64
+
+function (h::HostResponse)(out, E, ρ)
+    if isnothing(h.Eh)
+        HT = _hosteltype(eltype(E))
+        h.Eh = zeros(HT, size(E))
+        h.Ph = zeros(HT, size(E))
+        #= A device run needs a host buffer in the run's own element type on both sides
+           of the copy: `copyto!` between a device array and a host one does not convert
+           the precision. A scaled host run converts in the broadcast instead. =#
+        if Utils.isdevice(E)
+            h.stage = zeros(eltype(E), size(E))
+            h.Pd = fill!(similar(out), zero(eltype(out)))
+        end
+    end
+    #= Function barrier: the fields above are `Any`, so everything which touches the
+       buffers per element lives in a method specialised on their concrete types. =#
+    _hostresponse!(out, E, ρ, h.resp, h.Eh, h.Ph, h.Pd, h.stage, h.Eref, h.invfac)
+end
+
+function _hostresponse!(out, E, ρ, resp, Eh, Ph, Pd, stage, Eref, invfac)
+    _tohost!(Eh, E, stage, Eref)
+    fill!(Ph, 0)
+    _hostcolumns!(Ph, Eh, resp, ρ)
+    _toout!(out, Ph, Pd, stage, invfac)
+    out
+end
+
+# A host run needs no staging copy: the broadcast converts the precision directly.
+_tohost!(Eh, E, ::Nothing, Eref) = (@. Eh = Eref * E)
+_tohost!(Eh, E, stage, Eref) = (copyto!(stage, E); @. Eh = Eref * stage)
+
+_toout!(out, Ph, Pd, ::Nothing, invfac) = (@. out += invfac * Ph)
+function _toout!(out, Ph, Pd, stage, invfac)
+    @. stage = invfac * Ph
+    copyto!(Pd, stage)
+    @. out += Pd
+    out
+end
+
+#= The columnwise contract: a 1-D or `(nt, npol)` block is one column, anything bigger is
+   sliced along every axis past the polarisation one, exactly as `Et_to_Pt!`'s `idcs`
+   loop does. =#
+function _hostcolumns!(Ph::AbstractArray{<:Any, N}, Eh, resp, ρ) where {N}
+    N <= 2 && return (resp(Ph, Eh, ρ); Ph)
+    for i in CartesianIndices(size(Eh)[3:end])
+        resp(view(Ph, :, :, i), view(Eh, :, :, i), ρ)
+    end
+    Ph
+end
 
 #= The Kerr responses are structs rather than closures so that they can carry an `Adapt`
    rule for their arrays and take the protocol's methods. The constructors

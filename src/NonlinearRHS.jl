@@ -154,7 +154,9 @@ Each response is applied according to its
   for the whole group, and it runs wherever the block does.
 - a **batched** response is called once with the whole block.
 - a **columnwise** response is called once per column, on the host. On a device this is
-  refused.
+  refused; [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale) wraps such a response in a
+  [`Nonlinear.HostResponse`](@ref Luna.Nonlinear.HostResponse), which is batched, before
+  a device transform ever sees it.
 
 The first group written *assigns* into `Pt` instead of zero-filling it and accumulating,
 which is one pass over the block fewer. Everything after it accumulates, in tuple order,
@@ -336,7 +338,9 @@ end
 
 _refuse_on_device(Pt, r) = Utils.isdevice(Pt) && error(
     "the nonlinear response $(typeof(r)) is evaluated column by column on the host, so "*
-    "it cannot be applied to a $(typeof(Pt)).")
+    "it cannot be applied to a $(typeof(Pt)). `Nonlinear.rescale` wraps a columnwise "*
+    "response in a `Nonlinear.HostResponse` for a device run; this one reached the "*
+    "transform unwrapped.")
 
 """
     TransModal

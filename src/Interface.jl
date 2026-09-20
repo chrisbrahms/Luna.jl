@@ -374,11 +374,12 @@ If `raman` is `true`, then the following options apply:
     responses so far, false for plasma, Raman and anything else). Otherwise it stays on
     the CPU, whatever `Luna.settings["device"]` says, exactly as before this keyword
     existed -- loading a GPU package must never turn a working default call into an
-    error. An *explicit* `device`/`precision` request which cannot be honoured (multimode
-    and radial propagation, a response with no `Nonlinear.rescale` method such as plasma
-    or Raman, and [`prop_gnlse`](@ref)) errors naming the fix (`device=:cpu` or
-    `Luna.set_device(:cpu)`), rather than being silently narrowed to the CPU or failing
-    with an unrelated `MethodError`. See the "Running on a GPU" page (`docs/src/gpu.md`).
+    error. An *explicit* `device` or `precision` request which cannot be honoured
+    (multimode and radial propagation, a response with no device kernel such as plasma or
+    Raman, and [`prop_gnlse`](@ref)) errors naming the fix (`device=:cpu` or
+    `Luna.set_device(:cpu)`), rather than being silently narrowed to the CPU, run on the
+    host through `Nonlinear.HostResponse` at every step, or failing with an unrelated
+    `MethodError`. See the "Running on a GPU" page (`docs/src/gpu.md`).
 - `precision`: `Float32` to run in reduced precision (on the CPU or on a device),
     `Float64` for double, `nothing` (default) for whatever `device` resolves to
     normally (`Float64` on the CPU, `Float32` on Metal). A `Float32` run is scaled (see
@@ -417,22 +418,27 @@ boundary_kwargs(kwargs) = NamedTuple(
     if k in (:boundary, :boundary_N, :boundary_length, :tcollar))
 
 #= Error, naming the fix, when an *explicit* `device`/`precision` request cannot be
-   honoured because `resp` (mode-averaged only; multimode/radial go through `_cpu_only!`
-   instead) contains a response with no `Nonlinear.rescale` method (plasma, Raman, ...).
-   Does nothing for the CPU/Float64 default, whatever `resp` contains -- that combination
-   always works, `rescale`'s own fallback passes an unscaled response through unchanged.
-   Without this, the same situation fails deep inside `Nonlinear.rescale` with a message
-   that does not mention `device=:cpu`. =#
+   honoured well because `resp` (mode-averaged only; multimode/radial go through
+   `_cpu_only!` instead) contains a response with no device kernel (plasma, Raman, ...).
+   Does nothing for the CPU/Float64 default, whatever `resp` contains.
+
+   Such a response is not impossible on a device: `Nonlinear.rescale` wraps it in a
+   `Nonlinear.HostResponse`, which copies the whole block to the host and back at every
+   right-hand side. That is the low-level interface's hackability fallback, and it is far
+   slower than the CPU run the caller almost certainly wanted; the simple interface
+   therefore refuses rather than silently produces it. =#
 function _check_responses_device_capable!(device, precision, resp)
     spec = Luna.withprecision(Luna.resolve_device(device), precision)
     (Luna.arraytype(spec) === Array && Luna.realtype(spec) === Float64) && return nothing
     bad = unique(string.(typeof.(Iterators.filter(!Nonlinear.device_capable, resp))))
     isempty(bad) && return nothing
-    error("this propagation includes a response with no `Nonlinear.rescale` method "*
+    error("this propagation includes a response with no device kernel "*
           "($(join(bad, ", "))), so it cannot run on a device or in reduced precision "*
-          "yet. Pass device=:cpu (or call Luna.set_device(:cpu)) to run on the CPU "*
+          "without falling back to the host at every step. Pass device=:cpu (or call "*
+          "Luna.set_device(:cpu)) and leave `precision` unset to run on the CPU "*
           "instead, or remove the response (e.g. plasma=false, raman=false) for a "*
-          "device-capable Kerr-only run.")
+          "device-capable Kerr-only run. The low-level interface will run it through "*
+          "`Nonlinear.HostResponse` if that is really what you want.")
 end
 
 """
@@ -506,10 +512,17 @@ function prop_capillary_args(radius, flength, gas, pressure;
        package does not turn a silent, working default call -- multimode, or
        field-resolved with plasma on by default -- into an error: only an *explicit*
        `device`/`precision` request reaches `_cpu_only!`'s check (multimode/radial) or
-       `_check_responses_device_capable!`'s (mode-averaged with a non-Kerr response). =#
+       `_check_responses_device_capable!`'s (mode-averaged with a non-Kerr response).
+
+       An explicit `precision` counts as an explicit request even with `device` left
+       unspecified: `precision=Float32` with a response which has no device kernel is a
+       scaled run in which that response falls back to the host, which is not what the
+       caller asked for, so it is refused with the same message. =#
+    if mode_s isa Modes.AbstractMode && !(isnothing(device) && isnothing(precision))
+        _check_responses_device_capable!(something(device, Luna.HostSpec()), precision,
+                                         resp)
+    end
     devicereq = if !isnothing(device)
-        mode_s isa Modes.AbstractMode &&
-            _check_responses_device_capable!(device, precision, resp)
         device
     elseif mode_s isa Modes.AbstractMode && all(Nonlinear.device_capable, resp)
         Luna.device_request()
