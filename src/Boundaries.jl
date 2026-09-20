@@ -104,10 +104,20 @@ import ..Maths
 import ..Grid
 import ..NonlinearRHS
 import ..Utils
-import Luna: upload_like, scalar
+import Luna: upload_like, scalar, assert_resident, DeviceSpec
 import LinearAlgebra: mul!
 import Logging
 import Printf: @sprintf
+
+#= `assert_resident` (GPU_PLAN.md §4.2 rule 5) needs a `DeviceSpec`, which none of these
+   constructors otherwise has any reason to carry -- they are handed already-resident
+   arrays (`Et`, or `Eω` for `RadialCollar`) and mirror everything else from them with
+   `upload_like`/`convert`. Deriving one from the reference array is enough to catch a
+   mismatched low-level construction (e.g. a host `Et` with a device `Eω` passed to the
+   functor later): `RateAbsorber`/`LegacyAbsorber`/`CartesianCollar`'s own mirrors are
+   always consistent with it by construction, so the assertion is a standing structural
+   contract, the same role it plays in `NonlinearRHS.TransModeAvg`. =#
+_specof(x::AbstractArray) = DeviceSpec(Base.typename(typeof(x)).wrapper, real(eltype(x)))
 
 "Default number of applications of the historical window profile over the propagation."
 const DEFAULT_N = 20
@@ -422,6 +432,7 @@ struct RadialCollar{mT, rT, bT}
     Tbwd::Matrix{mT}
     αr::Vector{rT}
     weight::Vector{rT} # radial integration weights, to measure what is removed
+    fac::Vector{rT} # scratch: exp(-αr*Δz/2), recomputed every step
     buf::bT
     removed::Base.RefValue{Float64}
     reference::Base.RefValue{Float64}
@@ -431,9 +442,13 @@ end
 function RadialCollar(rgrid::Grid.RadialGrid, αr, Eω)
     TT = eltype(Eω)
     RT = real(TT)
-    RadialCollar(convert(Matrix{TT}, rgrid.Tfwd), convert(Matrix{TT}, rgrid.Tbwd),
-                 convert(Vector{RT}, αr), convert(Vector{RT}, rgrid.wr), similar(Eω),
-                 Ref(0.0), Ref(0.0), Ref(false))
+    Tfwd = convert(Matrix{TT}, rgrid.Tfwd)
+    Tbwd = convert(Matrix{TT}, rgrid.Tbwd)
+    αrc = convert(Vector{RT}, αr)
+    weight = convert(Vector{RT}, rgrid.wr)
+    buf = similar(Eω)
+    assert_resident(_specof(Eω), Eω, Tfwd, Tbwd, buf)
+    RadialCollar(Tfwd, Tbwd, αrc, weight, similar(αrc), buf, Ref(0.0), Ref(0.0), Ref(false))
 end
 
 _wabs2map(e, w) = w*abs2(e)
@@ -451,8 +466,8 @@ function apply_kspace!(c::RadialCollar, Eω, Δz)
             Broadcast.instantiate(Broadcast.broadcasted(_wabs2map, c.buf, wB)); init=z))
     end
     halfΔz = scalar(c.buf, Δz/2)
-    fac = @. exp(-c.αr * halfΔz)
-    facB = reshape(fac, ones_d..., :)
+    @. c.fac = exp(-c.αr * halfΔz)
+    facB = reshape(c.fac, ones_d..., :)
     c.removed[] += Float64(mapreduce(identity, +,
         Broadcast.instantiate(Broadcast.broadcasted(_wabsorbedmap, c.buf, facB, wB)); init=z))
     c.buf .*= facB
@@ -462,7 +477,7 @@ end
 apply_kspace!(c, Eω, Δz) = nothing
 
 """
-    CartesianCollar(αxy)
+    CartesianCollar(αxy, Et)
 
 Transverse absorbing boundary for the Cartesian free-space grids: the power rate `αxy` over
 the spatial axes `(Nx,)` or `(Nx, Ny)`, applied as `exp(-αxy Δz/2)` per accepted step. The
@@ -475,6 +490,7 @@ by `Luna.upload_like` at construction (the identity on the default CPU path).
 """
 struct CartesianCollar{N, AT<:AbstractArray}
     αxy::AT # real precision of the state, host array type until gpu/21
+    fac::AT # scratch: exp(-αxy*Δz/2), recomputed every step, same shape as αxy
     removed::Base.RefValue{Float64}
     reference::Base.RefValue{Float64}
     warned::Base.RefValue{Bool}
@@ -485,19 +501,21 @@ end
    apply this collar shares. =#
 function CartesianCollar(αxy::Array{Float64, N}, Et) where {N}
     αd = upload_like(Et, αxy)
-    CartesianCollar{N, typeof(αd)}(αd, Ref(0.0), Ref(0.0), Ref(false))
+    fac = similar(αd)
+    assert_resident(_specof(Et), Et, αd, fac)
+    CartesianCollar{N, typeof(αd)}(αd, fac, Ref(0.0), Ref(0.0), Ref(false))
 end
 
 # applied after the temporal collar, in (t, x[, y]) space
 function apply_realspace!(c::CartesianCollar{N}, Et, Δz) where {N}
     d = ndims(Et)
     ones_d = ntuple(_ -> 1, d - N)
-    αxyB = reshape(c.αxy, ones_d..., size(c.αxy)...)
-    c.reference[] == 0 && (c.reference[] = Float64(sum(abs2, Et)))
     halfΔz = scalar(Et, Δz/2)
-    fac = @. exp(-αxyB * halfΔz)
-    c.removed[] += Float64(_absorbed(Et, fac))
-    Et .*= fac
+    @. c.fac = exp(-c.αxy * halfΔz)
+    facB = reshape(c.fac, ones_d..., size(c.fac)...)
+    c.reference[] == 0 && (c.reference[] = Float64(sum(abs2, Et)))
+    c.removed[] += Float64(_absorbed(Et, facB))
+    Et .*= facB
     nothing
 end
 apply_realspace!(c, Et, Δz) = nothing
@@ -506,10 +524,14 @@ apply_realspace!(c, Et, Δz) = nothing
     spatialcollar(spacegrid, αr, grid, Et)
 
 The transverse absorber functor for `spacegrid`, given the power rate `αr` over its real
-space. `grid` and `Et` size the buffer the radial collar needs.
+space. `grid` and `Et` size the buffer the radial collar needs, and `Et`'s real precision
+is what that buffer (and hence `RadialCollar`'s `Tfwd`/`Tbwd`/`αr`/`weight`) is built in
+-- `Complex{real(eltype(Et))}` rather than a hardcoded `ComplexF64`, so a reduced-precision
+radial run (should `TransRadial` ever gain one, `gpu/21`) would not be handed a
+`Float64` collar buffer and matrices to multiply its `Float32` state against.
 """
 spatialcollar(rg::Grid.RadialGrid, αr, grid, Et) = RadialCollar(
-    rg, αr, zeros(ComplexF64, (length(grid.ω), size(Et)[2:end]...)))
+    rg, αr, zeros(Complex{real(eltype(Et))}, (length(grid.ω), size(Et)[2:end]...)))
 spatialcollar(sg::Union{Grid.Free2DGrid, Grid.FreeGrid}, αr, grid, Et) = CartesianCollar(αr, Et)
 
 # --------------------------------------------------------------------------- application
@@ -555,7 +577,9 @@ end
    the historical index loop but no scalar indexing and no gather, on every backend. =#
 function RateAbsorber(αt, Et, FT, output, z0; warnfrac=DEFAULT_WARNFRAC, spatial=nothing)
     αtd = upload_like(Et, αt)
-    RateAbsorber(αtd, similar(αtd), Et, FT, Utils.plan_ift(FT), output, spatial,
+    tfac = similar(αtd)
+    assert_resident(_specof(Et), Et, αtd, tfac)
+    RateAbsorber(αtd, tfac, Et, FT, Utils.plan_ift(FT), output, spatial,
                  Ref(float(z0)), Ref(0.0), Ref(0.0), Ref(false), warnfrac)
 end
 
@@ -646,8 +670,10 @@ end
    Eω's complex one) is enough: `Complex .* Real` promotes elementwise regardless. On the
    default CPU path `upload_like` returns the grid's own vectors unchanged. =#
 function LegacyAbsorber(grid, Et, FT, output)
-    LegacyAbsorber(grid, upload_like(Et, grid.ωwin), upload_like(Et, grid.twin),
-                   Et, FT, Utils.plan_ift(FT), output)
+    ωwin = upload_like(Et, grid.ωwin)
+    twin = upload_like(Et, grid.twin)
+    assert_resident(_specof(Et), Et, ωwin, twin)
+    LegacyAbsorber(grid, ωwin, twin, Et, FT, Utils.plan_ift(FT), output)
 end
 
 function (b::LegacyAbsorber)(Eω, z, dz, interpolant)

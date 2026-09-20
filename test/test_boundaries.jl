@@ -528,8 +528,13 @@ const BJLArray = JLArrays.JLArray
 
 _bnoop(args...; kwargs...) = nothing
 
+#= `allowscalar(false)` writes a task-local key and a process-global default. Restored at
+   the end of this block (as test_device.jl does), so this file does not change what a
+   later file in `Pkg.test()` sees -- this one runs early in `runtests.jl`. =#
+const BOUNDARIES_SCALAR_WAS = get(task_local_storage(), :ScalarIndexing, nothing)
+GPUArraysCore.allowscalar(false)
+
 @testset "RateAbsorber and LegacyAbsorber on JLArray" begin
-    GPUArraysCore.allowscalar(false)
     grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
     zmax = 1e-2
     dz = zmax/20
@@ -554,5 +559,8 @@ _bnoop(args...; kwargs...) = nothing
         @test maximum(abs, Array(Eω_d) .- Eω_h)/maximum(abs, Eω_h) < 1e-10
     end
 end
+
+isnothing(BOUNDARIES_SCALAR_WAS) ? delete!(task_local_storage(), :ScalarIndexing) :
+                                   task_local_storage(:ScalarIndexing, BOUNDARIES_SCALAR_WAS)
 
 end # have_jlarrays
