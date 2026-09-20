@@ -23,7 +23,7 @@ import Test: @test, @testset, @test_throws, @test_logs
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
              NonlinearRHS, PhysData, RK45, Stats, Boundaries, DeviceSpec, HostSpec,
-             UnitScaling, UNIT_SCALING
+             UnitScaling, UNIT_SCALING, Maths, Ionisation
 import LinearAlgebra
 import GPUArraysCore
 import Adapt
@@ -57,6 +57,27 @@ usercubic(s) = let s = s
     (out, E, ρ) -> (out .+= (ρ*s) .* E.^3)
 end
 
+#= The plasma response on Metal. Two rates: the analytic ADK formula, whose nine
+   constants are struct fields a kernel reads, and a tabulated rate with the interface of
+   a cached PPT rate, whose kernel indexes a spline. Both are the stray-Float64 case the
+   plan names (GPU_PLAN.md section 4.1): a Float64 field read inside a kernel never
+   compiles on Metal, so if `device_rate` missed one, this file is where it shows.
+
+   The table is built here rather than pre-calculated: `IonRatePPTAccel(E, rate)` is the
+   constructor the cache calls, the axis is uniform, and this takes milliseconds. =#
+metal_adkrate() = Ionisation.IonRateADK(:Ar)
+
+function metal_tablerate()
+    E = collect(range(1e9, 3e11, length=1024))
+    Ionisation.IonRatePPTAccel(E, metal_adkrate().(E))
+end
+
+#= A field which ionises, on a short grid: a 10 fs pulse at 800 nm, peak field `E0`. =#
+function metal_plasmafield(nt=512, E0=6e10, twidth=60e-15)
+    t = collect(range(-twidth, twidth, length=nt))
+    t, @. E0*exp(-t^2/(2*(10e-15/1.66)^2))*cos(2π*PhysData.c/800e-9*t)
+end
+
 #= The same mode-averaged Kerr propagation on whichever spec is asked for. `Luna.run`
    wraps the output in `ScaledOutput` itself now (gpu/11), so this test file never needs
    its own host-copy wrapper the way it did under gpu/10 -- `out`, the plain
@@ -66,7 +87,7 @@ end
    branch. =#
 function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
                    precision=nothing, thg=false, boundary=:none, stats=false, fixed=false,
-                   extraresp=())
+                   extraresp=(), plasma=false)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15; thg)
@@ -82,6 +103,16 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
         (Nonlinear.Kerr_env_thg(PhysData.γ3_gas(gas), grid.ω0, grid.to),)
     else
         (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
+    end
+    #= The default response set of a field-resolved `prop_capillary` call in a
+       non-Raman gas is Kerr and plasma, which is what gpu/13 has to make run on a
+       device. The rate is tabulated here rather than pre-calculated; what is under test
+       is the response, not the PPT series. =#
+    if plasma
+        resp = (resp...,
+                Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)),
+                                         metal_tablerate(),
+                                         PhysData.ionisation_potential(gas)))
     end
     resp = (resp..., extraresp...)
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0;
@@ -235,6 +266,30 @@ end
     @test all(isfinite, Array(outc))
     @test !all(iszero, Array(outc))
     @test Adapt.adapt(MtlArray, kt).C isa MtlArray
+
+    #= The ionisation rates: nine Float64 constants in the ADK struct, and a spline
+       whose knots, values, coefficients and index function are all Float64 as built.
+       `device_rate` is what converts them, and this is the only place which proves it
+       missed none -- a Float64 struct field read inside a kernel never compiles here. =#
+    Ei = Luna.todevice(MetalSpec, collect(range(1e9, 2e11, length=n)))
+    ri = Luna.alloc(MetalSpec, Float32, (n,))
+    for ir in (Ionisation.IonRateADK(:Ar), metal_tablerate())
+        ird = Ionisation.device_rate(ir, MetalSpec)
+        Ionisation.ionrate!(ri, ird, Ei)
+        @test all(isfinite, Array(ri))
+        @test !all(iszero, Array(ri))
+        #= The kernel's return type, on a *host* Float32 copy of the same rate: the
+           device one indexes device arrays and cannot be called from here. =#
+        irh = Ionisation.device_rate(ir, DeviceSpec(Array, Float32))
+        @test Ionisation.ratekernel(irh, 1f0)(1f10) isa Float32
+        # ... and with a unit scaling, where the kernel reconstructs the physical field
+        fill!(ri, 0)
+        Ionisation.ionrate!(ri, ird, Ei ./ 1f10, 1e10)
+        @test all(isfinite, Array(ri))
+        @test !all(iszero, Array(ri))
+    end
+    @test Adapt.adapt(MtlArray, Ionisation.device_rate(metal_tablerate(),
+                                                       MetalSpec)).spline.x isa MtlArray
 
     # The RK45 per-step kernels
     ks = ntuple(_ -> Luna.todevice(MetalSpec, rand(ComplexF64, n)), 7)
@@ -503,6 +558,93 @@ end
         cw, MetalSpec, UNIT_SCALING, Luna.alloc(MetalSpec, Float32, (16,)))
 end
 
+@testset "plasma on Metal" begin
+    t, E = metal_plasmafield()
+    Ev = hcat(E, 0.6 .* circshift(E, 7))
+    ionpot = PhysData.ionisation_potential(:Ar)
+    ρ = PhysData.density(:Ar, 1.0)
+    Eref = exp2(round(Int, log2(maximum(abs, E))))
+    sc = Luna.UnitScaling(Eref, PhysData.ε_0)
+    cpu32 = DeviceSpec(Array, Float32)
+
+    for (nm, ir) in (("ADK", metal_adkrate()), ("table", metal_tablerate())),
+        Eh in (E, Ev)
+        p = Nonlinear.PlasmaCumtrapz(t, Eh, ir, ionpot)
+
+        # host Float64, physical units: the reference
+        P64 = zeros(size(Eh)); p(P64, Eh, ρ)
+
+        # host Float32, scaled
+        Es = Float32.(Eh ./ Eref)
+        ph = Nonlinear.rescale(p, cpu32, sc, Es)
+        Ph = zeros(Float32, size(Eh))
+        Nonlinear.batched!(ph, Ph, Es, ρ, sc)
+
+        # Metal Float32, scaled
+        Ed = Luna.todevice(MetalSpec, Eh ./ Eref)
+        pd = Nonlinear.rescale(p, MetalSpec, sc, Ed)
+        @test pd.ratedev isa Ionisation.AbstractIonRate
+        @test pd.J isa MtlArray{Float32}
+        @test Luna.all_resident(MetalSpec, Nonlinear.resident_arrays(pd)...)
+        Pd = Luna.alloc(MetalSpec, Float32, size(Eh))
+        Nonlinear.batched!(pd, Pd, Ed, ρ, sc)
+
+        Pdh = Array(Pd)
+        @test all(isfinite, Pdh)
+        @test !all(iszero, Pdh) # the field really ionises: not two zeros agreeing
+        # Metal against the CPU at the same precision: the device path, not Float32
+        @test maximum(abs, Pdh .- Ph)/maximum(abs, Ph) < 1e-4
+        # ... and the scaled Float32 answer against the physical Float64 one
+        phys = Pdh .* Float32(PhysData.ε_0*Eref)
+        @test maximum(abs, phys .- P64)/maximum(abs, P64) < 1e-3
+    end
+
+    #= Dynamic range, case 1: helium at 0.3 bar and a field far below the ionisation
+       threshold. The rate underflows to zero in Float32 (and is ~1e-300 in Float64), and
+       what matters is that the response produces zeros rather than NaNs: an underflow
+       inside `exp` followed by a division by a zero field is exactly where the `ifelse`
+       loss term could poison the whole block. =#
+    tl, El = metal_plasmafield(512, 1e9)
+    ρhe = PhysData.density(:He, 0.3)
+    ipe = PhysData.ionisation_potential(:He)
+    pl = Nonlinear.PlasmaCumtrapz(tl, El, Ionisation.IonRateADK(:He), ipe)
+    ErefL = exp2(round(Int, log2(maximum(abs, El))))
+    scl = Luna.UnitScaling(ErefL, PhysData.ε_0)
+    Edl = Luna.todevice(MetalSpec, El ./ ErefL)
+    pdl = Nonlinear.rescale(pl, MetalSpec, scl, Edl)
+    Pdl = Luna.alloc(MetalSpec, Float32, size(El))
+    Nonlinear.batched!(pdl, Pdl, Edl, ρhe, scl)
+    @test all(isfinite, Array(Pdl))
+    @test all(iszero, Array(Pdl))
+
+    #= Dynamic range, case 2: argon at a field near barrier suppression, where the
+       ionisation fraction saturates at 1. `1 - exp(-x)` with a large `x`, a rate of
+       ~1e16 s^-1 accumulated over the whole time axis, and a loss term divided by the
+       field: the largest intermediates the response produces anywhere in Luna's
+       parameter range. =#
+    Ebs = Ionisation.barrier_suppression(ionpot, 1.0)
+    th, Eh2 = metal_plasmafield(512, Ebs)
+    ph2 = Nonlinear.PlasmaCumtrapz(th, Eh2, metal_adkrate(), ionpot)
+    P64h = zeros(size(Eh2)); ph2(P64h, Eh2, ρ)
+    ErefH = exp2(round(Int, log2(maximum(abs, Eh2))))
+    sch = Luna.UnitScaling(ErefH, PhysData.ε_0)
+    Es = Float32.(Eh2 ./ ErefH)
+    phh = Nonlinear.rescale(ph2, cpu32, sch, Es)
+    Phh = zeros(Float32, size(Eh2)); Nonlinear.batched!(phh, Phh, Es, ρ, sch)
+    Edh = Luna.todevice(MetalSpec, Eh2 ./ ErefH)
+    pdh = Nonlinear.rescale(ph2, MetalSpec, sch, Edh)
+    Pdh2 = Luna.alloc(MetalSpec, Float32, size(Eh2))
+    Nonlinear.batched!(pdh, Pdh2, Edh, ρ, sch)
+    @test all(isfinite, Array(Pdh2))
+    @test maximum(abs, Array(Pdh2) .- Phh)/maximum(abs, Phh) < 1e-4
+    physh = Array(Pdh2) .* Float32(PhysData.ε_0*ErefH)
+    @test maximum(abs, physh .- P64h)/maximum(abs, P64h) < 1e-2
+    #= The case really is the extreme one: a rate above 1e14 1/s and a tenth of the gas
+       ionised by the end of the pulse. =#
+    @test maximum(Array(pdh.rate)) > 1e14
+    @test maximum(Array(pdh.fraction)) > 0.1f0
+end
+
 @testset "prop_capillary on Metal" begin
     capkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
              trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=false)
@@ -539,6 +681,62 @@ end
               maximum(abs, hgrad64["Eω"][:, idx]) < 3e-4
     end
     @test isapprox(dgrad["stats"]["energy"], hgrad32["stats"]["energy"]; rtol=1e-3)
+
+    #= gpu/13's exit condition: Kerr *and* plasma, the default physics of a
+       field-resolved `prop_capillary` call in a non-Raman gas, on Metal end to end.
+       Argon at an intensity which ionises, and fixed steps, so the only difference
+       between the runs is the arithmetic. =#
+    p32, _ = metalcase(Grid.RealGrid, DeviceSpec(Array, Float32);
+                       gas=:Ar, energy=150e-6, plasma=true, fixed=true)
+    p64, _ = metalcase(Grid.RealGrid, HostSpec(); gas=:Ar, energy=150e-6, plasma=true,
+                       fixed=true)
+    pdm, ptr = metalcase(Grid.RealGrid, MetalSpec; gas=:Ar, energy=150e-6, plasma=true,
+                         fixed=true)
+    @test ptr.resp[2] isa Nonlinear.PlasmaCumtrapz
+    @test ptr.resp[2].J isa MtlArray{Float32}
+    @test ptr.resp[2].ratedev.spline.x isa MtlArray{Float32}
+    for idx in axes(p64["Eω"], 2)
+        @test maximum(abs, pdm["Eω"][:, idx] .- p32["Eω"][:, idx]) /
+              maximum(abs, p32["Eω"][:, idx]) < 1e-4
+        @test maximum(abs, pdm["Eω"][:, idx] .- p64["Eω"][:, idx]) /
+              maximum(abs, p64["Eω"][:, idx]) < 1e-3
+    end
+    #= The plasma really contributes: a Kerr-only run of the same case differs by far
+       more than the tolerances above. =#
+    nop64, _ = metalcase(Grid.RealGrid, HostSpec(); gas=:Ar, energy=150e-6, fixed=true)
+    @test maximum(abs, p64["Eω"][:, end] .- nop64["Eω"][:, end]) /
+          maximum(abs, nop64["Eω"][:, end]) > 1e-2
+
+    #= ... and through the simple interface, with a real cached PPT rate, which is what
+       a user gets from `prop_capillary(...; plasma=true)`. Argon at 0.1 bar and 300 µJ,
+       which ionises about 1 % of the gas: review round 1, finding 8 -- the first version
+       of this used the regression matrix's helium parameters, where the rate is exactly
+       zero, so the spline kernel was only ever exercised at zero. Built through
+       `prop_capillary_args` so that the steps can be fixed, which `prop_capillary`
+       itself has no keyword for. =#
+    plkw = (; λ0=800e-9, energy=300e-6, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
+            trange=400e-15, saveN=3, plasma=true, raman=false, shotnoise=false)
+    function ppt_prop(spec)
+        Eω, grid, linop, tr, FT, o = Luna.Interface.prop_capillary_args(
+            125e-6, 1e-2, :Ar, 0.1; plkw..., device=spec)
+        h = 1e-2/20
+        Luna.run(Eω, grid, linop, tr, FT, o;
+                 zmax=1e-2, init_dz=h, min_dz=h, max_dz=h, status_period=1e6)
+        o, tr
+    end
+    ph32, ptr32 = ppt_prop(DeviceSpec(Array, Float32))
+    pdm2, ptrm = ppt_prop(MetalSpec)
+    @test ptrm.resp[2].ratedev isa Ionisation.IonRatePPTAccel
+    @test ptrm.resp[2].ratedev.spline.x isa MtlArray{Float32}
+    @test eltype(pdm2["Eω"]) === ComplexF32
+    for idx in axes(ph32["Eω"], 2)
+        @test maximum(abs, pdm2["Eω"][:, idx] .- ph32["Eω"][:, idx]) /
+              maximum(abs, ph32["Eω"][:, idx]) < 1e-4
+    end
+    #= The cached rate really fires: the electron density is a fraction of a percent of
+       the gas, not zero. `Stats` computes it on the host from the saved field, so this
+       is the device run's own output. =#
+    @test maximum(pdm2["stats"]["electrondensity"])/PhysData.density(:Ar, 0.1) > 1e-3
 
     # `:auto` (what loading Metal sets) resolves to the same device as the explicit spec
     old = get(Luna.settings, "device", nothing)

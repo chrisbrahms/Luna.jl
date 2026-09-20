@@ -203,6 +203,7 @@ function _et_to_pt!(Pt, Et, ::Nothing, responses, density, scaling, idcs...)
         "a response collection which is not a tuple is applied one response at a time on "*
         "the columnwise contract, which is in physical units, so it cannot be used in a "*
         "run with $(scaling). Pass the responses as a tuple.")
+    _refuse_batched_legacy(responses)
     _et_to_pt_legacy!(Pt, Et, responses, density, idcs...)
 end
 
@@ -223,6 +224,26 @@ end
 
 _npol(Et::AbstractArray{<:Any, 1}) = 1
 _npol(Et::AbstractArray) = size(Et, 2)
+
+#= A `Batched` response is handed the whole block and owns buffers sized for it, which
+   the legacy loop cannot give it: for the transforms which pass `idcs` the loop calls
+   each response one column at a time. Caught here, with the fix, rather than later in
+   the response as a shape mismatch. =#
+function _refuse_batched_legacy(responses)
+    for r in responses
+        if r isa Tuple
+            _refuse_batched_legacy(r)
+            continue
+        end
+        Nonlinear.kind(r) isa Nonlinear.Batched && error(
+            "the nonlinear response $(nameof(typeof(r))) is batched: it is called once "*
+            "with the whole field block and its buffers are sized for it. A response "*
+            "collection which is not a `Tuple` is applied one response at a time, and "*
+            "one column at a time where the transform has several, so it cannot carry "*
+            "a batched response. Pass the responses as a `Tuple`.")
+    end
+    nothing
+end
 
 # The historical per-response loop, for a `responses` collection which is not a tuple.
 function _et_to_pt_legacy!(Pt, Et, responses, density::Number)
@@ -456,7 +477,8 @@ Construct a `TransModal`, transform E(ω) -> Pₙₗ(ω) for modal fields.
   spectral density. Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
 """
 function TransModal(tT, grid, ts::Modes.ToSpace, FT, resp, densityfun, norm!;
-                    rtol=1e-3, atol=0.0, mfcn=512, full=false, noise_field=nothing)
+                    rtol=1e-3, atol=0.0, mfcn=512, full=false, noise_field=nothing,
+                    spec=HostSpec(), scaling=UNIT_SCALING)
     Emω = Array{ComplexF64,2}(undef, length(grid.ω), ts.nmodes)
     Erω = Array{ComplexF64,2}(undef, length(grid.ω), ts.npol)
     Erωo = Array{ComplexF64,2}(undef, length(grid.ωo), ts.npol)
@@ -478,6 +500,14 @@ function TransModal(tT, grid, ts::Modes.ToSpace, FT, resp, densityfun, norm!;
         Er_noise = nothing
         Er_nl = nothing
     end
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape, and as a `Tuple`, because a
+       batched response cannot be applied by the legacy per-response loop (see
+       `_refuse_batched_legacy`). Every fallback returns the response unchanged on the
+       host Float64 path, which is the only one this transform runs today; `spec` and
+       `scaling` are threaded through so that Group E, which gives it a device path,
+       changes the caller and not this line. =#
+    resp = Nonlinear.rescale_responses(Tuple(resp), spec, scaling, Er)
     TransModal(ts, full, Modes.dimlimits(ts.ms[1]), Emω, Erω, Erωo, Er, Pr, Prω, Prωo, Prmω,
                FT, IFT, resp, grid, densityfun, densityfun(0.0), norm!, 0, 0.0, rtol, atol, mfcn,
                similar(Prmω), Emω_noise, Er_noise, Er_nl)
@@ -678,11 +708,11 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
     #= The four-argument form: `Eto` is the prototype of the block the responses are
        called with, so one which owns buffers can allocate them here, in the run's array
        type, in time for the residency assertion below. =#
-    resp = map(r -> Nonlinear.rescale(r, spec, scaling, Eto), Tuple(resp))
+    resp = Nonlinear.rescale_responses(Tuple(resp), spec, scaling, Eto)
     #= Every mirror the transform holds and every array its responses carry, not only the
        ones this transform's own kernels touch: the assertion is what catches a future
        mistake, so it has to cover everything. =#
-    resparrays = reduce((a, r) -> (a..., Nonlinear.resident_arrays(r)...), resp; init=())
+    resparrays = Nonlinear.resident_arrays_all(resp)
     assert_resident(spec, Eωo, Eto, Pto, Pωo, gv.ω, gv.ωwin, gv.twin, gv.towin, gv.sidx,
                     Et_noise, Et_nl, resparrays...)
     TransModeAvg(Pto, Eto, Eωo, Pωo, FT, IFT, resp, grid, gv, densityfun, norm!, aeff,
@@ -970,7 +1000,8 @@ Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisat
   Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
 """
 function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun, normfun,
-                     pol=false; noise_field=nothing)
+                     pol=false; noise_field=nothing, spec=HostSpec(),
+                     scaling=UNIT_SCALING)
     np = pol ? 2 : 1
     N = rgrid.N
     IFT = Utils.plan_ift(FT)
@@ -998,6 +1029,14 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
         Et_noise = nothing
         Et_nl = nothing
     end
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape, and as a `Tuple`, because a
+       batched response cannot be applied by the legacy per-response loop (see
+       `_refuse_batched_legacy`). Every fallback returns the response unchanged on the
+       host Float64 path, which is the only one this transform runs today; `spec` and
+       `scaling` are threaded through so that Group E, which gives it a device path,
+       changes the caller and not this line. =#
+    responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto_r)
     TransRadial(rgrid, FT, IFT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
                 Tfwd, Tbwd, Et_noise, Et_nl)
 end
@@ -1315,7 +1354,7 @@ free-space propagation.
   Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
 """
 function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false;
-                   noise_field=nothing)
+                   noise_field=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
     Ny = length(xygrid.y)
     Nx = length(xygrid.x)
     Eωo = zeros(ComplexF64, (length(grid.ωo), pol ? 2 : 1, Nx, Ny))
@@ -1336,6 +1375,14 @@ function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, 
         Et_noise = nothing
         Et_nl = nothing
     end
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape, and as a `Tuple`, because a
+       batched response cannot be applied by the legacy per-response loop (see
+       `_refuse_batched_legacy`). Every fallback returns the response unchanged on the
+       host Float64 path, which is the only one this transform runs today; `spec` and
+       `scaling` are threaded through so that Group E, which gives it a device path,
+       changes the caller and not this line. =#
+    responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto)
     TransFree(FT, Utils.plan_ift(FT), normfun, responses, grid, xygrid, densityfun,
               Pto, Eto, Eωo, Pωo, scale, idcs, Et_noise, Et_nl)
 end
@@ -1400,13 +1447,22 @@ function show(io::IO, t::TransFree2D)
     print(io, out)
 end
 
-function TransFree2D(TT, scale, grid, xgrid, FT, responses, densityfun, normfun, pol=false)
+function TransFree2D(TT, scale, grid, xgrid, FT, responses, densityfun, normfun, pol=false;
+                     spec=HostSpec(), scaling=UNIT_SCALING)
     Nx = length(xgrid.x)
     Eωo = zeros(ComplexF64, (length(grid.ωo), pol ? 2 : 1, Nx))
     Eto = zeros(TT, (length(grid.to), pol ? 2 : 1, Nx))
     Pto = similar(Eto)
     Pωo = similar(Eωo)
     idcs = CartesianIndices(size(Pto)[3:end])
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape, and as a `Tuple`, because a
+       batched response cannot be applied by the legacy per-response loop (see
+       `_refuse_batched_legacy`). Every fallback returns the response unchanged on the
+       host Float64 path, which is the only one this transform runs today; `spec` and
+       `scaling` are threaded through so that Group E, which gives it a device path,
+       changes the caller and not this line. =#
+    responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto)
     TransFree2D(FT, Utils.plan_ift(FT), normfun, responses, grid, xgrid, densityfun,
               Pto, Eto, Eωo, Pωo, scale, idcs)
 end

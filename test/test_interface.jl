@@ -502,30 +502,52 @@ end
     ograd = prop_capillary(125e-6, 1e-2, :He, (1.0, 0.0); kwargs...)
     @test size(ograd["Eω"]) == size(oref["Eω"])
 
-    #= A response with no device kernel (plasma, Raman) is refused for an explicit
-       `device` *or* `precision` request, naming the fix. Review round 1 of
-       gpu/12-response-traits, finding 9: the `precision`-only path was untested, and
-       without it `precision=Float32` would now run plasma through
-       `Nonlinear.HostResponse` at every step instead of erroring. =#
+    #= A response with no device kernel is refused for an explicit `device` *or*
+       `precision` request, naming the fix. Review round 1 of gpu/12-response-traits,
+       finding 9: the `precision`-only path was untested, and without it
+       `precision=Float32` would run the response through `Nonlinear.HostResponse` at
+       every step instead of erroring.
+
+       Tested against the check itself rather than through `prop_capillary`. Review
+       round 1 of gpu/13-plasma, finding 3: plasma has a kernel now and Raman gets one
+       in gpu/14, after which no response `prop_capillary` can build is columnwise, so
+       there would be nothing left to point a call-level test at. A user closure is
+       columnwise by definition and stays that way. =#
+    usercw = (out, E, ρ) -> (out .+= (ρ*1e-52) .* E.^3)
+    resp_nokernel = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)), usercw)
+    for (dev, prec) in ((Luna.HostSpec(), Float32),      # precision=Float32 alone
+                        (DeviceSpec(Array, Float32), nothing), # device= alone
+                        (DeviceSpec(Array, Float32), Float32)) # both
+        err = try
+            Interface._check_responses_device_capable!(dev, prec, resp_nokernel)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("device=:cpu", err.msg)
+    end
+    # ... and the same responses at the default device and precision are not refused
+    @test Interface._check_responses_device_capable!(Luna.HostSpec(), nothing,
+                                                     resp_nokernel) === nothing
+    # ... nor is a device request whose responses all have kernels
+    @test Interface._check_responses_device_capable!(
+        DeviceSpec(Array, Float32), nothing,
+        (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)) === nothing
+
+    #= Plasma is device-capable since gpu/13-plasma, so the default field-resolved
+       response set of a non-Raman gas -- Kerr and plasma -- now follows an explicit
+       `precision`/`device` request instead of being refused. =#
     plasmakw = (λ0=800e-9, energy=100e-9, τfwhm=10e-15, trange=400e-15,
                 λlims=(300e-9, 2000e-9), shotnoise=false, plasma=true, raman=false,
                 saveN=3)
-    err = try
-        prop_capillary(args...; plasmakw..., precision=Float32)
-        nothing
-    catch e
-        e
-    end
-    @test err isa ErrorException
-    @test occursin("device=:cpu", err.msg)
-    @test occursin("PlasmaCumtrapz", err.msg)
-    # the message names the type, not its several hundred characters of parameters
-    @test !occursin("IonRatePPTAccel", err.msg)
-    @test_throws ErrorException prop_capillary(args...; plasmakw...,
-                                               device=DeviceSpec(Array, Float32))
-    # ... and the same call with neither keyword is unaffected
     oplasma = prop_capillary(args...; plasmakw...)
     @test eltype(oplasma["Eω"]) === ComplexF64
+    oplasma32 = prop_capillary(args...; plasmakw..., precision=Float32)
+    @test eltype(oplasma32["Eω"]) === ComplexF32
+    @test size(oplasma32["Eω"]) == size(oplasma["Eω"])
+    @test maximum(abs, oplasma32["Eω"][:, end] .- oplasma["Eω"][:, end])/
+          maximum(abs, oplasma["Eω"][:, end]) < 1e-4
 
     # multimode/radial propagation is not device-capable: refused, not silently ignored
     @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,

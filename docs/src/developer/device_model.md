@@ -133,7 +133,7 @@ the columnwise loop's range.
 | --- | --- | --- | --- |
 | [`Nonlinear.Pointwise`](@ref) | fuses it into one broadcast over the whole block with the other pointwise responses, no buffer | [`pointwise_kernel`](@ref Luna.Nonlinear.pointwise_kernel) (a `T -> T`), or [`pointwise_expr`](@ref Luna.Nonlinear.pointwise_expr) if it carries per-sample arrays | `KerrField`, `KerrEnv` (scalar field), `KerrEnvTHG` |
 | [`Nonlinear.VectorPointwise`](@ref) | two broadcasts, one per polarisation component, each fused across the group | [`vector_kernel`](@ref Luna.Nonlinear.vector_kernel) (an `(ex, ey) -> SVector{2}`), or [`vector_expr`](@ref Luna.Nonlinear.vector_expr) | `KerrField`, `KerrEnv` (two-component field) |
-| [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block, through [`batched!`](@ref Luna.Nonlinear.batched!), which also hands it the unit scaling | [`batched!`](@ref Luna.Nonlinear.batched!) (or just the call operator, if its coefficients already carry the scaling), plus its own full-size buffers in the run's array type | `HostResponse`; `PlasmaCumtrapz`, `RamanPolar*` after Group D |
+| [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block, through [`batched!`](@ref Luna.Nonlinear.batched!), which also hands it the unit scaling | [`batched!`](@ref Luna.Nonlinear.batched!) (or just the call operator, if its coefficients already carry the scaling), plus its own full-size buffers in the run's array type | `HostResponse`, `PlasmaCumtrapz`; `RamanPolar*` after `gpu/14` |
 | [`Nonlinear.Columnwise`](@ref) | calls it once per column, on the host; refused on a device array | nothing — the default, so any callable works | anything user-written |
 
 Three functions carry the units and the precision:
@@ -250,6 +250,220 @@ The simple interface deliberately does not use it: `prop_capillary` refuses an e
 [`device_capable`](@ref Luna.Nonlinear.device_capable), naming `device=:cpu`, rather than
 silently producing a run slower than the CPU. `device_capable` means "has a kernel of its
 own", i.e. `kind` is not `Columnwise`; it is about speed, not possibility.
+
+## The plasma response
+
+[`Nonlinear.PlasmaCumtrapz`](@ref Luna.Nonlinear.PlasmaCumtrapz) is the first response
+with a device kernel which is not a single fused broadcast, and it is the one the rest of
+this section's machinery exists for. It is [`Batched`](@ref Luna.Nonlinear.Batched): it
+is handed the whole `(nt, npol, ncols...)` block and evaluates it as
+
+1. one broadcast for the ionisation rate (below);
+2. `fraction`, `J` and `P`, each a cumulative trapezoid integral along the time axis;
+3. one `ifelse` broadcast for the ionisation-loss term;
+4. one broadcast to accumulate into the output.
+
+**The integrals are the reason for the trait.** A trapezoid integral written as a loop —
+`out[i] = out[i-1] + δt(y[i-1] + y[i])/2`, which is what `Maths.cumtrapz!` does — has a
+serial dependency along the time axis and cannot be a broadcast.
+`Maths.cumtrapz_scan!` is the same integral as one
+prefix scan and one broadcast,
+
+```math
+\mathrm{out}_i = δt\left(\sum_{k\le i} y_k - \frac{y_1 + y_i}{2}\right)
+```
+
+which is `accumulate!(+, out, y; dims=1)` followed by `@. out = δt*(out - (y + y1)/2)`.
+Metal and CUDA both provide a native scan; `JLArrays` does not, so `test_device.jl`
+supplies a host-backed one. The summation order is not the loop's, so the answer differs
+at rounding level — measured end to end, over four propagations which ionise between 0.1
+and 3 per cent of the gas, at 0.9e-15 to 4.3e-15 relative in `Eω`.
+
+**The loss term** is `ifelse(abs(E) > 0, closs*rate*(1-fraction)/E, zero(E))`. `ifelse` is
+a select, not a branch: both arms are evaluated, so the division by a zero field does
+happen and produces an infinity, and the select discards it. That is the same value the
+loop's `if abs(E[ii]) > 0` produced, and it is why the arm has to be an `ifelse` rather
+than a short-circuit — a branch per element is what a device kernel cannot afford.
+
+For a two-component field the term divides by `Em²`, and **the guard is on `Em²`, not on
+`Em`**. In the wings of a pulse `Em` is many orders below its peak — `exp(-50)` is 1e-22
+— so `Em²` is 1e-44, which is subnormal in `Float32` and which a device flushes to zero
+while `Em` itself is still a normal number. The rate there is zero too, so the term
+becomes `0/0`, and one NaN travels through the three scans which follow and destroys the
+whole column. On the CPU the subnormal survives and `0/x` is `0`, so nothing but the
+Metal hardware test sees this; it is the clearest example of why rule 7 of the kernel
+discipline exists. In `Float64` the two guards differ only below 1e-162 V/m.
+
+**Buffers.** The response owns `rate` and `fraction` (one polarisation component, so a
+singleton second axis which broadcasts against both), `Em` for a two-component field, and
+`J` and `P` at the size of the block. `P` holds the phase-modulation term until the last
+scan and the polarisation after it; the two are never live at once, which is one
+block-sized buffer fewer than the columnwise response held per column.
+
+They are sized for the block, which for a radial or free-space transform is the whole
+transverse grid and not the single column the constructor is given a prototype of, so
+every transform calls
+[`Nonlinear.rescale_responses`](@ref Luna.Nonlinear.rescale_responses) — the
+four-argument [`rescale`](@ref Luna.Nonlinear.rescale) mapped over its response
+collection, through the tuple-of-tuples a gas mixture is — at construction. On the
+default CPU path every fallback returns the response unchanged, so this changes nothing
+for anything else.
+
+**Units.** The response has no single polynomial degree, so
+[`Luna.polscale`](@ref) does not apply and
+[`coefficients`](@ref Luna.Nonlinear.coefficients) returns four scalars instead of one:
+`Eref` (the rate is evaluated at the physical field `Eref*e`), `e_ratio*Eref`,
+`ionpot/Eref` and `ρ/(Pref*Eref)`. Each reduces to the physical constant at
+`Eref == Pref == 1`.
+
+**CPU threading.** A column of the block costs a rate evaluation and three prefix scans,
+which is a large grain, so above `Nonlinear.PLASMA_THREAD_MINLEN` elements and more than
+one column the host path shares the columns out with `Threads.@threads :dynamic`
+(GPU_PLAN.md §4.9; `:dynamic` rather than `:static`, which throws when nested). Each task
+takes one column of every buffer and runs the same `_plasma_block!` as the whole-block
+call, so no column's arithmetic depends on the threading or on how many columns are
+passed at once — `test_device.jl` asserts that as exact equality, not a tolerance. A
+mode-averaged or modal transform has one column and is never threaded.
+
+Measured on an M1 Pro, `batched!` on a 2048-sample block of columns in `Float64`:
+
+| columns | 1 thread | 8 threads | Metal (`Float32`) |
+| ---: | ---: | ---: | ---: |
+| 1 | 36 µs | 36 µs | 587 µs |
+| 16 | 538 µs | 95 µs | 653 µs |
+| 128 | 4.51 ms | 580 µs | 620 µs |
+
+The threading is close to linear from a handful of columns up. A single column — which is
+every mode-averaged and modal run — is launch-bound on the GPU and is left alone by the
+threading, as it should be.
+
+### Dynamic range in `Float32`
+
+The magnitude of every intermediate of the plasma response, in `Float32`, over 45
+parameter combinations: He, Ne, Ar, Kr and Xe at 0.1, 1 and 10 bar, driven at 1e12, 1e14
+and 1e16 W/cm² (800 nm, 10 fs, 1024 samples), with `E_ref` the peak field rounded to a
+power of two and `P_ref = ε₀`. "Headroom" is the distance to the `Float32` limits
+(`1.2e-38` normal, `3.4e38`); the last column is the smallest normal `Float32` divided by
+the largest magnitude of the same array, i.e. the size of the error a flushed subnormal
+could cause relative to that quantity's own peak.
+
+| quantity | smallest non-zero | largest | headroom (low / high) | worst subnormal / own peak |
+| --- | ---: | ---: | ---: | ---: |
+| `e = E/E_ref` | 5.5e-23 | 1.3e+00 | 5e+15 / 3e+38 | 1.5e-38 |
+| `E_ref` | 2.1e+09 | 2.8e+11 | 2e+47 / 1e+27 | 5.5e-48 |
+| rate `W` [1/s] | 5.7e-27 | 1.9e+17 | 5e+11 / 2e+21 | 1.0e-43 |
+| `cumsum(W)` | 5.7e-27 | 1.7e+19 | 5e+11 / 2e+19 | 2.4e-44 |
+| `fraction` (integral) | 3.4e-43 | 2.0e+03 | 3e-05 / 2e+35 | 2.0e-28 |
+| `fraction` (`1-exp`) | 6.0e-08 | 1.0e+00 | 5e+30 / 3e+38 | 1.8e-35 |
+| `e_ratio*E_ref` | 6.1e+01 | 7.8e+03 | 5e+39 / 4e+34 | 1.9e-40 |
+| phase term | 3.5e-23 | 7.7e+03 | 3e+15 / 4e+34 | 2.7e-38 |
+| `cumsum(phase)` | 3.6e-06 | 2.9e+04 | 3e+32 / 1e+34 | 7.3e-39 |
+| `J` (phase integral) | 4.9e-22 | 3.4e-12 | 4e+16 / 1e+50 | 6.4e-23 |
+| loss term | 5.6e-45 | 9.1e-14 | 5e-07 / 4e+51 | 7.2e-16 |
+| `J` (with loss) | 5.6e-45 | 3.4e-12 | 5e-07 / 1e+50 | 7.2e-16 |
+| `cumsum(J)` | 5.6e-45 | 9.7e-11 | 5e-07 / 4e+48 | 5.9e-16 |
+| `P` | 1.4e-45 | 1.1e-26 | 1e-07 / 3e+64 | 5.0e+00 |
+| `ρ/(P_ref E_ref)` | 1.0e+24 | 1.4e+28 | 9e+61 / 2e+10 | 1.2e-62 |
+| `out` | 1.4e-21 | 1.2e+00 | 1e+17 / 3e+38 | 6.2e-25 |
+
+Nothing overflows and nothing is non-finite anywhere in the range: the largest
+intermediate is `cumsum(W)` at 1.7e19, nineteen orders below `floatmax(Float32)`. The
+scaling is what buys that — unscaled, the output coefficient `ρ/(P_ref E_ref)` would be
+`ρ` itself and `P` would carry the whole of ε₀.
+
+One intermediate is missing from the table because it only exists for a two-component
+field: `Em²`, the square of the field magnitude the loss term divides by. It reaches
+1e-44 in the wings of a pulse, is subnormal in `Float32`, and is the one place in the
+response where flushing a subnormal to zero produces a NaN rather than a small error —
+see the loss term above.
+
+The bottom end is where it is worth looking. Four quantities reach the subnormal range,
+and for three of them (`fraction`'s integral, the loss term, `J`) the subnormal values are
+at least 1e15 times smaller than the peak of the array they are in, so flushing them to
+zero — which Metal does — is below `Float32`'s own precision and cannot matter. `P` is the
+exception: there are parameter combinations where the *whole* `P` array is subnormal, and
+Metal produces zero for the plasma polarisation rather than a very small number.
+
+| gas | pressure | intensity | peak `P` | peak plasma `out` / peak Kerr `out` |
+| --- | ---: | ---: | ---: | ---: |
+| He | 0.1, 1, 10 bar | 1e14 W/cm² | 2.3e-39 | 2.6e-07 |
+
+That is the one case in the range where single precision loses the plasma term
+altogether, and where it does, the term is 2.6e-7 of the Kerr term at the same
+parameters — the size of a single `Float32` rounding of the Kerr term itself. The ratio
+does not depend on pressure, since both terms are proportional to ρ. At 1e12 W/cm² helium
+does not ionise at all (the rate is zero in both precisions) and at 1e16 W/cm² the plasma
+term dominates and is nowhere near the subnormal range. A propagation which depends on a
+plasma contribution that small needs `Float64`.
+
+### Ionisation rates in a kernel
+
+The rate is the part of the response which is not arithmetic on the field: it either
+evaluates a formula from a dozen stored constants ([`Ionisation.IonRateADK`](@ref)) or
+indexes a spline of `log(rate)` ([`Ionisation.IonRatePPTAccel`](@ref)). Both are captured
+by the broadcast kernel rather than passed as broadcast arguments, because the spline is
+indexed at a data-dependent position; `Adapt` rewrites the closure when the kernel is
+compiled, which is what turns the rate's arrays into device pointers.
+
+| | |
+| --- | --- |
+| [`Ionisation.device_capable`](@ref)`(ir)` | whether `ir` has a kernel: ADK, and a cached PPT rate on a uniformly spaced table |
+| [`Ionisation.device_rate`](@ref)`(ir, spec)` | the same rate in `spec`'s precision and array type; `ir` itself on the default host path |
+| [`Ionisation.ionrate!`](@ref)`(out, ir, E, Eref)` | the array-level evaluation, one broadcast on any array type |
+| [`Ionisation.ratekernel`](@ref)`(ir, Eref)` | the kernel itself, `e -> W(Eref*e)` |
+
+Three things had to change for this to compile for a GPU.
+
+- **Every constant is parametric.** `IonRateADK` held nine `Float64` fields and
+  `IonRatePPTAccel`'s `Emin`/`Emax` were `Float64`; a `Float64` struct field read inside
+  a Metal kernel never compiles. So is the spline: `Maths.CSpline`'s arrays move with
+  `Maths.todevice_spline`, and the index function it
+  captured for a uniform axis, which was a closure over three `Float64`s, is now
+  `Maths.UniformIndex`.
+- **No error paths.** `Maths.spline_eval` is `CSpline`'s
+  evaluation without the optional bounds check, whose `DomainError` message is built by
+  string interpolation. Above the table `IonRatePPTAccel`'s kernel saturates at the
+  table's last value; the host keeps today's error, raised once per call from a
+  `maximum(abs, E)` check rather than once per element.
+- **The field is reconstructed, not scaled away.** A response of polynomial degree `n`
+  carries `Eref^(n-1)` in a coefficient; an ionisation rate has no degree, so the kernel
+  computes `W(Eref*e)`. `Eref` is 1 for every `Float64` run, where `1*e` is exact.
+
+What single precision costs the rate itself, over the field range where the rate is big
+enough to matter (`W > 1e6` 1/s), measured against the same rate in `Float64`:
+
+| gas | ADK | cached PPT table | field range [V/m] | stored `log(rate)` range |
+| --- | ---: | ---: | ---: | ---: |
+| He | 6.0e-06 | 6.4e-06 | 2.9e10 – 2.1e11 | −697 … +37 |
+| Ne | 3.9e-06 | 6.6e-06 | 2.4e10 – 1.6e11 | −698 … +37 |
+| Ar | 3.2e-06 | 6.3e-06 | 1.4e10 – 8.6e10 | −695 … +37 |
+| Kr | 2.9e-06 | 6.1e-06 | 1.2e10 – 6.8e10 | −694 … +37 |
+| Xe | 4.2e-06 | 6.8e-06 | 9.4e09 – 5.1e10 | −689 … +37 |
+
+Both are a few times `Float32`'s own precision, from two places: the ADK exponent, whose
+argument is order 10–100 so that a 1e-7 relative error in it becomes a 1e-5 one in the
+rate, and the table's knots, which are ~1e11 apart by ~3e6 and so are resolved to ~5e-3
+of an interval in `Float32` (the interpolation position, not the value).
+
+Below that range both rates underflow to zero in `Float32` — the ADK rate for helium
+first becomes non-zero at 8.0e9 V/m instead of the `Float64` threshold of 1.1e9 V/m,
+where its value is 4e-304 1/s. Over a 100 fs pulse that is an ionisation fraction of
+1e-290, so the two are the same answer.
+
+**The stored table needs no offset.** GPU_PLAN.md §4.1 suggests holding the PPT table "in
+`log` form with an offset so that `Float32` covers the range". It is already in `log`
+form (`IonRatePPTAccel` splines `log(rate)`), and the range that puts in the table is
+−708 to +37, which `Float32` holds with room to spare: the resolution is 6.1e-5 at −708
+and 3.8e-6 at +37, i.e. a 6.1e-5 and 3.8e-6 relative error in the rate after `exp`. The
+first of those is at a rate of 1e-308 1/s and is not a number anybody uses. An offset
+would move the whole table towards zero and improve the unused end; it is not implemented,
+because it would also change the `Float64` path, which is bit-identical to the one before
+this branch.
+
+A rate with no kernel — the direct [`Ionisation.IonRatePPT`](@ref), whose series
+summation and `BigFloat` fallback are host code, a table which ended up on a
+`Maths.FastFinder`, or a user's callable — is refused by
+`device_rate` with a message naming the alternatives and `device=:cpu`.
 
 ## The output and statistics boundary
 

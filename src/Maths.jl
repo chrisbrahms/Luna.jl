@@ -1,5 +1,6 @@
 module Maths
 import FiniteDifferences
+import Adapt
 import LinearAlgebra: Tridiagonal, mul!, ldiv!
 import SpecialFunctions: erf, erfc, gamma
 import StaticArrays: SVector
@@ -337,6 +338,46 @@ as `δx` directly
 _dx(x, i) = x[i] - x[i-1]
 _dx(δx::Number, i) = δx
 
+
+"""
+    cumtrapz_scan!(out, y, δt)
+
+Cumulative trapezoidal integral of `y` along the **first** dimension with uniform
+spacing `δt`, placed into `out`, as one prefix scan plus one broadcast:
+
+```math
+\\mathrm{out}_i = δt\\left(\\sum_{k\\le i} y_k - \\frac{y_1 + y_i}{2}\\right)
+```
+
+which is the trapezoid rule with `out[1] == 0`, written so that it consists only of
+operations every array type provides ([`accumulate!`](@ref Base.accumulate!) and a
+broadcast). `cumtrapz!` is the same integral as a serial loop, which no device
+can run; this is the form Luna's per-step code uses (GPU_PLAN.md §4.2 rule 2).
+
+`out` and `y` must not alias, and this is checked: `accumulate!` would overwrite `y`
+before the correction reads it and produce silent garbage. Columns are independent, so
+the result does not depend on how many of them are passed at once — a caller may split
+the array along its trailing dimensions and get the same answer in each column.
+
+The **summation order differs** from `cumtrapz!`: this accumulates `y` and corrects,
+where `cumtrapz!` accumulates the trapezoid increments. The two agree to rounding level,
+not bit for bit. On a device the scan is a parallel prefix sum, which differs again.
+"""
+function cumtrapz_scan!(out, y, δt)
+    axes(out) == axes(y) || throw(DimensionMismatch(
+        "cumtrapz_scan!: out has axes $(axes(out)), y has axes $(axes(y))"))
+    out === y && throw(ArgumentError(
+        "cumtrapz_scan!: out and y must not alias; the correction broadcast reads y "*
+        "after the scan has written out"))
+    accumulate!(+, out, y; dims=1)
+    y1 = _firstalong1(y)
+    h = convert(real(eltype(out)), δt)
+    @. out = h*(out - (y + y1)/2)
+end
+
+"A view of the first slice of `y` along dimension 1, keeping that dimension (size 1)."
+_firstalong1(y::AbstractArray{T, N}) where {T, N} =
+    view(y, 1:1, ntuple(_ -> Colon(), N-1)...)
 
 """
     cumtrapz(y, x; dim=1)
@@ -787,13 +828,7 @@ function make_spline_ifun(x, ifun)
         δx = x[2] - x[1]
         if all(diff(x) .≈ δx)
             # x is uniformly spaced - use fast lookup
-            xmax = maximum(x)
-            xmin = minimum(x)
-            N = length(x)
-            ffast(x0) = x0 <= xmin ? 2 :
-                        x0 >= xmax ? N :
-                        ceil(Int, (x0-xmin)/(xmax-xmin)*(N-1))+1
-            ifun = ffast
+            ifun = UniformIndex(minimum(x), maximum(x), length(x))
         else
             # x is not uniformly spaced - use brute-force lookup
             ifun = FastFinder(x)
@@ -801,6 +836,44 @@ function make_spline_ifun(x, ifun)
     end
     ifun
 end
+
+"""
+    UniformIndex(xmin, xmax, N)
+
+Index lookup for a uniformly spaced axis of `N` points from `xmin` to `xmax`:
+`UniformIndex(...)(x0)` is the index of the first element of the axis bigger than `x0`,
+clamped to `2:N` so that an interpolant always has a pair of knots to work with.
+
+This is a struct rather than the closure it replaces so that it is parametric in the
+element type. It is captured by a `CSpline`, which may be evaluated inside a
+device (GPU) kernel, and Metal's kernel compiler rejects a `Float64` field. The
+arithmetic is unchanged.
+
+`convertlike` makes the copy in another precision which a device spline needs.
+"""
+struct UniformIndex{T}
+    xmin::T
+    xmax::T
+    N::Int
+end
+
+UniformIndex(xmin, xmax, N) = UniformIndex(promote(xmin, xmax)..., Int(N))
+
+@inline (f::UniformIndex)(x0) =
+    x0 <= f.xmin ? 2 :
+    x0 >= f.xmax ? f.N :
+    ceil(Int, (x0-f.xmin)/(f.xmax-f.xmin)*(f.N-1))+1
+
+"""
+    convertlike(T, ifun)
+
+The index function `ifun` with its scalars converted to the real type `T`, for a spline
+whose knots have been converted to `T` (see [`Luna.todevice`](@ref)). Defined for
+`UniformIndex` only: a `FastFinder` is stateful and cannot run in a
+device kernel, so there is nothing to convert it for.
+"""
+convertlike(::Type{T}, f::UniformIndex) where {T<:AbstractFloat} =
+    UniformIndex(convert(T, f.xmin), convert(T, f.xmax), f.N)
 
 """
     CSpline
@@ -858,6 +931,24 @@ function (c::CSpline)(x0)
         x0 < c.x[1] && throw(DomainError("CSpline evaulated out of bounds, $x0 < $(c.x[1])"))
         x0 > c.x[end] && throw(DomainError("CSpline evaulated out of bounds, $x0 > $(c.x[end])"))
     end
+    spline_eval(c, x0)
+end
+
+"""
+    spline_eval(c::CSpline, x0)
+
+Evaluate `c` at `x0` **without** the optional bounds check. `(c::CSpline)(x0)` is this
+plus the check.
+
+This is the form a device (GPU) kernel calls: the bounds check throws a `DomainError`
+whose message is built by string interpolation, which cannot be compiled for a device,
+and a kernel has no way to report the error anyway. A caller which uses it takes
+responsibility for the range of `x0` (see
+[`Ionisation.IonRatePPTAccel`](@ref Luna.Ionisation.IonRatePPTAccel), which clamps).
+
+The arithmetic is exactly that of the checked form, so the two agree bit for bit.
+"""
+@inline function spline_eval(c::CSpline, x0)
     i = c.ifun(x0)
     x0 == c.x[i] && return c.y[i]
     x0 == c.x[i-1] && return c.y[i-1]
@@ -866,6 +957,35 @@ function (c::CSpline)(x0)
         + c.D[i - 1]*t
         + (3*(c.y[i] - c.y[i - 1]) - 2*c.D[i - 1] - c.D[i])*t^2
         + (2*(c.y[i - 1] - c.y[i]) + c.D[i - 1] + c.D[i])*t^3)
+end
+
+#= Moves the knot and coefficient arrays to a device. Called by the kernel adaptor on a
+   spline which a broadcast kernel captured (through the rate object it belongs to), so
+   that its arrays become device pointers; the index function has no arrays and is
+   already in the right precision by then (`todevice_spline`). =#
+Adapt.adapt_structure(to, c::CSpline) =
+    CSpline(Adapt.adapt(to, c.x), Adapt.adapt(to, c.y), Adapt.adapt(to, c.D), c.ifun,
+            c.bounds_error)
+
+"""
+    todevice_spline(spec, c::CSpline)
+
+The same spline with its knots, values and coefficients on the array type and in the
+precision of `spec` (see [`Luna.DeviceSpec`](@ref)), and its index function converted to
+match (`convertlike`).
+
+Only a spline on a uniformly spaced axis can be moved: the alternative index function,
+`FastFinder`, is mutable and caches the last index it found, which is neither
+thread-safe nor expressible in a device kernel.
+"""
+function todevice_spline(spec, c::CSpline)
+    c.ifun isa UniformIndex || error(
+        "this CSpline uses a $(typeof(c.ifun)) to find indices, which cannot run in a "*
+        "device kernel or in reduced precision. Only a spline on a uniformly spaced "*
+        "axis (which uses a `Maths.UniformIndex`) can be moved to a device.")
+    CSpline(Luna.todevice(spec, collect(c.x)), Luna.todevice(spec, collect(c.y)),
+            Luna.todevice(spec, collect(c.D)),
+            convertlike(Luna.realtype(spec), c.ifun), c.bounds_error)
 end
 
 """

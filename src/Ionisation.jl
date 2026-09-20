@@ -8,6 +8,8 @@ import Logging: @info
 import Luna.PhysData: c, ħ, electron, m_e, au_energy, au_time, au_Efield, wlfreq, polarisability_difference, polarisability, au_polarisability
 import Luna.PhysData: ionisation_potential, quantum_numbers
 import Luna: Maths, Utils
+import Luna
+import Adapt
 import Printf: @sprintf
 
 abstract type AbstractIonRate end
@@ -19,17 +21,22 @@ abstract type AbstractIonRate end
 Ionisation rate based on the ADK formula. If `threshold` is true, use [`ADK_threshold`](@ref)
 to avoid calculation below floating-point precision. If `cycle_average` is `true`, calculate
 the cycle-averaged ADK ionisation rate instead.
+
+The struct is parametric in the real type of its constants (`Float64` as built). Nothing
+reachable from a device kernel may hold a `Float64` (GPU_PLAN.md §4.1) and the rate is
+evaluated inside a broadcast which may be compiled for a GPU, so [`device_rate`](@ref)
+makes the copy in the run's precision.
 """
-struct IonRateADK <: AbstractIonRate
-    ionpot::Float64
+struct IonRateADK{T} <: AbstractIonRate
+    ionpot::T
     threshold::Bool
     cycle_average::Bool
-    nstar::Float64
-    cn_sq::Float64
-    ω_p::Float64
-    ω_t_prefac::Float64
-    thr::Float64
-    avfac::Float64
+    nstar::T
+    cn_sq::T
+    ω_p::T
+    ω_t_prefac::T
+    thr::T
+    avfac::T
     occupancy::Int
 end
 
@@ -61,25 +68,37 @@ function IonRateADK(ionpot::Number; occupancy=2, threshold=true, cycle_average=f
         avfac = 1.0
     end
 
-    IonRateADK(ionpot, threshold, cycle_average,
-               nstar, cn_sq, ω_p, ω_t_prefac, thr, avfac, occupancy)
+    #= One real type for every constant, so that the struct is `isbits` and a copy of it
+       in Float32 (`device_rate`) has no Float64 field left. =#
+    ip, ns, cn, wp, wt, th, av = promote(float(ionpot), nstar, cn_sq, ω_p, ω_t_prefac,
+                                         thr, avfac)
+    IonRateADK(ip, threshold, cycle_average, ns, cn, wp, wt, th, av, occupancy)
 end
 
+#= `-4/3` would be a Float64 literal and would promote a Float32 kernel; `-(4*one(T)/3)`
+   is the same value in the type of the argument. Everything else is an `Int` times a
+   field, which takes the field's type. The expression and its association are otherwise
+   exactly as they were, so the Float64 values are unchanged. =#
 function (ir::IonRateADK)(E)
     aE = abs(E)
     if aE >= ir.thr
+        c43 = 4*one(aE)/3
         r = (ir.occupancy * ir.ω_p * ir.cn_sq *
              (4 * ir.ω_p / (ir.ω_t_prefac * aE))^(2 * ir.nstar - 1)
-             * exp(-4 / 3 * ir.ω_p / (ir.ω_t_prefac * aE)))
+             * exp(-c43 * ir.ω_p / (ir.ω_t_prefac * aE)))
         if ir.avfac ≠ 1
             r *= ir.avfac*sqrt(aE)
         end
         return r
     else
-        return zero(E)
+        return zero(aE)
     end
 end
 
+#= The historical array form: a broadcast of the scalar rate, which is the same kernel
+   body `ratekernel` wraps. It stays separate from `ionrate!` because `ionrate!`'s
+   fallback calls this form for a rate with no kernel, and a rate whose array form
+   delegated back to `ionrate!` would recurse. =#
 function (ir::IonRateADK)(out::AbstractArray, E::AbstractArray)
     out .= ir.(E)
 end
@@ -323,10 +342,10 @@ function ionrate_PPT(material::Symbol, λ0, E;
     return ionrate_PPT(ip, λ0, Z, l, E; Δα, α_ion, kwargs...)
 end
 
-struct IonRatePPTAccel{ST} <: AbstractIonRate
-    spline::ST # spline interpolant
-    Emin::Float64 # minimum electric field strength
-    Emax::Float64 # maximum electric field strength
+struct IonRatePPTAccel{ST, T} <: AbstractIonRate
+    spline::ST # spline interpolant of log(rate)
+    Emin::T # minimum electric field strength
+    Emax::T # maximum electric field strength
 end
 
 """
@@ -354,8 +373,7 @@ function IonRatePPTAccel(E, rate)
     rate = rate[idcs]
     # Interpolating the log and re-exponentiating makes the spline more accurate
     cspl = Maths.CSpline(E, log.(rate); bounds_error=true)
-    Emin = minimum(E)
-    Emax = maximum(E)
+    Emin, Emax = promote(minimum(E), maximum(E))
     IonRatePPTAccel(cspl, Emin, Emax)
 end
 
@@ -414,20 +432,185 @@ end
 
 function (ir::IonRatePPTAccel)(E)
     aE = abs(E)
-    if aE < ir.Emin
-        return 0.0
-    elseif aE > ir.Emax
+    if aE > ir.Emax
         error(
             "Field strength $aE V/m exceeds maximum for PPT ionisation rate ($(ir.Emax) V/m)."
             )
-    else
-        return exp(ir.spline(aE))
     end
+    _pptaccel(ir, E)
 end
 
+#= The kernel: the same arithmetic without the error path, whose string interpolation
+   cannot be compiled for a device and which a kernel could not report anyway. Above the
+   table it returns the table's last value (`min` puts `aE` on the last knot, where the
+   spline returns `y[end]` exactly); the host path errors instead, through the
+   `maximum(abs, E)` check in `ionrate!`. GPU_PLAN.md §4.3. =#
+@inline function _pptaccel(ir::IonRatePPTAccel, E)
+    aE = abs(E)
+    aE < ir.Emin && return zero(aE)
+    exp(Maths.spline_eval(ir.spline, min(aE, ir.Emax)))
+end
+
+# See the note on `(::IonRateADK)(out, E)`.
 function (ir::IonRatePPTAccel)(out::AbstractArray, E::AbstractArray)
     out .= ir.(E)
 end
+
+#=================================================#
+#===========  ARRAY-LEVEL EVALUATION  ============#
+#=================================================#
+
+"""
+    ratekernel(ir, Eref)
+
+A callable `f(e)` giving the ionisation rate of the field `Eref*e`, in the element type
+of `Eref`. This is the body of a broadcast which may be compiled for a GPU, so it
+captures nothing but the rate object (which must be `isbits` in the run's precision, see
+[`device_rate`](@ref)) and `Eref`.
+
+`Eref` is the unit the field array is expressed in (see [`Luna.UnitScaling`](@ref)): a
+scaled state holds `e = E/E_ref`, and the rate is not polynomial in the field, so the
+physical field is reconstructed here rather than folded into a coefficient. `Eref == 1`
+for every `Float64` run, where `1*e` is exact and the arithmetic is unchanged.
+"""
+function ratekernel end
+
+ratekernel(ir::IonRateADK, Eref) = let ir=ir, Eref=Eref
+    e -> ir(Eref*e)
+end
+
+ratekernel(ir::IonRatePPTAccel, Eref) = let ir=ir, Eref=Eref
+    e -> _pptaccel(ir, Eref*e)
+end
+
+"""
+    ionrate!(out, ir, E, Eref=1)
+
+Ionisation rate of every element of the field array `E`, placed into `out`.
+
+`E` holds `E_phys/Eref` (see [`Luna.UnitScaling`](@ref)); `Eref` defaults to `1`, i.e.
+physical units. `out` and `E` must have the same shape.
+
+**Which path it takes is decided by [`device_capable`](@ref), not by the type.** A rate
+with a kernel is one broadcast of [`ratekernel`](@ref), on the host, on a GPU, at any
+shape. Anything else — the direct [`IonRatePPT`](@ref), a cached rate on a non-uniform
+table, a rate somebody wrote — is called as `ir(out, E)`, which is what it always was and
+which needs host arrays in physical units; a device or a scaled run is refused with a
+message naming the alternatives.
+
+`check=false` skips the range check for a caller which has already made it on the whole
+block (see [`check_field_range`](@ref)). The check is what raises the error for a field
+above a cached rate's table, so skipping it without making it elsewhere would leave the
+rate saturating silently.
+"""
+function ionrate!(out, ir, E, Eref=1; check=true)
+    if device_capable(ir)
+        check && check_field_range(ir, E, Eref)
+        f = ratekernel(ir, Luna.scalar(out, Eref))
+        out .= f.(E)
+    else
+        (Eref == 1 && !Utils.isdevice(E)) || error(
+            "the ionisation rate $(nameof(typeof(ir))) has no device kernel, so it can "*
+            "only be evaluated on host arrays in physical units. Use "*
+            "`Ionisation.IonRateADK` or a cached PPT rate (`IonRatePPTCached`) on a "*
+            "device or in reduced precision, or run on the CPU with `device=:cpu`.")
+        ir(out, E)
+    end
+    out
+end
+
+"""
+    check_field_range(ir, E, Eref)
+
+Raise if any element of `Eref*E` is outside the range the rate `ir` can be evaluated
+over. Only a cached PPT rate has one: its spline is built on a table which stops at twice
+the barrier-suppression field.
+
+This is one reduction over the whole array rather than a branch per element, so a caller
+which splits an array into columns makes the check once, on the whole thing, and passes
+`check=false` to [`ionrate!`](@ref) — both so that the reduction happens once and so that
+the error is raised from the calling task rather than from inside a `@threads` loop.
+
+A no-op on a device array: a device kernel cannot raise, and there the rate saturates at
+the table's last value instead (see [`IonRatePPTAccel`](@ref)).
+"""
+check_field_range(ir, E, Eref) = nothing
+
+function check_field_range(ir::IonRatePPTAccel, E, Eref)
+    Utils.isdevice(E) && return nothing
+    m = maximum(abs, E)*Eref
+    m > ir.Emax && error(
+        "Field strength $m V/m exceeds maximum for PPT ionisation rate ($(ir.Emax) V/m).")
+    nothing
+end
+
+#=================================================#
+#===========  DEVICE (GPU) EVALUATION  ===========#
+#=================================================#
+
+"""
+    device_capable(ir) -> Bool
+
+Whether the ionisation rate `ir` can be evaluated inside a device (GPU) kernel and in
+reduced precision: the analytic ADK rate, and a cached PPT rate whose table is uniformly
+spaced (which every table `makePPTcache` builds is).
+
+`false` for the direct [`IonRatePPT`](@ref), whose series summation, `BigFloat` fallback
+and `factorial`s cannot be compiled for a device, for a cached rate which ended up on a
+`Maths.FastFinder`, and for a user-supplied callable.
+"""
+device_capable(ir) = false
+device_capable(::IonRateADK) = true
+device_capable(ir::IonRatePPTAccel) = ir.spline.ifun isa Maths.UniformIndex
+
+"""
+    device_rate(ir, spec)
+
+The same ionisation rate with its constants in the precision of `spec` and its lookup
+tables on its array type (see [`Luna.DeviceSpec`](@ref)), ready to be captured by a
+broadcast kernel. Returns `ir` itself for the default host `Float64` run.
+
+Errors, naming the alternatives, for a rate which is not
+[`device_capable`](@ref).
+"""
+function device_rate(ir, spec)
+    (Luna.isdevicespec(spec) || Luna.realtype(spec) !== Float64) || return ir
+    device_capable(ir) || error(
+        "the ionisation rate $(nameof(typeof(ir))) cannot be evaluated on "*
+        "$(Luna.arraytype(spec)) in $(Luna.realtype(spec)): its rate function has no "*
+        "device kernel. Use `Ionisation.IonRateADK`, or a cached PPT rate "*
+        "(`IonRatePPTCached`/`IonRatePPTAccel`, whose table is uniformly spaced), or "*
+        "run on the CPU with `device=:cpu`.")
+    _device_rate(ir, spec)
+end
+
+_device_rate(ir::IonRateADK, spec) =
+    IonRateADK{Luna.realtype(spec)}(ir.ionpot, ir.threshold, ir.cycle_average, ir.nstar,
+                                    ir.cn_sq, ir.ω_p, ir.ω_t_prefac, ir.thr, ir.avfac,
+                                    ir.occupancy)
+
+function _device_rate(ir::IonRatePPTAccel, spec)
+    T = Luna.realtype(spec)
+    IonRatePPTAccel(Maths.todevice_spline(spec, ir.spline),
+                    convert(T, ir.Emin), convert(T, ir.Emax))
+end
+
+"""
+    resident_arrays(ir)
+
+The arrays an ionisation rate carries which a device kernel indexes, for the residency
+assertion of the response which holds it
+(see [`Nonlinear.resident_arrays`](@ref Luna.Nonlinear.resident_arrays)).
+"""
+resident_arrays(ir) = ()
+resident_arrays(ir::IonRatePPTAccel) = (ir.spline.x, ir.spline.y, ir.spline.D)
+
+#= Structural moves for the kernel adaptor: when a broadcast kernel which captured one of
+   these is compiled for a device, every array inside it has to become a device pointer.
+   The scalars are already in the right precision (`device_rate`). =#
+Adapt.adapt_structure(to, ir::IonRateADK) = ir
+Adapt.adapt_structure(to, ir::IonRatePPTAccel) =
+    IonRatePPTAccel(Adapt.adapt(to, ir.spline), ir.Emin, ir.Emax)
 
 function makePPTcache(ionpot::Float64, λ0, Z, l;
                       N=2^16, Emax=nothing, kwargs...)
