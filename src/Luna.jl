@@ -55,7 +55,7 @@ When enabled, `Utils.loadFFTwisdom()` imports accumulated FFTW wisdom from a fil
 afterwards, so that expensive planning modes (`:measure`, `:patient`, `:exhaustive`, see
 [`set_fftw_mode`](@ref)) only have to be paid for once per transform shape. When disabled,
 both functions do nothing, so the plan FFTW produces depends only on the planning mode and
-the transform shape.
+the transform shape. The FFTW thread count is re-asserted either way.
 
 Disabling wisdom is needed to make runs reproducible: the wisdom file is shared by every
 process using the same Julia depot, so wisdom written by an unrelated `:patient` run (for
@@ -66,6 +66,11 @@ not leak into plans made later.
 
 Turning wisdom back on does not re-import the file; the next call to
 `Utils.loadFFTwisdom()` (which `Luna.setup` makes) does that.
+
+Like [`set_fftw_mode`](@ref) and [`set_fftw_threads`](@ref), this changes `settings` in the
+calling process only: `Scans` workers load `Luna` fresh and start from the defaults, so a
+scan that has to be reproducible needs `@everywhere Luna.set_fftw_wisdom(false)` — and the
+same for the other two — after the workers exist.
 """
 function set_fftw_wisdom(enabled::Bool)
     settings["fftw_wisdom"] = enabled
