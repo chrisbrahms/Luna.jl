@@ -23,7 +23,7 @@ import Test: @test, @testset, @test_throws, @test_logs
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
              NonlinearRHS, PhysData, RK45, Stats, Boundaries, DeviceSpec, HostSpec,
-             UnitScaling, UNIT_SCALING, Maths, Ionisation
+             UnitScaling, UNIT_SCALING, Maths, Ionisation, Raman
 import LinearAlgebra
 import GPUArraysCore
 import Adapt
@@ -87,7 +87,7 @@ end
    branch. =#
 function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
                    precision=nothing, thg=false, boundary=:none, stats=false, fixed=false,
-                   extraresp=(), plasma=false)
+                   extraresp=(), plasma=false, raman=false, nothg=false)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15; thg)
@@ -98,7 +98,10 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
     ρ = PhysData.density(gas, pres)
     dens = z -> ρ
     resp = if GT === Grid.RealGrid
-        (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+        #= `thg=false` on a `RealGrid` is `prop_capillary`'s no-THG Kerr response, which
+           needs the analytic signal of the block and is therefore batched. =#
+        (nothg ? Nonlinear.Kerr_field_nothg(PhysData.γ3_gas(gas), length(grid.to)) :
+                 Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
     elseif thg
         (Nonlinear.Kerr_env_thg(PhysData.γ3_gas(gas), grid.ω0, grid.to),)
     else
@@ -113,6 +116,14 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
                 Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)),
                                          metal_tablerate(),
                                          PhysData.ionisation_potential(gas)))
+    end
+    #= The default response set of a molecular gas: Kerr and the Raman polarisation,
+       which is what gpu/14 has to make run on a device. =#
+    if raman
+        rr = Raman.raman_response(grid.to, gas)
+        resp = (resp..., GT === Grid.RealGrid ?
+                         Nonlinear.RamanPolarField(grid.to, rr; thg=!nothg) :
+                         Nonlinear.RamanPolarEnv(grid.to, rr))
     end
     resp = (resp..., extraresp...)
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0;
@@ -266,6 +277,54 @@ end
     @test all(isfinite, Array(outc))
     @test !all(iszero, Array(outc))
     @test Adapt.adapt(MtlArray, kt).C isa MtlArray
+
+    #= The batched responses of gpu/14: the Raman convolution and the no-THG Kerr. Their
+       kernels are broadcasts and planned FFTs over the block, and the scalars they carry
+       (the frequency-domain factor and the density) go through `Luna.scalar`. The
+       frequency-domain response function is the array a kernel broadcasts against, and
+       the only part of the kernel machinery which leaves the host. =#
+    tr = collect(range(-100e-15, 100e-15, length=n))
+    ρn = PhysData.density(:N2, 1.0)
+    Er = Luna.todevice(MetalSpec, rand(n) .- 0.5)
+    outr = Luna.alloc(MetalSpec, Float32, (n,))
+    #= Its own scaling, with an `E_ref` of the size `Luna.unitscaling` picks for a real
+       pulse (`8.6e9` V/m). The Raman polarisation in scaled units carries `E_ref^2`, so
+       with the `E_ref = 1024` of the rest of this testset -- a field of a kilovolt per
+       metre, which nothing here propagates -- the frequency-domain product is genuinely
+       around 1e-44 and underflows in Float32. See PR_14-raman.md's audit. =#
+    scr = Luna.UnitScaling(exp2(33), PhysData.ε_0)
+    for thg in (true, false)
+        Rd = Nonlinear.rescale(
+            Nonlinear.RamanPolarField(tr, Raman.raman_response(tr, :N2); thg),
+            MetalSpec, scr, Er)
+        @test Rd.hω isa MtlArray{ComplexF32, 1}
+        @test Rd.E2 isa MtlArray{Float32}
+        @test Luna.all_resident(MetalSpec, Nonlinear.resident_arrays(Rd)...)
+        fill!(outr, 0)
+        NonlinearRHS.Et_to_Pt!(outr, Er, (Rd,), ρn; scaling=scr)
+        @test all(isfinite, Array(outr))
+        @test !all(iszero, Array(outr))
+        # the scaled frequency-domain factor is a normal Float32, not a flushed zero
+        hfac = Luna.scalar(outr, Nonlinear.coefficients(Rd, ρn, scr)[1])
+        @test hfac isa Float32
+        @test floatmin(Float32) < abs(hfac) < floatmax(Float32)
+        @test floatmin(Float32) < maximum(abs, Array(Rd.hω)) < floatmax(Float32)
+    end
+    Red = Nonlinear.rescale(Nonlinear.RamanPolarEnv(tr, Raman.raman_response(tr, :N2)),
+                            MetalSpec, scr, Ec)
+    fill!(outc, 0)
+    NonlinearRHS.Et_to_Pt!(outc, Ec, (Red,), ρn; scaling=scr)
+    @test all(isfinite, Array(outc))
+    @test !all(iszero, Array(outc))
+
+    knd = Nonlinear.rescale(Nonlinear.Kerr_field_nothg(PhysData.γ3_gas(:He), n),
+                            MetalSpec, sc, Er)
+    @test knd.an.mask isa MtlArray{Float32, 1}
+    @test knd.an.c1 isa MtlArray{ComplexF32}
+    fill!(outr, 0)
+    NonlinearRHS.Et_to_Pt!(outr, Er, (knd,), ρ; scaling=sc)
+    @test all(isfinite, Array(outr))
+    @test !all(iszero, Array(outr))
 
     #= The ionisation rates: nine Float64 constants in the ADK struct, and a spline
        whose knots, values, coefficients and index function are all Float64 as built.
@@ -645,6 +704,79 @@ end
     @test maximum(Array(pdh.fraction)) > 0.1f0
 end
 
+#= The Raman polarisation on Metal: nitrogen and hydrogen -- the gas with the largest
+   Raman gain Luna is used with -- in the three forms the response takes. Compared with
+   the CPU at the same precision, which is the device path rather than single precision,
+   and with the physical Float64 answer. =#
+@testset "Raman and the no-THG Kerr on Metal" begin
+    t, E = metal_plasmafield(512, 1e10)
+    Eenv = complex.(@. 1e10*exp(-t^2/(2*(10e-15/1.66)^2)))
+    Eref = exp2(round(Int, log2(maximum(abs, E))))
+    sc = Luna.UnitScaling(Eref, PhysData.ε_0)
+    cpu32 = DeviceSpec(Array, Float32)
+    for gas in (:N2, :H2)
+        ρ = PhysData.density(gas, 1.0)
+        cases = (("field, THG",
+                  () -> Nonlinear.RamanPolarField(t, Raman.raman_response(t, gas)), E),
+                 ("field, no THG",
+                  () -> Nonlinear.RamanPolarField(t, Raman.raman_response(t, gas);
+                                                  thg=false), E),
+                 ("envelope",
+                  () -> Nonlinear.RamanPolarEnv(t, Raman.raman_response(t, gas)), Eenv))
+        for (nm, make, Eh) in cases
+            # host Float64, physical units: the reference
+            R64 = Nonlinear.rescale(make(), HostSpec(), UNIT_SCALING, Eh)
+            P64 = zeros(eltype(Eh), size(Eh)); R64(P64, Eh, ρ)
+
+            # host Float32, scaled
+            Es = Luna.todevice(cpu32, Eh ./ Eref)
+            Rh = Nonlinear.rescale(make(), cpu32, sc, Es)
+            Ph = zeros(eltype(Es), size(Eh))
+            Nonlinear.batched!(Rh, Ph, Es, ρ, sc)
+
+            # Metal Float32, scaled
+            Ed = Luna.todevice(MetalSpec, Eh ./ Eref)
+            Rd = Nonlinear.rescale(make(), MetalSpec, sc, Ed)
+            @test Rd.hω isa MtlArray{ComplexF32, 1}
+            @test Rd.E2 isa MtlArray
+            @test Luna.all_resident(MetalSpec, Nonlinear.resident_arrays(Rd)...)
+            Pd = Luna.alloc(MetalSpec, eltype(Es), size(Eh))
+            Nonlinear.batched!(Rd, Pd, Ed, ρ, sc)
+
+            Pdh = Array(Pd)
+            @test all(isfinite, Pdh)
+            @test !all(iszero, Pdh) # not two zeros agreeing
+            @test maximum(abs, Pdh .- Ph)/maximum(abs, Ph) < 1e-4
+            phys = Pdh .* Float32(PhysData.ε_0*Eref)
+            @test maximum(abs, phys .- P64)/maximum(abs, P64) < 1e-3
+        end
+    end
+
+    #= The no-THG Kerr response, whose analytic signal is the same transform, on the same
+       field. The device comparison in the propagation test below cannot separate it from
+       the plain Kerr response -- the third-harmonic term is smaller than the Float32
+       tolerance there -- but here it can: the two responses differ by 30 % of the peak. =#
+    γ3 = PhysData.γ3_gas(:He)
+    ρ = PhysData.density(:He, 1.0)
+    kn = Nonlinear.Kerr_field_nothg(γ3, length(E))
+    P64 = zeros(size(E)); kn(P64, E, ρ)
+    Es = Luna.todevice(cpu32, E ./ Eref)
+    knh = Nonlinear.rescale(kn, cpu32, sc, Es)
+    Ph = zeros(Float32, size(E)); Nonlinear.batched!(knh, Ph, Es, ρ, sc)
+    Ed = Luna.todevice(MetalSpec, E ./ Eref)
+    knd = Nonlinear.rescale(kn, MetalSpec, sc, Ed)
+    Pd = Luna.alloc(MetalSpec, Float32, size(E))
+    Nonlinear.batched!(knd, Pd, Ed, ρ, sc)
+    Pdh = Array(Pd)
+    @test all(isfinite, Pdh)
+    @test !all(iszero, Pdh)
+    @test maximum(abs, Pdh .- Ph)/maximum(abs, Ph) < 1e-4
+    @test maximum(abs, Pdh .* Float32(PhysData.ε_0*Eref) .- P64)/maximum(abs, P64) < 1e-3
+    # ... and it is not the plain Kerr response
+    Pk = zeros(size(E)); Nonlinear.Kerr_field(γ3)(Pk, E, ρ)
+    @test maximum(abs, Pk .- P64)/maximum(abs, P64) > 0.1
+end
+
 @testset "prop_capillary on Metal" begin
     capkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
              trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=false)
@@ -706,6 +838,59 @@ end
     nop64, _ = metalcase(Grid.RealGrid, HostSpec(); gas=:Ar, energy=150e-6, fixed=true)
     @test maximum(abs, p64["Eω"][:, end] .- nop64["Eω"][:, end]) /
           maximum(abs, nop64["Eω"][:, end]) > 1e-2
+
+    #= gpu/14's exit condition: Kerr *and* the Raman polarisation, the default physics of
+       a field-resolved `prop_capillary` call in a molecular gas, on Metal end to end.
+       Nitrogen and hydrogen, hydrogen being the largest Raman gain Luna is used with.
+       Fixed steps, so the only difference between the runs is the arithmetic. =#
+    for gas in (:N2, :H2)
+        rkw = (; gas, energy=50e-6, raman=true, fixed=true)
+        r32, _ = metalcase(Grid.RealGrid, DeviceSpec(Array, Float32); rkw...)
+        r64, _ = metalcase(Grid.RealGrid, HostSpec(); rkw...)
+        rdm, rtr = metalcase(Grid.RealGrid, MetalSpec; rkw...)
+        @test rtr.resp[2] isa Nonlinear.RamanPolarField
+        @test rtr.resp[2].hω isa MtlArray{ComplexF32, 1}
+        @test rtr.resp[2].E2 isa MtlArray{Float32}
+        for idx in axes(r64["Eω"], 2)
+            @test maximum(abs, rdm["Eω"][:, idx] .- r32["Eω"][:, idx]) /
+                  maximum(abs, r32["Eω"][:, idx]) < 1e-4
+            @test maximum(abs, rdm["Eω"][:, idx] .- r64["Eω"][:, idx]) /
+                  maximum(abs, r64["Eω"][:, idx]) < 1e-3
+        end
+        #= The Raman term really contributes: a Kerr-only run of the same case differs by
+           far more than the tolerances above. =#
+        nor64, _ = metalcase(Grid.RealGrid, HostSpec(); gas, energy=50e-6, fixed=true)
+        @test maximum(abs, r64["Eω"][:, end] .- nor64["Eω"][:, end]) /
+              maximum(abs, nor64["Eω"][:, end]) > 1e-2
+    end
+
+    #= The no-THG Kerr response, which `prop_capillary(...; thg=false)` selects on a
+       `RealGrid`: batched, because removing the third harmonic needs the analytic signal
+       of the whole column. =#
+    tkw = (; energy=100e-6, nothg=true, fixed=true)
+    t32, _ = metalcase(Grid.RealGrid, DeviceSpec(Array, Float32); tkw...)
+    t64, _ = metalcase(Grid.RealGrid, HostSpec(); tkw...)
+    tdm, ttr = metalcase(Grid.RealGrid, MetalSpec; tkw...)
+    @test ttr.resp[1] isa Nonlinear.KerrFieldNoTHG
+    @test ttr.resp[1].an.c1 isa MtlArray{ComplexF32}
+    @test ttr.resp[1].an.mask isa MtlArray{Float32, 1}
+    for idx in axes(t64["Eω"], 2)
+        @test maximum(abs, tdm["Eω"][:, idx] .- t32["Eω"][:, idx]) /
+              maximum(abs, t32["Eω"][:, idx]) < 1e-4
+        @test maximum(abs, tdm["Eω"][:, idx] .- t64["Eω"][:, idx]) /
+              maximum(abs, t64["Eω"][:, idx]) < 1e-3
+    end
+    #= Removing THG really changes the answer, so this is not a comparison of two
+       ordinary Kerr runs. The threshold is small because the third-harmonic term itself
+       is: helium at 100 µJ over a centimetre gives 5.4e-5, and no parameters in this
+       file's range make it larger. That is a comparison of two *Float64* runs, where
+       5e-5 is enormous, but it is below the 1e-4 the device comparison above allows --
+       so what rules out the wrong response on the device is the structural check on
+       `ttr.resp[1]`, and the bit-exact host test of `AnalyticSignal` against
+       `Maths.plan_hilbert` in `test_device.jl`, rather than this number. =#
+    k64, _ = metalcase(Grid.RealGrid, HostSpec(); energy=100e-6, fixed=true)
+    @test maximum(abs, t64["Eω"][:, end] .- k64["Eω"][:, end]) /
+          maximum(abs, k64["Eω"][:, end]) > 1e-5
 
     #= ... and through the simple interface, with a real cached PPT rate, which is what
        a user gets from `prop_capillary(...; plasma=true)`. Argon at 0.1 bar and 300 µJ,
