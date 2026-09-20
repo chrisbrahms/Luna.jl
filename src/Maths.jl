@@ -351,7 +351,7 @@ spacing `δt`, placed into `out`, as one prefix scan plus one broadcast:
 
 which is the trapezoid rule with `out[1] == 0`, written so that it consists only of
 operations every array type provides ([`accumulate!`](@ref Base.accumulate!) and a
-broadcast). [`cumtrapz!`](@ref) is the same integral as a serial loop, which no device
+broadcast). `cumtrapz!` is the same integral as a serial loop, which no device
 can run; this is the form Luna's per-step code uses (GPU_PLAN.md §4.2 rule 2).
 
 `out` and `y` must not alias. Columns are independent, so the result does not depend on
@@ -841,11 +841,11 @@ Index lookup for a uniformly spaced axis of `N` points from `xmin` to `xmax`:
 clamped to `2:N` so that an interpolant always has a pair of knots to work with.
 
 This is a struct rather than the closure it replaces so that it is parametric in the
-element type. It is captured by a [`CSpline`](@ref), which may be evaluated inside a
+element type. It is captured by a `CSpline`, which may be evaluated inside a
 device (GPU) kernel, and Metal's kernel compiler rejects a `Float64` field. The
 arithmetic is unchanged.
 
-[`convertlike`](@ref) makes the copy in another precision which a device spline needs.
+`convertlike` makes the copy in another precision which a device spline needs.
 """
 struct UniformIndex{T}
     xmin::T
@@ -865,7 +865,7 @@ UniformIndex(xmin, xmax, N) = UniformIndex(promote(xmin, xmax)..., Int(N))
 
 The index function `ifun` with its scalars converted to the real type `T`, for a spline
 whose knots have been converted to `T` (see [`Luna.todevice`](@ref)). Defined for
-[`UniformIndex`](@ref) only: a [`FastFinder`](@ref) is stateful and cannot run in a
+`UniformIndex` only: a `FastFinder` is stateful and cannot run in a
 device kernel, so there is nothing to convert it for.
 """
 convertlike(::Type{T}, f::UniformIndex) where {T<:AbstractFloat} =
@@ -968,10 +968,10 @@ Adapt.adapt_structure(to, c::CSpline) =
 
 The same spline with its knots, values and coefficients on the array type and in the
 precision of `spec` (see [`Luna.DeviceSpec`](@ref)), and its index function converted to
-match ([`convertlike`](@ref)).
+match (`convertlike`).
 
 Only a spline on a uniformly spaced axis can be moved: the alternative index function,
-[`FastFinder`](@ref), is mutable and caches the last index it found, which is neither
+`FastFinder`, is mutable and caches the last index it found, which is neither
 thread-safe nor expressible in a device kernel.
 """
 function todevice_spline(spec, c::CSpline)

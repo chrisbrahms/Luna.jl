@@ -4,18 +4,20 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! warning "Work in progress: only mode-averaged Kerr propagation runs on a device"
-    This page describes what the device model does as of `gpu/11-boundaries-output`.
+!!! warning "Work in progress: mode-averaged propagation with Kerr and plasma"
+    This page describes what the device model does as of `gpu/13-plasma`.
     `prop_capillary` and `prop_gnlse` take `device` and `precision` keywords (below), and
-    for mode-averaged propagation with Kerr responses (`modes` a single mode; no plasma,
-    no Raman, no χ⁽²⁾) `prop_capillary` runs end to end on a device: the absorbing
-    boundaries (`boundary=:rate`, the default) and the default per-step statistics both
-    work now. Anything else -- multimode and radial propagation, `prop_gnlse`, and every
-    response but Kerr -- is still host code; `Luna.setup`/`Luna.run` refuse a device or a
-    reduced precision there rather than running it wrongly (or, for the simple interface,
-    error with a message naming the actual limitation). Free space and multimode
-    propagation, and the other nonlinear responses, follow in later branches; the page is
-    completed in `gpu/32-docs`.
+    for mode-averaged propagation (`modes` a single mode) with the Kerr and plasma
+    responses -- which is what `prop_capillary` builds by default for a field-resolved
+    run in a non-Raman gas -- it runs end to end on a device, including the absorbing
+    boundaries (`boundary=:rate`, the default) and the default per-step statistics.
+    Anything else -- multimode and radial propagation, `prop_gnlse`, and the Raman and
+    χ⁽²⁾ responses -- is still host code; `Luna.setup`/`Luna.run` refuse a device or a
+    reduced precision for a *transform* rather than running it wrongly, and fall back to
+    the host for a *response* (or, for the simple interface, error with a message naming
+    the actual limitation). Free space and multimode propagation, and the other
+    nonlinear responses, follow in later branches; the page is completed in
+    `gpu/32-docs`.
 
 ## Enabling it
 
@@ -131,7 +133,7 @@ round 1".)
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-plasma, Raman and χ⁽²⁾ responses, and the radial, free-space and multimode transforms.
+the Raman and χ⁽²⁾ responses, and the radial, free-space and multimode transforms.
 `Luna.setup` refuses a device or a reduced precision for the *transforms*, through the
 residency checks each of them makes, rather than running them wrongly. A *response* is
 not refused: it falls back to the host copy described under "An ad hoc response on a
@@ -171,10 +173,29 @@ quickly.
 
 Because of that, the *simple* interface refuses instead of falling back: an explicit
 `device` or `precision` request to `prop_capillary` with a response that has no device
-kernel of its own (plasma, Raman, χ⁽²⁾ at the moment) is an error naming `device=:cpu`. A
+kernel of its own (Raman and χ⁽²⁾ at the moment) is an error naming `device=:cpu`. A
 call which does not mention `device` or `precision` is never affected — it stays on the
 CPU as it always did. Use the low-level interface (`Luna.setup`/`Luna.run`) if you really
 want the host fallback.
+
+### Ionisation rates on a device
+
+The plasma response evaluates its ionisation rate inside a kernel, which only two of
+Luna's rates can do: [`Ionisation.IonRateADK`](@ref) (an analytic formula) and a cached
+PPT rate, [`Ionisation.IonRatePPTAccel`](@ref)/`IonRatePPTCached`, whose table is
+uniformly spaced — which every table Luna builds is. Those are what
+`prop_capillary(...; plasma=true)` uses, so a default call needs no thought.
+
+The direct [`Ionisation.IonRatePPT`](@ref), which sums a series and falls back to
+`BigFloat`, cannot, and neither can a rate you wrote yourself. `Luna.setup` refuses those
+on a device or in single precision with a message naming the alternatives; run on the CPU
+with `device=:cpu`.
+
+One behaviour differs on a device. The cached rate has a maximum field strength (twice
+the barrier-suppression field), above which the CPU raises an error saying so. A device
+kernel cannot raise one, so it returns the table's last value instead. The host path
+keeps the error, which now comes from a check on the largest field in the block rather
+than from every element.
 
 ### `stats_period`
 

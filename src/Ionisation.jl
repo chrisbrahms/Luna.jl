@@ -487,7 +487,7 @@ broadcast of [`ratekernel`](@ref) — on the host, on a GPU, at any shape.
 `E` holds `E_phys/Eref` (see [`Luna.UnitScaling`](@ref)); `Eref` defaults to `1`, i.e.
 physical units. `out` and `E` must have the same shape.
 
-A rate which is not an [`AbstractIonRate`](@ref) — a user-supplied `rate!(out, E)` — is
+A rate which is not an `AbstractIonRate` — a user-supplied `rate!(out, E)` — is
 called as it always was, which needs host arrays in physical units.
 """
 function ionrate!(out, ir::AbstractIonRate, E, Eref=1)
@@ -529,11 +529,11 @@ end
 
 Whether the ionisation rate `ir` can be evaluated inside a device (GPU) kernel and in
 reduced precision: the analytic ADK rate, and a cached PPT rate whose table is uniformly
-spaced (which every table [`makePPTcache`](@ref) builds is).
+spaced (which every table `makePPTcache` builds is).
 
 `false` for the direct [`IonRatePPT`](@ref), whose series summation, `BigFloat` fallback
 and `factorial`s cannot be compiled for a device, for a cached rate which ended up on a
-[`Maths.FastFinder`](@ref Luna.Maths.FastFinder), and for a user-supplied callable.
+`Maths.FastFinder`, and for a user-supplied callable.
 """
 device_capable(ir) = false
 device_capable(::IonRateADK) = true

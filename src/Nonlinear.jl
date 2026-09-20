@@ -861,13 +861,13 @@ A. Scrinzi, M. Schnürer, F. Krausz, and T. Brabec, Physical Review Letters 83, 
 
 `t` is the (oversampled) time grid, `E` a prototype of the time-domain field block the
 response will be applied to, `ratefunc` an ionisation rate (see
-[`Ionisation`](@ref Luna.Ionisation)) and `ionpot` the ionisation potential in Joules.
+`Ionisation`) and `ionpot` the ionisation potential in Joules.
 `preionfrac` is a pre-ionised fraction, which is not a well founded physical model.
 
 [`Batched`](@ref): the response is handed the whole `(nt, npol, ncols...)` block and
 evaluates it with whole-array operations — one broadcast for the rate, one prefix scan
 plus one broadcast for each of the three cumulative integrals
-([`Maths.cumtrapz_scan!`](@ref Luna.Maths.cumtrapz_scan!)), and one `ifelse` broadcast
+(`Maths.cumtrapz_scan!`), and one `ifelse` broadcast
 for the ionisation-loss term. That is the same code on the host and on a device
 (GPU_PLAN.md §4.2). On the host the columns are shared out over threads when there are
 enough of them; each column's arithmetic is the same either way, and the same as if the

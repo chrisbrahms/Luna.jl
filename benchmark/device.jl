@@ -23,7 +23,7 @@
 =#
 using Luna
 import Luna: RK45, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear, Output,
-             PhysData, Utils, DeviceSpec, HostSpec
+             PhysData, Utils, DeviceSpec, HostSpec, Ionisation
 import LinearAlgebra
 import BenchmarkTools: @benchmarkable, run as brun, minimum as bminimum
 import Printf: @printf, @sprintf
@@ -50,13 +50,25 @@ const FLENGTH = 1e-2
 
 quiet(f) = Logging.with_logger(f, Logging.NullLogger())
 
-"""
-    prepare(spec, trange)
+#= The tabulated rate a `plasma=true` run uses, built here rather than pre-calculated:
+   `IonRatePPTAccel(E, rate)` is the constructor the PPT cache calls, the axis is uniform
+   (so the kernel is the spline lookup a real cached rate uses), and it costs
+   milliseconds. What is timed is the response, not the PPT series. =#
+function tablerate(gas)
+    Ebs = Ionisation.barrier_suppression(PhysData.ionisation_potential(gas), 1.0)
+    E = collect(range(2Ebs/5000, 2Ebs, length=1<<16))
+    Ionisation.IonRatePPTAccel(E, Ionisation.IonRateADK(gas).(E))
+end
 
-Set up the mode-averaged Kerr propagation on `spec` and return everything the timings
-need. `boundary=:none`, since the absorbing boundaries are host code until `gpu/11`.
 """
-function prepare(spec, trange)
+    prepare(spec, trange; plasma=false)
+
+Set up the mode-averaged propagation on `spec` and return everything the timings need.
+`boundary=:none`. With `plasma=true` the response set is Kerr *and*
+`Nonlinear.PlasmaCumtrapz` on a tabulated rate, which is what `prop_capillary` builds by
+default for a field-resolved run in a non-Raman gas.
+"""
+function prepare(spec, trange; plasma=false)
     quiet() do
         grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), trange)
         m = Capillary.MarcatiliMode(75e-6, GAS, PRES, loss=false)
@@ -67,6 +79,12 @@ function prepare(spec, trange)
         ρ = PhysData.density(GAS, PRES)
         dens = z -> ρ
         resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(GAS)),)
+        if plasma
+            resp = (resp...,
+                    Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)),
+                                             tablerate(GAS),
+                                             PhysData.ionisation_potential(GAS)))
+        end
         linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
         inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
         Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
@@ -86,15 +104,15 @@ end
    the launch, not the kernel. `device_synchronize` is a no-op on the CPU. =#
 sync(spec) = Luna.device_synchronize(spec)
 
-function rhstime(spec, trange)
-    Eω, _, transform, _, _ = prepare(spec, trange)
+function rhstime(spec, trange; plasma=false)
+    Eω, _, transform, _, _ = prepare(spec, trange; plasma)
     nl = similar(Eω)
     b = @benchmarkable (($transform)($nl, $Eω, 0.0); sync($spec)) seconds=BUDGET
     (length(Eω), bminimum(brun(b)).time/1e9)
 end
 
-function steptime(spec, trange)
-    Eω, linop, transform, _, _ = prepare(spec, trange)
+function steptime(spec, trange; plasma=false)
+    Eω, linop, transform, _, _ = prepare(spec, trange; plasma)
     dz = FLENGTH/NSTEPS
     b = @benchmarkable (RK45.step!(s); sync($spec)) setup=(
             s = RK45.PreconStepper($transform, $linop, $Eω, 0.0, $dz;
@@ -103,9 +121,9 @@ function steptime(spec, trange)
     bminimum(brun(b)).time/1e9
 end
 
-function proptime(spec, trange; samples=3)
+function proptime(spec, trange; samples=3, plasma=false)
     minimum(1:samples) do _
-        Eω, linop, transform, grid, FT = prepare(spec, trange)
+        Eω, linop, transform, grid, FT = prepare(spec, trange; plasma)
         out = Output.MemoryOutput(0, FLENGTH, 3, Output.nostats)
         output = Utils.isdevice(Eω) ? ToHost(out) : out
         dz = FLENGTH/NSTEPS
@@ -130,17 +148,48 @@ for name in Luna.devicenames()
     Luna.device_functional(name) && push!(specs, (string(name)*" "*string(Luna.realtype(spec)), spec))
 end
 
-@printf("Mode-averaged Kerr, %s at %g bar, %g m, %d fixed steps, boundary=:none\n",
+@printf("%s at %g bar, %g m, %d fixed steps, boundary=:none\n",
         GAS, PRES, FLENGTH, NSTEPS)
-@printf("1 Julia thread, 1 FFTW thread, 1 BLAS thread, :estimate, no wisdom\n\n")
-@printf("%-14s %8s %10s %12s %12s %12s\n",
-        "device", "trange", "state", "rhs", "step", "prop")
-@printf("%s\n", "-"^72)
-for trange in TRANGES, (name, spec) in specs
-    n, tr = rhstime(spec, trange)
-    ts = steptime(spec, trange)
-    tp = proptime(spec, trange)
-    @printf("%-14s %6.0f fs %10d %12s %12s %12s\n",
-            name, trange*1e15, n, fmttime(tr), fmttime(ts), fmttime(tp))
-    flush(stdout)
+@printf("%d Julia threads, 1 FFTW thread, 1 BLAS thread, :estimate, no wisdom\n",
+        Threads.nthreads())
+for plasma in (false, true)
+    @printf("\nresponses: %s\n\n", plasma ? "Kerr + plasma (tabulated rate)" : "Kerr")
+    @printf("%-14s %8s %10s %12s %12s %12s\n",
+            "device", "trange", "state", "rhs", "step", "prop")
+    @printf("%s\n", "-"^72)
+    for trange in TRANGES, (name, spec) in specs
+        n, tr = rhstime(spec, trange; plasma)
+        ts = steptime(spec, trange; plasma)
+        tp = proptime(spec, trange; plasma)
+        @printf("%-14s %6.0f fs %10d %12s %12s %12s\n",
+                name, trange*1e15, n, fmttime(tr), fmttime(ts), fmttime(tp))
+        flush(stdout)
+    end
+end
+
+#= The plasma response on its own, over a block of transverse columns -- the shape a
+   radial or free-space transform passes, and the only case where the host path threads
+   the columns. Run the script with `-t 1` and with `-t N` to see the threading; the
+   thread count is fixed for the process. =#
+@printf("\nplasma response alone, %d-sample block of columns, %d threads\n\n",
+        1<<11, Threads.nthreads())
+@printf("%-14s %10s %12s\n", "device", "columns", "batched!")
+@printf("%s\n", "-"^40)
+let nt = 1<<11, ionpot = PhysData.ionisation_potential(GAS), ir = tablerate(GAS),
+    ρ = PhysData.density(GAS, PRES)
+    t = collect(range(-60e-15, 60e-15, length=nt))
+    E = @. 6e10*exp(-t^2/(2*(10e-15/1.66)^2))*cos(2π*PhysData.c/800e-9*t)
+    p0 = Nonlinear.PlasmaCumtrapz(t, E, ir, ionpot)
+    for (name, spec) in specs, ncols in (1, 16, 128)
+        Eh = repeat(reshape(E, nt, 1, 1), 1, 1, ncols)
+        sc = Luna.realtype(spec) === Float64 ? Luna.UNIT_SCALING :
+             Luna.unitscaling(Luna.realtype(spec), Eh, PhysData.ε_0)
+        Ed = Luna.todevice(spec, Eh ./ sc.Eref)
+        p = Nonlinear.rescale(p0, spec, sc, Ed)
+        out = Luna.alloc(spec, Luna.realtype(spec), size(Ed))
+        b = @benchmarkable (Nonlinear.batched!($p, $out, $Ed, $ρ, $sc); sync($spec)
+                            ) seconds=BUDGET
+        @printf("%-14s %10d %12s\n", name, ncols, fmttime(bminimum(brun(b)).time/1e9))
+        flush(stdout)
+    end
 end
