@@ -306,16 +306,25 @@ factor ([`iscale`](@ref)) so that the factor can be folded into the scale of the
 oversampling copy; see [`plan_ift`](@ref).
 """
 iplan(p::AbstractFFTs.ScaledPlan) = p.p
-iplan(p) = p
+iplan(p) = _notinverse(p)
 
 """
     iscale(IFT)
 
 The normalisation factor of an inverse plan, `1/N`, separated from the plan itself
-([`iplan`](@ref)). `1` for a plan which is already normalised.
+([`iplan`](@ref)).
 """
 iscale(p::AbstractFFTs.ScaledPlan) = p.scale
-iscale(p) = 1
+iscale(p) = _notinverse(p)
+
+#= Every inverse plan Luna makes is a `ScaledPlan`: that is what `inv` returns for an
+   FFTW plan, for a Metal or CUDA plan, and for the JLArray shim in the tests. Anything
+   else reaching here is a forward plan passed where an inverse one belongs, which would
+   otherwise transform the wrong way -- a method error on a real grid, silently wrong
+   output on an envelope grid. Dispatch decides, so the check costs nothing. =#
+_notinverse(p) = error(
+    "an inverse plan is required here, not $(typeof(p)). Build it with "*
+    "`Utils.plan_ift(FT)`, or use the transform's own `IFT` field.")
 
 function format_elapsed(ms::Dates.Millisecond)
     stot = Dates.value(ms)/1000 # total seconds

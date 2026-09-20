@@ -31,6 +31,19 @@ function rescale(r, spec, scaling)
           "(Float64, unscaled) any callable `resp!(out, E, ρ)` works.")
 end
 
+"""
+    resident_arrays(response) -> Tuple
+
+The arrays a nonlinear response carries which a kernel broadcasts against, and which
+therefore have to live on the run's array type and precision. A transform passes them to
+[`Luna.assert_resident`](@ref) at construction, together with its own buffers and grid
+mirrors.
+
+Empty by default, which is right for a response whose coefficients are all scalars and
+for anything which does not run on a device at all.
+"""
+resident_arrays(r) = ()
+
 #= The Kerr responses are structs rather than closures so that they can be parametric in
    the real element type (nothing reachable from a Metal kernel may hold a Float64), carry
    an `Adapt` rule for their arrays, and take a `rescale` method. The constructors
@@ -163,6 +176,8 @@ rescale(k::KerrEnvTHG, spec, scaling) = KerrEnvTHG(
     Luna.todevice(spec, k.C))
 
 Adapt.adapt_structure(to, k::KerrEnvTHG) = KerrEnvTHG(k.γ3, Adapt.adapt(to, k.C))
+
+resident_arrays(k::KerrEnvTHG) = (k.C,)
 
 struct Chi2Field{χT}
     χ2::χT

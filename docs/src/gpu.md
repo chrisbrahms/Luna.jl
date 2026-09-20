@@ -4,14 +4,19 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! note "Work in progress"
+!!! warning "Work in progress: the simple interface is not device-capable yet"
     This page describes what the device model does as of `gpu/10-device-model`, the first
     branch of the GPU work. At this point only mode-averaged propagation with Kerr
-    responses runs on a device, through the low-level interface, and with
-    `boundary=:none`. The absorbing boundaries, the output wrapper and the simple
-    interface (`prop_capillary`, `prop_gnlse`) follow in `gpu/11`; plasma, Raman, χ⁽²⁾,
-    radial, free-space and multimode propagation follow after that. The page is completed
-    in `gpu/32-docs`.
+    responses runs on a device, through the **low-level** interface (`Luna.setup` /
+    `Luna.run`), and with `boundary=:none`.
+
+    `prop_capillary` and `prop_gnlse` deliberately stay on the CPU in double precision
+    whatever `Luna.settings["device"]` says, and give exactly the result they always did,
+    because the absorbing boundaries, the per-step statistics and every response but Kerr
+    are still host code. They gain `device` and `precision` keywords in `gpu/11`, together
+    with the absorbing boundaries and the output wrapper; plasma, Raman, χ⁽²⁾, radial,
+    free-space and multimode propagation follow after that. The page is completed in
+    `gpu/32-docs`.
 
 ## Enabling it
 
@@ -21,8 +26,9 @@ using Metal      # or: using CUDA
 ```
 
 Loading the GPU package registers the backend and sets `Luna.settings["device"] = :auto`
-**if the key is absent**, so a script which has not said anything about devices starts
-using the GPU. To opt out:
+**if the key is absent**, so a low-level script which has not said anything about devices
+starts using the GPU. (`prop_capillary` and `prop_gnlse` do not: see the warning above.)
+To opt out:
 
 ```julia
 Luna.set_device(:cpu)
@@ -112,9 +118,18 @@ Luna, BenchmarkTools and the GPU package.
 ## Running the hardware tests
 
 ```
+julia --project=<env> -e '
+  using Pkg
+  Pkg.develop(path=".")
+  Pkg.add(["Metal", "Test", "GPUArraysCore", "Adapt"])'
 julia --project=<env> -t 1 -e 'using Luna, Metal; include("test/test_metal.jl")'
 ```
 
-where `<env>` is an environment with Luna developed into it and Metal added. The file
-skips itself if Metal is not loaded or not functional. `test/test_device.jl`, which runs
-the same code paths on `JLArrays` without any GPU, is part of `Pkg.test()`.
+`<env>` needs Luna developed into it *and* the packages the test file imports directly,
+which is the set the CI job installs. The file skips itself if Metal is not loaded or not
+functional.
+
+`test/test_device.jl`, which runs the same code paths on `JLArrays` without any GPU, is
+part of `Pkg.test()`. On its own it needs
+`Pkg.add(["JLArrays", "Test", "GPUArraysCore", "Adapt", "AbstractFFTs", "FFTW"])` in the
+same way.

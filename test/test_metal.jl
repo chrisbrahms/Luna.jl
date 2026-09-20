@@ -1,11 +1,16 @@
 #= Metal hardware tests.
 
-   Run with Metal loaded and in an environment where it is installed:
+   Metal must not be a dependency of Luna, so it goes into a *separate* environment
+   stacked on the package (which is what the CI job builds), never into Project.toml.
+   That environment needs Luna developed into it plus the packages this file imports
+   directly:
 
-       julia --project=<env> -e 'using Luna, Metal; include("test/test_metal.jl")'
+       julia --project=<env> -e '
+         using Pkg
+         Pkg.develop(path=".")
+         Pkg.add(["Metal", "Test", "GPUArraysCore", "Adapt"])'
+       julia --project=<env> -t 1 -e 'using Luna, Metal; include("test/test_metal.jl")'
 
-   Metal must not be a dependency of Luna, so it is added to a *separate* environment
-   stacked on the package (or to the CI job's test environment), never to Project.toml.
    Without Metal loaded, or on a machine where it is not functional, everything here is
    skipped.
 
@@ -81,6 +86,28 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
     output = Utils.isdevice(Eω) ? ToHostM(out) : out
     Luna.run(Eω, grid, linop, transform, FT, output;
              zmax=flength, boundary=:none, init_dz=flength/20, rtol=1e-8)
+    out, transform
+end
+
+#= A pressure gradient: a z-dependent operator closure and `constβ=false`, which is the
+   only case exercising `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s
+   host-buffer branch -- the two pieces which still upload from the host on every stage
+   until gpu/23. Fixed steps, so the runs differ only in arithmetic. =#
+function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9)
+    grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
+    coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
+    m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    linop, βfun! = LinearOps.make_linop(grid, m, λ0)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
+    Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
+                                   device=spec)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    output = Utils.isdevice(Eω) ? ToHostM(out) : out
+    dz = flength/20
+    Luna.run(Eω, grid, linop, transform, FT, output;
+             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz)
     out, transform
 end
 
@@ -224,6 +251,58 @@ end
         h = href["Eω"][:, idx]
         d = ComplexF64.(dref["Eω"][:, idx]) .* Eref
         @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    end
+end
+
+@testset "pressure gradient on Metal" begin
+    href, htr = metalgradientcase(DeviceSpec(Array, Float32))
+    dref, dtr = metalgradientcase(MetalSpec)
+
+    # The z-dependent branch: β is staged on the host and uploaded per evaluation
+    @test !isnothing(dtr.norm!.β)
+    @test dtr.norm!.β.host isa Vector{Float64}
+    @test dtr.norm!.β.stage isa Vector{Float32}
+    @test dtr.norm!.β.dev isa MtlArray{Float32, 1}
+
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = dref["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    end
+end
+
+#= Finding 1 of review round 1: loading Metal sets settings["device"] = :auto for the
+   whole process, and the simple interface is not device-capable in this branch. It must
+   therefore give the same answer whatever the setting says, which is what
+   `Interface` passing `device=Luna.HostSpec()` guarantees until gpu/11 plumbs the
+   keywords through. =#
+@testset "the simple interface stays on the CPU" begin
+    old = get(Luna.settings, "device", nothing)
+    capargs = (125e-6, 1e-3, :He, 1.0)
+    capkw = (; λ0=800e-9, energy=1e-9, τfwhm=10e-15, λlims=(300e-9, 2e-6),
+             trange=400e-15, saveN=3, plasma=false, shotnoise=false,
+             PPT_options=Dict(:cache => false))
+    gnlsekw = (; λ0=835e-9, τfwhm=100e-15, power=1e3, pulseshape=:sech,
+               λlims=(450e-9, 2e-6), trange=1e-12, saveN=3, raman=false,
+               shotnoise=false)
+    try
+        Luna.set_device(:cpu)
+        ocap = Luna.prop_capillary(capargs...; capkw...)
+        ognlse = Luna.prop_gnlse(0.1, 1e-3, [0.0, 0.0, -1e-26]; gnlsekw...)
+
+        Luna.set_device(:auto)
+        @test Luna.device() === MetalSpec # the GPU really is selected globally
+        dcap = Luna.prop_capillary(capargs...; capkw...)
+        dgnlse = Luna.prop_gnlse(0.1, 1e-3, [0.0, 0.0, -1e-26]; gnlsekw...)
+
+        # Same answer, on the host, in double precision
+        @test eltype(dcap["Eω"]) === ComplexF64
+        @test dcap["Eω"] == ocap["Eω"]
+        @test eltype(dgnlse["Eω"]) === ComplexF64
+        @test dgnlse["Eω"] == ognlse["Eω"]
+    finally
+        isnothing(old) ? delete!(Luna.settings, "device") :
+                         (Luna.settings["device"] = old)
     end
 end
 

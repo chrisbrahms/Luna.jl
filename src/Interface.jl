@@ -883,10 +883,17 @@ function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, 
                                                     linopkw(grid, thg)...)
 
     #= The operator is constant, so `βfun!` is too: the normalisation folds it in once at
-       setup instead of calling it on every right-hand side. =#
+       setup instead of calling it on every right-hand side.
+
+       `device=Luna.HostSpec()` is passed explicitly, not left to `Luna.settings`: loading
+       a GPU package sets the global request to `:auto`, and the simple interface is not
+       device-capable yet (the absorbing boundaries, the statistics and every response but
+       Kerr are host code). Until gpu/11 plumbs `device` and `precision` through
+       `prop_capillary`, the simple interface stays on the CPU whatever is loaded, which
+       is what "the simple interface is unchanged" requires. =#
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
                                    βfun!, z -> Modes.Aeff(mode, z=z);
-                                   noise_field, constβ=true)
+                                   noise_field, constβ=true, device=Luna.HostSpec())
     linop, Eω, transform, FT
 end
 
@@ -896,8 +903,10 @@ function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, 
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ;
                                         linopkw(grid, thg)...)
 
+    # `device=Luna.HostSpec()`: see the constant-operator branch above
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z); noise_field)
+                                   βfun!, z -> Modes.Aeff(mode, z=z);
+                                   noise_field, device=Luna.HostSpec())
     linop, Eω, transform, FT
 end
 
@@ -1111,8 +1120,9 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
     inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
 
     norm! = NonlinearRHS.norm_mode_average_gnlse(grid, aeff; shock)
+    # `device=Luna.HostSpec()`: see `setup(grid, mode::Modes.AbstractMode, ...)` above
     Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
-                                   norm!, noise_field)
+                                   norm!, noise_field, device=Luna.HostSpec())
     stats = Stats.default(grid, Eω, mode_s, linop, transform)
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 

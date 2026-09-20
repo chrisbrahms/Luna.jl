@@ -135,7 +135,17 @@ The setting may be
 
 See [`Luna.set_device`](@ref).
 """
-device() = resolve_device(get(settings, "device", :cpu))
+device() = resolve_device(device_request())
+
+"""
+    Luna.device_request()
+
+`Luna.settings["device"]` as the user set it, or `:cpu` if the key is absent -- the
+unresolved form of [`Luna.device`](@ref). This is what `Luna.setup` takes as the default
+of its `device` keyword, so that [`log_device`](@ref) can distinguish `:auto` which found
+no GPU from an explicit `:cpu`.
+"""
+device_request() = get(settings, "device", :cpu)
 
 "Resolve a device specification (see [`Luna.device`](@ref)) to a [`DeviceSpec`](@ref)."
 resolve_device(s::DeviceSpec) = s
@@ -266,8 +276,10 @@ todevice(::DeviceSpec, ::Nothing) = nothing
    package defines an `Adapt.adapt_storage` rule for its bare array type (JLArrays does
    not), and `Adapt.adapt` silently returns the host array when none exists, which would
    put a host array into a device kernel. The constructor is the documented way to move
-   an array and every backend has it. =#
-_adapt(::Type{Array}, x::AbstractArray) = x
+   an array and every backend has it. The `Array` method still has to copy a device array
+   down, so that `todevice(HostSpec(), x)` means what its name says whatever `x` is. =#
+_adapt(::Type{Array}, x::Array) = x
+_adapt(::Type{Array}, x::AbstractArray) = isdevice(x) ? Array(x) : x
 _adapt(::Type{A}, x::AbstractArray) where {A} = A(x)
 
 _convertprec(::Type{T}, x::AbstractArray{T}) where {T<:AbstractFloat} = x
@@ -351,6 +363,16 @@ function assert_resident(spec::DeviceSpec, xs...)
     end
     nothing
 end
+
+"""
+    all_resident(spec, arrays...) -> Bool
+
+The predicate form of [`assert_resident`](@ref): `true` if every array (skipping
+`nothing`) lives on `spec`'s array type and precision. Used where a failure is reported
+with a different message.
+"""
+all_resident(spec::DeviceSpec, xs...) =
+    all(x -> isnothing(x) || _resident(spec, x), xs)
 
 function _resident(spec::DeviceSpec, x::AbstractArray)
     T = realtype(spec)

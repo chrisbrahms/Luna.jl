@@ -58,8 +58,12 @@ field-sized arrays. The rules, in the order they bite:
    slowdown rather than an error.
 5. **Inverse FFT plans are held explicitly** as `IFT` on every backend, and their `1/N` is
    folded into the scale factor of the oversampling copy
-   ([`NonlinearRHS.to_time!`](@ref Luna.NonlinearRHS.to_time!)), one pass fewer. Luna's
-   time grids are powers of two, so the folding is exact.
+   ([`NonlinearRHS.to_time!`](@ref Luna.NonlinearRHS.to_time!)), one pass fewer. The
+   folding is exact whenever `1/N` is a power of two, which covers every transform over
+   the time axis alone (Luna's time grids are powers of two). A multi-axis free-space
+   transform normalises by `1/(Nt·Nx·Ny)` and the transverse grids accept any `Nx`, `Ny`;
+   for a non-power-of-two length the two routes differ at rounding level instead
+   (measured: 5.6e-17 for length 24).
 6. **Anything which cannot meet the above runs on the host through an explicit copy**, and
    says so once.
 7. **Every branch which adds or changes a kernel runs the Metal hardware tests.** That is

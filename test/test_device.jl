@@ -10,11 +10,23 @@
      same no-scalar-indexing contract. It is a test-only dependency, so these tests are
      skipped if it cannot be loaded.
 
+   `Pkg.test()` runs this file with everything it needs (`JLArrays` is in
+   `[extras]`/`[targets]`; the rest are Luna's own dependencies). To run it on its own,
+   the environment needs Luna developed into it plus the packages this file imports
+   directly:
+
+       julia --project=<env> -e '
+         using Pkg
+         Pkg.develop(path=".")
+         Pkg.add(["JLArrays", "Test", "GPUArraysCore", "Adapt", "AbstractFFTs", "FFTW"])'
+       julia --project=<env> -t 1 -e 'using Luna; include("test/test_device.jl")'
+
+
    What this file cannot catch, and what `test/test_metal.jl` must: JLArrays interprets
    its kernels on the host, so a stray `Float64` in a struct field or a mixed host/device
    broadcast passes here and would still fail on real hardware. =#
 
-import Test: @test, @testset, @test_throws, @inferred
+import Test: @test, @testset, @test_throws, @test_logs, @inferred
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
              NonlinearRHS, PhysData, RK45
@@ -92,6 +104,29 @@ end
         @test Luna.device() === HostSpec()
         @test_throws ErrorException Luna.set_device(:nonsense)
         @test Luna.settings["device"] === :cpu # a failed set changes nothing
+    finally
+        had ? (Luna.settings["device"] = old) : delete!(Luna.settings, "device")
+    end
+
+    #= The *unresolved* request is what `Luna.setup` defaults to, so that `log_device`
+       can tell `:auto` which found no GPU from an explicit `:cpu`. =#
+    had = haskey(Luna.settings, "device")
+    old = get(Luna.settings, "device", nothing)
+    try
+        delete!(Luna.settings, "device")
+        @test Luna.device_request() === :cpu
+        Luna.settings["device"] = :auto
+        @test Luna.device_request() === :auto
+        @test Luna.device() === HostSpec() # no GPU package loaded here
+        #= GPU_PLAN.md section 3 requires this message: it is what a `Scans` worker which
+           only did `using Luna` sees, and section 8 relies on it as the safety net
+           against `:auto` picking a GPU unexpectedly. =#
+        @test_logs (:info, r"no GPU package is loaded") match_mode=:any begin
+            Luna.log_device(Luna.resolve_device(:auto), :auto)
+        end
+        @test_logs (:info, r"precision") match_mode=:any begin
+            Luna.log_device(HostSpec(), :cpu)
+        end
     finally
         had ? (Luna.settings["device"] = old) : delete!(Luna.settings, "device")
     end
@@ -187,9 +222,13 @@ end
     @test pc isa FFTW.cFFTWPlan
     @test Utils.iscale(Utils.plan_ift(pc)) == 1/16
 
-    # A plan which is already normalised reports a factor of 1
-    @test Utils.iscale(pr) == 1
-    @test Utils.iplan(pr) === pr
+    #= A forward plan where an inverse one belongs is refused rather than transforming
+       the wrong way (a method error on a real grid, silently wrong output on an envelope
+       grid). Dispatch decides, so the check costs nothing per step. =#
+    @test_throws ErrorException Utils.iscale(pr)
+    @test_throws ErrorException Utils.iplan(pr)
+    @test_throws ErrorException NonlinearRHS.to_time!(zeros(16), rand(ComplexF64, 9),
+                                                      zeros(ComplexF64, 9), pc)
 
     #= The whole point of folding: with a power-of-two length the two routes agree
        bitwise, which is why the default CPU path did not move. =#
@@ -240,6 +279,49 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
     out, transform
 end
 
+
+#= A pressure gradient. `LinearOps.make_linop` gives a z-dependent operator closure and
+   `constβ` is left at its default of false, so this is the only case which exercises
+   `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s host-buffer branch -- the
+   two pieces of GPU_PLAN.md section 4.5 layer 1 which upload from the host on every stage
+   until gpu/23 tabulates them. Fixed steps, so that the only difference between the runs
+   is the arithmetic. =#
+function gradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9,
+                      precision=nothing)
+    grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
+    coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
+    m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    linop, βfun! = LinearOps.make_linop(grid, m, λ0)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
+    Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
+                                   device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    output = Utils.isdevice(Eω) ? ToHost(out) : out
+    dz = flength/20
+    Luna.run(Eω, grid, linop, transform, FT, output;
+             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz)
+    out, transform
+end
+
+@testset "constβ is checked, not trusted" begin
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    coren, densityfun = Capillary.gradient(:Ar, 1e-2, 1.0, 0.0)
+    m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    _, βfun! = LinearOps.make_linop(grid, m, 800e-9)
+    #= `constβ=true` with a z-dependent βfun! would freeze β at z = 0 and give a silently
+       wrong propagation, so setup evaluates it twice and refuses. =#
+    @test_throws ErrorException NonlinearRHS.norm_mode_average(grid, βfun!, aeff;
+                                                               constβ=true)
+    # The constant operator's βfun! passes, which is what Interface relies on
+    mc = Capillary.MarcatiliMode(75e-6, :Ar, 1.0, loss=false)
+    _, βc!, _, _ = LinearOps.make_const_linop(grid, mc, 800e-9)
+    @test NonlinearRHS.norm_mode_average(grid, βc!, z -> Modes.Aeff(mc, z=z);
+                                         constβ=true) isa NonlinearRHS.NormModeAvg
+end
+
 # --- The device path proper, skipped without JLArrays -------------------------
 have_jlarrays = try
     @eval import JLArrays
@@ -283,6 +365,11 @@ LinearAlgebra.mul!(y::JLArrays.JLArray, p::JLPlan, x::JLArrays.JLArray) =
 const JLArray = JLArrays.JLArray
 const JLSpec = DeviceSpec(JLArray, Float64)
 
+#= `allowscalar(false)` writes a task-local key and a process-global default. The
+   task-local key is restored at the end of the file, so that one test file does not
+   change what the rest of `Pkg.test()` sees; the process-global default is
+   `ScalarDisallowed` in a non-interactive run anyway, which is what this sets it to. =#
+const SCALAR_WAS = get(task_local_storage(), :ScalarIndexing, nothing)
 GPUArraysCore.allowscalar(false)
 
 @testset "JLArray basics" begin
@@ -377,6 +464,27 @@ end
     end
 end
 
+@testset "pressure gradient on JLArray" begin
+    href, htr = gradientcase(HostSpec())
+    dref, dtr = gradientcase(JLSpec)
+
+    # The z-dependent branch: β is mirrored rather than folded into `pre`
+    @test !isnothing(dtr.norm!.β)
+    @test dtr.norm!.β.host isa Vector{Float64}
+    @test dtr.norm!.β.dev isa JLArray{Float64, 1}
+    @test dtr.norm!.β.stage isa Vector{Float64}
+    # ... and on the host the mirror is the host buffer itself, so `upload!` does nothing
+    @test htr.norm!.β.dev === htr.norm!.β.host
+    @test isnothing(htr.norm!.β.stage)
+
+    @test dref["z"] ≈ href["z"]
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = dref["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+    end
+end
+
 @testset "a device run refuses host-only machinery" begin
     grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
     m = Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false)
@@ -396,10 +504,23 @@ end
     hostnorm = NonlinearRHS.norm_mode_average(grid, βfun!, aeff)
     @test_throws ErrorException Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                            norm! = hostnorm, device=JLSpec)
+    #= Nor can one built for the right array type but the wrong units: that would be
+       wrong by the factor Pref = ε₀ with nothing to say so. =#
+    s32 = DeviceSpec(Array, Float32)
+    wrongunits = NonlinearRHS.norm_mode_average(grid, βfun!, aeff; spec=s32)
+    @test_throws ErrorException NonlinearRHS.check_norm(
+        wrongunits, s32, Luna.UnitScaling(1024.0, PhysData.ε_0))
+    rightunits = NonlinearRHS.norm_mode_average(
+        grid, βfun!, aeff; spec=s32, scaling=Luna.UnitScaling(1024.0, PhysData.ε_0))
+    @test NonlinearRHS.check_norm(
+        rightunits, s32, Luna.UnitScaling(1024.0, PhysData.ε_0)) === nothing
     # A response with no `rescale` method is refused in a scaled run
     @test_throws ErrorException Nonlinear.rescale(
         (out, E, ρ) -> nothing, DeviceSpec(Array, Float32), UNIT_SCALING)
 end
+
+isnothing(SCALAR_WAS) ? delete!(task_local_storage(), :ScalarIndexing) :
+                        task_local_storage(:ScalarIndexing, SCALAR_WAS)
 
 end # have_jlarrays
 

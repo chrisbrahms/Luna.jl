@@ -277,6 +277,14 @@ end
 """
 Embedded error estimate `Σᵢ dt kᵢ eᵢ` in one pass. `errest[2] == 0`, which the sequential
 accumulation also skipped; `dt*kᵢ*eᵢ` keeps that association so the result is unchanged.
+
+!!! note
+    The skip of the second term is written into the expression rather than branched on, as
+    `combine!` branches on `iszero(b[7])`: with one tableau compiled in there is nothing to
+    branch on, and the `@assert`s above hold it to DOPRI5's zero pattern. If the tableau
+    ever becomes a runtime choice, this function needs the same treatment `combine!` has --
+    a branch per zero pattern, or the term restored unconditionally (which costs one
+    multiply-add per element and is bit-identical only when `kᵢ` is finite).
 """
 function errorestimate!(yerr, ks, dt)
     R = real(eltype(yerr))
@@ -452,10 +460,11 @@ One reduction over several arrays, as `op` folded over `f` applied elementwise.
 
 The arrays are combined into a lazy `Broadcast.Broadcasted` rather than passed to
 `mapreduce` directly, which matters on both backends. With an explicit `init` Base
-reduces a `Broadcasted` with `mapfoldl`: a serial fold in index order, which allocates
-nothing and performs the same operations in the same order as the scalar loops these
-replace, so the result is bit-identical on the CPU. Base's *multi-array* `mapreduce`, by
-contrast, materialises `map(f, As...)` first, which is a field-sized allocation per step.
+reduces a `Broadcasted` with `mapfoldl`: a serial fold in index order which performs the
+same operations in the same order as the scalar loops these replace, so the result is
+bit-identical on the CPU, and which allocates only the boxed tuple result (16 bytes per
+call) rather than anything field-sized. Base's *multi-array* `mapreduce`, by contrast,
+materialises `map(f, As...)` first, which is a field-sized allocation per step.
 `GPUArrays` has a `mapreduce` method for a `Broadcasted` of its own style, so on a device
 this is its tree reduction -- whose summation order differs, as a parallel reduction's
 must.

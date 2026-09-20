@@ -17,8 +17,8 @@ import LinearAlgebra: mul!, ldiv!
 import NumericalIntegration: integrate, SimpsonEven
 import Luna: PhysData, Modes, Maths, Grid, Utils, Nonlinear
 import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING, GridVectors, HostMirror
-import Luna: alloc, todevice, gridvectors, assert_resident, scalar, upload!, realtype,
-             arraytype, isdevicespec, isunity
+import Luna: alloc, todevice, gridvectors, assert_resident, all_resident, scalar,
+             upload!, realtype, arraytype, isdevicespec, isunity
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
 import Luna.LinearOps: βz, transverse_k2
 import Logging
@@ -32,9 +32,12 @@ explicit inverse plan `IFT` (see [`Utils.plan_ift`](@ref Luna.Utils.plan_ift)).
 
 The plan's `1/N` normalisation is folded into the scale factor of the oversampling copy
 rather than applied as a separate pass, which is one pass fewer over the oversampled
-array. Since the time grids are powers of two, `1/N` is a power of two and folding it
-changes nothing: scaling by a power of two is exact, and an exactly scaled FFT input
-gives an exactly scaled output.
+array. Where `1/N` is a power of two the folding is exact -- scaling by a power of two is
+exact, and an exactly scaled FFT input gives an exactly scaled output -- so a transform
+over the time axis alone changes nothing, Luna's time grids being powers of two. A
+multi-axis transform normalises by `1/(Nt·Nx·Ny)`, and the free-space grids accept any
+`Nx`, `Ny`; where those are not powers of two the folded and unfolded routes differ at
+rounding level instead (measured: 5.6e-17 for a length-24 transform, 0 for 16 or 32).
 
 Dispatches on the element type of `Ato`, not on its array type, so the same code runs on
 the host and on a device. For a field-resolved (real) transform the inverse plan
@@ -452,8 +455,12 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
         Et_nl = nothing
     end
     resp = map(r -> Nonlinear.rescale(r, spec, scaling), Tuple(resp))
-    assert_resident(spec, Eωo, Eto, Pto, Pωo, gv.ω, gv.ωwin, gv.towin, gv.sidx,
-                    Et_noise, Et_nl)
+    #= Every mirror the transform holds and every array its responses carry, not only the
+       ones this transform's own kernels touch: the assertion is what catches a future
+       mistake, so it has to cover everything. =#
+    resparrays = reduce((a, r) -> (a..., Nonlinear.resident_arrays(r)...), resp; init=())
+    assert_resident(spec, Eωo, Eto, Pto, Pωo, gv.ω, gv.ωwin, gv.twin, gv.towin, gv.sidx,
+                    Et_noise, Et_nl, resparrays...)
     TransModeAvg(Pto, Eto, Eωo, Pωo, FT, IFT, resp, grid, gv, densityfun, norm!, aeff,
                  Et_noise, Et_nl, scaling)
 end
@@ -507,6 +514,9 @@ for residency, and so that the per-`z` propagation constant can be mirrored.
 - `mask`: `grid.sidx` as a `Bool` mask
 - `β`: mirror of the propagation constant, or `nothing` when it is z-independent
 - `βfun!`, `aeff`: the host callables for `β(z)` and `Aeff(z)`
+- `scaling`: the [`Luna.UnitScaling`](@ref) `pre` was built for, so that a normalisation
+  handed to a run with a different one is refused rather than silently wrong by a factor
+  of `Pref`
 """
 struct NormModeAvg{vT, mT, bT, fT, aT}
     pre::vT
@@ -514,6 +524,7 @@ struct NormModeAvg{vT, mT, bT, fT, aT}
     β::bT
     βfun!::fT
     aeff::aT
+    scaling::UnitScaling
 end
 
 """
@@ -541,6 +552,7 @@ function norm_mode_average(grid, βfun!, aeff; shock=true, spec=HostSpec(),
     if constβ
         βh = zeros(Float64, length(grid.ω))
         βfun!(βh, 0.0)
+        check_constβ(βfun!, βh)
         pre = pre ./ βh
         β = nothing
     else
@@ -549,7 +561,40 @@ function norm_mode_average(grid, βfun!, aeff; shock=true, spec=HostSpec(),
     pre = todevice(spec, pre)
     mask = todevice(spec, grid.sidx)
     assert_resident(spec, pre, mask, isnothing(β) ? nothing : β.dev)
-    NormModeAvg(pre, mask, β, βfun!, aeff)
+    NormModeAvg(pre, mask, β, βfun!, aeff, scaling)
+end
+
+"""
+The distance, in metres, at which [`check_constβ`](@ref) evaluates `βfun!` a second time.
+Small enough to be inside any waveguide Luna is used for, and far enough from zero that a
+taper or a pressure gradient has moved.
+"""
+const CONSTβ_PROBE_Z = 1e-3
+
+"""
+    check_constβ(βfun!, β0)
+
+Check the claim `constβ=true` makes, rather than trusting it: `β` is baked into the
+normalisation at `z = 0`, so a `βfun!` which does depend on `z` would give a silently
+wrong propagation with `β` frozen there. Evaluating it once more at
+[`CONSTβ_PROBE_Z`](@ref) at setup turns that into an error message.
+"""
+function check_constβ(βfun!, β0)
+    βz = similar(β0)
+    try
+        βfun!(βz, CONSTβ_PROBE_Z)
+    catch e
+        error("constβ=true was passed, but βfun! could not be evaluated at "*
+              "z = $(CONSTβ_PROBE_Z) m, which is how that claim is checked: $e. Pass "*
+              "constβ=false for a z-dependent waveguide.")
+    end
+    βz == β0 || error(
+        "constβ=true was passed, but βfun! gives a different propagation constant at "*
+        "z = $(CONSTβ_PROBE_Z) m than at z = 0 (largest difference "*
+        "$(maximum(abs, βz .- β0))). It would be folded into the normalisation at z = 0 "*
+        "and the propagation would be silently wrong. Pass constβ=false, which is the "*
+        "default and what a taper or a pressure gradient needs.")
+    nothing
 end
 
 #= β is 1 rather than 0 outside the simulation band (`LinearOps` fills it that way), so
@@ -585,6 +630,7 @@ struct NormModeAvgGNLSE{vT, mT, aT}
     pre::vT
     mask::mT
     aeff::aT
+    scaling::UnitScaling
 end
 
 """
@@ -602,7 +648,7 @@ function norm_mode_average_gnlse(grid, aeff; shock=true, spec=HostSpec(),
     pre = todevice(spec, pre)
     mask = todevice(spec, grid.sidx)
     assert_resident(spec, pre, mask)
-    NormModeAvgGNLSE(pre, mask, aeff)
+    NormModeAvgGNLSE(pre, mask, aeff, scaling)
 end
 
 function (n::NormModeAvgGNLSE)(nl, z)
@@ -618,19 +664,32 @@ end
 
 Check that a caller-supplied normalisation can be used with `spec` and `scaling`.
 
-Luna's own normalisations take the spec and the scaling at construction and are checked
-structurally; anything else is accepted only for an unscaled `Float64` host run, which is
-the default CPU path.
+Luna's own normalisations take both at construction, so they are checked against both:
+the arrays for residency and the scaling for equality. A normalisation built with the
+right array type but the wrong scaling would otherwise produce a polarisation wrong by
+the factor `Pref` with nothing to say so. Anything else is accepted only for an unscaled
+`Float64` host run, which is the default CPU path.
 """
-check_norm(n, spec, scaling) = (arraytype(spec) === Array && realtype(spec) === Float64 &&
-                                isunity(scaling)) ? nothing : error(
+_normerror(n, spec, scaling) = error(
     "the normalisation $(typeof(n)) was not built for $(spec) with $(scaling). Build it "*
     "with the `spec` and `scaling` keywords of `norm_mode_average` (or let `Luna.setup` "*
     "do it), or run on the default CPU path.")
 
-check_norm(n::NormModeAvg, spec, scaling) =
-    assert_resident(spec, n.pre, n.mask, isnothing(n.β) ? nothing : n.β.dev)
-check_norm(n::NormModeAvgGNLSE, spec, scaling) = assert_resident(spec, n.pre, n.mask)
+check_norm(n, spec, scaling) = (arraytype(spec) === Array && realtype(spec) === Float64 &&
+                                isunity(scaling)) ? nothing : _normerror(n, spec, scaling)
+
+function check_norm(n::NormModeAvg, spec, scaling)
+    (n.scaling == scaling &&
+     all_resident(spec, n.pre, n.mask, isnothing(n.β) ? nothing : n.β.dev)) ||
+        _normerror(n, spec, scaling)
+    nothing
+end
+
+function check_norm(n::NormModeAvgGNLSE, spec, scaling)
+    (n.scaling == scaling && all_resident(spec, n.pre, n.mask)) ||
+        _normerror(n, spec, scaling)
+    nothing
+end
 
 """
     TransRadial

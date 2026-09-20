@@ -10,8 +10,13 @@ linear operators, and the whole of `RK45` — run unchanged on `Array{Float64}`,
 on hardware). The CUDA extension loads and registers but is untested: there is no CUDA
 device here.
 
-**The default CPU path is bit-for-bit unchanged. The regression gate is exactly
+**The default CPU path is unchanged — bit-for-bit wherever the transform lengths are
+powers of two, which is every case Luna runs today; see "Why the default CPU path did not
+move" for the one construction that is only rounding-level. The regression gate is exactly
 `0.000e+00` for all 21 cases, in both modes and both classes.**
+
+Review round 1 requested changes; they are all in, and what changed is in
+"Changes after review round 1" at the end.
 
 ## Motivation
 
@@ -174,14 +179,23 @@ confirms it:
   they perform the identical sequence of operations.
 - The norms are folded over a lazy `Broadcast.Broadcasted`. With an explicit `init`, Base
   reduces that with `mapfoldl` — a serial fold in index order — so it is the same
-  arithmetic as the scalar loops. (Base's *multi-array* `mapreduce`, which GPU_PLAN.md §4.6
-  assumed was a zipped fold, was measured to materialise `map(f, As...)` first: 2.4 MB per
-  call at n = 1e5. It is not used. `GPUArrays` has a `mapreduce` method for a `Broadcasted`
-  of its own style, so the device path is still its tree reduction.)
-- Folding the inverse plan's `1/N` into the oversampling copy is exact, because Luna's time
-  grids are powers of two: scaling by a power of two is exact, and an exactly scaled FFT
-  input gives an exactly scaled output. This was the change most likely to move the radial
-  and free-space cases, and it moved nothing.
+  arithmetic as the scalar loops, and it allocates only the boxed tuple result (16 bytes
+  per call), not anything field-sized. (Base's *multi-array* `mapreduce`, which
+  GPU_PLAN.md §4.6 assumed was a zipped fold, was measured to materialise `map(f, As...)`
+  first: 2.4 MB per call at n = 1e5. It is not used. `GPUArrays` has a `mapreduce` method
+  for a `Broadcasted` of its own style, so the device path is still its tree reduction.)
+- Folding the inverse plan's `1/N` into the oversampling copy is exact **when `1/N` is a
+  power of two**: scaling by a power of two is exact, and an exactly scaled FFT input gives
+  an exactly scaled output. That covers every transform over the time axis alone, Luna's
+  time grids being powers of two by construction (`Grid.jl:57, 78, 178, 200`). A
+  multi-axis free-space transform normalises by `1/(Nt·Nx·Ny)` instead, and
+  `Grid.FreeGrid`/`Grid.Free2DGrid` accept any `Nx`, `Ny`; for a transverse length which is
+  not a power of two the folded and unfolded routes differ at rounding level. Measured
+  directly against `copy_scale!` + `ldiv!`: 0 for length 16 and 32, 5.6e-17 for 24, 6.9e-17
+  for 48. Every free-space grid in the gate, the tests and the examples happens to use a
+  power of two, so the gate cannot see this; it is within what GPU_PLAN.md §3 allows, and
+  it is stated here, in the `to_time!` docstring and in the developer guide rather than
+  left to the reader. (Found by review round 1, finding 3.)
 - `pre/β·√aeff` precombined at setup under `constβ` uses the same operands in the same
   order as the per-element expression it replaces.
 - The masked broadcasts (`norm!`, the band limit) write an exact zero where the indexed
@@ -241,23 +255,26 @@ is in `[extras]`/`[targets]`, and skips itself otherwise):
 | testset | assertions |
 | --- | ---: |
 | backend trait | 16 |
-| device spec and settings | 18 |
+| device spec and settings | 24 |
 | allocation and transfer | 18 |
 | residency assertions | 6 |
 | unit scaling | 8 |
-| FFT planner dispatch | 8 |
+| FFT planner dispatch | 9 |
+| constβ is checked, not trusted | 2 |
 | JLArray basics | 14 |
 | RK45 kernels on JLArray | 11 |
 | mode-averaged Kerr on JLArray | 24 |
-| a device run refuses host-only machinery | 3 |
+| pressure gradient on JLArray | 12 |
+| a device run refuses host-only machinery | 5 |
 | Float32 on the CPU | 11 |
 
-**137 pass, 0 fail.** The two propagation comparisons:
+**157 pass, 0 fail.** The propagation comparisons:
 
 | comparison | max relative difference in `Eω` |
 | --- | ---: |
 | `JLArray` vs host, field-resolved Kerr | 0 |
 | `JLArray` vs host, envelope Kerr | 0 |
+| `JLArray` vs host, pressure gradient (z-dependent operator) | 0 |
 | CPU `Float32` (scaled) vs CPU `Float64`, He at 0.3 bar | 3.7e-7 |
 
 `test/test_metal.jl` (not part of the suite; run from an environment with Metal):
@@ -269,9 +286,11 @@ is in `[extras]`/`[targets]`, and skips itself otherwise):
 | no stray Float64 in the kernels | 16 |
 | mode-averaged Kerr on Metal | 20 |
 | Metal against the Float64 CPU path | 4 |
+| pressure gradient on Metal | 7 |
+| the simple interface stays on the CPU | 5 |
 | Metal refuses what it cannot run | 1 |
 
-**56 pass, 0 fail**, on an Apple M1 Pro with Metal.jl v1.11.
+**68 pass, 0 fail**, on an Apple M1 Pro with Metal.jl v1.11.
 
 | comparison | field-resolved | envelope |
 | --- | ---: | ---: |
@@ -397,6 +416,12 @@ single-column run, and the user page says so.
 
 Stated as such; each is another branch's scope in GPU_PLAN.md.
 
+- **The simple interface is not device-capable and deliberately stays on the CPU.**
+  `Interface` passes `device=Luna.HostSpec()` explicitly, so `prop_capillary` and
+  `prop_gnlse` give exactly the result they always did whatever `settings["device"]` says.
+  They gain the `device`/`precision` keywords in `gpu/11`, together with the boundaries
+  and the output wrapper. Tested on hardware (`test_metal.jl`, "the simple interface stays
+  on the CPU").
 - **Only mode-averaged Kerr runs on a device.** The radial, free-space and multimode
   transforms, and the plasma, Raman and χ⁽²⁾ responses, are unchanged host code. They keep
   compiling and passing their CPU tests, and they are refused rather than run wrongly on a
@@ -440,3 +465,126 @@ Stated as such; each is another branch's scope in GPU_PLAN.md.
    `Adapt.adapt` then silently returns the host array, which would put a host array into a
    device kernel. `Adapt` is still used for the `adapt_structure` rules on `GridVectors`
    and `KerrEnvTHG`.
+
+## Changes after review round 1
+
+The review's verdict was "request changes" on two majors, plus six minors and six nits.
+All fourteen are addressed. Nothing in the review's reproduction of the numbers changed:
+the regression gate is still exactly `0.000e+00` on all 21 cases, in both modes and both
+classes.
+
+### 1 (major) — loading Metal or CUDA broke `prop_capillary`/`prop_gnlse`
+
+The extension sets `settings["device"] = :auto` for the whole process and
+`Interface.setup` inherited it through `Luna.setup`'s default keyword, so the simple
+interface failed (or, for `modes=4`, silently ran on the CPU) as soon as a GPU package was
+loaded — for whatever reason the user loaded it.
+
+`Interface` now passes `device=Luna.HostSpec()` explicitly at all three call sites: both
+mode-averaged branches of `prop_capillary` (`Interface.jl:896, 909`) and `prop_gnlse`
+(`Interface.jl:1125`). Until `gpu/11` plumbs `device` and `precision` through the simple
+interface, it stays on the CPU in double precision whatever is loaded, which is what
+"the simple interface is unchanged" requires — the boundaries, the statistics and every
+response but Kerr are still host code.
+
+`test_metal.jl` gains "the simple interface stays on the CPU": with Metal loaded, it runs
+`prop_capillary` (Kerr only, `plasma=false`) and `prop_gnlse` under `set_device(:cpu)` and
+again under `set_device(:auto)` — checking first that `:auto` really does resolve to
+`MtlArray` — and asserts that both give `ComplexF64` output **equal** to the CPU run.
+`docs/src/gpu.md` now opens with a warning saying so, and it is in "Known gaps".
+
+### 2 (major) — the "`:auto` requested but no GPU package is loaded" message was dead code
+
+`setup`'s `device` keyword defaulted to `Luna.device()`, which had already resolved the
+setting, so `log_device`'s `request === :auto` test could never be true from any Luna code
+path. GPU_PLAN.md §3 requires the message and §8 relies on it.
+
+The default is now the *unresolved* request, `Luna.device_request()` (a new one-line
+accessor: `get(settings, "device", :cpu)`), and `setup_mode_average` resolves it itself.
+`test_device.jl`'s "device spec and settings" now sets `settings["device"] = :auto` in a
+process with no GPU package and `@test_logs` for the message, and for the ordinary
+"Propagating on …" line in the `:cpu` case.
+
+### 3 (minor) — the bit-identity claim was unconditional
+
+Qualified in three places (the headline, "Why the default CPU path did not move", the
+`to_time!` docstring and `device_model.md` rule 5), with the reviewer's measurement: exact
+for a power-of-two transform length, 5.6e-17 for 24 and 6.9e-17 for 48. Every grid Luna
+runs today uses a power of two.
+
+### 4 (minor) — `check_norm` ignored the scaling
+
+`NormModeAvg` and `NormModeAvgGNLSE` now carry the `UnitScaling` they were built for, and
+`check_norm` compares it as well as checking residency. Both failure modes now go through
+one message, the same one the generic fallback gives, so a normalisation built with the
+right array type but the wrong units is refused instead of producing a polarisation wrong
+by `Pref`. `Luna.all_resident` (the predicate form of `assert_resident`) was added for
+this. Tested in "a device run refuses host-only machinery".
+
+### 5 (minor) — no device test of the z-dependent path
+
+`test_device.jl` and `test_metal.jl` gain a pressure-gradient case
+(`Capillary.gradient` + `LinearOps.make_linop`, `constβ=false`, fixed steps,
+`boundary=:none`), which is the only thing that exercises `NormModeAvg`'s `HostMirror`
+branch and `RK45.make_prop!`'s host-buffer branch — the two pieces of §4.5 layer 1 the
+exit criteria name. Both testsets also assert the shape of the mirror (host `Float64`
+buffer, staging buffer in the device precision, device array; and, on the host, that the
+device array *is* the host buffer and `upload!` does nothing).
+
+`JLArray` vs host, fixed steps: max relative difference in `Eω` **0**. Metal vs the
+`Float32` CPU path: within 1e-4, as for the constant-operator cases.
+
+### 6 (minor) — the documented way to run the test files did not work
+
+`docs/src/gpu.md` and the headers of both test files now give the same package list the CI
+job installs (`Test`, `GPUArraysCore`, `Adapt` for `test_metal.jl`; those plus
+`AbstractFFTs`, `FFTW` and `JLArrays` for `test_device.jl`), as a copy-pastable
+`Pkg.develop`/`Pkg.add` pair.
+
+### 7 (minor) — the residency assertion had holes
+
+`TransModeAvg` now asserts `gv.twin` as well, and the arrays its rescaled responses carry,
+through a new `Nonlinear.resident_arrays(response)` hook which returns a tuple (empty by
+default, `(k.C,)` for `KerrEnvTHG`).
+
+### 8 (minor) — `constβ=true` was unguarded
+
+`NonlinearRHS.check_constβ` evaluates `βfun!` a second time at
+`NonlinearRHS.CONSTβ_PROBE_Z = 1e-3` m and errors if the result differs from the one at
+`z = 0`, naming `constβ=false` as the fix; a `βfun!` which throws at that `z` gets its own
+message. A silent physics error (β frozen at the entrance) becomes an error at setup.
+Tested both ways in "constβ is checked, not trusted".
+
+### 9, 11, 13, 14 (nits)
+
+- The `_zipreduce` docstring and the PR now say 16 bytes per call (the boxed tuple), not
+  "allocates nothing".
+- `_adapt(::Type{Array}, x)` copies a device array to the host rather than returning it,
+  so `todevice(HostSpec(), x)` means what its name says. (Still unreachable from Luna.)
+- `test_device.jl` restores the task-local `:ScalarIndexing` key at the end of the file, so
+  one file no longer changes what the rest of `Pkg.test()` sees. The process-global default
+  is `ScalarDisallowed` in a non-interactive run anyway, which is what `allowscalar(false)`
+  sets it to; that is recorded in a comment.
+- `Project.toml`'s `CUDA` and `Metal` compat entries are in alphabetical order.
+
+### 10, 12 (nits)
+
+- `Utils.iplan`/`Utils.iscale` now error for anything that is not a `ScaledPlan` instead of
+  passing a forward plan through with a factor of 1, so `to_time!` called with `FT` says so
+  rather than transforming the wrong way. Every inverse plan Luna makes is a `ScaledPlan`
+  (FFTW, Metal, CUDA and the JLArray shim all return one), dispatch decides, and the check
+  costs nothing per step. Tested in "FFT planner dispatch".
+- `errorestimate!` carries a note saying that its skip of the second term encodes DOPRI5's
+  zero pattern, that the `@assert`s above hold the tableau to it, and what would have to
+  change if the tableau ever became a runtime choice.
+
+### Re-run after the changes
+
+| | |
+|---|---|
+| `test_regression.jl` vs `782f55d1` | **460 pass, 0 fail**, every case `0.000e+00` |
+| `test_device.jl` | **157 pass, 0 fail** (13 testsets) |
+| `test_metal.jl` (M1 Pro) | **68 pass, 0 fail** (8 testsets) |
+| `test_rk45.jl` | 48 pass |
+| `test_interface.jl` | 301 pass |
+| `test_gnlse.jl`, `test_gradient.jl`, `test_tapers.jl`, `test_linops.jl` | pass |

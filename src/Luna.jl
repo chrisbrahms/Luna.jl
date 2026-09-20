@@ -163,9 +163,11 @@ frequency-domain field from `inputs`, and return `(Eω, transform, FT)`.
 - `constβ=false`: declare that `βfun!` does not depend on `z`, which lets the
     normalisation fold it in once instead of calling it on every right-hand side. True
     whenever the linear operator is constant.
-- `device=Luna.device()`: where to run, as `:cpu`, `:auto`, `:metal`, `:cuda` or a
-    [`Luna.DeviceSpec`](@ref). The default follows `Luna.settings["device"]`, which a
-    loaded GPU package sets to `:auto`. See [`Luna.set_device`](@ref).
+- `device`: where to run, as `:cpu`, `:auto`, `:metal`, `:cuda` or a
+    [`Luna.DeviceSpec`](@ref). The default is `Luna.settings["device"]` as the user set
+    it (`:cpu` if the key is absent), which a loaded GPU package sets to `:auto`; it is
+    resolved here, so that the log line can say what was asked for as well as what was
+    chosen. See [`Luna.set_device`](@ref).
 - `precision=nothing`: `Float32` to run in single precision on the chosen device,
     `Float64` for double, `nothing` for whatever the device's own spec says (`Float64` on
     the CPU, `Float32` on Metal). A `Float32` run is scaled (see
@@ -186,7 +188,10 @@ timetype(::Grid.EnvGrid, ::Type{T}) where {T} = Complex{T}
 
 function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
                             norm! = nothing, noise_field=nothing, constβ=false,
-                            device=Luna.device(), precision=nothing)
+                            device=device_request(), precision=nothing)
+    #= The *unresolved* request is the default and the resolution happens here, so that
+       `log_device` can tell `:auto` which found no GPU from a plain `:cpu` -- which is
+       what a `Scans` worker that only did `using Luna` sees. =#
     spec = withprecision(resolve_device(device), precision)
     T = realtype(spec)
     log_device(spec, device)
