@@ -114,14 +114,19 @@ At 0.3 bar -- the case whose unscaled coefficient does not exist in `Float32` at
 Metal agrees with the `Float64` CPU path to 2.4e-7.
 
 With the absorbing boundaries (`boundary=:rate`, the default) and the default
-statistics, Metal vs CPU `Float32` for the same propagation is 3.9e-6 (field-resolved)
-and 4.4e-6 (envelope) -- still three orders of magnitude inside the exit-criterion
-tolerance, the extra digit coming from the collar broadcasts and the host round trip the
-statistics need. `prop_capillary` itself, at the exit criterion's own parameters (100 nJ,
-1 cm, Kerr only), agrees exactly: at that pulse energy the nonlinear phase is far below
-`Float32`'s precision floor, so the right-hand side rounds to zero on both backends and
-the propagation is the linear operator's `exp`, which has no backend-dependent
-summation order.
+statistics, at the exit criterion's own parameters (100 nJ, 10 cm, Kerr only -- weakly
+nonlinear: the spectrum barely broadens over that length) Metal agrees with a genuine CPU
+`Float32` run to 4.4e-6 and with CPU `Float64` to 4.2e-6. With the nonlinearity clearly
+visible (He at 5 bar, 300 µJ, ~×2.5 spectral broadening, fixed steps so the comparison is
+of arithmetic rather than of step sequence) the agreement is 4.3e-6 -- comfortably inside
+the 1e-4 the hardware tests assert throughout. (An earlier version of this page and of
+`PR_11-boundaries-output.md` claimed the exit-criterion comparison was exactly `0.0` and
+explained it as the nonlinear right-hand side rounding to zero below `Float32`'s precision
+floor. That claim was wrong:
+the comparison it was based on had no host reference at all -- both sides were resolving
+to the GPU through `Luna.settings["device"] = :auto` -- so it was comparing Metal with
+itself. Fixed in review round 1; see `PR_11-boundaries-output.md`'s "Changes after review
+round 1".)
 
 ## What runs where
 

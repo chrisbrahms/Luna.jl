@@ -101,18 +101,23 @@ from the plan's wording; see "Deviations" below).
 
 ### `src/Interface.jl`
 
-`prop_capillary`/`prop_gnlse` gain `device` (default `Luna.device_request()`),
-`precision` (default `nothing`) and `stats_period` (default `1`) keywords, replacing the
-`device=Luna.HostSpec()` `gpu/10` hardcoded at every call site. An untouched call
-reproduces today's behaviour (the default resolves to the CPU unless the user has set
-something); once a GPU package is loaded and `Luna.settings["device"]` becomes `:auto`,
-a plain `prop_capillary(...)` call now actually runs on the GPU for the cases it can.
+`prop_capillary`/`prop_gnlse` gain `device` (default `nothing`, a sentinel meaning "not
+specified" -- see review round 1, finding 2, below for why it is not simply
+`Luna.device_request()`), `precision` (default `nothing`) and `stats_period` (default
+`1`) keywords, replacing the `device=Luna.HostSpec()` `gpu/10` hardcoded at every call
+site. An untouched call reproduces today's behaviour: `prop_capillary_args` resolves the
+sentinel to `Luna.device_request()` (following a loaded GPU package) only when the
+propagation is mode-averaged *and* every response it was built with is device-capable
+(`Nonlinear.device_capable`); otherwise, and always for `prop_gnlse`, it resolves to the
+CPU regardless of `Luna.settings["device"]`, exactly as before this keyword existed.
 
 Multimode and radial propagation (`modes` a collection) and `prop_gnlse` are not device-
 or reduced-precision-capable yet: their `setup`/`prop_gnlse_args` methods accept and
 validate `device`/`precision` with a new `_cpu_only!` helper, erroring with a message
 naming the actual limitation rather than an unrelated `MethodError` or a silent fallback
-to the CPU that the caller did not ask for.
+to the CPU that the caller did not ask for. Mode-averaged propagation with a response
+that is not device-capable (plasma, Raman) gets the analogous
+`_check_responses_device_capable!` for an *explicit* incompatible request.
 
 Found on Metal hardware (see "What Metal caught"): `Stats.default`'s `Eω` argument is
 used only to size its buffers at construction, but `Stats.jl`'s `EnvGrid` code path plans
@@ -253,6 +258,13 @@ have only one path. An *explicit* `device`/`precision` argument still reaches
 
 ## Metal hardware results
 
+**Superseded by review round 1, finding 1 -- see "Changes after review round 1" below for
+the corrected numbers.** The table below was measured with a testset bug (`href` had no
+explicit `device`, so it resolved through the sentinel to `:auto` = Metal in this
+Metal-loaded process, making the "exit criterion" comparison Metal against itself) and an
+incorrect physical explanation for the resulting `0.0`; kept here, struck through in
+spirit, only so the history of what changed is visible.
+
 Apple M1 Pro, Metal.jl v1.11.1, environment built per `docs/src/gpu.md`'s "Running the
 hardware tests".
 
@@ -271,40 +283,22 @@ hardware tests".
 | **`Luna.set_device(:cpu)` opts out** (new) | 8 |
 | Metal refuses what it cannot run | 2 |
 
-Largest relative difference in `Eω` over the saves, and in the energy statistic where
-computed:
-
-| comparison | `Eω` | energy |
+| comparison (superseded numbers, see below) | `Eω` | energy |
 | --- | ---: | ---: |
 | mode-averaged Kerr, field-resolved, Metal vs CPU `Float32` (`boundary=:none`) | 2.7e-7 | -- |
 | mode-averaged Kerr, envelope, Metal vs CPU `Float32` (`boundary=:none`) | 5.2e-8 | -- |
 | Metal vs CPU `Float64`, He at 0.3 bar (`boundary=:none`) | 2.4e-7 | -- |
 | field-resolved, `boundary=:rate` + default statistics | 3.9e-6 | 7.7e-7 |
 | envelope, `boundary=:rate` + default statistics | 4.4e-6 | 5.3e-7 |
-| `prop_capillary`, constant pressure (exit criterion) | 0.0 | 0.0 |
-| `prop_capillary`, gradient pressure (exit criterion) | 0.0 | 0.0 |
+| `prop_capillary`, constant pressure ("exit criterion", `href` bug) | 0.0 (invalid) | 0.0 (invalid) |
+| `prop_capillary`, gradient pressure ("exit criterion", `href` bug) | 0.0 (invalid) | 0.0 (invalid) |
 
-All well inside the `1e-4` gate `test_metal.jl` asserts. `boundary=:none` reproduces the
-`gpu/10` numbers to within a factor of 2 (that branch's own table: 2.7e-7/5.2e-8/2.4e-7 for
-the same three comparisons -- unchanged, since `gpu/11` did not touch the mode-averaged
-RHS). Adding `boundary=:rate` and the default statistics moves the field-resolved and
-envelope cases from ~1e-7 to ~1e-6 -- the collar broadcasts and the extra host round trip
-for statistics both add their own rounding, an order of magnitude the plan's own §8
-estimate (~1e-4 for Float32 phase accumulation) has ample room for.
-
-The exit-criterion `prop_capillary` comparisons (100 nJ, 1 cm, `plasma=false`,
-`raman=false`) come back at *exactly* `0.0`, not merely small: at that pulse energy the
-Kerr phase accumulated over 1 cm is far below `Float32`'s precision floor, so the
-nonlinear right-hand side rounds to exact zero on both backends and the propagation
-reduces to the linear operator's elementwise `exp` -- an operation with no
-backend-dependent summation order, hence bit-identical. This is a property of the chosen
-exit-criterion parameters, not a general claim; the field-resolved/envelope cases above,
-at higher energy (1 µJ) where the nonlinearity is not negligible, show the ~1e-6 that
-actually reflects the device path's rounding.
+The `boundary=:none` rows above (unaffected by the `href` bug -- `metalcase` always took
+an explicit `spec`) still stand and reproduce `gpu/10`'s own numbers.
 
 `Luna.set_device(:cpu)` opts out of a globally-registered GPU (exit criterion 3): verified
 with `prop_capillary`, `prop_gnlse` and multimode `prop_capillary` all under
-`Luna.set_device(:auto)` with Metal registered and functional.
+`Luna.set_device(:auto)` with Metal registered and functional. Unaffected by finding 1.
 
 ## Benchmarks
 
@@ -435,3 +429,169 @@ branch (`c1ffc410`) does (`LinearOps.βz` x3, `loadFFTwisdom`, `saveFFTwisdom`,
    condition like `every_nth` is not speculatively evaluated, and conservatively returns
    `true`) -- acceptable, or should `willsave` instead take a `mutates::Bool` trait so a
    stateless custom save condition could also benefit?
+
+## Changes after review round 1
+
+The review's verdict was "request changes" on three majors, plus six minors/nits. All
+nine are addressed here.
+
+### 1 (major) — the exit-criterion testset compared Metal with Metal
+
+`test_metal.jl`'s "prop_capillary on Metal" built its CPU reference with
+`precision=Float32` and no `device`, which resolves through the sentinel to
+`Luna.device_request()` -- `:auto` throughout `test_metal.jl` (Metal is loaded and
+nothing in that testset had overridden the global setting), which resolves to Metal. Both
+sides of the comparison were therefore the same run, and the `0.0` it measured said
+nothing about the device path. The physical explanation offered for it (the Kerr phase
+below `Float32`'s precision floor) was consequently wrong, since it was never being
+tested; the review's own measurement with a genuine CPU Float32 reference gave 3.7e-6 at
+the same parameters, not `0.0`.
+
+Fixed:
+- Every comparison in `test_metal.jl` now uses an explicit `device` for its host
+  reference(s) -- `DeviceSpec(Array, Float32)` and, newly, `HostSpec()` (`Float64`) as
+  well, so Metal is checked against both precisions on the host.
+- The fibre length is the brief's own (`0.1` m), not the `1e-2` the file had (finding 9).
+- `metalcase`/`metalgradientcase` gained a `fixed::Bool` keyword (`min_dz == max_dz`,
+  bypassing the step-size controller) so a comparison's tolerance reflects arithmetic
+  only, not a possibly different step sequence -- the same principle the regression
+  gate's own `:fixed` mode uses. `metalgradientcase` already did this by default.
+- "boundaries and default statistics on Metal" now runs the brief's own (weakly
+  nonlinear) parameters *and* a visibly nonlinear one (He at 5 bar, 300 µJ, about ×2
+  spectral broadening -- checked with a `broadening` helper, the ratio of the last save's
+  rms spectral width to the first's), fixed steps, against both host references, for both
+  constant and gradient pressure. One adaptive case (the strongly nonlinear gradient) is
+  kept with a documented, looser tolerance (see finding 1's own note on this below).
+- `precision`'s docstring now says explicitly that it does not select the CPU on its own
+  when a GPU package is loaded.
+- The wrong `0.0`/precision-floor claim is withdrawn from this document ("Metal hardware
+  results", struck through above) and from `docs/src/gpu.md`, replaced with the measured
+  numbers below.
+
+One further problem surfaced while fixing this: 600 µJ at 5 bar over the full 10 cm at
+only 20 fixed steps is numerically under-resolved (both host and device runs produced
+`NaN`) -- a step-count problem with that combination of energy and grid, not a boundary
+or device defect (300 µJ at 5 bar, used for the non-gradient visible-Kerr case, is well
+resolved at the same step count). The gradient's visibly-nonlinear case uses 300 µJ
+instead, matching the non-gradient one.
+
+### 2 (major) — the default `prop_capillary` call failed once a GPU package was loaded
+
+See "What Metal caught", finding 2, above (written before the review; the review found
+the same bug independently on hardware). Fixed with `Nonlinear.device_capable` and the
+sentinel now checking `all(Nonlinear.device_capable, resp)` as well as the mode count;
+an explicit incompatible request now errors before `Luna.setup`, naming `device=:cpu`/
+`Luna.set_device(:cpu)`. Verified interactively with a fake registered device forcing
+`:auto`: a default (plasma on) call stays on the CPU in `Float64`; a Kerr-only call
+follows `:auto`; an explicit device request with plasma raises the new message. New
+`test_metal.jl` testset "Luna.set_device(:cpu) opts out" runs `prop_gnlse` and multimode
+`prop_capillary` under a real `:auto` with Metal registered.
+
+### 3 (major) — `stats_period` did not skip the device-to-host copy
+
+`needs_host_y` was decided once, at `ScaledOutput` construction, from whether the wrapped
+statistics function was `Output.nostats` -- a `PeriodicStats`-wrapped function never is,
+so the copy ran on every accepted step regardless of the period; only the statistics
+arithmetic was actually skipped. Fixed: `needs_host_y(o, t)` is now evaluated fresh every
+step, and a new `Output.willfire(p::PeriodicStats, t)` predicts whether the *next* call to
+`p` would run its wrapped function, without running it or mutating `p`. Verified directly
+(not by timing, which is noisy under contention on this machine, but by construction): a
+`ScaledOutput` built around a `PeriodicStats(period=3)` and called with different `y`
+values each step shows its `ybuf` bit-for-bit unchanged on the two steps between fires and
+updated only on a fire (`test_device.jl`, "stats_period skips the device-to-host copy",
+JLArray, 10 assertions); the one-time host-statistics warning still fires exactly once.
+
+### 4 (minor) — `stats_period` unvalidated; the "every Δz" form missing
+
+Both `Interface.jl` call sites now go through a new `Output.maybe_periodic(statsfun,
+period)`, which validates unconditionally (an integer must be `>= 1`, a non-integer
+`> 0`) and only skips wrapping for the literal trivial value (integer `1`). `PeriodicStats`
+gained the distance form: a non-integer `Real` period now means "every `period` metres of
+propagation", firing when the propagation coordinate has advanced by at least that much
+since the last fire (`Output.willfire` and the call operator both switch on it).
+Documented in `prop_capillary`'s/`prop_gnlse`'s `stats_period` docstrings.
+`test_output.jl`'s "PeriodicStats" grew from 4 to 19 assertions: `willfire`, both invalid
+classes in both modes, the distance form, and `maybe_periodic`.
+
+### 5 (minor) — `RadialCollar`'s precision parameter was inert
+
+`spatialcollar`'s `RadialCollar` branch built its buffer with a hardcoded
+`zeros(ComplexF64, ...)`; now `zeros(Complex{real(eltype(Et))}, ...)`, so `RadialCollar`'s
+matrices and vectors actually follow the state's precision, as the PR already claimed.
+Nothing is reachable at a different precision today (`TransRadial` has no device path),
+so this is forward-looking, for `gpu/21`.
+
+### 6 (minor) — no residency assertion on the new absorber structs
+
+`RateAbsorber`, `LegacyAbsorber`, `RadialCollar` and `CartesianCollar` now call
+`assert_resident` on their own buffers/mirrors at construction (a local `_specof` helper
+derives the `DeviceSpec` from the reference array they are handed, since none of these
+constructors otherwise has a reason to carry one). Self-consistent by construction today,
+like `NonlinearRHS.TransModeAvg`'s own assertion; it catches a future mismatched
+low-level construction that `JLArrays` would not.
+
+### 7 (minor) — the collars allocated a profile array every accepted step
+
+`RadialCollar` and `CartesianCollar` now hold a reusable `fac` scratch buffer, matching
+`RateAbsorber`'s `tfac`, instead of allocating a fresh array every step.
+
+### 8 (nit) — `test_boundaries.jl` did not restore `allowscalar`
+
+Fixed with the same save/restore of the task-local `:ScalarIndexing` key
+`test_device.jl` already does.
+
+### 9 (nit) — the tested exit criterion was a tenth of the brief's
+
+Covered by finding 1: `test_metal.jl` now uses `flength=0.1`, the brief's own length.
+
+### Self-caught: `prop_capillary_args`'s docstring was silently orphaned
+
+While filling in this section's numbers, rebuilding the docs (`include("docs/make.jl")`)
+turned up a tenth `@ref` failure beyond the 9 pre-existing ones: `Interface.prop_capillary_args`,
+plus two "no docstring found" warnings for the same binding. Cause: finding 2's
+`_check_responses_device_capable!` helper was inserted between `prop_capillary_args`'s
+docstring and the `function prop_capillary_args(...)` it documents, so Julia silently
+attached the docstring to `_check_responses_device_capable!` instead -- a plain reordering
+bug, not a review finding, introduced while fixing finding 2 and only caught by actually
+rebuilding the docs afterwards. Fixed by moving the docstring immediately above `function
+prop_capillary_args` again (`_check_responses_device_capable!` now precedes it). Confirmed
+fixed: `include("docs/make.jl")` now reports exactly the same 9 pre-existing unresolved
+`@ref`s as the base branch, none from this branch. `test_interface.jl` re-run after the
+fix: still 317 pass, 0 fail -- a pure reordering of two independent top-level definitions.
+
+### Re-run after the changes
+
+| | |
+|---|---|
+| regression gate, `LUNA_REGRESSION_BASE=c1ffc410` | 460 pass, 0 fail, every case `0.000e+00` |
+| regression gate, `LUNA_REGRESSION_BRANCH=gpu/int-A` | 460 pass, 0 fail, every case `0.000e+00` |
+| `test_boundaries.jl` (worktree env) | 182 pass, 0 fail |
+| `test_boundaries.jl` (JLArrays env) | 184 pass, 0 fail |
+| `test_output.jl` | 117 pass, 0 fail |
+| `test_device.jl` (JLArrays env) | 179 pass, 0 fail |
+| `test_interface.jl` | 317 pass, 0 fail |
+| `test_metal.jl` (M1 Pro, hardware) | 175 pass, 0 fail (10 testsets) |
+
+Metal hardware numbers, corrected (finding 1) -- largest relative difference in `Eω` over
+the saves, measured directly (a small standalone script reproducing each testset's own
+parameters, not inferred from the pass/fail assertions):
+
+| comparison | `Eω` | energy |
+| --- | ---: | ---: |
+| exit criterion (100 nJ, 10 cm, He 1 bar), Metal vs CPU `Float32` | 4.4e-6 | 4.2e-6 |
+| exit criterion, Metal vs CPU `Float64` | 4.2e-6 | -- |
+| visible Kerr (300 µJ, 10 cm, He 5 bar, ~×2.5 broadening), Metal vs CPU `Float32`, fixed steps | 4.3e-6 | 1.5e-6 |
+| gradient, brief's parameters (100 nJ, Ar 1 bar→0), Metal vs CPU `Float32`, fixed steps | 3.1e-6 | 1.6e-6 |
+| gradient, visible Kerr (300 µJ, Ar 5 bar→0), Metal vs CPU `Float32`, **adaptive** (looser tolerance, see finding 1) | 4.6e-4 | -- |
+| `prop_capillary`, constant pressure, Metal vs CPU `Float32` / `Float64` | 4.4e-6 / 4.2e-6 | 4.2e-6 |
+| `prop_capillary`, gradient pressure, Metal vs CPU `Float32` / `Float64` | 5.9e-6 / 2.0e-4 | -- |
+
+The `prop_capillary` gradient row's `Float64` column (2.0e-4) is the same Float32-rounding-
+perturbs-the-adaptive-controller effect as the low-level adaptive gradient row above it
+(4.6e-4 vs `Float32`, within the file's own documented 5e-4 tolerance for that comparison)
+-- both are well above the 1e-4 used for every fixed-step comparison in the file, and
+`prop_capillary`'s own two hardware assertions for this case use 1e-4 (`Float32` reference)
+and a separately documented 3e-4 (`Float64` reference) accordingly. Not a device defect:
+every fixed-step comparison in `test_metal.jl`, including this same gradient at the same
+energy and pressure, agrees to 1e-4 or better.
+
