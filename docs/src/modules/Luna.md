@@ -32,6 +32,7 @@ user-facing description and
 ```@docs
 Luna.DeviceSpec
 Luna.device
+Luna.device_request
 Luna.set_device
 Luna.register_device!
 Luna.DeviceHooks
@@ -46,6 +47,7 @@ Luna.scalar
 Luna.upload_like
 Luna.mask_like
 Luna.assert_resident
+Luna.all_resident
 Luna.UnitScaling
 Luna.unitscaling
 Luna.GridVectors
