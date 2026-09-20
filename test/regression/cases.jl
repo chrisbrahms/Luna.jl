@@ -316,6 +316,13 @@ const CASES = Case[
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=200e-9,
                    plasma=false),
 
+    #= `thg=false` on a `RealGrid` selects `Nonlinear.Kerr_field_nothg`, which removes the
+       third-harmonic term by way of the analytic signal and is what `prop_capillary` uses
+       for a field run with `thg=false`. `Kerr_field` is everything else in the matrix. =#
+    capillary_case("modeavg_field_nothg", A_CAP, L_CAP, :He, 1.0;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=200e-9,
+                   plasma=false, thg=false),
+
     capillary_case("modeavg_field_plasma", A_CAP, L_CAP, :He, 1.0;
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
                    plasma=true, PPT_options=NOCACHE),

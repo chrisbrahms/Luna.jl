@@ -51,7 +51,7 @@ the device-contract tests from `gpu/10-device-model` on. No Metal, no CUDA.
 
 | File | What it is |
 | --- | --- |
-| `cases.jl` | `RegressionCases.CASES`, 20 cases, and `runcase(case, mode)`. |
+| `cases.jl` | `RegressionCases.CASES`, 21 cases, and `runcase(case, mode)`. |
 | `compare.jl` | Storage format (HDF5), the difference metric and the tolerance classes. |
 | `run_cases.jl` | Runs everything and writes the HDF5 files. |
 | `generate.jl` | Makes a worktree of a commit and runs `run_cases.jl` in it. |
@@ -64,6 +64,7 @@ The cases, all with `shotnoise=false` and `saveN=11`:
 | Case | Geometry / physics |
 | --- | --- |
 | `modeavg_field_kerr` | mode-averaged field, Kerr only |
+| `modeavg_field_nothg` | mode-averaged field, **`Kerr_field_nothg`** (`thg=false`) |
 | `modeavg_field_plasma` | mode-averaged field, Kerr + PPT plasma (`PPT_options=Dict(:cache=>false)`) |
 | `modeavg_field_raman` | mode-averaged field, Kerr + Raman (N₂, 0.5 bar) |
 | `modeavg_field_mixture` | mode-averaged field, He/Ne mixture, low-level API |
@@ -84,9 +85,9 @@ The cases, all with `shotnoise=false` and `saveN=11`:
 | `taper_field_kerr` | core radius tapered 125 → 93.75 µm |
 | `modeavg_field_legacy` | as `modeavg_field_kerr` but `boundary=:legacy` |
 
-The five in bold were added after review round 1 (finding 8) so that the gate covers the
-responses Groups C and D rewrite: `Kerr_env_thg`, `Chi2Env`, ADK ionisation, the vector
-response path and `prop_gnlse`'s Raman and self-steepening branches.
+The six in bold were added after review round 1 (finding 8) so that the gate covers the
+responses Groups C and D rewrite: `Kerr_field_nothg`, `Kerr_env_thg`, `Chi2Env`, ADK
+ionisation, the vector response path and `prop_gnlse`'s Raman and self-steepening branches.
 
 All four free-space cases now record `z` and `dz` through `Stats.collect_stats(grid, Eω)`,
 so their step sequence is checked too. There is still no `Stats.default` for free-space
@@ -137,21 +138,21 @@ operator, and one fixed-step propagation through `Luna.run`.
 
 | What | Result |
 | --- | --- |
-| `test/test_regression.jl` | **436 pass, 0 fail**. Every case, both modes, both classes, difference exactly `0.000e+00`. 90 s |
+| `test/test_regression.jl` | **460 pass, 0 fail**. Every case, both modes, both classes, difference exactly `0.000e+00`. 92 s |
 | `test/test_utils.jl` | **33 pass, 0 fail**, 3.7 s (includes the new `set_fftw_wisdom` testset) |
 | `test/test_output.jl` | pass, 22.4 s |
 | `test/test_interface.jl` | pass, 268.6 s |
 | `test/test_freespace.jl` | pass, 313.9 s |
 | every other `test/test_*.jl` | all 33 files exit 0; table under "Per-file test timings" |
-| `test/regression/generate.jl fdf8dbe3` | baseline written, 20 cases × 2 modes |
+| `test/regression/generate.jl fdf8dbe3` | baseline written, 21 cases × 2 modes |
 | `test/regression/generate.jl <other commit>` | exercised for two further commits — see "Re-baselining" |
 | `test/regression/sensitivity.jl` | table below |
 | `benchmark/run.jl` | table below |
 | `include("docs/make.jl")` | fails, identically to the base commit — see "Known gaps" 5 |
 
 The per-file timings below predate review round 1; only `test_utils.jl` changed since (it
-gained a testset that adds 0.1 s), and `test_regression.jl` went from 66 s to 90 s with the
-five new cases.
+gained a testset that adds 0.1 s), and `test_regression.jl` went from 66 s to 92 s with the
+six new cases.
 
 Commands:
 
@@ -244,13 +245,14 @@ revisited without regenerating.
 
 ### Regression gate against `fdf8dbe3`
 
-**436 pass, 0 fail.** Every case, every mode, every class: `0.000e+00`. Largest difference
+**460 pass, 0 fail.** Every case, every mode, every class: `0.000e+00`. Largest difference
 over all cases and modes: `0.000e+00`. The tolerances are from `tolerances.jl`; Δ is the
 observed difference.
 
 | Case | `:fixed` Eω Δ / tol | `:fixed` stats Δ / tol | `:adaptive` Eω Δ / tol | `:adaptive` stats Δ / tol |
 | --- | --- | --- | --- | --- |
 | `modeavg_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 5.9e-07 |
+| `modeavg_field_nothg` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.3e-12 | 0 / 2.1e-04 |
 | `modeavg_field_plasma` | 0 / 1.0e-12 | 0 / 2.5e-12 | 0 / 1.0e-12 | 0 / 7.3e-06 |
 | `modeavg_field_raman` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.4e-09 |
 | `modeavg_field_mixture` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.5e-10 |
@@ -286,6 +288,7 @@ each tolerance class, using the gate's own comparison (`:adaptive` excludes `sta
 | Case | `:fixed` Eω | `:fixed` stats | driven by | `:adaptive` Eω | `:adaptive` stats | driven by |
 | --- | --- | --- | --- | --- | --- | --- |
 | `modeavg_field_kerr` | 8.60e-16 | 1.59e-15 | `peakpower` | 1.45e-15 | 5.89e-09 | `peakintensity` |
+| `modeavg_field_nothg` | 1.10e-15 | 9.34e-16 | `peakintensity` | 2.25e-14 | 2.11e-06 | `peakpower` |
 | `modeavg_field_plasma` | 1.40e-15 | 2.50e-14 | `peak_ionisation_rate` | 2.20e-15 | 7.29e-08 | `peak_ionisation_rate` |
 | `modeavg_field_raman` | 1.41e-15 | 1.59e-15 | `peakpower` | 2.26e-15 | 2.38e-11 | `peakintensity` |
 | `modeavg_field_mixture` | 1.32e-15 | 9.52e-16 | `Eω` | 2.86e-15 | 1.48e-12 | `peakpower` |
@@ -342,8 +345,8 @@ Before the changes below, `Eω` and the statistics shared one tolerance per (cas
 | loosest `Eω` tolerance, `:adaptive` | 5.3e-04 (shared with `stats`) | 8.7e-07 |
 | `Eω` tolerance, `gradient_field_kerr` `:adaptive` | 1.6e-04 | 2.6e-07 |
 | `Eω` sensitivity, `multimode_field_plasma` `:fixed` | not separately measured; whole-array metric dominated by mode 1 | 1.16e-13, located in mode 4 |
-| assertions in the gate | 304 | 436 |
-| cases | 15 | 20 |
+| assertions in the gate | 304 | 460 |
+| cases | 15 | 21 |
 
 ### Benchmarks (`benchmark/run.jl`)
 
@@ -353,6 +356,7 @@ Before the changes below, `Eω` and the statistics shared one tolerance per (cas
 | Case | state | rhs | step | prop |
 | --- | ---: | ---: | ---: | ---: |
 | `modeavg_field_kerr` | 2049 | 41.2 µs | 495 µs | 36.7 ms |
+| `modeavg_field_nothg` | 2049 | 100 µs | 852 µs | 45.2 ms |
 | `modeavg_field_plasma` | 2049 | 112 µs | 927 µs | 5.60 s |
 | `modeavg_field_raman` | 2049 | 251 µs | 1.76 ms | 72.9 ms |
 | `modeavg_field_mixture` | 2049 | 42.5 µs | 580 µs | 39.5 ms |
@@ -383,6 +387,9 @@ Notes on the numbers:
   every `prepare()`, about 5 s. 20 steps of `modeavg_field_plasma` is 19 ms.
 - `gradient_field_kerr` and `taper_field_kerr` are slower per step than the constant case
   because their operator is z-dependent: it is rebuilt at every stage.
+- `modeavg_field_nothg` costs about 2.5x `modeavg_field_kerr` per RHS: removing the
+  third-harmonic term goes through the analytic signal, which is an extra pair of
+  transforms.
 - `modeavg_field_vector` costs as much as the four-mode case despite having two components:
   elliptical polarisation turns a mode-averaged run into a two-mode `TransModal`, so it pays
   the adaptive modal integral. Its `prop` is setup-dominated for the same PPT reason as the
@@ -465,7 +472,7 @@ FFTW and documentation sections above.
 | 5 | `Scans` workers do not inherit the setting | said so in the `set_fftw_wisdom` docstring, for all three settings |
 | 6 | no test for `set_fftw_wisdom` | new testset in `test/test_utils.jl`: default, both functions return `nothing`, cache mtime unchanged, no pidlock, restore |
 | 7 | free-space cases recorded no statistics, so their step sequence was unchecked | all five now use `Stats.collect_stats(grid, Eω)`, recording `z` and `dz` |
-| 8 | response coverage gaps before Groups C and D | five new cases: `gnlse_raman_shock`, `modeavg_env_thg`, `free2d_env_chi2`, `modeavg_field_adk`, `modeavg_field_vector` |
+| 8 | response coverage gaps before Groups C and D | six new cases: `modeavg_field_nothg`, `gnlse_raman_shock`, `modeavg_env_thg`, `free2d_env_chi2`, `modeavg_field_adk`, `modeavg_field_vector` |
 | 9 | `benchmark/run.jl` dropped all boundary keywords but `:boundary` | all four mapped onto `Boundaries.setup`; unused `linop`/`dz` bindings removed |
 | 10 | `Project.toml` and PR staleness | `JLArrays = "0.1, 0.2, 0.3"` (current release 0.3.3); stale "branch head", the 326-vs-304 paragraph and the duplicated table header fixed |
 | 11 | nits | `-` printed when the maximum is zero; soliton comment corrected (N = 2 is second order, `GNLSE_LENGTH` is 0.2 soliton periods); `runcase` now suppresses `Info` and below rather than everything, so warnings reach the gate output; `benchmark/Project.toml` carries a relative `[sources]` entry |
@@ -553,10 +560,10 @@ zero, on a baseline regenerated from `fdf8dbe3` with the new `cases.jl` and `com
   `:fixed` `stats` tolerance for the two modal cases at 1.8e-09 and 2.9e-07 while everything
   else in those cases is at rounding level. Worth doing if `gpu/22-modal` turns out to move
   them.
-- **Response coverage.** Finding 8 is addressed for `Kerr_env_thg`, `Chi2Env`, ADK, the
-  vector path and GNLSE Raman/shock. `Kerr_field_nothg` is still uncovered: it is what
-  `prop_capillary` selects for a `RealGrid` with `thg=false`, and adding a case for it is
-  one line if Group D wants it.
+- **Response coverage.** Finding 8 is addressed: `Kerr_field_nothg`, `Kerr_env_thg`,
+  `Chi2Env`, ADK, the vector path and GNLSE Raman/shock all have a case. The remaining
+  uncovered responses are the ones no `prop_capillary`/`prop_gnlse` keyword combination
+  reaches, so they would need low-level cases; none is a Group C or D target.
 - **Re-baselining.** `gpu/int-A` has to re-baseline for `gpu/01-zmax`'s changed signatures.
   `generate.jl` takes the commit as an argument and `cases.jl` is copied from the branch
   under test, so the mechanism is there, but `cases.jl` itself will need its `Luna.run` and

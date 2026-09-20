@@ -61,6 +61,9 @@ const TOLERANCES = Dict{String, Dict{Symbol, Dict{Symbol, Float64}}}(
     "modeavg_field_kerr" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
         :adaptive  => Dict(:Eω => 1.0e-12, :stats => 5.9e-07)),
+    "modeavg_field_nothg" => Dict(
+        :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
+        :adaptive  => Dict(:Eω => 2.3e-12, :stats => 2.1e-04)),
     "modeavg_field_plasma" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 2.5e-12),
         :adaptive  => Dict(:Eω => 1.0e-12, :stats => 7.3e-06)),
