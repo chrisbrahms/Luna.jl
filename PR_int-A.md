@@ -1,12 +1,13 @@
-# Group A integration: `zmax` out of the grids and `Grid.RadialGrid`
+# Group A integration: the regression gate, `zmax` out of the grids, `Grid.RadialGrid`
 
 Branch `gpu/int-A`. Base `gpu/01-zmax` (`80fe61ca`), merged with `gpu/02-radialgrid`
-(`9dd6afaa`). Both branch from `evanescent` (`fdf8dbe3`).
+(`9dd6afaa`) and `gpu/00-harness` (`c0c7b76a`). All three branch from `evanescent`
+(`fdf8dbe3`).
 
-This branch is the Group A integration described in GPU_PLAN.md §5/§6. It contains no new
-work of its own beyond resolving the overlap between the two branches; the two PR
-descriptions `PR_01-zmax.md` and `PR_02-radialgrid.md` are on the branch and describe what
-each one does.
+This branch is the Group A integration described in GPU_PLAN.md §5/§6. Apart from the
+compatibility shim in the regression cases it contains no work of its own beyond resolving
+the overlap between the three branches; `PR_01-zmax.md`, `PR_02-radialgrid.md` and
+`PR_00-harness.md` are on the branch and describe what each one does.
 
 ## Merged branches
 
@@ -14,16 +15,22 @@ each one does.
 |---|---|---|
 | `gpu/01-zmax` | `80fe61ca` | §4.13: `Grid.RealGrid`/`Grid.EnvGrid` lose the `zmax` field; `Luna.run` takes `zmax` as a required keyword and writes it to the output |
 | `gpu/02-radialgrid` | `9dd6afaa` | §4.14: `Grid.RadialGrid` replaces `Hankel.QDHT` in every Luna dispatch signature; the transverse grid is written to the output |
+| `gpu/00-harness` | `c0c7b76a` | the regression gate (`test/regression/`, `test/test_regression.jl`), `Luna.set_fftw_wisdom`, the `Adapt`/`GPUArraysCore` dependencies, `JLArrays` in the test target, and `benchmark/` |
 
 Commits on this branch:
 
 - `1021a5bf` Merge gpu/02-radialgrid into gpu/int-A (the textual merge and its conflict
   resolutions)
 - `e94c2b14` Semantic sweep after the gpu/01-zmax + gpu/02-radialgrid merge
+- `cb9415a8` Merge gpu/00-harness into gpu/int-A (no conflicts)
+- `ff716000` Regression cases: a compatibility shim for the Group A signature changes
 
-They are separate so that a reviewer can see what the merge did and what it did not do.
+The merge and the sweep are separate commits so that a reviewer can see what the merge did
+and what it did not do.
 
-`gpu/00-harness` is **not** merged yet; see "Pending" below.
+`Manifest.toml` is gitignored, and this worktree's copy was replaced by `gpu/00-harness`'s
+so that `Adapt` and `GPUArraysCore` resolve and so that the package versions match the ones
+the existing `fdf8dbe3` baseline was generated with.
 
 ## Conflicts and how they were resolved
 
@@ -59,6 +66,12 @@ Three hunks carried content beyond the two-line pattern:
 
 `src/Grid.jl`, `src/Luna.jl`, `src/Boundaries.jl`, `src/Fields.jl`, `src/LinearOps.jl`,
 `src/NonlinearRHS.jl`, `src/Interface.jl` and `test/runtests.jl` merged without conflict.
+
+**`gpu/00-harness` merged with no conflicts at all.** The only file it shares with the other
+two is `src/Luna.jl`, where it adds `"fftw_wisdom" => true` to the `settings` `Dict` and a
+`set_fftw_wisdom` function at the top of the module, well away from `gpu/01-zmax`'s changes
+to `run`. `Project.toml`, `src/Utils.jl`, `docs/src/modules/Luna.md`, `test/test_utils.jl`,
+`benchmark/` and `test/regression/` came over untouched.
 
 Three places where both branches edited the same function and the textual merge happened to
 be right were read in full:
@@ -109,6 +122,117 @@ Nothing in the ~35 `examples/` lines the `gpu/01-zmax` reviewer counted on `gpu/
 needed fixing after the merge: all the example files 02 touched are ones 01 touched too, so
 they either conflicted (the five above) or took 01's side cleanly.
 
+## The compatibility shim in the regression cases (commit `ff716000`)
+
+`test/regression/generate.jl` copies `cases.jl` into a worktree of the baseline commit and
+runs it there, so the baseline is the *old* Luna running the *new* case definitions. One
+`cases.jl` therefore has to build the same propagations on `evanescent` and on this branch,
+and Group A changed two APIs it uses:
+
+- `gpu/01-zmax`: the grid constructors lose their leading `zmax` argument, `Grid.RealGrid`
+  loses the field, `Luna.run` gains a required `zmax` keyword, and `Boundaries.setup` gains
+  a `zmax` positional argument after `z0`.
+- `gpu/02-radialgrid`: `Grid.RadialGrid` replaces `Hankel.QDHT`.
+
+`gpu/00-harness` anticipated this and said `cases.jl` would have to be updated and would
+then stop running against `evanescent`. It does not have to: a marked block at the top of
+`cases.jl` detects which API is loaded and the cases go through it. Detection is from the
+API itself, so nothing has to be edited when a further branch is merged:
+
+```julia
+const GRID_HAS_ZMAX  = hasfield(Grid.RealGrid, :zmax)   # true before gpu/01-zmax
+const HAS_RADIALGRID = isdefined(Grid, :RadialGrid)     # true from gpu/02-radialgrid on
+```
+
+and four helpers built on them: `makegrid(GT, zmax, referenceλ, λ_lims, trange; kwargs...)`,
+`runkw(zmax)` (which returns `(; zmax)` or an empty `NamedTuple` for splatting into
+`Luna.run`), `radialgrid(R, N)` and `absorber_setup(...)` (used by `benchmark/run.jl`, which
+builds an absorber outside `Luna.run`). Eleven call sites in `cases.jl` and one in
+`benchmark/run.jl` use them; `compare.jl`, `run_cases.jl`, `generate.jl`, `sensitivity.jl`,
+`tolerances.jl` and `test/test_regression.jl` needed no change, because they go through
+`runcase`.
+
+**The shim is numerically inert on `evanescent`, checked rather than assumed.** Regenerating
+the `fdf8dbe3` baseline with the shimmed `cases.jl`, into a separate directory, reproduces
+the stored baseline bit for bit: 21 files, 502 datasets, `isequal` throughout. So the Group A
+gate below runs against the existing baseline and nothing was regenerated over it.
+
+The block is marked in the file and is to be deleted, with its call sites, once no baseline
+in use predates `gpu/int-A`. `test/regression/README.md` says so, and gains a section on
+which base a branch should compare against.
+
+## Regression: Group A against `evanescent`
+
+`LUNA_REGRESSION_BASE=fdf8dbe3`, the baseline the `gpu/00-harness` implementer generated
+with 21 cases, not regenerated. **460 pass, 0 fail, 88 s.** Δ is the observed
+`maximum(abs, Δ)/maximum(abs, baseline)` (per component and per save for `Eω`); tol is from
+`tolerances.jl`. The four non-zero entries are in bold.
+
+| case | `:fixed` Eω Δ / tol | `:fixed` stats Δ / tol | `:adaptive` Eω Δ / tol | `:adaptive` stats Δ / tol |
+|---|---|---|---|---|
+| `modeavg_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 5.9e-07 |
+| `modeavg_field_nothg` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.3e-12 | 0 / 2.1e-04 |
+| `modeavg_field_plasma` | 0 / 1.0e-12 | 0 / 2.5e-12 | 0 / 1.0e-12 | 0 / 7.3e-06 |
+| `modeavg_field_raman` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.4e-09 |
+| `modeavg_field_mixture` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.5e-10 |
+| `modeavg_field_adk` | 0 / 1.0e-12 | 0 / 2.3e-11 | 0 / 1.0e-12 | 0 / 3.8e-05 |
+| `modeavg_field_vector` | 0 / 1.0e-12 | 0 / 1.8e-09 | 0 / 1.0e-12 | 0 / 9.8e-05 |
+| `modeavg_env_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 5.6e-12 | 0 / 5.3e-04 |
+| `modeavg_env_raman` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.9e-12 | 0 / 4.2e-04 |
+| `modeavg_env_thg` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.3e-07 |
+| `gnlse_sech` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 3.6e-11 | 0 / 1.6e-09 |
+| `gnlse_raman_shock` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.9e-10 | 0 / 1.2e-08 |
+| `multimode_field_plasma` | 0 / 1.2e-11 | 0 / 2.9e-07 | 0 / 1.8e-07 | 0 / 7.7e-06 |
+| `radial_field_kerr` | **1.901e-15** / 1.0e-12 | 0 / 1.0e-12 | **6.713e-11** / 1.2e-08 | 0 / 1.0e-12 |
+| `radial_env_kerr` | **2.866e-15** / 1.0e-12 | 0 / 1.0e-12 | **4.017e-11** / 8.2e-09 | 0 / 1.0e-12 |
+| `free3d_env_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 |
+| `free2d_field_chi2` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 7.4e-12 | 0 / 1.0e-12 |
+| `free2d_env_chi2` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 5.0e-12 | 0 / 1.0e-12 |
+| `gradient_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.6e-07 | 0 / 1.6e-04 |
+| `taper_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 8.7e-07 | 0 / 3.1e-05 |
+| `modeavg_field_legacy` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.3e-11 | 0 / 7.8e-08 |
+
+**Largest difference over all cases and modes: 6.713e-11**, in `radial_field_kerr`
+`:adaptive`.
+
+Every case except the two radial ones is **exactly zero** in both modes and both classes,
+including the step count. That is the statement `gpu/01-zmax` and `gpu/00-harness` make about
+themselves — neither changes any arithmetic — and it holds through the merge.
+
+The two radial cases move, which is what `gpu/02-radialgrid` predicted and measured: it
+replaces Hankel's `permutedims` + left GEMM by a right GEMM on a reshape in
+`Boundaries.RadialCollar`, in `Fields.transform` (the input field) and in the `TransRadial`
+noise setup, and folds the scalar `scaleRK` into the transform matrix. Both change the order
+of the floating-point operations.
+
+- `:fixed` (20 imposed steps, so the difference is attributable to the arithmetic alone):
+  **1.901e-15** and **2.866e-15**. That is the same order as the 4.82e-15 worst case
+  `PR_02-radialgrid.md` reports over its own 12 `test_freespace.jl` cases, and about one to
+  three ulps. Both are three orders of magnitude inside the 1e-12 tolerance.
+- `:adaptive`: **6.713e-11** and **4.017e-11**, against tolerances of 1.2e-08 and 8.2e-09.
+  These are larger because the step-size controller amplifies a rounding change: the one-ulp
+  sensitivity of those two cases in that mode is 1.24e-10 and 8.18e-11 (`sensitivity.jl`, in
+  `PR_00-harness.md`), so the observed differences are *about half of what one ulp on the
+  input field does to the same case*. The step counts are unchanged, which the gate checks
+  separately and which is a hard failure if it moves.
+- The `stats` class is exactly zero for both radial cases in both modes. The free-space cases
+  record only `z` and `dz`; in `:fixed` those are compared and match exactly, which confirms
+  the step sequence really was imposed.
+
+This table is the Group A regression record against `evanescent`.
+
+## Regression: `gpu/int-A` against itself
+
+Baseline generated from this branch's `ff716000` (`test/regression/generate.jl ff716000`),
+gate run with `LUNA_REGRESSION_BASE=ff716000`: **460 pass, 0 fail, 88 s, every case, both
+modes, both classes exactly `0.000e+00`.** Largest difference over all cases and modes:
+`0.000e+00`.
+
+That is the baseline Group B onwards compares against
+(`LUNA_REGRESSION_BRANCH=gpu/int-A`), and it also confirms that the generator reproduces the
+run environment exactly from a separate worktree and a separate process on the new
+signatures.
+
 ## Tests
 
 `julia --project=/Users/mb140/.julia/dev/Luna-gpu/gpu-int-A -t 1`, with
@@ -116,6 +240,8 @@ they either conflicted (the five above) or took 01's side cleanly.
 `LinearAlgebra.BLAS.set_num_threads(1)`. `test_processing.jl` was run with an empty `ARGS`
 (the `Scans` command-line parsing reads `ARGS`). Machine: Apple M1 Pro, Julia 1.13, with
 other agents' jobs running at the same time, so the times are upper bounds.
+
+Stage 1, after the `gpu/01-zmax` + `gpu/02-radialgrid` merge:
 
 | file | result | time |
 |---|---|---|
@@ -134,6 +260,35 @@ other agents' jobs running at the same time, so the times are upper bounds.
 originating branch reported for that file, so the merge did not silently drop or weaken a
 testset.
 
+Rerun after the `gpu/00-harness` merge and the shim, on the `gpu/00-harness` `Manifest.toml`
+(so `Adapt` and `GPUArraysCore` resolve):
+
+| file | result | time |
+|---|---|---|
+| `test/test_utils.jl` | 33 pass | 3.8 s |
+| `test/test_grid.jl` | 88 pass | 6.1 s |
+| `test/test_radialgrid.jl` | 159 pass | 9.7 s |
+| `test/test_output.jl` | 71 pass | 12.7 s |
+| `test/test_interface.jl` | 301 pass | 254.3 s |
+| `test/test_regression.jl` vs `fdf8dbe3` | 460 pass | 88.4 s |
+| `test/test_regression.jl` vs `ff716000` (self) | 460 pass | 88.0 s |
+
+`test_utils.jl` covers `gpu/00-harness`'s new `set_fftw_wisdom` testset and passes
+unchanged at its 33 assertions.
+
+`benchmark/run.jl` was run for the two radial cases, through the shimmed `absorber_setup`,
+as a check that the benchmark still builds an absorber outside `Luna.run`:
+
+```
+case                          state          rhs         step         prop
+radial_field_kerr              4128   155.541 µs     1.675 ms    64.991 ms
+radial_env_kerr                4096   125.708 µs     1.535 ms    54.146 ms
+```
+
+which is within run-to-run noise of `PR_00-harness.md`'s numbers for the same two cases on
+`evanescent` (156 µs / 1.68 ms / 63.3 ms and 126 µs / 1.54 ms / 56.2 ms): `Grid.RadialGrid`
+did not change the per-step cost of a radial run.
+
 All 129 `.jl` files under `src/`, `test/` and `examples/` parse (`Meta.parseall` on the file
 contents, walking the result for `:error`/`:incomplete` nodes).
 
@@ -151,19 +306,20 @@ basic_modeAvg.jl                        OK (5.9 s)
 gradients/gradient_modeAvg.jl           OK (9.6 s)
 ```
 
-## Pending
+## Known gaps and carried-over notes
 
-- **`gpu/00-harness` is not merged.** It carries the regression generator and
-  `test/test_regression.jl`, the `settings["fftw_wisdom"]` switch, the `Adapt`/`GPUArraysCore`
-  dependencies and the `benchmark/` environment. It will be merged into this branch as
-  stage 2, and the regression gate re-baselined here for the changed signatures: the
-  baseline generator takes the base commit as an argument, and `gpu/02-radialgrid`'s radial
-  deltas against `evanescent` (worst case 4.82e-15, recorded in `PR_02-radialgrid.md`) have
-  to be recorded before the re-baseline, as GPU_PLAN.md §6 requires.
 - The regression scripts in the project scratchpad (`radial_cases.jl`,
   `reviews/scratch-02/rerun_cases.jl`) still use `Grid.RealGrid(L, …)` and `Luna.run` without
-  `zmax`. They are not in the repository; they need updating before they are used against
-  this branch.
+  `zmax`, so they do not run against this branch. They are not in the repository and are
+  superseded by the gate; `test/regression/cases.jl` is the maintained version of what they
+  did.
+- `Manifest.toml` in this worktree is `gpu/00-harness`'s. It is gitignored, but it matters:
+  it is the one the existing `fdf8dbe3` baseline was generated with, and the one that has
+  `Adapt` and `GPUArraysCore`. A fresh worktree of this branch needs `Pkg.instantiate()` (or
+  that Manifest) before `using Luna` works.
+- Carried over from `gpu/00-harness`: the gate is not wired into CI; the free-space cases
+  record only `z` and `dz`; the documentation build fails on six pre-existing unresolved
+  `@ref`s, identically with and without this branch.
 - Carried over from `gpu/02-radialgrid`: `Test.detect_ambiguities(Luna; recursive=true)`
   reports 13 new latent pairs in `Luna.setup` and `NonlinearRHS.TransRadial`, all judged
   unreachable by the reviewer.
