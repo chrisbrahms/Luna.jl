@@ -90,8 +90,11 @@ function runcase(c::Case, mode::Symbol; perturb=0.0)
     end
 end
 
-"Run `f()` with all logging suppressed."
-quiet(f) = Logging.with_logger(f, Logging.NullLogger())
+#= Suppress `Info` and below, not everything: a warning raised by a later branch -- the
+   absorber's "removed more than `warnfrac` of the pulse", a deprecation from a changed
+   signature -- has to be visible in the gate's output, and a `NullLogger` would swallow it. =#
+"Run `f()` with `Info`-level logging and below suppressed. Warnings and errors still print."
+quiet(f) = Logging.with_logger(f, Logging.ConsoleLogger(stderr, Logging.Warn))
 
 #= The absorbing-boundary options have to be given both to `prop_capillary_args` (which
    records them) and to `Luna.run` (which uses them). `Luna.prop_capillary` does this with
@@ -158,6 +161,16 @@ function setup_mixture()
     Eω, grid, linop, transform, FT, output
 end
 
+#= There is no `Stats.default` for free-space geometries: `Stats.default` dispatches on
+   `Modes.AbstractMode`/`Modes.ModeCollection`, and the individual functions do not work on a
+   3- or 4-dimensional `Eω` (`Stats.ω0`'s `squeeze` has 1- and 2-dimensional methods only;
+   `Stats.energy` and `Stats.peakpower` index `Eω[:, i]`). `Stats.collect_stats` with no
+   functions does work, and appends `Stats.zdz!`, so these cases at least record `z` and `dz`
+   -- enough for the fixed-step check that the step sequence really was imposed, and for the
+   step-count check in the adaptive mode. =#
+"`z` and `dz` only: the statistics a free-space geometry can record."
+freestats(grid, Eω) = Stats.collect_stats(grid, Eω)
+
 #= Free-space parameters, following test/test_freespace.jl but on smaller grids. =#
 const R_FREE = 1.0e-3
 const L_FREE = 0.15
@@ -187,9 +200,7 @@ function setup_free(grid, sg, normfun, responses)
     inputs = Fields.GaussGaussField(;λ0=Λ0, τfwhm=ΤFWHM, energy=1e-12,
                                      w0=W0_FREE, propz=-L_FREE)
     Eω, transform, FT = Luna.setup(grid, sg, densityfun, normfun, responses, inputs)
-    #= There is no `Stats.default` for free-space geometries, so these cases compare `Eω`
-       only. `Output.nostats` is what the free-space examples use. =#
-    output = Output.MemoryOutput(0, grid.zmax, SAVEN)
+    output = Output.MemoryOutput(0, grid.zmax, SAVEN, freestats(grid, Eω))
     Eω, grid, linop, transform, FT, output
 end
 
@@ -221,47 +232,73 @@ function setup_free3d_env()
 end
 
 #= Type I SHG in BBO on a 2-D Cartesian grid: the χ⁽²⁾ response with two polarisation
-   components. Same setup as the "BBO SHG" testset in test/test_freespace.jl. =#
+   components. Same setup as the "BBO SHG" testset in test/test_freespace.jl, which runs it
+   both field-resolved and as an envelope; so do we, because `Chi2Field` and `Chi2Env` are
+   separate implementations and GPU_PLAN.md section 6 makes both of them targets. =#
 const BBO_THICKNESS = 30e-6
+const BBO_θ = deg2rad(29.2) # type I phase-matching angle
+const BBO_ϕ = deg2rad(30)
+const BBO_λ0 = 800e-9
+const BBO_τFWHM = 30e-15
+const BBO_W0 = 20e-6
+const BBO_ENERGY = 10e-9
 
-function setup_bbo_field()
-    λ0 = 800e-9
-    τfwhm = 30e-15
-    w0 = 20e-6
-    energy = 10e-9
-    θ = deg2rad(29.2) # type I phase-matching angle
-    ϕ = deg2rad(30)
-    grid = Grid.RealGrid(BBO_THICKNESS, λ0, (250e-9, 2e-6), 120e-15)
-    xgrid = Grid.Free2DGrid(4w0, 2^5)
-    nfuns = PhysData.ref_index_fun_xy(:BBO, θ)
+"""
+    setup_bbo(grid, response)
+
+Type I SHG in BBO on a `Grid.Free2DGrid`, with `response` the χ⁽²⁾ response matching `grid`.
+"""
+function setup_bbo(grid, response)
+    xgrid = Grid.Free2DGrid(4BBO_W0, 2^5)
+    nfuns = PhysData.ref_index_fun_xy(:BBO, BBO_θ)
     linop = LinearOps.make_const_linop(grid, xgrid, nfuns)
     normfun = NonlinearRHS.const_norm_free2D(grid, xgrid, nfuns)
     densityfun = z -> 1 # unity density: we're considering a solid
-    responses = (Nonlinear.Chi2Field(θ, ϕ, PhysData.χ2(:BBO)),)
-    inputs = Fields.GaussGaussField(;λ0, τfwhm, energy=energy/(sqrt(π/2)*w0), w0)
-    Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, responses, inputs)
-    output = Output.MemoryOutput(0, grid.zmax, SAVEN)
+    inputs = Fields.GaussGaussField(;λ0=BBO_λ0, τfwhm=BBO_τFWHM,
+                                     energy=BBO_ENERGY/(sqrt(π/2)*BBO_W0), w0=BBO_W0)
+    Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, (response,), inputs)
+    output = Output.MemoryOutput(0, grid.zmax, SAVEN, freestats(grid, Eω))
     Eω, grid, linop, transform, FT, output
 end
 
-#= GNLSE: an N = 2 soliton over a tenth of a soliton period, from
-   examples/simple_interface/gnlse_sol.jl. =#
+function setup_bbo_field()
+    grid = Grid.RealGrid(BBO_THICKNESS, BBO_λ0, (250e-9, 2e-6), 120e-15)
+    setup_bbo(grid, Nonlinear.Chi2Field(BBO_θ, BBO_ϕ, PhysData.χ2(:BBO)))
+end
+
+function setup_bbo_env()
+    grid = Grid.EnvGrid(BBO_THICKNESS, BBO_λ0, (250e-9, 2e-6), 120e-15; thg=true)
+    setup_bbo(grid, Nonlinear.Chi2Env(BBO_θ, BBO_ϕ, PhysData.χ2(:BBO), grid.ω0, grid.to))
+end
+
+#= GNLSE: a second-order (N = 2) soliton, from examples/simple_interface/gnlse_sol.jl.
+   `GNLSE_LENGTH = 0.1π τ₀²/|β₂|` is 0.2 soliton periods (z₀ = (π/2) τ₀²/|β₂|), i.e. the
+   first compression is in the propagation. =#
 const GNLSE_γ = 0.1
 const GNLSE_β2 = -1e-26
 const GNLSE_τ0 = 280e-15
 const GNLSE_FR = 0.18
 const GNLSE_LENGTH = 0.1π*GNLSE_τ0^2/abs(GNLSE_β2)
 
-"A fundamental-soliton GNLSE propagation (N = 2, sech input, no Raman, no shock)."
-function setup_gnlse()
+"""
+    setup_gnlse(; raman, shock)
+
+An N = 2 sech soliton through `prop_gnlse`. `raman` switches on the `fr`-weighted Raman
+response and `shock` the self-steepening term, which are separate code paths in
+`Interface.prop_gnlse_args`.
+"""
+function setup_gnlse(; raman, shock)
     N = 2.0
     P0 = N^2*abs(GNLSE_β2)/((1 - GNLSE_FR)*GNLSE_γ*GNLSE_τ0^2)
     Interface.prop_gnlse_args(
         GNLSE_γ, GNLSE_LENGTH, [0.0, 0.0, GNLSE_β2];
         λ0=835e-9, λlims=(450e-9, 8000e-9), trange=2e-12,
         τfwhm=(2*log(1 + sqrt(2)))*GNLSE_τ0, power=P0, pulseshape=:sech,
-        raman=false, shock=false, fr=GNLSE_FR, shotnoise=false, saveN=SAVEN)
+        raman, shock, fr=GNLSE_FR, shotnoise=false, saveN=SAVEN)
 end
+
+setup_gnlse_sech() = setup_gnlse(raman=false, shock=false)
+setup_gnlse_raman_shock() = setup_gnlse(raman=true, shock=true)
 
 "A linear taper of the core radius from `A_CAP` to `3A_CAP/4`."
 taper(z) = A_CAP + (0.75A_CAP - A_CAP)*z/L_CAP
@@ -289,6 +326,18 @@ const CASES = Case[
 
     lowlevel_case("modeavg_field_mixture", 0.02, setup_mixture),
 
+    #= ADK rather than PPT. `makeplasma!` takes the model as a `Symbol`, and the default for
+       a noble gas is `:PPT`, so nothing else in the matrix reaches `Ionisation.IonRateADK`. =#
+    capillary_case("modeavg_field_adk", A_CAP, L_CAP, :He, 1.0;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
+                   plasma=:ADK),
+
+    #= Elliptically polarised input: two polarisation components, so the vector forms of the
+       Kerr and plasma responses and a two-mode `TransModal`. =#
+    capillary_case("modeavg_field_vector", A_CAP, L_CAP, :He, 1.0;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
+                   polarisation=0.5, plasma=true, PPT_options=NOCACHE),
+
     capillary_case("modeavg_env_kerr", A_CAP, L_CAP, :He, 1.0;
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=200e-9,
                    envelope=true),
@@ -297,7 +346,15 @@ const CASES = Case[
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=200e-9,
                    envelope=true, raman=true),
 
-    lowlevel_case("gnlse_sech", GNLSE_LENGTH, setup_gnlse),
+    #= `thg=true` on an `EnvGrid` selects `Nonlinear.Kerr_env_thg`, which carries the
+       carrier-phase array and is a different response from `Kerr_env`. =#
+    capillary_case("modeavg_env_thg", A_CAP, L_CAP, :He, 1.0;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=200e-9,
+                   envelope=true, thg=true),
+
+    lowlevel_case("gnlse_sech", GNLSE_LENGTH, setup_gnlse_sech),
+
+    lowlevel_case("gnlse_raman_shock", GNLSE_LENGTH, setup_gnlse_raman_shock),
 
     capillary_case("multimode_field_plasma", A_CAP, L_CAP, :He, 1.0;
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
@@ -307,6 +364,7 @@ const CASES = Case[
     lowlevel_case("radial_env_kerr", L_FREE, setup_radial_env),
     lowlevel_case("free3d_env_kerr", L_FREE, setup_free3d_env),
     lowlevel_case("free2d_field_chi2", BBO_THICKNESS, setup_bbo_field),
+    lowlevel_case("free2d_env_chi2", BBO_THICKNESS, setup_bbo_env),
 
     capillary_case("gradient_field_kerr", A_CAP, L_CAP, :He, (2.0, 0.1);
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=200e-9,
