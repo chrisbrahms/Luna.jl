@@ -1453,7 +1453,7 @@ function _checkramangrid(R::RamanPolar, Et)
 end
 
 """
-    coefficients(R::RamanPolar, ρ, scaling) -> (hfac, ρ)
+    coefficients(R::RamanPolar, ρ, scaling) -> (hfac, ρout)
 
 The two scalars the Raman kernels need at number density `ρ`, in the units of `scaling`.
 
@@ -1462,23 +1462,24 @@ transformed driving term. It combines
 
 - the time step `dt`, which is the `dt dt df` the pair of transforms does not supply
   (the `1/n` of the inverse transform is `dt df`, so one `dt` is left);
-- the `1/N` of the inverse transform, which is held unnormalised (GPU_PLAN.md §4.2
-  rule 6);
 - [`Luna.polscale`](@ref)`(scaling, 3)`, the response being cubic in the field;
 - the power of two the frequency-domain response function was divided by (`_splitscale`).
 
-`ρ` multiplies the convolution and the field, as it always has.
+`ρout` multiplies the convolution and the field, as `ρ` always has, and carries the
+`1/N` of the inverse transform, which is held unnormalised (GPU_PLAN.md §4.2 rule 6).
+It goes there rather than into `hfac` because it is a factor of 2^18 or so: applied
+before the inverse transform it would cost the frequency-domain buffer five orders of
+`Float32` headroom for nothing. Both placements are exact, `1/N` being a power of two.
 
 Only valid once the response function is up to date for this `ρ` and `scaling`, which
 `batched!` does first: the power of two in `hfac` is chosen there.
 """
-coefficients(R::RamanPolar, ρ, scaling) = (_hfac(R, scaling), ρ)
+coefficients(R::RamanPolar, ρ, scaling) = (_hfac(R, scaling), ρ*R.iscale)
 
-_hfac(R::RamanPolar, scaling) =
-    R.dt*Luna.polscale(scaling, 3)*R.iscale*R.hsplit[]
+_hfac(R::RamanPolar, scaling) = R.dt*Luna.polscale(scaling, 3)*R.hsplit[]
 
 #= Everything in `hfac` except the power of two, which is chosen against it. =#
-_unitfac(R::RamanPolar, scaling) = R.dt*Luna.polscale(scaling, 3)*R.iscale
+_unitfac(R::RamanPolar, scaling) = R.dt*Luna.polscale(scaling, 3)
 
 """
     _splitscale(hω, b) -> s
@@ -1586,8 +1587,9 @@ function batched!(R::RamanPolar, out, Et, ρ, scaling)
     @. Eω2 = hω*Eω2*hfac
     mul!(R.P, R.IFT, Eω2)
     #= Only the first half of the convolution is on the field's own time grid; the rest is
-       the tail which the padding made room for. =#
-    ρc = Luna.scalar(Et, ρ)
+       the tail which the padding made room for. The density carries the `1/N` of the
+       inverse transform (see `coefficients`). =#
+    ρc = Luna.scalar(Et, ρ*R.iscale)
     Pv = _firsthalf(R.P, R.nt)
     @. out += ρc*Et*Pv
     out
