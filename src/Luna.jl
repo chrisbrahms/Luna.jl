@@ -148,42 +148,73 @@ function doinput_sm(grid, inputs::Tuple{Vararg{T} where T <: NamedTuple{<:Any, <
     doinput_sm(grid, inputs_flat, FT)
 end
 
-function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff;
-               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff),
-               noise_field=nothing)
-    Logging.@info("Setting up and planning FFTs...")
-    flush(stderr)
-    Utils.loadFFTwisdom()
-    xo = Array{Float64}(undef, length(grid.to))
-    FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff;
-                                          noise_field)
-    x = Array{Float64}(undef, length(grid.t))
-    FT = FFTW.plan_rfft(x, 1, flags=settings["fftw_flag"])
-    Eω = doinput_sm(grid, inputs, FT)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
-    Utils.saveFFTwisdom()
-    Logging.@info("Setup finished.")
-    flush(stderr)
-    Eω, transform, FT
+"""
+    setup(grid, densityfun, responses, inputs, βfun!, aeff; kwargs...)
+
+Set up a mode-averaged propagation: plan the transforms, build the initial
+frequency-domain field from `inputs`, and return `(Eω, transform, FT)`.
+
+# Keyword arguments
+- `norm!`: the normalisation of the nonlinear polarisation. Built with
+    [`NonlinearRHS.norm_mode_average`](@ref Luna.NonlinearRHS.norm_mode_average) for the
+    chosen device and precision if not given; a normalisation supplied here must have
+    been built for the same ones.
+- `noise_field=nothing`: frequency-domain noise field for the modified shot-noise model.
+- `constβ=false`: declare that `βfun!` does not depend on `z`, which lets the
+    normalisation fold it in once instead of calling it on every right-hand side. True
+    whenever the linear operator is constant.
+- `device=Luna.device()`: where to run, as `:cpu`, `:auto`, `:metal`, `:cuda` or a
+    [`Luna.DeviceSpec`](@ref). The default follows `Luna.settings["device"]`, which a
+    loaded GPU package sets to `:auto`. See [`Luna.set_device`](@ref).
+- `precision=nothing`: `Float32` to run in single precision on the chosen device,
+    `Float64` for double, `nothing` for whatever the device's own spec says (`Float64` on
+    the CPU, `Float32` on Metal). A `Float32` run is scaled (see
+    [`Luna.UnitScaling`](@ref)) and its state is stored and saved in `ComplexF32`.
+"""
+function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff; kwargs...)
+    setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff; kwargs...)
 end
 
-function setup(grid::Grid.EnvGrid, densityfun, responses, inputs, βfun!, aeff;
-               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff),
-               noise_field=nothing)
+@doc (@doc setup)
+function setup(grid::Grid.EnvGrid, densityfun, responses, inputs, βfun!, aeff; kwargs...)
+    setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff; kwargs...)
+end
+
+"The time-domain element type for a grid at real precision `T`."
+timetype(::Grid.RealGrid, ::Type{T}) where {T} = T
+timetype(::Grid.EnvGrid, ::Type{T}) where {T} = Complex{T}
+
+function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
+                            norm! = nothing, noise_field=nothing, constβ=false,
+                            device=Luna.device(), precision=nothing)
+    spec = withprecision(resolve_device(device), precision)
+    T = realtype(spec)
+    log_device(spec, device)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
-    x = Array{ComplexF64}(undef, length(grid.t))
-    FT = FFTW.plan_fft(x, 1, flags=settings["fftw_flag"])
-    xo = Array{ComplexF64}(undef, length(grid.to))
-    FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff;
-                                          noise_field)
-    Eω = doinput_sm(grid, inputs, FT)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
+    #= The input fields are built on the host in Float64 (`Fields` uses host FFTs and
+       scalar code), so the transform they need is planned on the host whatever the run
+       uses. On the default CPU path it is also the transform `setup` returns. =#
+    xh = Array{timetype(grid, Float64)}(undef, length(grid.t))
+    FTh = Utils.plan_ft(xh, 1)
+    Eωh = doinput_sm(grid, inputs, FTh)
+    scaling = unitscaling(T, () -> FTh \ Eωh, PhysData.ε_0)
+    xo = alloc(spec, timetype(grid, T), (length(grid.to),))
+    FTo = Utils.plan_ft(xo, 1)
+    IFTo = Utils.plan_ift(FTo)
+    FT = (arraytype(spec) === Array && T === Float64) ? FTh :
+         Utils.plan_ft(alloc(spec, timetype(grid, T), (length(grid.t),)), 1)
+    Utils.plan_ift(FT) # create inverse FT plans now, so wisdom is saved
+    Utils.plan_ift(FTh)
+    if isnothing(norm!)
+        norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff; spec, scaling, constβ)
+    else
+        NonlinearRHS.check_norm(norm!, spec, scaling)
+    end
+    transform = NonlinearRHS.TransModeAvg(grid, FTo, IFTo, responses, densityfun, norm!,
+                                          aeff; noise_field, spec, scaling)
+    Eω = todevice(spec, isunity(scaling) ? Eωh : Eωh ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
     flush(stderr)
@@ -578,7 +609,19 @@ function run(Eω, grid,
             "the same length to both.")
     end
 
-    Et = FT \ Eω
+    #= Absorbing boundaries and per-step statistics are host code (scalar loops over the
+       collar, host reductions), so a device run needs boundary=:none until gpu/11. The
+       check is here rather than in `Boundaries` so that the message names the keyword
+       the caller passed. =#
+    if Utils.isdevice(Eω) && boundary !== :none
+        error("boundary=:$boundary is not available on a device yet: the absorbers run "*
+              "on the host. Use boundary=:none, or run on the CPU "*
+              "(`Luna.set_device(:cpu)`).")
+    end
+
+    #= Et is the time-domain field the absorbers and the transverse collar work on. A
+       device run only reaches here with boundary=:none, which uses neither. =#
+    Et = Utils.isdevice(Eω) ? nothing : FT \ Eω
 
     # check_cache does nothing except for HDF5Outputs
     Eωc, zc, dzc = Output.check_cache(output, Eω, z0, init_dz)
@@ -602,7 +645,21 @@ function run(Eω, grid,
        transform leaves outside the band. Not for :legacy, which must reproduce the
        historical scheme exactly -- its per-step `ωwin` multiply does the same job from the
        first step anyway. =#
-    boundary === :legacy || (Eω[.!grid.sidx, ntuple(_ -> :, ndims(Eω) - 1)...] .= 0)
+    #= One masked broadcast rather than logical indexing, so it runs on any array type.
+       `ifelse` leaves the in-band elements untouched and writes an exact zero elsewhere,
+       which is what the indexed assignment did. =#
+    if boundary !== :legacy
+        sidx = reshape(mask_like(Eω, grid.sidx), :, ntuple(_ -> 1, ndims(Eω) - 1)...)
+        z0c = zero(eltype(Eω))
+        @. Eω = ifelse(sidx, Eω, z0c)
+    end
+
+    #= The linear operator is built on the host, in Float64, and wrapped by
+       `Boundaries.setup` -- so the upload has to happen after it. A constant operator is
+       uploaded once, here; a closure is evaluated into a host buffer per stage by
+       `RK45.make_prop!` until gpu/23 tabulates it. On the default CPU path this returns
+       the operator unchanged. =#
+    linop = upload_like(Eω, linop)
 
     output(Grid.to_dict(grid), group="grid")
     #= Written once: on a resumed HDF5 propagation it is already in the file. An output

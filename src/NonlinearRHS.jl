@@ -15,41 +15,58 @@ import Cubature
 import Base: show
 import LinearAlgebra: mul!, ldiv!
 import NumericalIntegration: integrate, SimpsonEven
-import Luna: PhysData, Modes, Maths, Grid
+import Luna: PhysData, Modes, Maths, Grid, Utils, Nonlinear
+import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING, GridVectors, HostMirror
+import Luna: alloc, todevice, gridvectors, assert_resident, scalar, upload!, realtype,
+             arraytype, isdevicespec, isunity
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
 import Luna.LinearOps: βz, transverse_k2
 import Logging
 using EllipsisNotation
 
 """
-    to_time!(Ato, Aω, Aωo, IFTplan)
+    to_time!(Ato, Aω, Aωo, IFT)
 
-Transform ``A(ω)`` on normal grid to ``A(t)`` on oversampled time grid.
+Transform ``A(ω)`` on the normal grid to ``A(t)`` on the oversampled time grid, with the
+explicit inverse plan `IFT` (see [`Utils.plan_ift`](@ref Luna.Utils.plan_ift)).
+
+The plan's `1/N` normalisation is folded into the scale factor of the oversampling copy
+rather than applied as a separate pass, which is one pass fewer over the oversampled
+array. Since the time grids are powers of two, `1/N` is a power of two and folding it
+changes nothing: scaling by a power of two is exact, and an exactly scaled FFT input
+gives an exactly scaled output.
+
+Dispatches on the element type of `Ato`, not on its array type, so the same code runs on
+the host and on a device. For a field-resolved (real) transform the inverse plan
+overwrites `Aωo`, which `fill!` refills on the next call.
 """
-function to_time!(Ato::Array{<:Real, D}, Aω, Aωo, FT) where D
+function to_time!(Ato::AbstractArray{<:Real}, Aω, Aωo, IFT)
     N = size(Aω, 1)
     No = size(Aωo, 1)
-    scale = (No-1)/(N-1) # Scale factor makes up for difference in FFT array length
+    # Scale factor makes up for difference in FFT array length, and normalises the
+    # inverse transform
+    scale = (No-1)/(N-1) * Utils.iscale(IFT)
     fill!(Aωo, 0)
     copy_scale!(Aωo, Aω, N, scale)
-    ldiv!(Ato, FT, Aωo)
+    mul!(Ato, Utils.iplan(IFT), Aωo)
 end
 
-function to_time!(Ato::Array{<:Complex, D}, Aω, Aωo, FT) where D
+function to_time!(Ato::AbstractArray{<:Complex}, Aω, Aωo, IFT)
     N = size(Aω, 1)
     No = size(Aωo, 1)
-    scale = No/N # Scale factor makes up for difference in FFT array length
+    scale = No/N * Utils.iscale(IFT)
     fill!(Aωo, 0)
     copy_scale_both!(Aωo, Aω, N÷2, scale)
-    ldiv!(Ato, FT, Aωo)
+    mul!(Ato, Utils.iplan(IFT), Aωo)
 end
 
 """
     to_freq!(Aω, Aωo, Ato, FTplan)
 
-Transform oversampled A(t) to A(ω) on normal grid
+Transform oversampled A(t) to A(ω) on normal grid. Dispatches on the element type of
+`Ato`, not on its array type.
 """
-function to_freq!(Aω, Aωo, Ato::Array{<:Real, D}, FTplan) where D
+function to_freq!(Aω, Aωo, Ato::AbstractArray{<:Real}, FTplan)
     N = size(Aω, 1)
     No = size(Aωo, 1)
     scale = (N-1)/(No-1) # Scale factor makes up for difference in FFT array length
@@ -57,7 +74,7 @@ function to_freq!(Aω, Aωo, Ato::Array{<:Real, D}, FTplan) where D
     copy_scale!(Aω, Aωo, N, scale)
 end
 
-function to_freq!(Aω, Aωo, Ato::Array{<:Complex, D}, FTplan) where D
+function to_freq!(Aω, Aωo, Ato::AbstractArray{<:Complex}, FTplan)
     N = size(Aω, 1)
     No = size(Aωo, 1)
     scale = N/No # Scale factor makes up for difference in FFT array length
@@ -65,65 +82,45 @@ function to_freq!(Aω, Aωo, Ato::Array{<:Complex, D}, FTplan) where D
     copy_scale_both!(Aω, Aωo, N÷2, scale)
 end
 
+#= Views of the first and last N samples along the first axis, with every other axis
+   taken whole. A broadcast over these is one kernel on any array type. =#
+_front(A, N) = view(A, 1:N, ntuple(_ -> Colon(), ndims(A)-1)...)
+_back(A, N) = view(A, size(A, 1)-N+1:size(A, 1), ntuple(_ -> Colon(), ndims(A)-1)...)
+
+function _checkshape(dest, source)
+    size(dest)[2:end] == size(source)[2:end] || error(
+        "dest and source must be same size except along first dimension")
+end
+
 """
     copy_scale!(dest, source, N, scale)
 
-Copy first N elements from source to dest and simultaneously multiply by scale factor.
-For multi-dimensional `dest` and `source`, work along first axis.
-"""
-function copy_scale!(dest::Vector, source::Vector, N, scale)
-    for i = 1:N
-        dest[i] = scale * source[i]
-    end
-end
+Copy the first `N` elements from `source` to `dest` and simultaneously multiply by
+`scale`. For multi-dimensional `dest` and `source`, work along the first axis.
 
+`scale` is converted to the real element type of `dest` so that no `Float64` enters a
+device kernel; on the default `Float64` path the conversion is the identity.
 """
-    copy_scale_both!(dest::Vector, source::Vector, N, scale)
-
-Copy first and last N elements from source to first and last N elements in dest
-and simultaneously multiply by scale factor.
-For multi-dimensional `dest` and `source`, work along first axis.
-"""
-function copy_scale_both!(dest::Vector, source::Vector, N, scale)
-    for i = 1:N
-        dest[i] = scale * source[i]
-    end
-    for i = 1:N
-        dest[end-i+1] = scale * source[end-i+1]
-    end
-end
-
 function copy_scale!(dest, source, N, scale)
-    (size(dest)[2:end] == size(source)[2:end]
-     || error("dest and source must be same size except along first dimension"))
-    idcs = CartesianIndices(size(dest)[2:end])
-    _cpsc_core(dest, source, N, scale, idcs)
+    _checkshape(dest, source)
+    s = convert(real(eltype(dest)), scale)
+    _front(dest, N) .= s .* _front(source, N)
+    dest
 end
 
-function _cpsc_core(dest, source, N, scale, idcs)
-    for i in idcs
-        for j = 1:N
-            dest[j, i] = scale * source[j, i]
-        end
-    end
-end
+"""
+    copy_scale_both!(dest, source, N, scale)
 
+Copy the first and last `N` elements from `source` to the first and last `N` elements of
+`dest` and simultaneously multiply by `scale`. For multi-dimensional `dest` and `source`,
+work along the first axis.
+"""
 function copy_scale_both!(dest, source, N, scale)
-    (size(dest)[2:end] == size(source)[2:end]
-     || error("dest and source must be same size except along first dimension"))
-    idcs = CartesianIndices(size(dest)[2:end])
-    _cpscb_core(dest, source, N, scale, idcs)
-end
-
-function _cpscb_core(dest, source, N, scale, idcs)
-    for i in idcs
-        for j = 1:N
-            dest[j, i] = scale * source[j, i]
-        end
-        for j = 1:N
-            dest[end-j+1, i] = scale * source[end-j+1, i]
-        end
-    end
+    _checkshape(dest, source)
+    s = convert(real(eltype(dest)), scale)
+    _front(dest, N) .= s .* _front(source, N)
+    _back(dest, N) .= s .* _back(source, N)
+    dest
 end
 
 # Note on noise and ionization/plasma: when the modified shot-noise model is active,
@@ -172,7 +169,7 @@ Transform E(ω) -> Pₙₗ(ω) for multimode propagation via spatial integration
 - `Er_noise`: preallocated buffer for the real-space time-domain noise, same shape as `Er`.
 - `Er_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`.
 """
-mutable struct TransModal{tsT, lT, TT, FTT, rT, gT, dT, ddT, nT, eT, enT, enlT}
+mutable struct TransModal{tsT, lT, TT, FTT, IFTT, rT, gT, dT, ddT, nT, eT, enT, enlT}
     ts::tsT
     full::Bool
     dimlimits::lT
@@ -185,6 +182,7 @@ mutable struct TransModal{tsT, lT, TT, FTT, rT, gT, dT, ddT, nT, eT, enT, enlT}
     Prωo::Array{ComplexF64,2}
     Prmω::Array{ComplexF64,2}
     FT::FTT
+    IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
     resp::rT
     grid::gT
     densityfun::dT
@@ -243,7 +241,7 @@ function TransModal(tT, grid, ts::Modes.ToSpace, FT, resp, densityfun, norm!;
     Prω = Array{ComplexF64,2}(undef, length(grid.ω), ts.npol)
     Prωo = Array{ComplexF64,2}(undef, length(grid.ωo), ts.npol)
     Prmω = Array{ComplexF64,2}(undef, length(grid.ω), ts.nmodes)
-    IFT = inv(FT)
+    IFT = Utils.plan_ift(FT)
     # For the modified shot-noise model, store the modal noise field and allocate a buffer
     # for the real-space time-domain noise. The noise is projected to space at each
     # integration point in Erω_to_Prω!, so we store it in the modal domain.
@@ -257,7 +255,7 @@ function TransModal(tT, grid, ts::Modes.ToSpace, FT, resp, densityfun, norm!;
         Er_nl = nothing
     end
     TransModal(ts, full, Modes.dimlimits(ts.ms[1]), Emω, Erω, Erωo, Er, Pr, Prω, Prωo, Prmω,
-               FT, resp, grid, densityfun, densityfun(0.0), norm!, 0, 0.0, rtol, atol, mfcn,
+               FT, IFT, resp, grid, densityfun, densityfun(0.0), norm!, 0, 0.0, rtol, atol, mfcn,
                similar(Prmω), Emω_noise, Er_noise, Er_nl)
 end
 
@@ -318,13 +316,13 @@ end
 
 function Erω_to_Prω!(t, x)
     Modes.to_space!(t.Erω, t.Emω, x, t.ts, z=t.z)
-    to_time!(t.Er, t.Erω, t.Erωo, t.FT)
+    to_time!(t.Er, t.Erω, t.Erωo, t.IFT)
     # Modified shot-noise model: project noise modes to real space at this spatial point,
     # convert to oversampled time domain, and combine with field in a separate buffer (Er_nl)
     # so the propagating field (Er) is never contaminated.
     if !isnothing(t.Emω_noise)
         Modes.to_space!(t.Erω, t.Emω_noise, x, t.ts, z=t.z)
-        to_time!(t.Er_noise, t.Erω, t.Erωo, t.FT)
+        to_time!(t.Er_noise, t.Erω, t.Erωo, t.IFT)
         @. t.Er_nl = t.Er + t.Er_noise
         Et_to_Pt!(t.Pr, t.Er_nl, t.resp, t.density)
     else
@@ -382,19 +380,22 @@ Transform E(ω) -> Pₙₗ(ω) for mode-averaged single-mode propagation.
   `Et_nl = Eto + Et_noise` is computed at each step and passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified; dispersion acts only on the physical field.
 """
-struct TransModeAvg{TT, FTT, rT, gT, dT, nT, aT, eT, nlT}
-    Pto::Vector{TT}
-    Eto::Vector{TT}
-    Eωo::Vector{ComplexF64}
-    Pωo::Vector{ComplexF64}
+struct TransModeAvg{TT, ωT, FTT, IFTT, rT, gT, gvT, dT, nT, aT, eT, nlT}
+    Pto::TT
+    Eto::TT
+    Eωo::ωT
+    Pωo::ωT
     FT::FTT
+    IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
     resp::rT
-    grid::gT
+    grid::gT # host grid, for metadata and for anything not in a kernel
+    gv::gvT # mirror of the grid vectors the kernels broadcast against
     densityfun::dT
     norm!::nT
     aeff::aT # function which returns effective area
     Et_noise::eT # time-domain noise for modified shot-noise model, or nothing
     Et_nl::nlT # buffer for field+noise passed to Et_to_Pt!, or nothing
+    scaling::UnitScaling # units the state and the polarisation are expressed in
 end
 
 function show(io::IO, t::TransModeAvg)
@@ -406,49 +407,74 @@ function show(io::IO, t::TransModeAvg)
 end
 
 """
-    TransModeAvg(TT, grid, FT, resp, densityfun, norm!, aeff; noise_field=nothing)
+    TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff; kwargs...)
 
-Construct a `TransModeAvg` transform for mode-averaged propagation.
+Construct a `TransModeAvg` transform for mode-averaged propagation. `TT` is the
+time-domain element type (`Float64`/`Float32` on a `RealGrid`, complex on an `EnvGrid`);
+the two-argument forms taking the grid pick it. `FT` and `IFT` are the forward and
+inverse plans for the oversampled time grid
+(see [`Utils.plan_ft`](@ref Luna.Utils.plan_ft)).
 
 # Keyword arguments
 - `noise_field=nothing`: optional frequency-domain noise field (on the normal grid) for the
   modified shot-noise model. When provided, it is converted to the oversampled time grid and
   stored as `Et_noise` for injection into the nonlinear operator at every propagation step.
   Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `spec=HostSpec()`: the [`Luna.DeviceSpec`](@ref) the buffers, mirrors and responses live
+  on.
+- `scaling=UNIT_SCALING`: the [`Luna.UnitScaling`](@ref) the state and the nonlinear
+  polarisation are expressed in. The responses are converted to it with
+  [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale) and the noise field is divided by
+  `Eref`.
 """
-function TransModeAvg(TT, grid, FT, resp, densityfun, norm!, aeff; noise_field=nothing)
-    Eωo = zeros(ComplexF64, length(grid.ωo))
-    Eto = zeros(TT, length(grid.to))
+function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
+                      noise_field=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
+    nωo = length(grid.ωo)
+    nto = length(grid.to)
+    CT = Complex{realtype(spec)}
+    Eωo = alloc(spec, CT, (nωo,))
+    Eto = alloc(spec, TT, (nto,))
     Pto = similar(Eto)
     Pωo = similar(Eωo)
+    gv = gridvectors(grid, spec)
     # Precompute time-domain noise on the oversampled grid if noise_field is provided.
     # Uses the same ω→t conversion path as to_time!: copy_scale! into oversampled spectral
     # array, then inverse FFT. The result is constant throughout propagation.
     if !isnothing(noise_field)
-        Eωo_noise = zeros(ComplexF64, length(grid.ωo))
-        Et_noise = zeros(TT, length(grid.to))
-        to_time!(Et_noise, noise_field, Eωo_noise, FT)
-        Et_nl = zeros(TT, length(grid.to))
+        Eωo_noise = alloc(spec, CT, (nωo,))
+        Et_noise = alloc(spec, TT, (nto,))
+        #= The noise is a state-unit quantity, so it carries the same 1/Eref the state
+           does. Scaled here, once, rather than in the per-step kernel. =#
+        to_time!(Et_noise, todevice(spec, noise_field ./ scaling.Eref), Eωo_noise, IFT)
+        Et_nl = alloc(spec, TT, (nto,))
     else
         Et_noise = nothing
         Et_nl = nothing
     end
-    TransModeAvg(Pto, Eto, Eωo, Pωo, FT, resp, grid, densityfun, norm!, aeff, Et_noise, Et_nl)
+    resp = map(r -> Nonlinear.rescale(r, spec, scaling), Tuple(resp))
+    assert_resident(spec, Eωo, Eto, Pto, Pωo, gv.ω, gv.ωwin, gv.towin, gv.sidx,
+                    Et_noise, Et_nl)
+    TransModeAvg(Pto, Eto, Eωo, Pωo, FT, IFT, resp, grid, gv, densityfun, norm!, aeff,
+                 Et_noise, Et_nl, scaling)
 end
 
-function TransModeAvg(grid::Grid.RealGrid, FT, resp, densityfun, norm!, aeff; kwargs...)
-    TransModeAvg(Float64, grid, FT, resp, densityfun, norm!, aeff; kwargs...)
+function TransModeAvg(grid::Grid.RealGrid, FT, IFT, resp, densityfun, norm!, aeff;
+                      spec=HostSpec(), kwargs...)
+    TransModeAvg(realtype(spec), grid, FT, IFT, resp, densityfun, norm!, aeff;
+                 spec, kwargs...)
 end
 
-function TransModeAvg(grid::Grid.EnvGrid, FT, resp, densityfun, norm!, aeff; kwargs...)
-    TransModeAvg(ComplexF64, grid, FT, resp, densityfun, norm!, aeff; kwargs...)
+function TransModeAvg(grid::Grid.EnvGrid, FT, IFT, resp, densityfun, norm!, aeff;
+                      spec=HostSpec(), kwargs...)
+    TransModeAvg(Complex{realtype(spec)}, grid, FT, IFT, resp, densityfun, norm!, aeff;
+                 spec, kwargs...)
 end
 
 const nlscale = sqrt(PhysData.ε_0*PhysData.c/2)
 
 function (t::TransModeAvg)(nl, Eω, z)
-    to_time!(t.Eto, Eω, t.Eωo, t.FT)
-    sc = nlscale*sqrt(t.aeff(z))
+    to_time!(t.Eto, Eω, t.Eωo, t.IFT)
+    sc = scalar(t.Eto, nlscale*sqrt(t.aeff(z)))
     @. t.Eto /= sc
     # Modified shot-noise model: compute field+noise in a separate buffer (Et_nl) so that
     # the propagating field (Eto) is never contaminated. The noise is scaled by the same
@@ -459,47 +485,152 @@ function (t::TransModeAvg)(nl, Eω, z)
     else
         Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z))
     end
-    @. t.Pto *= t.grid.towin
+    @. t.Pto *= t.gv.towin
     to_freq!(nl, t.Pωo, t.Pto, t.FT)
     t.norm!(nl, z)
-    @. nl *= t.grid.ωwin # zero outside the simulation band, where ωwin is exactly 0
+    @. nl *= t.gv.ωwin # zero outside the simulation band, where ωwin is exactly 0
 end
 
-function norm_mode_average(grid, βfun!, aeff; shock=true)
-    β = zeros(Float64, length(grid.ω))
+"""
+    NormModeAvg
+
+Normalisation of the mode-averaged nonlinear polarisation, built by
+[`norm_mode_average`](@ref). A callable `norm!(nl, z)` which multiplies `nl` in place by
+`pre/β(z)·√aeff(z)` inside the simulation band and zeroes it outside.
+
+A struct rather than a closure so that its arrays can live on a device and be checked
+for residency, and so that the per-`z` propagation constant can be mirrored.
+
+# Fields
+- `pre`: the z-independent part of the factor, with the unit scaling already folded in,
+  and divided by `β` as well when that is z-independent
+- `mask`: `grid.sidx` as a `Bool` mask
+- `β`: mirror of the propagation constant, or `nothing` when it is z-independent
+- `βfun!`, `aeff`: the host callables for `β(z)` and `Aeff(z)`
+"""
+struct NormModeAvg{vT, mT, bT, fT, aT}
+    pre::vT
+    mask::mT
+    β::bT
+    βfun!::fT
+    aeff::aT
+end
+
+"""
+    norm_mode_average(grid, βfun!, aeff; shock=true, spec=HostSpec(),
+                      scaling=UNIT_SCALING, constβ=false)
+
+Normalisation function for mode-averaged propagation; see [`NormModeAvg`](@ref).
+
+If `shock` is `false`, the intrinsic frequency dependence of the nonlinear response is
+ignored, which turns off optical shock formation/self-steepening.
+
+`constβ=true` declares that `βfun!` does not depend on `z` -- which is the case whenever
+the linear operator is constant, i.e. for a waveguide of fixed radius at fixed pressure.
+`β` is then evaluated once at construction and divided into `pre`, so that no host code
+runs inside the right-hand side. With `constβ=false` (the default, and what a taper or a
+pressure gradient needs) `βfun!` is called on every evaluation and its result uploaded;
+that is the interim arrangement until `gpu/23` tabulates it.
+"""
+function norm_mode_average(grid, βfun!, aeff; shock=true, spec=HostSpec(),
+                           scaling=UNIT_SCALING, constβ=false)
     shockterm = shock ? grid.ω.^2 : grid.ω .* PhysData.wlfreq(grid.referenceλ)
-    pre = @. -im*shockterm/4 / nlscale / PhysData.c
-    function norm!(nl, z)
-        βfun!(β, z)
-        sqrtaeff = sqrt(aeff(z))
-        for i in eachindex(nl)
-            #= β is only filled inside the simulation band, so the normalisation cannot be
-               evaluated outside it. Zero nl there rather than skipping: skipping leaves the
-               raw, unnormalised transform of the polarisation in place, and since the
-               linear operator is also zero out of band, nothing downstream removes it. =#
-            if !grid.sidx[i]
-                nl[i] = 0
-                continue
-            end
-            nl[i] *= pre[i]/β[i]*sqrtaeff
-        end
+    #= `Pref` converts the polarisation buffer's units back to physical ones. It is 1 on
+       every Float64 run, so `pre` is then exactly what it always was. =#
+    pre = @. -im*shockterm/4 / nlscale / PhysData.c * scaling.Pref
+    if constβ
+        βh = zeros(Float64, length(grid.ω))
+        βfun!(βh, 0.0)
+        pre = pre ./ βh
+        β = nothing
+    else
+        β = HostMirror(spec, length(grid.ω))
     end
+    pre = todevice(spec, pre)
+    mask = todevice(spec, grid.sidx)
+    assert_resident(spec, pre, mask, isnothing(β) ? nothing : β.dev)
+    NormModeAvg(pre, mask, β, βfun!, aeff)
 end
 
-function norm_mode_average_gnlse(grid, aeff; shock=true)
+#= β is 1 rather than 0 outside the simulation band (`LinearOps` fills it that way), so
+   the division is finite everywhere and the mask decides what survives. Zeroing out of
+   band rather than skipping matters: skipping would leave the raw, unnormalised
+   transform of the polarisation in place, and since the linear operator is also zero out
+   of band nothing downstream would remove it. =#
+function (n::NormModeAvg{vT, mT, Nothing})(nl, z) where {vT, mT}
+    sqrtaeff = scalar(nl, sqrt(n.aeff(z)))
+    pre = n.pre
+    mask = n.mask
+    z0 = zero(eltype(nl))
+    @. nl = ifelse(mask, nl*(pre*sqrtaeff), z0)
+end
+
+function (n::NormModeAvg)(nl, z)
+    n.βfun!(n.β.host, z)
+    β = upload!(n.β)
+    sqrtaeff = scalar(nl, sqrt(n.aeff(z)))
+    pre = n.pre
+    mask = n.mask
+    z0 = zero(eltype(nl))
+    @. nl = ifelse(mask, nl*(pre/β*sqrtaeff), z0)
+end
+
+"""
+    NormModeAvgGNLSE
+
+Normalisation of the mode-averaged nonlinear polarisation in the GNLSE form, built by
+[`norm_mode_average_gnlse`](@ref). See [`NormModeAvg`](@ref).
+"""
+struct NormModeAvgGNLSE{vT, mT, aT}
+    pre::vT
+    mask::mT
+    aeff::aT
+end
+
+"""
+    norm_mode_average_gnlse(grid, aeff; shock=true, spec=HostSpec(),
+                            scaling=UNIT_SCALING)
+
+Normalisation function for the GNLSE form of mode-averaged propagation; see
+[`norm_mode_average`](@ref) and [`NormModeAvgGNLSE`](@ref).
+"""
+function norm_mode_average_gnlse(grid, aeff; shock=true, spec=HostSpec(),
+                                 scaling=UNIT_SCALING)
     shockterm = shock ? grid.ω.^2 : grid.ω .* PhysData.wlfreq(grid.referenceλ)
     pre = @. -im*shockterm/(2*PhysData.c^(3/2)*sqrt(2*PhysData.ε_0))/(grid.ω/PhysData.c)
-    function norm!(nl, z)
-        sqrtaeff = sqrt(aeff(z))
-        for i in eachindex(nl)
-            if !grid.sidx[i] # as in norm_mode_average
-                nl[i] = 0
-                continue
-            end
-            nl[i] *= pre[i]*sqrtaeff
-        end
-    end
+    pre = pre .* scaling.Pref
+    pre = todevice(spec, pre)
+    mask = todevice(spec, grid.sidx)
+    assert_resident(spec, pre, mask)
+    NormModeAvgGNLSE(pre, mask, aeff)
 end
+
+function (n::NormModeAvgGNLSE)(nl, z)
+    sqrtaeff = scalar(nl, sqrt(n.aeff(z)))
+    pre = n.pre
+    mask = n.mask
+    z0 = zero(eltype(nl))
+    @. nl = ifelse(mask, nl*(pre*sqrtaeff), z0)
+end
+
+"""
+    check_norm(norm!, spec, scaling)
+
+Check that a caller-supplied normalisation can be used with `spec` and `scaling`.
+
+Luna's own normalisations take the spec and the scaling at construction and are checked
+structurally; anything else is accepted only for an unscaled `Float64` host run, which is
+the default CPU path.
+"""
+check_norm(n, spec, scaling) = (arraytype(spec) === Array && realtype(spec) === Float64 &&
+                                isunity(scaling)) ? nothing : error(
+    "the normalisation $(typeof(n)) was not built for $(spec) with $(scaling). Build it "*
+    "with the `spec` and `scaling` keywords of `norm_mode_average` (or let `Luna.setup` "*
+    "do it), or run on the default CPU path.")
+
+check_norm(n::NormModeAvg, spec, scaling) =
+    assert_resident(spec, n.pre, n.mask, isnothing(n.β) ? nothing : n.β.dev)
+check_norm(n::NormModeAvgGNLSE, spec, scaling) = assert_resident(spec, n.pre, n.mask)
 
 """
     TransRadial
@@ -512,9 +643,10 @@ Transform E(ω) -> Pₙₗ(ω) for radially symmetric free-space propagation.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
 """
-struct TransRadial{TT, RGT, FTT, nT, rT, gT, dT, iT, eT, nlT}
+struct TransRadial{TT, RGT, FTT, IFTT, nT, rT, gT, dT, iT, eT, nlT}
     rgrid::RGT # transverse grid (Grid.RadialGrid: space to k-space)
     FT::FTT # Fourier transform (time to frequency)
+    IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
     normfun::nT # Function which returns normalisation factor
     resp::rT # nonlinear responses (tuple of callables)
     grid::gT # time grid
@@ -558,6 +690,7 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
                      pol=false; noise_field=nothing)
     np = pol ? 2 : 1
     N = rgrid.N
+    IFT = Utils.plan_ift(FT)
     Eωo = zeros(ComplexF64, (length(grid.ωo), np, N))
     Eto_r = zeros(TT, (length(grid.to), np, N))
     Pto_r = similar(Eto_r)
@@ -575,14 +708,14 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
     if !isnothing(noise_field)
         Eωo_noise = zeros(ComplexF64, (length(grid.ωo), np, N))
         Et_noise = zeros(TT, (length(grid.to), np, N))
-        to_time!(Et_noise, noise_field, Eωo_noise, FT)
+        to_time!(Et_noise, noise_field, Eωo_noise, IFT)
         Grid.radial_matmul!(Et_noise, Et_noise, Tbwd)
         Et_nl = zeros(TT, (length(grid.to), np, N))
     else
         Et_noise = nothing
         Et_nl = nothing
     end
-    TransRadial(rgrid, FT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
+    TransRadial(rgrid, FT, IFT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
                 Tfwd, Tbwd, Et_noise, Et_nl)
 end
 
@@ -606,7 +739,7 @@ Calculate the reciprocal-domain (ω-k-space) nonlinear response due to the field
 place the result in `nl`
 """
 function (t::TransRadial)(nl, Eω, z)
-    to_time!(t.Eto_k, Eω, t.Eωo, t.FT) # transform ω -> t
+    to_time!(t.Eto_k, Eω, t.Eωo, t.IFT) # transform ω -> t
     # transform Eto k -> r
     # iterate over polarisation directions (either 1:2 or just 1)
     for ip in axes(t.Eto_k, 2)
@@ -858,8 +991,9 @@ Transform E(ω) -> Pₙₗ(ω) for 3D free-space propagation.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
 """
-mutable struct TransFree{TT, FTT, nT, rT, gT, xygT, dT, iT, eT, nlT}
+mutable struct TransFree{TT, FTT, IFTT, nT, rT, gT, xygT, dT, iT, eT, nlT}
     FT::FTT # 3D Fourier transform (space to k-space and time to frequency)
+    IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
     normfun::nT # Function which returns normalisation factor
     resp::rT # nonlinear responses (tuple of callables)
     grid::gT # time grid
@@ -919,7 +1053,7 @@ function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, 
         Et_noise = nothing
         Et_nl = nothing
     end
-    TransFree(FT, normfun, responses, grid, xygrid, densityfun,
+    TransFree(FT, Utils.plan_ift(FT), normfun, responses, grid, xygrid, densityfun,
               Pto, Eto, Eωo, Pωo, scale, idcs, Et_noise, Et_nl)
 end
 
@@ -944,7 +1078,7 @@ Calculate the reciprocal-domain (ω-kx-ky-space) nonlinear response due to the f
 and place the result in `nl`.
 """
 function (t::TransFree)(nl, Eωk, z)
-    to_time!(t.Eto, Eωk, t.Eωo, t.FT) # transform (ω, kx, ky) -> (t, x, y)
+    to_time!(t.Eto, Eωk, t.Eωo, t.IFT) # transform (ω, kx, ky) -> (t, x, y)
     # Modified shot-noise: compute field+noise in separate buffer (Et_nl) so the
     # propagating field (Eto) is never contaminated.
     if !isnothing(t.Et_noise)
@@ -958,8 +1092,9 @@ function (t::TransFree)(nl, Eωk, z)
     nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
 end
 
-mutable struct TransFree2D{TT, FTT, nT, rT, gT, xgT, dT, iT}
+mutable struct TransFree2D{TT, FTT, IFTT, nT, rT, gT, xgT, dT, iT}
     FT::FTT # 2D Fourier transform (space to k-space and time to frequency)
+    IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
     normfun::nT # Function which returns normalisation factor
     resp::rT # nonlinear responses (tuple of callables)
     grid::gT # time grid
@@ -989,7 +1124,7 @@ function TransFree2D(TT, scale, grid, xgrid, FT, responses, densityfun, normfun,
     Pto = similar(Eto)
     Pωo = similar(Eωo)
     idcs = CartesianIndices(size(Pto)[3:end])
-    TransFree2D(FT, normfun, responses, grid, xgrid, densityfun,
+    TransFree2D(FT, Utils.plan_ift(FT), normfun, responses, grid, xgrid, densityfun,
               Pto, Eto, Eωo, Pωo, scale, idcs)
 end
 
@@ -1028,7 +1163,7 @@ and place the result in `nl`.
 """
 function (t::TransFree2D)(nl, Eωk, z)
     # TODO: this can probably be combined with the case for TransFree
-    to_time!(t.Eto, Eωk, t.Eωo, t.FT) # transform (ω, kx) -> (t, x)
+    to_time!(t.Eto, Eωk, t.Eωo, t.IFT) # transform (ω, kx) -> (t, x)
     Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z), t.idcs) # add up responses
     @. t.Pto *= t.grid.towin # apodisation
     to_freq!(nl, t.Pωo, t.Pto, t.FT) # transform (t, x) -> (ω, kx)

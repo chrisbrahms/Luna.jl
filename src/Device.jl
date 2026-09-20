@@ -206,6 +206,24 @@ end
 #=================================================#
 
 """
+    log_device(spec, request)
+
+Log, once per `Luna.setup`, which device and precision the run will use, and warn when
+`:auto` was asked for but no GPU package is loaded in this process (which is what a
+`Scans` worker that only did `using Luna` sees).
+"""
+function log_device(spec::DeviceSpec, request)
+    if request === :auto && !isdevicespec(spec)
+        Logging.@info(
+            "`:auto` requested but no GPU package is loaded in this process; running on "*
+            "the CPU. `Scans` workers load Luna on their own, so a scan needs "*
+            "`@everywhere using Metal` (or CUDA).")
+    end
+    Logging.@info("Propagating on $(arraytype(spec)) in $(realtype(spec)) precision.")
+    nothing
+end
+
+"""
     alloc(spec, T, dims)
 
 A zero-filled array of element type `T`, shape `dims` and the array type of `spec`.
@@ -280,6 +298,15 @@ function upload_like(y::AbstractArray, x::AbstractArray)
 end
 
 upload_like(y::AbstractArray, x) = x # a closure operator: nothing to upload
+
+"""
+    mask_like(y, m)
+
+The boolean mask `m` on the array type of `y`. Returns `m` itself when `y` is a host
+array, so a `BitArray` stays one and the host path allocates nothing.
+"""
+mask_like(y::AbstractArray, m::AbstractArray{Bool}) =
+    isdevice(y) ? copyto!(similar(y, Bool, size(m)), Array{Bool}(m)) : m
 
 _matcheltype(::Type{Complex{T}}, ::Type{<:Complex}) where {T} = Complex{T}
 _matcheltype(::Type{Complex{T}}, ::Type{<:Real}) where {T} = T
@@ -370,6 +397,11 @@ polarisation is measured in (`ε₀`, supplied by the caller). A zero or non-fin
 falls back to 1.
 """
 unitscaling(::Type{Float64}, Et, Pref) = UNIT_SCALING
+
+#= `Et` may be given as a thunk, so that a Float64 run -- which never needs it -- does not
+   pay for the inverse transform of the input field. =#
+unitscaling(::Type{Float64}, Et::Function, Pref) = UNIT_SCALING
+unitscaling(::Type{T}, Et::Function, Pref) where {T} = unitscaling(T, Et(), Pref)
 
 function unitscaling(::Type{T}, Et, Pref) where {T}
     m = Float64(maximum(abs, Et))

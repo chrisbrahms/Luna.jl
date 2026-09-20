@@ -882,8 +882,11 @@ function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, 
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ;
                                                     linopkw(grid, thg)...)
 
+    #= The operator is constant, so `βfun!` is too: the normalisation folds it in once at
+       setup instead of calling it on every right-hand side. =#
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z); noise_field)
+                                   βfun!, z -> Modes.Aeff(mode, z=z);
+                                   noise_field, constβ=true)
     linop, Eω, transform, FT
 end
 

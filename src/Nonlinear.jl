@@ -2,37 +2,81 @@ module Nonlinear
 import Luna
 import Luna.PhysData: ε_0, e_ratio
 import Luna: Maths, Utils
+import Adapt
 import FFTW
 import LinearAlgebra: mul!, ldiv!
 import Rotations: RotZY, RotYZ, RotMatrix, RotMatrix3
 import StaticArrays: SMatrix, MArray
 
+"""
+    rescale(response, spec, scaling)
+
+The same nonlinear response, with its coefficients expressed in the units of `scaling`
+(see [`Luna.UnitScaling`](@ref)) and every array and constant it carries converted to
+`spec`'s array type and precision (see [`Luna.DeviceSpec`](@ref)).
+
+A transform calls this on each of its responses at construction, so that the powers of
+`E_ref` are combined with the physical constants once, on the host, in `Float64`. There
+is one kernel body per response; the units are a property of the constants it holds.
+
+The fallback passes the response through unchanged for an unscaled `Float64` run -- which
+is every run on the default CPU path, so an ad hoc response written as a closure keeps
+working -- and errors otherwise. Responses gain their own methods as they are made
+device-capable.
+"""
+function rescale(r, spec, scaling)
+    (Luna.realtype(spec) === Float64 && Luna.isunity(scaling)) && return r
+    error("the nonlinear response $(typeof(r)) has no `Nonlinear.rescale` method, so it "*
+          "cannot be used in a reduced-precision or device run. On the default CPU path "*
+          "(Float64, unscaled) any callable `resp!(out, E, ρ)` works.")
+end
+
+#= The Kerr responses are structs rather than closures so that they can be parametric in
+   the real element type (nothing reachable from a Metal kernel may hold a Float64), carry
+   an `Adapt` rule for their arrays, and take a `rescale` method. The constructors
+   `Kerr_field(γ3)` etc. keep their signatures and return the structs. =#
+
+"""
+    KerrField(γ3)
+
+Kerr response for a real (field-resolved) field; built by `Kerr_field(γ3)`. In physical
+units `γ3` is the third-order hyperpolarisability, e.g.
+[`PhysData.γ3_gas`](@ref Luna.PhysData.γ3_gas); after [`rescale`](@ref) it carries the
+powers of `E_ref` as well.
+"""
+struct KerrField{T}
+    γ3::T
+end
+
+"Kerr response for real field"
+Kerr_field(γ3) = KerrField(γ3)
+
+function (k::KerrField)(out, E, ρ)
+    fac = Luna.scalar(E, ρ*ε_0*k.γ3)
+    if size(E, 2) == 1
+        KerrScalar!(out, E, fac)
+    else
+        KerrVector!(out, E, fac)
+    end
+end
+
+rescale(k::KerrField, spec, scaling) =
+    KerrField(convert(Luna.realtype(spec), k.γ3*scaling.Eref^2/scaling.Pref))
+
 function KerrScalar!(out, E, fac)
     @. out += fac*E^3
 end
 
+#= One broadcast per polarisation component, over views of the two columns. Each
+   component's expression is the one the scalar loop evaluated, in the same order. =#
 function KerrVector!(out, E, fac)
-    for i = 1:size(E,1)
-        Ex = E[i,1]
-        Ey = E[i,2]
-        Ex2 = Ex^2
-        Ey2 = Ey^2
-        out[i,1] += fac*(Ex2 + Ey2)*Ex
-        out[i,2] += fac*(Ex2 + Ey2)*Ey
-    end
-end
-
-"Kerr response for real field"
-function Kerr_field(γ3)
-    Kerr = let γ3 = γ3
-        function Kerr(out, E, ρ)
-            if size(E,2) == 1
-                KerrScalar!(out, E, ρ*ε_0*γ3)
-            else
-                KerrVector!(out, E, ρ*ε_0*γ3)
-            end
-        end
-    end
+    Ex = view(E, :, 1)
+    Ey = view(E, :, 2)
+    ox = view(out, :, 1)
+    oy = view(out, :, 2)
+    @. ox += fac*(Ex^2 + Ey^2)*Ex
+    @. oy += fac*(Ex^2 + Ey^2)*Ey
+    out
 end
 
 "Kerr response for real field but without THG"
@@ -46,44 +90,79 @@ function Kerr_field_nothg(γ3, n)
     end
 end
 
-function KerrScalarEnv!(out, E, fac)
-    @. out += 3/4*fac*abs2(E)*E
-end
+"""
+    KerrEnv(γ3)
 
-function KerrVectorEnv!(out, E, fac)
-    for i = 1:size(E,1)
-        Ex = E[i,1]
-        Ey = E[i,2]
-        Ex2 = abs2(Ex)
-        Ey2 = abs2(Ey)
-        out[i,1] += 3/4*fac*((Ex2 + 2/3*Ey2)*Ex + 1/3*conj(Ex)*Ey^2)
-        out[i,2] += 3/4*fac*((Ey2 + 2/3*Ex2)*Ey + 1/3*conj(Ey)*Ex^2)
-    end
+Kerr response for an envelope field without THG; built by `Kerr_env(γ3)`. See
+[`KerrField`](@ref) for `γ3`.
+"""
+struct KerrEnv{T}
+    γ3::T
 end
 
 "Kerr response for envelope"
-function Kerr_env(γ3)
-    Kerr = let γ3 = γ3
-        function Kerr(out, E, ρ)
-            if size(E,2) == 1
-                KerrScalarEnv!(out, E, ρ*ε_0*γ3)
-            else
-                KerrVectorEnv!(out, E, ρ*ε_0*γ3)
-            end
-        end
+Kerr_env(γ3) = KerrEnv(γ3)
+
+function (k::KerrEnv)(out, E, ρ)
+    #= The 3/4 is folded into the scalar factor here rather than left inside the
+       broadcast, where its Float64 literal would promote a Float32 kernel. The value is
+       unchanged: the broadcast evaluated the same product of scalars for every element. =#
+    fac = Luna.scalar(E, 3/4*(ρ*ε_0*k.γ3))
+    if size(E, 2) == 1
+        KerrScalarEnv!(out, E, fac)
+    else
+        KerrVectorEnv!(out, E, fac)
     end
 end
 
-"Kerr response for envelope but with THG"
-# see Eq. 4, Genty et al., Opt. Express 15 5382 (2007)
-function Kerr_env_thg(γ3, ω0, t)
-    C = exp.(2im*ω0.*t)
-    Kerr = let γ3 = γ3, C = C
-        function Kerr(out, E, ρ)
-            @. out += ρ*ε_0*γ3/4*(3*abs2(E) + C*E^2)*E
-        end
-    end
+rescale(k::KerrEnv, spec, scaling) =
+    KerrEnv(convert(Luna.realtype(spec), k.γ3*scaling.Eref^2/scaling.Pref))
+
+"`fac` includes the factor 3/4; see [`KerrEnv`](@ref)."
+function KerrScalarEnv!(out, E, fac)
+    @. out += fac*abs2(E)*E
 end
+
+@doc (@doc KerrScalarEnv!)
+function KerrVectorEnv!(out, E, fac)
+    R = real(eltype(E))
+    c23 = convert(R, 2/3)
+    c13 = convert(R, 1/3)
+    Ex = view(E, :, 1)
+    Ey = view(E, :, 2)
+    ox = view(out, :, 1)
+    oy = view(out, :, 2)
+    @. ox += fac*((abs2(Ex) + c23*abs2(Ey))*Ex + c13*conj(Ex)*Ey^2)
+    @. oy += fac*((abs2(Ey) + c23*abs2(Ex))*Ey + c13*conj(Ey)*Ex^2)
+    out
+end
+
+"""
+    KerrEnvTHG(γ3, C)
+
+Kerr response for an envelope field including THG; built by `Kerr_env_thg(γ3, ω0, t)`.
+`C` is the carrier factor `exp(2iω₀t)` on the (oversampled) time grid. See Eq. 4, Genty
+et al., Opt. Express 15 5382 (2007).
+"""
+struct KerrEnvTHG{T, V}
+    γ3::T
+    C::V
+end
+
+"Kerr response for envelope but with THG"
+Kerr_env_thg(γ3, ω0, t) = KerrEnvTHG(γ3, exp.(2im*ω0.*t))
+
+function (k::KerrEnvTHG)(out, E, ρ)
+    fac = Luna.scalar(E, ρ*ε_0*k.γ3/4)
+    C = k.C
+    @. out += fac*(3*abs2(E) + C*E^2)*E
+end
+
+rescale(k::KerrEnvTHG, spec, scaling) = KerrEnvTHG(
+    convert(Luna.realtype(spec), k.γ3*scaling.Eref^2/scaling.Pref),
+    Luna.todevice(spec, k.C))
+
+Adapt.adapt_structure(to, k::KerrEnvTHG) = KerrEnvTHG(k.γ3, Adapt.adapt(to, k.C))
 
 struct Chi2Field{χT}
     χ2::χT
