@@ -467,7 +467,7 @@ summation and `BigFloat` fallback are host code, a table which ended up on a
 
 ## The Raman polarisation
 
-[`Nonlinear.RamanPolarField`](@ref) and [`Nonlinear.RamanPolarEnv`](@ref) are
+[`Nonlinear.RamanPolarField`](@ref Luna.Nonlinear.RamanPolarField) and [`Nonlinear.RamanPolarEnv`](@ref Luna.Nonlinear.RamanPolarEnv) are
 [`Batched`](@ref Luna.Nonlinear.Batched) for the same reason the plasma response is: the
 convolution of the driving term with the Raman response function is a transform of the
 whole column, not an operation on one sample. Per right-hand side each is
@@ -560,12 +560,12 @@ O₂ is missing because its Raman parameters are incomplete in
 ## The no-THG Kerr response
 
 `Kerr_field_nothg(γ3, n)` builds a
-[`Nonlinear.KerrFieldNoTHG`](@ref) rather than the closure it used to. Removing the
+[`Nonlinear.KerrFieldNoTHG`](@ref Luna.Nonlinear.KerrFieldNoTHG) rather than the closure it used to. Removing the
 third-harmonic term means replacing `E³` with `|A|²E`, where `A` is the analytic signal
 of the whole column, so this too is [`Batched`](@ref Luna.Nonlinear.Batched) rather than
 pointwise. Its coefficient is the ordinary cubic one.
 
-[`Nonlinear.AnalyticSignal`](@ref) is the whole-block form of `Maths.plan_hilbert`: one
+[`Nonlinear.AnalyticSignal`](@ref Luna.Nonlinear.AnalyticSignal) is the whole-block form of `Maths.plan_hilbert`: one
 complex FFT along the time axis, one broadcast against a filter vector, one inverse FFT.
 The host version keeps the mean, doubles the positive frequencies and zeroes the negative
 ones with three slice assignments; the filter vector is the same three factors, which is
