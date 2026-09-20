@@ -108,11 +108,6 @@ kind(r) = Columnwise()
 kind(r, ::Val) = kind(r)
 kind(r, npol::Integer) = kind(r, Val(Int(npol)))
 
-"`true` for the kinds which are fused into one broadcast per right-hand side."
-isfused(::Pointwise) = true
-isfused(::VectorPointwise) = true
-isfused(::ResponseKind) = false
-
 """
     coefficients(response, ρ, scaling)
 
@@ -186,49 +181,147 @@ vector_expr(r, Ex, Ey, ρ, scaling) =
     Base.broadcasted(vector_kernel(r, Ex, ρ, scaling), Ex, Ey)
 
 """
+    batched!(response, out, E, ρ, scaling)
+
+Evaluate a [`Batched`](@ref) response on the whole field block `E`, accumulating into
+`out`. `scaling` is the [`Luna.UnitScaling`](@ref) the block and `out` are expressed in.
+
+The default ignores the scaling and calls `response(out, E, ρ)`, which is right for a
+response whose coefficients already carry it — every response built by
+[`rescale`](@ref)`(r, spec, scaling, Et)`, including [`HostResponse`](@ref). Override it
+only for a response which would rather combine the scaling per call than at construction.
+
+This is the batched counterpart of [`coefficients`](@ref): a batched response owns its
+buffers and its own loop, so the dispatcher can give it nothing but the block, the
+density and the units.
+"""
+batched!(r, out, E, ρ, scaling) = r(out, E, ρ)
+
+"""
     rescale(response, spec, scaling)
+    rescale(response, spec, scaling, Et)
 
 The same nonlinear response, with every array it carries converted to `spec`'s array type
-and precision (see [`Luna.DeviceSpec`](@ref)), ready for a run whose state is expressed in
-the units of `scaling` (see [`Luna.UnitScaling`](@ref)).
+and precision (see [`Luna.DeviceSpec`](@ref)) and with whatever state depends on the shape
+of the field block allocated, ready for a run whose state is expressed in the units of
+`scaling` (see [`Luna.UnitScaling`](@ref)).
 
-A transform calls this on each of its responses at construction. Scalar coefficients are
-*not* converted here: they are combined with the density and the unit scaling once per
-right-hand side by [`coefficients`](@ref), in `Float64`, and only the result is converted.
-A response struct therefore never enters a kernel — only the scalars its kernel captures
-and the arrays this function converted.
+Scalar coefficients are *not* converted here: they are combined with the density and the
+unit scaling once per right-hand side by [`coefficients`](@ref), in `Float64`, and only
+the result is converted. A response struct therefore never enters a kernel — only the
+scalars its kernel captures and the arrays this function converted.
 
-The fallback passes the response through unchanged for an unscaled `Float64` run on host
-arrays — which is every run on the default CPU path, so an ad hoc response written as a
-closure keeps working — and otherwise wraps a [`Columnwise`](@ref) response in a
-[`HostResponse`](@ref),
-which runs it on the host. A response which declares a device kind
-([`Pointwise`](@ref), [`VectorPointwise`](@ref), [`Batched`](@ref)) is passed through
-unchanged if it carries no arrays ([`resident_arrays`](@ref) is empty), which is every
-response whose coefficients are scalars; one which does carry an array and has no
-`rescale` method is an error, since nothing would have converted it.
+**Which form to implement.** A transform calls the **four**-argument form on each of its
+responses at construction, passing `Et`, a prototype of the time-domain field block the
+response will be called with: `size(Et)` is `(nt, npol, ncols...)`, `eltype(Et)` says
+whether the field is real or complex and in what precision, and `similar(Et)` allocates a
+buffer of the run's array type. A [`Batched`](@ref) response, which owns full-size
+buffers, implements that form, so that its buffers exist at construction and the
+transform's [`Luna.assert_resident`](@ref) check can see them (GPU_PLAN.md §4.2 rule 5).
+Everything else implements the **three**-argument form, which the four-argument fallback
+delegates to.
+
+**What the fallbacks do.** Both forms pass the response through unchanged for an unscaled
+`Float64` run on host arrays, which is every run on the default CPU path, so an ad hoc
+response written as a closure keeps working. Otherwise:
+
+- a [`Columnwise`](@ref) response is wrapped in a [`HostResponse`](@ref), which runs it on
+  the host. This needs `Et`, so it is only available from the four-argument form;
+- a [`Pointwise`](@ref) or [`VectorPointwise`](@ref) response with no arrays of its own
+  ([`resident_arrays`](@ref) empty) is passed through, which is right for every response
+  whose coefficients are scalars: `coefficients` combines them per call in `Float64`;
+- a [`Batched`](@ref) response is **not** passed through, because nothing else would give
+  it the scaling or allocate its buffers in the run's array type. It needs its own
+  `rescale` method unless the run is unscaled and on the host;
+- a response which carries an array and has no `rescale` method is an error, since nothing
+  would have converted it.
+
+A response which declares a device kind must also list every non-`isbits` array it carries
+in [`resident_arrays`](@ref); the fallbacks check this structurally and name the field
+which is missing.
 """
 function rescale(r, spec, scaling)
-    #= The default CPU path: host arrays, double precision, physical units. Every
-       response is already expressed in exactly those, so there is nothing to do. =#
-    (!Luna.isdevicespec(spec) && Luna.realtype(spec) === Float64 &&
-        Luna.isunity(scaling)) && return r
+    _isdefaultrun(spec, scaling) && return r
     _rescale_fallback(kind(r), r, spec, scaling)
 end
 
-_rescale_fallback(::Columnwise, r, spec, scaling) = HostResponse(r, spec, scaling)
+rescale(r, spec, scaling, Et) = _rescale_dims(kind(r), r, spec, scaling, Et)
+
+#= Only a columnwise response needs the prototype in the generic path: its wrapper is
+   built here rather than by the response, which by definition has no `rescale` method of
+   its own. Everything else implements the three-argument form, or overrides the
+   four-argument one. =#
+_rescale_dims(::ResponseKind, r, spec, scaling, Et) = rescale(r, spec, scaling)
+
+function _rescale_dims(::Columnwise, r, spec, scaling, Et)
+    _isdefaultrun(spec, scaling) && return r
+    HostResponse(r, spec, scaling, Et)
+end
+
+"The default CPU path: host arrays, double precision, physical units."
+_isdefaultrun(spec, scaling) =
+    !Luna.isdevicespec(spec) && Luna.realtype(spec) === Float64 && Luna.isunity(scaling)
+
+_rescale_fallback(::Columnwise, r, spec, scaling) = error(
+    "the nonlinear response $(nameof(typeof(r))) is columnwise, so it has to be wrapped "*
+    "in a `Nonlinear.HostResponse` to run on $(Luna.arraytype(spec))/"*
+    "$(Luna.realtype(spec)) in $(scaling), and that needs the shape of the field block. "*
+    "Call `Nonlinear.rescale(response, spec, scaling, Et)` with a prototype of the block.")
 
 #= A response with a device kernel and no arrays of its own -- which is every response
    whose coefficients are scalars -- needs no conversion: `coefficients` combines them in
-   Float64 per call and the kernel converts the result. One which does carry an array has
-   to say how it moves. =#
-function _rescale_fallback(k::ResponseKind, r, spec, scaling)
+   Float64 per call and the kernel converts the result. One which carries an array has to
+   say how it moves. =#
+function _rescale_fallback(k::Union{Pointwise, VectorPointwise}, r, spec, scaling)
+    _check_listed_arrays(r, k)
     isempty(resident_arrays(r)) && return r
-    error("the nonlinear response $(typeof(r)) declares `Nonlinear.kind` = $(k) and "*
-          "carries $(length(resident_arrays(r))) array(s), but has no "*
-          "`Nonlinear.rescale` method, so they cannot be converted to "*
-          "$(Luna.arraytype(spec))/$(Luna.realtype(spec)). Give it a `rescale` method, "*
-          "or declare `Nonlinear.kind` = Columnwise() to run it on the host.")
+    _no_rescale_error(k, r, spec)
+end
+
+#= A batched response is different: it is handed the block and the density and nothing
+   else, so the only place its coefficients can meet `E_ref`/`P_ref` is its own `rescale`
+   method, and the only place its buffers can be allocated in the run's array type is the
+   same method. Passing it through would run physical-unit coefficients against a scaled
+   state -- silently wrong rather than an error. =#
+function _rescale_fallback(k::Batched, r, spec, scaling)
+    _check_listed_arrays(r, k)
+    (Luna.isunity(scaling) && !Luna.isdevicespec(spec)) && return r
+    error("the nonlinear response $(nameof(typeof(r))) declares `Nonlinear.kind` = "*
+          "Batched() but has no `Nonlinear.rescale` method. A batched response is called "*
+          "with the block, the density and the units and nothing else, so it needs a "*
+          "`rescale(r, spec, scaling, Et)` method which combines its coefficients with "*
+          "`scaling` (see `Luna.polscale`) and allocates its buffers with `similar(Et)`. "*
+          "Without one it would run physical-unit coefficients against a state in "*
+          "$(scaling) on $(Luna.arraytype(spec))/$(Luna.realtype(spec)).")
+end
+
+_no_rescale_error(k, r, spec) = error(
+    "the nonlinear response $(nameof(typeof(r))) declares `Nonlinear.kind` = $(k) and "*
+    "carries $(length(resident_arrays(r))) array(s), but has no `Nonlinear.rescale` "*
+    "method, so they cannot be converted to $(Luna.arraytype(spec))/"*
+    "$(Luna.realtype(spec)). Give it a `rescale` method, or declare `Nonlinear.kind` = "*
+    "Columnwise() to run it on the host.")
+
+#= Structural check, once per setup: a response which declares a device kind may not keep
+   an array on the host, so every non-`isbits` `AbstractArray` field of it has to be one
+   `resident_arrays` names (a `StaticArrays` matrix or a `Rotations` matrix is `isbits`
+   and travels inside the struct, so it is exempt). Catches the array an author forgot to
+   list, which the pass-through would otherwise hand to a kernel as a host array --
+   a kernel-compilation error far from the cause on Metal, and nothing at all on
+   JLArrays. =#
+function _check_listed_arrays(r, k)
+    listed = resident_arrays(r)
+    for f in fieldnames(typeof(r))
+        x = getfield(r, f)
+        (x isa AbstractArray && !isbits(x)) || continue
+        any(a -> a === x, listed) && continue
+        error("the nonlinear response $(nameof(typeof(r))) declares `Nonlinear.kind` = "*
+              "$(k) and carries the array `$(f)::$(typeof(x))`, which "*
+              "`Nonlinear.resident_arrays` does not list. Every array a device kernel "*
+              "broadcasts against has to be listed, so that `rescale` converts it and "*
+              "the transform's residency assertion checks it.")
+    end
+    nothing
 end
 
 """
@@ -267,7 +360,7 @@ device_capable(r) = !(kind(r) isa Columnwise)
 #=================================================#
 
 """
-    HostResponse(response, spec, scaling)
+    HostResponse(response, spec, scaling, Et)
 
 A [`Columnwise`](@ref) response made to work in a run whose state is not host `Float64`:
 a [`Batched`](@ref) wrapper which, at every right-hand side, copies the whole field block
@@ -275,67 +368,65 @@ to a host `Float64`/`ComplexF64` buffer in physical SI units, calls `response` o
 column by column exactly as the host path does, converts the result back into the units
 and precision of the run, and adds it to the output.
 
+`Et` is a prototype of the block (see [`rescale`](@ref)): every buffer is allocated here,
+at construction, so the per-call code is fully typed. A device run needs four of them —
+`Eh` and `Ph` on the host in physical `Float64`, `stage` on the host in the run's element
+type, and `Pd` in the run's array type — because `copyto!` between a host array and a
+device array does not convert the precision. A scaled host run needs only `Eh` and `Ph`
+and leaves `stage`/`Pd` as `nothing`.
+
 This is the fallback which keeps Luna hackable (GPU_PLAN.md §3): a user-written
 `resp!(out, E, ρ)` closure, and every response which has not yet been given a device
 kernel, works on a GPU or in `Float32` without being rewritten. It is correct and slow —
-two host copies and a host evaluation of the response per right-hand side, which on a GPU
-also serialises the step — and [`rescale`](@ref) logs one line per wrapped response at
-setup saying so.
+two copies and a host evaluation of the response per right-hand side, which on a GPU also
+serialises the step — and its constructor logs one line saying so.
 
-Constructed by [`rescale`](@ref); there is no reason to build one directly.
+Built by [`rescale`](@ref); there is no reason to build one directly.
 """
-mutable struct HostResponse{R}
+struct HostResponse{R, H, S, D}
     resp::R
     Eref::Float64 # the field the state is measured in
     invfac::Float64 # 1/(Pref*Eref): the polarisation the buffer is measured in
-    #= Allocated on the first call, when the block shape is known: `rescale` sees the
-       device spec and the scaling but not the grid. Untyped, and read through a function
-       barrier, so that the per-call code is still compiled for concrete types. =#
-    stage::Any # host buffer in the run's element type (device runs only)
-    Eh::Any # host field buffer, physical units, Float64/ComplexF64
-    Ph::Any # host polarisation buffer, physical units
-    Pd::Any # buffer in the run's array type and element type
+    Eh::H # host field buffer, physical units, Float64/ComplexF64
+    Ph::H # host polarisation buffer, physical units
+    stage::S # host buffer in the run's element type, or nothing on a host run
+    Pd::D # buffer in the run's array type and element type, or nothing on a host run
 end
 
-function HostResponse(resp, spec, scaling)
+function HostResponse(resp, spec, scaling, Et)
     Logging.@info(
-        "The nonlinear response $(typeof(resp)) runs on the host: the field block is "*
-        "copied to the host in physical units at every right-hand side, the response "*
-        "evaluated column by column in Float64, and the result copied back. Correct but "*
-        "slow; give it a `Nonlinear.kind`/kernel to run it in place.")
-    HostResponse(resp, scaling.Eref, 1/(scaling.Pref*scaling.Eref),
-                 nothing, nothing, nothing, nothing)
+        "The nonlinear response $(nameof(typeof(resp))) runs on the host: the field "*
+        "block is copied to the host in physical units at every right-hand side, the "*
+        "response evaluated column by column in Float64, and the result copied back. "*
+        "Correct but slow; give it a `Nonlinear.kind` and a kernel to run it in place.")
+    HT = _hosteltype(eltype(Et))
+    Eh = zeros(HT, size(Et))
+    Ph = zeros(HT, size(Et))
+    if Luna.isdevicespec(spec)
+        stage = zeros(eltype(Et), size(Et))
+        Pd = fill!(similar(Et), zero(eltype(Et)))
+    else
+        stage = nothing
+        Pd = nothing
+    end
+    HostResponse(resp, scaling.Eref, 1/(scaling.Pref*scaling.Eref), Eh, Ph, stage, Pd)
 end
 
 kind(::HostResponse) = Batched()
+
+#= `Pd` is the one buffer which has to be on the device; the others are host by design.
+   Listed so that the transform's residency assertion covers it. =#
+resident_arrays(h::HostResponse) = (h.Pd,)
 
 "The element type a host copy of a block of element type `T` is held in."
 _hosteltype(::Type{T}) where {T<:Real} = Float64
 _hosteltype(::Type{Complex{T}}) where {T<:Real} = ComplexF64
 
 function (h::HostResponse)(out, E, ρ)
-    if isnothing(h.Eh)
-        HT = _hosteltype(eltype(E))
-        h.Eh = zeros(HT, size(E))
-        h.Ph = zeros(HT, size(E))
-        #= A device run needs a host buffer in the run's own element type on both sides
-           of the copy: `copyto!` between a device array and a host one does not convert
-           the precision. A scaled host run converts in the broadcast instead. =#
-        if Utils.isdevice(E)
-            h.stage = zeros(eltype(E), size(E))
-            h.Pd = fill!(similar(out), zero(eltype(out)))
-        end
-    end
-    #= Function barrier: the fields above are `Any`, so everything which touches the
-       buffers per element lives in a method specialised on their concrete types. =#
-    _hostresponse!(out, E, ρ, h.resp, h.Eh, h.Ph, h.Pd, h.stage, h.Eref, h.invfac)
-end
-
-function _hostresponse!(out, E, ρ, resp, Eh, Ph, Pd, stage, Eref, invfac)
-    _tohost!(Eh, E, stage, Eref)
-    fill!(Ph, 0)
-    _hostcolumns!(Ph, Eh, resp, ρ)
-    _toout!(out, Ph, Pd, stage, invfac)
+    _tohost!(h.Eh, E, h.stage, h.Eref)
+    fill!(h.Ph, 0)
+    _hostcolumns!(h.Ph, h.Eh, h.resp, ρ)
+    _toout!(out, h.Ph, h.Pd, h.stage, h.invfac)
     out
 end
 

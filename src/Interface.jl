@@ -430,7 +430,10 @@ boundary_kwargs(kwargs) = NamedTuple(
 function _check_responses_device_capable!(device, precision, resp)
     spec = Luna.withprecision(Luna.resolve_device(device), precision)
     (Luna.arraytype(spec) === Array && Luna.realtype(spec) === Float64) && return nothing
-    bad = unique(string.(typeof.(Iterators.filter(!Nonlinear.device_capable, resp))))
+    #= `nameof` rather than the full type: a plasma response's type parameters run to
+       several hundred characters and would bury the fix past a wrapped paragraph. =#
+    bad = unique(string.(nameof.(typeof.(
+        Iterators.filter(!Nonlinear.device_capable, resp)))))
     isempty(bad) && return nothing
     error("this propagation includes a response with no device kernel "*
           "($(join(bad, ", "))), so it cannot run on a device or in reduced precision "*

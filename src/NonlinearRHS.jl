@@ -140,7 +140,11 @@ Accumulate the nonlinear polarisation induced by the time-domain field block `Et
 `Pt`, one term per response, in the order the responses are given.
 
 `Et` is `(nt,)`, `(nt, npol)` or `(nt, npol, ncols...)`; `idcs`, where a transform has
-more than one column, indexes the axes past the polarisation one. `density` is a number,
+more than one column, indexes the axes past the polarisation one and **must cover every
+column of the block**. The pointwise and batched paths act on the whole block and ignore
+it — it is there for the columnwise path, which is a loop — so a subset would leave the
+other columns holding the previous step's polarisation rather than zero. Every transform
+which passes one builds it as `CartesianIndices(size(Pt)[3:end])`. `density` is a number,
 or a vector with one entry per gas of a mixture, in which case `responses` is a tuple of
 tuples, one per gas. `scaling` is the [`Luna.UnitScaling`](@ref) the state and the
 polarisation buffer are expressed in.
@@ -258,7 +262,7 @@ function _respgroups_step!(Pt, Et, ::Tuple{}, rest::Tuple, scaling, v::Val, firs
                            idcs...)
     firstgroup && fill!(Pt, 0)
     r, ρ = rest[1]
-    _apply_unfused!(Pt, Et, Nonlinear.kind(r, v), r, ρ, idcs...)
+    _apply_unfused!(Pt, Et, Nonlinear.kind(r, v), r, ρ, scaling, idcs...)
     _respgroups!(Pt, Et, Base.tail(rest), scaling, v, false, idcs...)
 end
 
@@ -268,7 +272,8 @@ function _respgroups_step!(Pt, Et, fused::Tuple, rest::Tuple, scaling, v::Val, f
     _respgroups!(Pt, Et, rest, scaling, v, false, idcs...)
 end
 
-# The longest prefix of `pairs` whose responses fuse, and the rest.
+#= The longest prefix of `pairs` whose responses fuse, and the rest. The `Union` below is
+   the single place which decides which kinds fuse; a fifth kind is added there. =#
 _splitfused(pairs::Tuple, v::Val) = _splitfused(pairs, v, ())
 _splitfused(::Tuple{}, ::Val, acc) = (acc, ())
 _splitfused(pairs::Tuple, v::Val, acc) =
@@ -277,11 +282,25 @@ _splitfused(::Union{Nonlinear.Pointwise, Nonlinear.VectorPointwise}, pairs, v, a
     _splitfused(Base.tail(pairs), v, (acc..., pairs[1]))
 _splitfused(::Nonlinear.ResponseKind, pairs, v, acc) = (acc, pairs)
 
-function _fusedbroadcast!(Pt, Et, fused::Tuple, scaling, ::Val{1}, firstgroup)
-    bc = _sumexprs(map(q -> Nonlinear.pointwise_expr(q[1], Et, q[2], scaling), fused))
-    _materialise!(Pt, bc, firstgroup)
+function _fusedbroadcast!(Pt, Et, fused::Tuple, scaling, v::Val{1}, firstgroup)
+    exprs = map(q -> _scalarexpr(q[1], Nonlinear.kind(q[1], v), Et, q[2], scaling), fused)
+    _materialise!(Pt, exprs, firstgroup)
     Pt
 end
+
+_scalarexpr(r, ::Nonlinear.Pointwise, Et, ρ, scaling) =
+    Nonlinear.pointwise_expr(r, Et, ρ, scaling)
+
+#= A response which declares `VectorPointwise()` unconditionally -- the natural way to
+   write a two-component-only response -- would otherwise be handed the scalar path and
+   silently evaluated as if it were elementwise. =#
+_scalarexpr(r, ::Nonlinear.VectorPointwise, Et, ρ, scaling) = error(
+    "the nonlinear response $(nameof(typeof(r))) reports `Nonlinear.kind` = "*
+    "VectorPointwise() for a field block with one polarisation component. A "*
+    "vector-pointwise response couples the two components, so it needs a two-component "*
+    "block: declare `Nonlinear.kind(::$(nameof(typeof(r))), ::Val{2}) = "*
+    "Nonlinear.VectorPointwise()` and give the one-component case its own kind "*
+    "(`Pointwise()` if the same formula applies per component, `Columnwise()` otherwise).")
 
 #= Two components, two broadcasts. Luna's buffers are (nt, npol, ncols...), so the
    polarisation index is the slow axis: a single broadcast writing an `SVector{2}` would
@@ -297,9 +316,9 @@ function _fusedbroadcast!(Pt, Et, fused::Tuple, scaling, ::Val{2}, firstgroup)
 end
 
 function _fusedcomponent!(o, Et, Ex, Ey, fused::Tuple, scaling, firstgroup, p::Val)
-    bc = _sumexprs(map(q -> _componentexpr(q[1], Nonlinear.kind(q[1], Val(2)),
-                                           Et, Ex, Ey, q[2], scaling, p), fused))
-    _materialise!(o, bc, firstgroup)
+    exprs = map(q -> _componentexpr(q[1], Nonlinear.kind(q[1], Val(2)),
+                                    Et, Ex, Ey, q[2], scaling, p), fused)
+    _materialise!(o, exprs, firstgroup)
     o
 end
 
@@ -316,31 +335,50 @@ _component(::Val{2}) = last
 _sumexprs(e::Tuple{Any}) = e[1]
 _sumexprs(e::Tuple) = Base.broadcasted(+, _sumexprs(Base.front(e)), e[end])
 
-_materialise!(dest, bc, firstgroup) =
-    firstgroup ? Base.materialize!(dest, bc) :
-                 Base.materialize!(dest, Base.broadcasted(+, dest, bc))
+#= `dest` is folded in as the *leading* term of a group which is not the first, so that
+   the element-by-element sequence of additions is `((dest + t1) + t2) + ...`, exactly the
+   one the per-response loop produced. Summing the group first and adding `dest` to the
+   total would associate differently and move the result at rounding level. =#
+_materialise!(dest, exprs::Tuple, firstgroup) =
+    Base.materialize!(dest, _sumexprs(firstgroup ? exprs : (dest, exprs...)))
 
-_apply_unfused!(Pt, Et, ::Nonlinear.Batched, r, ρ) = r(Pt, Et, ρ)
-_apply_unfused!(Pt, Et, ::Nonlinear.Batched, r, ρ, idcs) = r(Pt, Et, ρ)
+_apply_unfused!(Pt, Et, ::Nonlinear.Batched, r, ρ, scaling) =
+    Nonlinear.batched!(r, Pt, Et, ρ, scaling)
 
-function _apply_unfused!(Pt, Et, ::Nonlinear.Columnwise, r, ρ)
-    _refuse_on_device(Pt, r)
+_apply_unfused!(Pt, Et, ::Nonlinear.Batched, r, ρ, scaling, idcs) =
+    Nonlinear.batched!(r, Pt, Et, ρ, scaling)
+
+function _apply_unfused!(Pt, Et, ::Nonlinear.Columnwise, r, ρ, scaling)
+    _refuse_columnwise(Pt, r, scaling)
     r(Pt, Et, ρ)
 end
 
-function _apply_unfused!(Pt, Et, ::Nonlinear.Columnwise, r, ρ, idcs)
-    _refuse_on_device(Pt, r)
+function _apply_unfused!(Pt, Et, ::Nonlinear.Columnwise, r, ρ, scaling, idcs)
+    _refuse_columnwise(Pt, r, scaling)
     for i in idcs
         r(view(Pt, .., i), view(Et, .., i), ρ)
     end
     Pt
 end
 
-_refuse_on_device(Pt, r) = Utils.isdevice(Pt) && error(
-    "the nonlinear response $(typeof(r)) is evaluated column by column on the host, so "*
-    "it cannot be applied to a $(typeof(Pt)). `Nonlinear.rescale` wraps a columnwise "*
-    "response in a `Nonlinear.HostResponse` for a device run; this one reached the "*
-    "transform unwrapped.")
+#= The columnwise contract is host arrays in physical SI units, so both departures from
+   it are refused in the same place: a device block, and a scaled state (where the
+   response's own coefficients would be applied to `E/Eref` and its result read as
+   `P/(Pref*Eref)`). Neither is reachable through a transform, which rescales every
+   response at construction, but a low-level caller can produce both. =#
+function _refuse_columnwise(Pt, r, scaling)
+    Utils.isdevice(Pt) && error(
+        "the nonlinear response $(nameof(typeof(r))) is evaluated column by column on "*
+        "the host, so it cannot be applied to a $(typeof(Pt)). `Nonlinear.rescale` wraps "*
+        "a columnwise response in a `Nonlinear.HostResponse` for a device run; this one "*
+        "reached the transform unwrapped.")
+    isunity(scaling) || error(
+        "the nonlinear response $(nameof(typeof(r))) is evaluated column by column in "*
+        "physical SI units, so it cannot be applied to a state in $(scaling). "*
+        "`Nonlinear.rescale` wraps a columnwise response in a `Nonlinear.HostResponse` "*
+        "for a scaled run; this one reached the transform unwrapped.")
+    nothing
+end
 
 """
     TransModal
@@ -637,7 +675,10 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
         Et_noise = nothing
         Et_nl = nothing
     end
-    resp = map(r -> Nonlinear.rescale(r, spec, scaling), Tuple(resp))
+    #= The four-argument form: `Eto` is the prototype of the block the responses are
+       called with, so one which owns buffers can allocate them here, in the run's array
+       type, in time for the residency assertion below. =#
+    resp = map(r -> Nonlinear.rescale(r, spec, scaling, Eto), Tuple(resp))
     #= Every mirror the transform holds and every array its responses carry, not only the
        ones this transform's own kernels touch: the assertion is what catches a future
        mistake, so it has to cover everything. =#
