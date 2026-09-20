@@ -29,7 +29,7 @@
 import Test: @test, @testset, @test_throws, @test_logs, @inferred
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
-             NonlinearRHS, PhysData, RK45
+             NonlinearRHS, PhysData, RK45, Stats
 import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING
 import GPUArraysCore
 import AbstractFFTs
@@ -242,20 +242,13 @@ end
     @test a == b
 end
 
-#= An output which copies whatever the solver hands it down to the host. The real one
-   (`ScaledOutput`, which also unscales) is gpu/11's; this is the minimum this branch
-   needs in order to save a device propagation. =#
-struct ToHost{O}
-    o::O
-end
-(h::ToHost)(y, t, dt, yfun) = h.o(Array(y), t, dt, ti -> Array(yfun(ti)))
-(h::ToHost)(args...; kwargs...) = h.o(args...; kwargs...)
-Base.getindex(h::ToHost, k) = h.o[k]
-
 #= One small mode-averaged Kerr propagation, built once and run on whichever spec is
-   asked for. `boundary=:none` because the absorbers are host code until gpu/11. =#
+   asked for. `Luna.run` wraps `out` in `ScaledOutput` itself, whenever the state is on a
+   device or the run is scaled, so the test only ever sees the plain `Output.MemoryOutput`
+   it built -- already on the host, already unscaled. `boundary=:none` by default: the
+   `:rate` case, which exercises `Boundaries.RateAbsorber`, has its own testset below. =#
 function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
-                  precision=nothing)
+                  precision=nothing, boundary=:none, stats=false)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15)
@@ -272,10 +265,10 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                    constβ=true, device=spec, precision)
-    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
-    output = Utils.isdevice(Eω) ? ToHost(out) : out
-    Luna.run(Eω, grid, linop, transform, FT, output;
-             zmax=flength, boundary=:none, init_dz=flength/20, rtol=1e-8)
+    statsfun = stats ? Stats.default(grid, Eω, m, linop, transform; gas) : Output.nostats
+    out = Output.MemoryOutput(0, flength, 3, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, init_dz=flength/20, rtol=1e-8)
     out, transform
 end
 
@@ -298,9 +291,8 @@ function gradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9
     Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
                                    device=spec, precision)
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
-    output = Utils.isdevice(Eω) ? ToHost(out) : out
     dz = flength/20
-    Luna.run(Eω, grid, linop, transform, FT, output;
+    Luna.run(Eω, grid, linop, transform, FT, out;
              zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz)
     out, transform
 end
@@ -485,6 +477,28 @@ end
     end
 end
 
+#= gpu/11's exit condition for this test file: RateAbsorber and the default statistics,
+   both broadcasts and reductions now (Boundaries.jl, Stats.jl is untouched but the field
+   it is called with is host, unscaled data whatever device the state lives on), run on a
+   device end to end through `Luna.run`, with no explicit host-copy wrapper from the
+   caller -- `ScaledOutput` is automatic. =#
+@testset "boundaries and default statistics on JLArray" begin
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        href, htr = kerrcase(GT, HostSpec(); boundary=:rate, stats=true)
+        dref, dtr = kerrcase(GT, JLSpec; boundary=:rate, stats=true)
+
+        @test dref["z"] ≈ href["z"]
+        for idx in axes(href["Eω"], 2)
+            h = href["Eω"][:, idx]
+            d = dref["Eω"][:, idx]
+            @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+        end
+        # The statistics agree too: they were computed from a host copy on both paths
+        @test dref["stats"]["energy"] ≈ href["stats"]["energy"] rtol=1e-8
+        @test length(dref["stats"]["z"]) == length(href["stats"]["z"])
+    end
+end
+
 @testset "a device run refuses host-only machinery" begin
     grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
     m = Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false)
@@ -493,12 +507,6 @@ end
     resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, 800e-9)
     inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
-    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
-                                   constβ=true, device=JLSpec)
-    out = ToHost(Output.MemoryOutput(0, 1e-3, 3, Output.nostats))
-    # The absorbers are host scalar code, so they are refused rather than run slowly
-    @test_throws ErrorException Luna.run(Eω, grid, linop, transform, FT, out;
-                                         zmax=1e-3, boundary=:rate)
 
     # A normalisation built for the host cannot be used for a device run
     hostnorm = NonlinearRHS.norm_mode_average(grid, βfun!, aeff)
@@ -538,9 +546,7 @@ end # have_jlarrays
     href, _ = kerrcase(Grid.RealGrid, HostSpec(); pres=0.3)
     f32, tr32 = kerrcase(Grid.RealGrid, DeviceSpec(Array, Float32); pres=0.3)
 
-    #= The state and every buffer are single precision. `Output.MemoryOutput` still
-       allocates ComplexF64 and widens on the way in (Output.jl:44); making the output
-       carry `eltype(y)` is gpu/11's, together with the unscaling wrapper. =#
+    #= The state and every buffer are single precision. =#
     @test tr32.Eto isa Vector{Float32}
     @test tr32.Eωo isa Vector{ComplexF32}
     @test tr32.gv.ω isa Vector{Float32}
@@ -550,13 +556,14 @@ end # have_jlarrays
     # The scaled coefficient is a normal Float32 with room to spare
     @test floatmin(Float32) < abs(tr32.resp[1].γ3*ρ*PhysData.ε_0) < floatmax(Float32)
 
-    #= The state is scaled, and unscaling is gpu/11's job (the output wrapper), so
-       multiply by Eref here. The tolerance is measured, not aspirational: see
-       PR_10-device-model.md. =#
-    Eref = tr32.scaling.Eref
+    #= `ScaledOutput` unscales on the way into the output and `Output.MemoryOutput` now
+       allocates with `eltype(y)`, so the saved field is `ComplexF32`, in physical units,
+       directly comparable with the `Float64` run -- no manual `* Eref` here any more.
+       The tolerance is measured, not aspirational: see PR_10-device-model.md. =#
+    @test eltype(f32["Eω"]) === ComplexF32
     for idx in axes(href["Eω"], 2)
         h = href["Eω"][:, idx]
-        d = ComplexF64.(f32["Eω"][:, idx]) .* Eref
+        d = ComplexF64.(f32["Eω"][:, idx])
         @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
     end
 end
