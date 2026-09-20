@@ -478,6 +478,10 @@ function TransModal(tT, grid, ts::Modes.ToSpace, FT, resp, densityfun, norm!;
         Er_noise = nothing
         Er_nl = nothing
     end
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape. Every fallback returns the
+       response unchanged on this host Float64 path. =#
+    resp = Nonlinear.rescale_responses(resp, HostSpec(), UNIT_SCALING, Er)
     TransModal(ts, full, Modes.dimlimits(ts.ms[1]), Emω, Erω, Erωo, Er, Pr, Prω, Prωo, Prmω,
                FT, IFT, resp, grid, densityfun, densityfun(0.0), norm!, 0, 0.0, rtol, atol, mfcn,
                similar(Prmω), Emω_noise, Er_noise, Er_nl)
@@ -678,11 +682,11 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
     #= The four-argument form: `Eto` is the prototype of the block the responses are
        called with, so one which owns buffers can allocate them here, in the run's array
        type, in time for the residency assertion below. =#
-    resp = map(r -> Nonlinear.rescale(r, spec, scaling, Eto), Tuple(resp))
+    resp = Nonlinear.rescale_responses(resp, spec, scaling, Eto)
     #= Every mirror the transform holds and every array its responses carry, not only the
        ones this transform's own kernels touch: the assertion is what catches a future
        mistake, so it has to cover everything. =#
-    resparrays = reduce((a, r) -> (a..., Nonlinear.resident_arrays(r)...), resp; init=())
+    resparrays = Nonlinear.resident_arrays_all(resp)
     assert_resident(spec, Eωo, Eto, Pto, Pωo, gv.ω, gv.ωwin, gv.twin, gv.towin, gv.sidx,
                     Et_noise, Et_nl, resparrays...)
     TransModeAvg(Pto, Eto, Eωo, Pωo, FT, IFT, resp, grid, gv, densityfun, norm!, aeff,
@@ -998,6 +1002,10 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
         Et_noise = nothing
         Et_nl = nothing
     end
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape. Every fallback returns the
+       response unchanged on this host Float64 path. =#
+    responses = Nonlinear.rescale_responses(responses, HostSpec(), UNIT_SCALING, Eto_r)
     TransRadial(rgrid, FT, IFT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
                 Tfwd, Tbwd, Et_noise, Et_nl)
 end
@@ -1336,6 +1344,10 @@ function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, 
         Et_noise = nothing
         Et_nl = nothing
     end
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape. Every fallback returns the
+       response unchanged on this host Float64 path. =#
+    responses = Nonlinear.rescale_responses(responses, HostSpec(), UNIT_SCALING, Eto)
     TransFree(FT, Utils.plan_ift(FT), normfun, responses, grid, xygrid, densityfun,
               Pto, Eto, Eωo, Pωo, scale, idcs, Et_noise, Et_nl)
 end
@@ -1407,6 +1419,10 @@ function TransFree2D(TT, scale, grid, xgrid, FT, responses, densityfun, normfun,
     Pto = similar(Eto)
     Pωo = similar(Eωo)
     idcs = CartesianIndices(size(Pto)[3:end])
+    #= Responses are given the prototype of the block they will be called with, so that
+       a batched one has its buffers in the right shape. Every fallback returns the
+       response unchanged on this host Float64 path. =#
+    responses = Nonlinear.rescale_responses(responses, HostSpec(), UNIT_SCALING, Eto)
     TransFree2D(FT, Utils.plan_ift(FT), normfun, responses, grid, xgrid, densityfun,
               Pto, Eto, Eωo, Pωo, scale, idcs)
 end

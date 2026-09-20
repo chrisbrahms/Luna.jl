@@ -325,6 +325,42 @@ function _check_listed_arrays(r, k)
 end
 
 """
+    rescale_responses(responses, spec, scaling, Et) -> Tuple
+
+[`rescale`](@ref) applied to a transform's whole response collection, including the
+tuple-of-tuples a gas mixture is (each inner tuple is rescaled element by element and
+stays a tuple, so that it still lines up with the density it is paired with).
+
+`Et` is the prototype of the time-domain field block, as for the four-argument
+[`rescale`](@ref). Every transform calls this at construction, so that a response which
+owns block-sized buffers ([`Batched`](@ref)) has them in the right shape, array type and
+precision before the transform asserts residency.
+
+On the default CPU path — host arrays, `Float64`, physical units — every fallback
+returns the response unchanged, so this is a no-op except for a response which
+implements the four-argument form because it has something to size to the block.
+"""
+rescale_responses(responses, spec, scaling, Et) =
+    map(r -> _rescale_each(r, spec, scaling, Et), Tuple(responses))
+
+_rescale_each(r::Tuple, spec, scaling, Et) =
+    map(x -> _rescale_each(x, spec, scaling, Et), r)
+_rescale_each(r, spec, scaling, Et) = rescale(r, spec, scaling, Et)
+
+"""
+    resident_arrays_all(responses) -> Tuple
+
+Every array [`resident_arrays`](@ref) names, over a whole response collection and
+through the tuple-of-tuples a gas mixture is. This is what a transform hands to
+[`Luna.assert_resident`](@ref) along with its own buffers.
+"""
+resident_arrays_all(responses) =
+    reduce((a, r) -> (a..., _resident_each(r)...), Tuple(responses); init=())
+
+_resident_each(r::Tuple) = resident_arrays_all(r)
+_resident_each(r) = resident_arrays(r)
+
+"""
     resident_arrays(response) -> Tuple
 
 The arrays a nonlinear response carries which a kernel broadcasts against, and which
@@ -812,97 +848,249 @@ function env_products!(Anl, Ac, cp, cm)
     Anl[6] = 2*(cp*Ac[1]*Ac[2] + cm*real(Ac[1]*conj(Ac[2])))
 end
 
-"Response type for cumtrapz-based plasma polarisation, adapted from:
-M. Geissler, G. Tempea, A. Scrinzi, M. Schnürer, F. Krausz, and T. Brabec, Physical Review Letters 83, 2930 (1999)."
-struct PlasmaCumtrapz{R, EType, tType}
-    ratefunc::R # the ionization rate function
-    ionpot::Float64 # the ionization potential (for calculation of ionization loss)
+"""
+    PlasmaCumtrapz(t, E, ratefunc, ionpot; preionfrac=0.0)
+
+Cumulative-trapezoid plasma polarisation response, adapted from M. Geissler, G. Tempea,
+A. Scrinzi, M. Schnürer, F. Krausz, and T. Brabec, Physical Review Letters 83, 2930
+(1999).
+
+`t` is the (oversampled) time grid, `E` a prototype of the time-domain field block the
+response will be applied to, `ratefunc` an ionisation rate (see
+[`Ionisation`](@ref Luna.Ionisation)) and `ionpot` the ionisation potential in Joules.
+`preionfrac` is a pre-ionised fraction, which is not a well founded physical model.
+
+[`Batched`](@ref): the response is handed the whole `(nt, npol, ncols...)` block and
+evaluates it with whole-array operations — one broadcast for the rate, one prefix scan
+plus one broadcast for each of the three cumulative integrals
+([`Maths.cumtrapz_scan!`](@ref Luna.Maths.cumtrapz_scan!)), and one `ifelse` broadcast
+for the ionisation-loss term. That is the same code on the host and on a device
+(GPU_PLAN.md §4.2). On the host the columns are shared out over threads when there are
+enough of them; each column's arithmetic is the same either way, and the same as if the
+block were passed one column at a time.
+
+The buffers are sized for the block, so a transform reallocates them for the block it
+will pass by calling [`rescale`](@ref), which is also where the rate function is
+converted to the run's precision and array type.
+
+Its result differs from a serial `Maths.cumtrapz!` at rounding level: the scan
+accumulates the integrand and corrects, where the loop accumulates the trapezoid
+increments.
+
+# Fields
+- `ratefunc`: the rate as given, in physical units on the host. `Stats` evaluates it.
+- `ratedev`: the same rate in the run's precision and array type; `=== ratefunc` on the
+  default host path.
+- `rate`, `fraction`, `Em`: buffers with one polarisation component (`Em`, the field
+  magnitude, only for a two-component field; `nothing` otherwise).
+- `J`, `P`: block-sized buffers. `P` holds the phase-modulation term before it holds the
+  polarisation; the two are never needed at the same time.
+"""
+struct PlasmaCumtrapz{R, RD, tType, EType, mType}
+    ratefunc::R # the ionisation rate function, as given (host, physical units)
+    ratedev::RD # the same rate in the run's precision and array type
+    ionpot::Float64 # the ionisation potential (for the ionisation loss term)
     rate::tType # buffer to hold the rate
-    fraction::tType # buffer to hold the ionization fraction
-    phase::EType # buffer to hold the plasma induced (mostly) phase modulation
+    fraction::tType # buffer to hold the ionisation fraction
+    Em::mType # buffer for the field magnitude (two-component field), or nothing
     J::EType # buffer to hold the plasma current
-    P::EType # buffer to hold the plasma polarisation
+    P::EType # buffer to hold the phase modulation, then the plasma polarisation
     δt::Float64 # the time step
     preionfrac::Float64 # the pre-ionisation fraction
+    scaling::Luna.UnitScaling # units the field block and the output are expressed in
 end
 
-"""
-    PlasmaCumtrapz(t, E, ratefunc, ionpot)
-
-Construct the Plasma polarisation response for a field on time grid `t`
-with example electric field like `E`, an ionization rate callable
-`ratefunc` and ionization potential `ionpot`.
-"""
 function PlasmaCumtrapz(t, E, ratefunc, ionpot; preionfrac=0.0)
-    rate = similar(t)
-    fraction = similar(t)
-    phase = similar(E)
-    J = similar(E)
-    P = similar(E)
     !(0.0 <= preionfrac <= 1.0) && throw(DomainError(preionfrac, "preionfrac must be between 0 and 1"))
     if preionfrac > 0.0
         @warn("Using preionfrac > 0.0 is not a well founded physical model. Use only after careful consideration.")
     end
-    return PlasmaCumtrapz(ratefunc, ionpot, rate, fraction, phase, J, P, t[2]-t[1], preionfrac)
+    rate, fraction, Em, J, P = _plasmabuffers(E)
+    PlasmaCumtrapz(ratefunc, ratefunc, ionpot, rate, fraction, Em, J, P,
+                   t[2]-t[1], preionfrac, Luna.UNIT_SCALING)
 end
 
-"The plasma response for a scalar electric field"
-function PlasmaScalar!(Plas::PlasmaCumtrapz, E)
-    Plas.ratefunc(Plas.rate, E)
-    Maths.cumtrapz!(Plas.fraction, Plas.rate, Plas.δt)
-    @. Plas.fraction = Plas.preionfrac + 1 - exp(-Plas.fraction)
-    @. Plas.phase = Plas.fraction * e_ratio * E
-    Maths.cumtrapz!(Plas.J, Plas.phase, Plas.δt)
-    for ii in eachindex(E)
-        if abs(E[ii]) > 0
-            Plas.J[ii] += Plas.ionpot * Plas.rate[ii] * (1-Plas.fraction[ii])/E[ii]
-        end
-    end
-    Maths.cumtrapz!(Plas.P, Plas.J, Plas.δt)
+#= The rate, the ionisation fraction and the field magnitude are the same for both
+   polarisation components, so they are held with a singleton second axis and broadcast
+   against the block. A one-dimensional block (mode-averaged) has no such axis. =#
+_singletonpol(dims::Tuple{}) = ()
+_singletonpol(dims::Tuple{Int}) = dims
+_singletonpol(dims::Tuple) = (dims[1], 1, dims[3:end]...)
+
+function _plasmabuffers(E)
+    RT = real(eltype(E))
+    pdims = _singletonpol(size(E))
+    rate = fill!(similar(E, RT, pdims), zero(RT))
+    fraction = similar(rate)
+    Em = _npol(E) == 2 ? similar(rate) : nothing
+    J = fill!(similar(E), zero(eltype(E)))
+    P = similar(J)
+    (rate, fraction, Em, J, P)
+end
+
+"The number of polarisation components of a field block."
+_npol(E::AbstractArray) = ndims(E) < 2 ? 1 : size(E, 2)
+
+"The number of columns (transverse points) of a field block."
+_ncols(E::AbstractArray) = ndims(E) < 3 ? 1 : prod(size(E)[3:end])
+
+kind(::PlasmaCumtrapz) = Batched()
+kind(::PlasmaCumtrapz, ::Val) = Batched()
+
+resident_arrays(p::PlasmaCumtrapz) =
+    (p.rate, p.fraction, p.Em, p.J, p.P,
+     Luna.Ionisation.resident_arrays(p.ratedev)...)
+
+"""
+    coefficients(p::PlasmaCumtrapz, ρ, scaling)
+
+The four scalars the plasma kernels need at number density `ρ`, in the units of
+`scaling`: `(Eref, cphase, closs, cout)`.
+
+The response is not polynomial in the field, so [`Luna.polscale`](@ref) does not apply
+and the scaling is carried by each stage separately. With `e = E/E_ref` and the output
+in `P/(P_ref E_ref)`:
+
+| | |
+| --- | --- |
+| `Eref` | the rate is evaluated at the physical field `Eref*e` |
+| `cphase` | `e_ratio*Eref`, so that `fraction*cphase*e` is the physical phase term |
+| `closs` | `ionpot/Eref`; the loss term divides by the physical field (twice, for a two-component field, and multiplies by it once) |
+| `cout` | `ρ/(P_ref E_ref)`, applied to the physical polarisation |
+
+All four are `Float64` here and converted once, by the kernel, with
+[`Luna.scalar`](@ref). Every one of them reduces to the physical constant when
+`E_ref == P_ref == 1`, which is every `Float64` run.
+"""
+function coefficients(p::PlasmaCumtrapz, ρ, scaling)
+    Eref = scaling.Eref
+    (Eref, e_ratio*Eref, p.ionpot/Eref, ρ/(scaling.Pref*Eref))
 end
 
 """
-The plasma response for a vector electric field.
+    rescale(p::PlasmaCumtrapz, spec, scaling, Et)
 
-We take the magnitude of the electric field to calculate the ionization
-rate and fraction, and then solve the plasma polarisation component-wise
-for the vector field.
+A copy of the plasma response with buffers sized for the block `Et`, in its array type
+and precision, and with the ionisation rate converted to match
+([`Ionisation.device_rate`](@ref Luna.Ionisation.device_rate)).
 
-A similar approach was used in: C Tailliez et al 2020 New J. Phys. 22 103038.
+Every transform calls this on its responses at construction, so the buffers always match
+the block the response is handed — which for a radial or free-space transform is the
+whole transverse grid, not the single column the constructor was given a prototype of.
+
+The rate as given is kept in `ratefunc` (the host, physical-unit object `Stats`
+evaluates) whatever the run.
 """
-function PlasmaVector!(Plas::PlasmaCumtrapz, E)
-    Ex = E[:,1]
-    Ey = E[:,2]
-    Em = @. hypot.(Ex, Ey)
-    Plas.ratefunc(Plas.rate, Em)
-    Maths.cumtrapz!(Plas.fraction, Plas.rate, Plas.δt)
-    @. Plas.fraction = Plas.preionfrac + 1 - exp(-Plas.fraction)
-    @. Plas.phase = Plas.fraction * e_ratio * E
-    Maths.cumtrapz!(Plas.J, Plas.phase, Plas.δt)
-    for ii in eachindex(Em)
-        if abs(Em[ii]) > 0
-            pre = Plas.ionpot * Plas.rate[ii] * (1-Plas.fraction[ii])/Em[ii]^2
-            Plas.J[ii,1] += pre*Ex[ii]
-            Plas.J[ii,2] += pre*Ey[ii]
-        end
-    end
-    Maths.cumtrapz!(Plas.P, Plas.J, Plas.δt)
+function rescale(p::PlasmaCumtrapz, spec, scaling, Et)
+    ratedev = Luna.Ionisation.device_rate(p.ratefunc, spec)
+    rate, fraction, Em, J, P = _plasmabuffers(Et)
+    Luna.assert_resident(spec, rate, fraction, Em, J, P)
+    PlasmaCumtrapz(p.ratefunc, ratedev, p.ionpot, rate, fraction, Em, J, P,
+                   p.δt, p.preionfrac, scaling)
 end
 
-"Handle plasma polarisation routing to `PlasmaVector` or `PlasmaScalar`."
-function (Plas::PlasmaCumtrapz)(out, Et, ρ)
-    if ndims(Et) > 1
-        if size(Et, 2) == 1 # handle scalar case but within modal simulation
-            PlasmaScalar!(Plas, reshape(Et, size(Et,1)))
-            out .+= ρ .* reshape(Plas.P, size(Et))
-        else
-            PlasmaVector!(Plas, Et) # vector case
-            out .+= ρ .* Plas.P
+#= Below this many elements the block is not worth the task overhead; above it, one task
+   per column. A column costs an ionisation-rate evaluation and three prefix scans over
+   the time axis, so the grain is large even for one column. =#
+const PLASMA_THREAD_MINLEN = 1 << 14
+
+"Whether to share this block's columns out over threads."
+_plasma_threaded(E) =
+    (Threads.nthreads() > 1) && !Utils.isdevice(E) &&
+    (_ncols(E) > 1) && (length(E) >= PLASMA_THREAD_MINLEN)
+
+#= The dispatcher hands a batched response the units the block is in, which is what a
+   transform is running in; `p.scaling` is only what `rescale` was told, and is what a
+   direct call falls back on. =#
+batched!(p::PlasmaCumtrapz, out, E, ρ, scaling) =
+    _plasma_run!(p, out, E, coefficients(p, ρ, scaling))
+
+(p::PlasmaCumtrapz)(out, Et, ρ) =
+    _plasma_run!(p, out, Et, coefficients(p, ρ, p.scaling))
+
+function _plasma_run!(p::PlasmaCumtrapz, out, Et, c)
+    size(out) == size(Et) || throw(DimensionMismatch(
+        "PlasmaCumtrapz: output block is $(size(out)), field block is $(size(Et))"))
+    size(Et) == size(p.J) || error(
+        "PlasmaCumtrapz was given a $(join(size(Et), "x")) field block but its buffers "*
+        "are $(join(size(p.J), "x")). A batched response is handed the whole block, so "*
+        "its buffers have to match it: call "*
+        "`Nonlinear.rescale(response, spec, scaling, Et)` with a prototype of the block "*
+        "(every transform does this at construction).")
+    _npol(Et) in (1, 2) || error(
+        "PlasmaCumtrapz: a field block has one or two polarisation components along "*
+        "dimension 2, not $(_npol(Et)).")
+    if _plasma_threaded(Et)
+        nc = _ncols(Et)
+        #= Host arrays only, so the reshapes are free. Each task gets one column of
+           every buffer; the columns are independent, so the arithmetic in each is the
+           same as it would be in one call over the whole block. =#
+        o3, E3, rate3, frac3, Em3, J3, P3 =
+            map(x -> _as3d(x, nc), (out, Et, p.rate, p.fraction, p.Em, p.J, p.P))
+        Threads.@threads :dynamic for i in 1:nc
+            _plasma_block!(_col(o3, i), _col(E3, i), _col(rate3, i), _col(frac3, i),
+                           _col(Em3, i), _col(J3, i), _col(P3, i),
+                           p.ratedev, p.δt, p.preionfrac, c)
         end
     else
-        PlasmaScalar!(Plas, Et) # straight scalar case
-        out .+= ρ .* Plas.P
+        _plasma_block!(out, Et, p.rate, p.fraction, p.Em, p.J, p.P,
+                       p.ratedev, p.δt, p.preionfrac, c)
     end
+    out
+end
+
+_as3d(x::AbstractArray, nc) = reshape(x, size(x, 1), _npol(x), nc)
+_as3d(::Nothing, nc) = nothing
+
+_col(x::AbstractArray, i) = view(x, :, :, i:i)
+_col(::Nothing, i) = nothing
+
+#= The whole of the plasma response, for a block of any shape and on any array type: one
+   broadcast for the rate, three (scan + broadcast) cumulative integrals, one `ifelse`
+   broadcast for the ionisation loss and one for the output. `P` is the phase-modulation
+   buffer up to the last scan and the polarisation afterwards.
+
+   The ionisation rate, the fraction and the field magnitude have a singleton
+   polarisation axis and broadcast against both components. =#
+function _plasma_block!(out, E, rate, fraction, Em, J, P, ratefunc, δt, preionfrac, c)
+    Eref, cphase, closs, cout = c
+    _ratefield!(rate, Em, E, ratefunc, Eref)
+    Maths.cumtrapz_scan!(fraction, rate, δt)
+    pf = Luna.scalar(E, preionfrac)
+    @. fraction = pf + 1 - exp(-fraction)
+    cp = Luna.scalar(E, cphase)
+    @. P = fraction * cp * E
+    Maths.cumtrapz_scan!(J, P, δt)
+    _plasma_loss!(J, E, Em, rate, fraction, Luna.scalar(E, closs))
+    Maths.cumtrapz_scan!(P, J, δt)
+    co = Luna.scalar(E, cout)
+    @. out += co * P
+    out
+end
+
+# Scalar field: the rate is a function of the field itself.
+_ratefield!(rate, ::Nothing, E, ratefunc, Eref) =
+    Luna.Ionisation.ionrate!(rate, ratefunc, E, Eref)
+
+#= Two-component field: the magnitude of the field drives the ionisation, and the plasma
+   polarisation is then solved component by component. See C Tailliez et al 2020 New J.
+   Phys. 22 103038. =#
+function _ratefield!(rate, Em, E, ratefunc, Eref)
+    Ex = view(E, :, 1:1, ntuple(_ -> Colon(), ndims(E)-2)...)
+    Ey = view(E, :, 2:2, ntuple(_ -> Colon(), ndims(E)-2)...)
+    @. Em = hypot(Ex, Ey)
+    Luna.Ionisation.ionrate!(rate, ratefunc, Em, Eref)
+end
+
+#= The ionisation-loss term, as one `ifelse` broadcast rather than the branch of a loop.
+   Both arms are evaluated, so the division happens where the field is zero too; `ifelse`
+   is a select, not a branch, so the infinity it produces there is discarded rather than
+   propagated. =#
+_plasma_loss!(J, E, ::Nothing, rate, fraction, closs) =
+    @. J += ifelse(abs(E) > 0, closs*rate*(1-fraction)/E, zero(E))
+
+function _plasma_loss!(J, E, Em, rate, fraction, closs)
+    @. J += ifelse(Em > 0, closs*rate*(1-fraction)/Em^2*E, zero(E))
 end
 
 "Raman polarisation response type"
