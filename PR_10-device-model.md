@@ -313,6 +313,19 @@ All CPU, all pass:
 | `test_grid.jl` | 88 pass | 5.5 s |
 | `test_polarisation.jl` | 15 pass | 0.2 s |
 | `test_polarisation_env.jl` | 4 pass | 5.7 s |
+| `test_vectorplasma.jl` | 2 pass | 34.3 s |
+| `test_linearprop.jl` | 2 pass | 1.5 s |
+| `test_polarisation_field.jl` | 8 pass | 1m17 |
+
+`using Luna` without Metal or CUDA installed was checked in a fresh process: neither is in
+`[deps]` (`Pkg.status` shows only `AbstractFFTs`, `Adapt` and `GPUArraysCore` of the three
+new-ish dependencies), `Luna.devicenames()` is empty, `Luna.device()` is
+`DeviceSpec(Array, Float64)`, and `prop_capillary` runs. With `using Metal` in the same
+process the extension registers, `settings["device"]` becomes `:auto` and `Luna.device()`
+is `DeviceSpec(MtlArray, Float32)`; `Luna.set_device(:cpu)` opts back out.
+
+The documentation build (`include("docs/make.jl")`) reports the same six pre-existing
+unresolved `@ref`s it did on the base branch, and none from this branch.
 
 Two existing tests called `NonlinearRHS.to_time!` with the forward plan
 (`test_interface.jl:426`, `test_freespace.jl:404`) and now pass the transform's `IFT`.
