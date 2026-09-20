@@ -260,10 +260,18 @@ the per-quantity breakdown and a `TOLERANCES` literal to paste into `tolerances.
 the gate's comparison, exclusions included, so its output pastes in unchanged.
 
 In the `:fixed` mode `Eω` is at the 1e-12 floor for every case but `multimode_field_plasma`
-(1.2e-11, in the weakest mode). In the `:adaptive` mode `Eω` runs from the floor to 8.7e-07,
-and the `:stats` class is looser, up to 5.3e-04, because the statistics are recorded per
+(6.7e-12, in the weakest mode). In the `:adaptive` mode `Eω` runs from the floor to 4.8e-03,
+and the `:stats` class is looser, up to 7.3e-02, because the statistics are recorded per
 step. The reasons for every number above the floor are in the header comment of
 `tolerances.jl`.
+
+The four ionising cases are the loose ones in the `:adaptive` mode, because the electron
+density feeds back into the step-size controller. `modeavg_field_plasma` does not have a
+reproducible adaptive step sequence at all: one ulp at the input moves it from 92 accepted
+steps to 98. Its `:stats` tolerance is therefore borrowed from the loosest of the four
+(7.3e-02) rather than measured, and a branch which moves the plasma arithmetic at rounding
+level should expect that row to fail on the step count and say so. Its `:fixed` mode is at
+the floor and is the row that measures the case.
 
 Read the table `test/test_regression.jl` prints, not only its pass/fail: a case that moves
 from 0 to 1e-9 in the `:fixed` mode is a real change even if it is inside the tolerance.

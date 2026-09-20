@@ -416,8 +416,17 @@ const CASES = Case[
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=200e-9,
                    plasma=false, thg=false),
 
-    capillary_case("modeavg_field_plasma", A_CAP, L_CAP, :He, 1.0;
-                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
+    #= The four plasma cases are argon at 0.1 bar rather than helium at 1 bar, and at
+       hundreds of µJ rather than 800 nJ. Review round 1 of gpu/13-plasma established
+       from the baseline files that the original parameters ionise nothing at all --
+       `maximum(stats/electrondensity)` was exactly 0.0 in all four cases and both modes,
+       so the plasma response contributed nothing and the cases were blind to every
+       change to it. These parameters give a peak ionised fraction of 0.1-0.8 %, which
+       shows up in the field, and are the ones the review measured (gpu-13-plasma-1.md,
+       "Recommended replacement parameters"). Everything else about the cases -- core
+       radius, length, λ0, λlims, trange, τfwhm -- is unchanged. =#
+    capillary_case("modeavg_field_plasma", A_CAP, L_CAP, :Ar, 0.1;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=300e-6,
                    plasma=true, PPT_options=NOCACHE),
 
     capillary_case("modeavg_field_raman", A_CAP, L_CAP, :N2, 0.5;
@@ -428,14 +437,14 @@ const CASES = Case[
 
     #= ADK rather than PPT. `makeplasma!` takes the model as a `Symbol`, and the default for
        a noble gas is `:PPT`, so nothing else in the matrix reaches `Ionisation.IonRateADK`. =#
-    capillary_case("modeavg_field_adk", A_CAP, L_CAP, :He, 1.0;
-                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
+    capillary_case("modeavg_field_adk", A_CAP, L_CAP, :Ar, 0.1;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=300e-6,
                    plasma=:ADK),
 
     #= Elliptically polarised input: two polarisation components, so the vector forms of the
        Kerr and plasma responses and a two-mode `TransModal`. =#
-    capillary_case("modeavg_field_vector", A_CAP, L_CAP, :He, 1.0;
-                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
+    capillary_case("modeavg_field_vector", A_CAP, L_CAP, :Ar, 0.1;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=150e-6,
                    polarisation=0.5, plasma=true, PPT_options=NOCACHE),
 
     capillary_case("modeavg_env_kerr", A_CAP, L_CAP, :He, 1.0;
@@ -456,8 +465,8 @@ const CASES = Case[
 
     lowlevel_case("gnlse_raman_shock", GNLSE_LENGTH, setup_gnlse_raman_shock),
 
-    capillary_case("multimode_field_plasma", A_CAP, L_CAP, :He, 1.0;
-                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=800e-9,
+    capillary_case("multimode_field_plasma", A_CAP, L_CAP, :Ar, 0.1;
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=150e-6,
                    modes=4, plasma=true, PPT_options=NOCACHE),
 
     lowlevel_case("radial_field_kerr", L_FREE, setup_radial_field),
