@@ -56,8 +56,15 @@ function prepare(case)
         Eω, grid, linop, transform, FT, output = case.prepare()
         dz = case.zmax/RegressionCases.NSTEPS
         Et = FT \ Eω
-        absorber = Boundaries.setup(get(case.runkwargs, :boundary, :rate),
-                                    grid, transform, linop, Et, FT, output, 0.0, dz, dz)
+        #= `case.runkwargs` carries the same four keys `Interface.boundary_kwargs` forwards
+           to `Luna.run`. `:boundary` is positional to `Boundaries.setup` and the other three
+           are keywords under different names, so they are mapped rather than splatted. =#
+        kw = case.runkwargs
+        absorber = Boundaries.setup(get(kw, :boundary, :rate),
+                                    grid, transform, linop, Et, FT, output, 0.0, dz, dz;
+                                    N=get(kw, :boundary_N, Boundaries.DEFAULT_N),
+                                    ℓ=get(kw, :boundary_length, nothing),
+                                    collar=get(kw, :tcollar, Boundaries.DEFAULT_TCOLLAR))
         (Eω, absorber.linop, transform, min(dz, absorber.max_dz))
     end
 end
@@ -69,7 +76,7 @@ end
 one evaluation of the nonlinear right-hand side.
 """
 function rhstime(case)
-    Eω, linop, transform, dz = prepare(case)
+    Eω, _, transform, _ = prepare(case)
     nl = similar(Eω)
     b = @benchmarkable $transform($nl, $Eω, 0.0) seconds=BUDGET
     (length(Eω), bminimum(brun(b)).time/1e9)
