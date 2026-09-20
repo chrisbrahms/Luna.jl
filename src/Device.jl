@@ -414,6 +414,26 @@ const UNIT_SCALING = UnitScaling(1.0, 1.0)
 "`true` if this scaling is the identity, i.e. the state is in physical units."
 isunity(s::UnitScaling) = (s.Eref == 1.0) && (s.Pref == 1.0)
 
+"""
+    polscale(scaling, degree)
+
+The factor a nonlinear response of polynomial degree `degree` in the electric field
+carries when the state is expressed in the units of `scaling`.
+
+A response contributes ``P = c E^n`` in physical units. With ``E = E_{ref} e`` and
+``p = P/(P_{ref} E_{ref})`` the same response contributes
+``p = c E_{ref}^{n-1}/P_{ref}\\,e^n``, so the coefficient its kernel needs is
+`c * polscale(scaling, n)`. The Kerr responses are cubic (`n = 3`); a ``χ^{(2)}``
+response is quadratic (`n = 2`).
+
+Exactly `1` for every `Float64` run, where `Eref == Pref == 1`, so multiplying by it
+changes nothing on the default CPU path.
+
+A response with no single polynomial degree (an ionisation rate, the plasma current)
+scales its intermediates individually instead; see the developer guide.
+"""
+polscale(s::UnitScaling, degree::Integer) = s.Eref^(degree-1)/s.Pref
+
 Base.show(io::IO, s::UnitScaling) = print(io, "UnitScaling(Eref=$(s.Eref), Pref=$(s.Pref))")
 
 """

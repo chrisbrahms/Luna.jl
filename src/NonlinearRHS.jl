@@ -133,18 +133,100 @@ end
 # response, so including noise in the field passed to all response functions is physically
 # reasonable. The noise meaningfully affects only Kerr and Raman processes, as intended.
 """
-    Et_to_Pt!(Pt, Et, responses, density)
+    Et_to_Pt!(Pt, Et, responses, density; scaling=UNIT_SCALING)
+    Et_to_Pt!(Pt, Et, responses, density, idcs; scaling=UNIT_SCALING)
 
-Accumulate responses induced by Et in Pt.
+Accumulate the nonlinear polarisation induced by the time-domain field block `Et` into
+`Pt`, one term per response, in the order the responses are given.
+
+`Et` is `(nt,)`, `(nt, npol)` or `(nt, npol, ncols...)`; `idcs`, where a transform has
+more than one column, indexes the axes past the polarisation one. `density` is a number,
+or a vector with one entry per gas of a mixture, in which case `responses` is a tuple of
+tuples, one per gas. `scaling` is the [`Luna.UnitScaling`](@ref) the state and the
+polarisation buffer are expressed in.
+
+Each response is applied according to its
+[`Nonlinear.kind`](@ref Luna.Nonlinear.kind):
+
+- consecutive **pointwise** responses (scalar or vector, and across the gases of a
+  mixture) are evaluated as **one** fused broadcast, which sums their per-sample
+  contributions in the broadcast body. No intermediate buffer, one pass over the block
+  for the whole group, and it runs wherever the block does.
+- a **batched** response is called once with the whole block.
+- a **columnwise** response is called once per column, on the host. On a device this is
+  refused.
+
+The first group written *assigns* into `Pt` instead of zero-filling it and accumulating,
+which is one pass over the block fewer. Everything after it accumulates, in tuple order,
+so the sequence of additions each element sees is the one the per-response loop produced
+— up to the sign of an exact zero, which `0 + (-0.0)` turned into `+0.0` and the
+assignment does not.
+
+A `responses` collection which is not a tuple (or a tuple of tuples for a mixture) falls
+back to the historical per-response loop, unfused.
 """
-function Et_to_Pt!(Pt, Et, responses, density::Number)
+function Et_to_Pt!(Pt, Et, responses, density, idcs...; scaling=UNIT_SCALING)
+    _et_to_pt!(Pt, Et, _resppairs(responses, density), responses, density, scaling,
+               idcs...)
+end
+
+#= Pairing each response with the density it sees turns the flat and the gas-mixture
+   cases into the same list, so a mixture's Kerr responses fuse into one broadcast with
+   their per-gas coefficients summed in its body, exactly as several responses of one gas
+   do. `nothing` means "not a tuple": keep the historical loop. =#
+_resppairs(responses::Tuple, density::Number) = map(r -> (r, density), responses)
+
+function _resppairs(responses::Tuple{Vararg{Tuple}}, density::AbstractVector)
+    length(responses) == length(density) || throw(DimensionMismatch(
+        "$(length(responses)) response tuples for $(length(density)) densities"))
+    _flatpairs(responses, density, 1)
+end
+
+_resppairs(responses, density) = nothing
+
+_flatpairs(::Tuple{}, density, i) = ()
+_flatpairs(rs::Tuple, density, i) =
+    (map(r -> (r, density[i]), first(rs))..., _flatpairs(Base.tail(rs), density, i+1)...)
+
+function _et_to_pt!(Pt, Et, ::Nothing, responses, density, scaling, idcs...)
+    #= The legacy loop calls each response on the columnwise contract, which is physical
+       SI units: it cannot carry a unit scaling. Nothing in Luna reaches it in a scaled
+       run (`TransModeAvg`, the only scaled transform, always holds a tuple), but a
+       low-level caller could. =#
+    isunity(scaling) || error(
+        "a response collection which is not a tuple is applied one response at a time on "*
+        "the columnwise contract, which is in physical units, so it cannot be used in a "*
+        "run with $(scaling). Pass the responses as a tuple.")
+    _et_to_pt_legacy!(Pt, Et, responses, density, idcs...)
+end
+
+function _et_to_pt!(Pt, Et, pairs::Tuple, responses, density, scaling, idcs...)
+    #= The number of polarisation components is resolved to a compile-time constant
+       before the responses are grouped, so that `kind(r, npol)` -- and with it which
+       responses fuse -- is known to the compiler. =#
+    npol = _npol(Et)
+    if npol == 1
+        _respgroups!(Pt, Et, pairs, scaling, Val(1), true, idcs...)
+    elseif npol == 2
+        _respgroups!(Pt, Et, pairs, scaling, Val(2), true, idcs...)
+    else
+        error("a nonlinear response block has 1 or 2 polarisation components, got $npol")
+    end
+    Pt
+end
+
+_npol(Et::AbstractArray{<:Any, 1}) = 1
+_npol(Et::AbstractArray) = size(Et, 2)
+
+# The historical per-response loop, for a `responses` collection which is not a tuple.
+function _et_to_pt_legacy!(Pt, Et, responses, density::Number)
     fill!(Pt, 0)
     for resp! in responses
         resp!(Pt, Et, density)
     end
 end
 
-function Et_to_Pt!(Pt, Et, responses, density::AbstractVector)
+function _et_to_pt_legacy!(Pt, Et, responses, density::AbstractVector)
     fill!(Pt, 0)
     for ii in eachindex(density)
         for resp! in responses[ii]
@@ -153,11 +235,108 @@ function Et_to_Pt!(Pt, Et, responses, density::AbstractVector)
     end
 end
 
-function Et_to_Pt!(Pt, Et, responses, density, idcs)
+function _et_to_pt_legacy!(Pt, Et, responses, density, idcs)
     for i in idcs
-        Et_to_Pt!(view(Pt, .., i), view(Et, .., i), responses, density)
+        _et_to_pt_legacy!(view(Pt, .., i), view(Et, .., i), responses, density)
     end
 end
+
+#= Walk the response list in order, taking the longest run of pointwise responses at a
+   time (one broadcast) and everything else one at a time. `firstgroup` is true while `Pt`
+   has not been written yet. =#
+_respgroups!(Pt, Et, ::Tuple{}, scaling, v::Val, firstgroup, idcs...) =
+    (firstgroup && fill!(Pt, 0); Pt)
+
+function _respgroups!(Pt, Et, pairs::Tuple, scaling, v::Val, firstgroup, idcs...)
+    fused, rest = _splitfused(pairs, v)
+    _respgroups_step!(Pt, Et, fused, rest, scaling, v, firstgroup, idcs...)
+end
+
+function _respgroups_step!(Pt, Et, ::Tuple{}, rest::Tuple, scaling, v::Val, firstgroup,
+                           idcs...)
+    firstgroup && fill!(Pt, 0)
+    r, ρ = rest[1]
+    _apply_unfused!(Pt, Et, Nonlinear.kind(r, v), r, ρ, idcs...)
+    _respgroups!(Pt, Et, Base.tail(rest), scaling, v, false, idcs...)
+end
+
+function _respgroups_step!(Pt, Et, fused::Tuple, rest::Tuple, scaling, v::Val, firstgroup,
+                           idcs...)
+    _fusedbroadcast!(Pt, Et, fused, scaling, v, firstgroup)
+    _respgroups!(Pt, Et, rest, scaling, v, false, idcs...)
+end
+
+# The longest prefix of `pairs` whose responses fuse, and the rest.
+_splitfused(pairs::Tuple, v::Val) = _splitfused(pairs, v, ())
+_splitfused(::Tuple{}, ::Val, acc) = (acc, ())
+_splitfused(pairs::Tuple, v::Val, acc) =
+    _splitfused(Nonlinear.kind(pairs[1][1], v), pairs, v, acc)
+_splitfused(::Union{Nonlinear.Pointwise, Nonlinear.VectorPointwise}, pairs, v, acc) =
+    _splitfused(Base.tail(pairs), v, (acc..., pairs[1]))
+_splitfused(::Nonlinear.ResponseKind, pairs, v, acc) = (acc, pairs)
+
+function _fusedbroadcast!(Pt, Et, fused::Tuple, scaling, ::Val{1}, firstgroup)
+    bc = _sumexprs(map(q -> Nonlinear.pointwise_expr(q[1], Et, q[2], scaling), fused))
+    _materialise!(Pt, bc, firstgroup)
+    Pt
+end
+
+#= Two components, two broadcasts. Luna's buffers are (nt, npol, ncols...), so the
+   polarisation index is the slow axis: a single broadcast writing an `SVector{2}` would
+   need a `reinterpret` of a contiguous leading axis of length 2, which this layout does
+   not have (GPU_PLAN.md section 4.3 assumed it did). Each component broadcast is still
+   fused across the whole group, which is where the saving is. =#
+function _fusedbroadcast!(Pt, Et, fused::Tuple, scaling, ::Val{2}, firstgroup)
+    Ex = selectdim(Et, 2, 1)
+    Ey = selectdim(Et, 2, 2)
+    _fusedcomponent!(selectdim(Pt, 2, 1), Et, Ex, Ey, fused, scaling, firstgroup, Val(1))
+    _fusedcomponent!(selectdim(Pt, 2, 2), Et, Ex, Ey, fused, scaling, firstgroup, Val(2))
+    Pt
+end
+
+function _fusedcomponent!(o, Et, Ex, Ey, fused::Tuple, scaling, firstgroup, p::Val)
+    bc = _sumexprs(map(q -> _componentexpr(q[1], Nonlinear.kind(q[1], Val(2)),
+                                           Et, Ex, Ey, q[2], scaling, p), fused))
+    _materialise!(o, bc, firstgroup)
+    o
+end
+
+_componentexpr(r, ::Nonlinear.Pointwise, Et, Ex, Ey, ρ, scaling, ::Val{p}) where {p} =
+    Nonlinear.pointwise_expr(r, selectdim(Et, 2, p), ρ, scaling)
+
+_componentexpr(r, ::Nonlinear.VectorPointwise, Et, Ex, Ey, ρ, scaling, p::Val) =
+    Base.broadcasted(_component(p), Nonlinear.vector_expr(r, Ex, Ey, ρ, scaling))
+
+_component(::Val{1}) = first
+_component(::Val{2}) = last
+
+# Left-associated, in the order the responses were given.
+_sumexprs(e::Tuple{Any}) = e[1]
+_sumexprs(e::Tuple) = Base.broadcasted(+, _sumexprs(Base.front(e)), e[end])
+
+_materialise!(dest, bc, firstgroup) =
+    firstgroup ? Base.materialize!(dest, bc) :
+                 Base.materialize!(dest, Base.broadcasted(+, dest, bc))
+
+_apply_unfused!(Pt, Et, ::Nonlinear.Batched, r, ρ) = r(Pt, Et, ρ)
+_apply_unfused!(Pt, Et, ::Nonlinear.Batched, r, ρ, idcs) = r(Pt, Et, ρ)
+
+function _apply_unfused!(Pt, Et, ::Nonlinear.Columnwise, r, ρ)
+    _refuse_on_device(Pt, r)
+    r(Pt, Et, ρ)
+end
+
+function _apply_unfused!(Pt, Et, ::Nonlinear.Columnwise, r, ρ, idcs)
+    _refuse_on_device(Pt, r)
+    for i in idcs
+        r(view(Pt, .., i), view(Et, .., i), ρ)
+    end
+    Pt
+end
+
+_refuse_on_device(Pt, r) = Utils.isdevice(Pt) && error(
+    "the nonlinear response $(typeof(r)) is evaluated column by column on the host, so "*
+    "it cannot be applied to a $(typeof(Pt)).")
 
 """
     TransModal
@@ -488,9 +667,9 @@ function (t::TransModeAvg)(nl, Eω, z)
     # normalisation factor (nlscale × √Aeff) so it enters in physical units.
     if !isnothing(t.Et_noise)
         @. t.Et_nl = t.Eto + t.Et_noise / sc
-        Et_to_Pt!(t.Pto, t.Et_nl, t.resp, t.densityfun(z))
+        Et_to_Pt!(t.Pto, t.Et_nl, t.resp, t.densityfun(z); scaling=t.scaling)
     else
-        Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z))
+        Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z); scaling=t.scaling)
     end
     @. t.Pto *= t.gv.towin
     to_freq!(nl, t.Pωo, t.Pto, t.FT)
