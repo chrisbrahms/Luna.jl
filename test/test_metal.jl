@@ -22,7 +22,8 @@
 import Test: @test, @testset, @test_throws
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
-             NonlinearRHS, PhysData, RK45, DeviceSpec, HostSpec
+             NonlinearRHS, PhysData, RK45, Stats, Boundaries, DeviceSpec, HostSpec,
+             UnitScaling, UNIT_SCALING
 import LinearAlgebra
 import GPUArraysCore
 import Adapt
@@ -48,19 +49,15 @@ const MetalSpec = DeviceSpec(MtlArray, Float32)
 # per step may do it.
 GPUArraysCore.allowscalar(false)
 
-#= An output which copies what the solver hands it down to the host. The real one
-   (`ScaledOutput`, which also unscales) is gpu/11's. =#
-struct ToHostM{O}
-    o::O
-end
-(h::ToHostM)(y, t, dt, yfun) = h.o(Array(y), t, dt, ti -> Array(yfun(ti)))
-(h::ToHostM)(args...; kwargs...) = h.o(args...; kwargs...)
-Base.getindex(h::ToHostM, k) = h.o[k]
-
-#= The same mode-averaged Kerr propagation on whichever spec is asked for. `boundary=:none`
-   because the absorbers are host code until gpu/11. =#
+#= The same mode-averaged Kerr propagation on whichever spec is asked for. `Luna.run`
+   wraps the output in `ScaledOutput` itself now (gpu/11), so this test file never needs
+   its own host-copy wrapper the way it did under gpu/10 -- `out`, the plain
+   `Output.MemoryOutput` this builds, already holds host, physical-unit data when the
+   propagation returns. `boundary=:none` by default; the `:rate` case (`RateAbsorber`,
+   `Boundaries.jl`) has its own testset below, since it is the whole point of this
+   branch. =#
 function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
-                   precision=nothing, thg=false)
+                   precision=nothing, thg=false, boundary=:none, stats=false)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15; thg)
@@ -82,10 +79,14 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                    constβ=true, device=spec, precision)
-    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
-    output = Utils.isdevice(Eω) ? ToHostM(out) : out
-    Luna.run(Eω, grid, linop, transform, FT, output;
-             zmax=flength, boundary=:none, init_dz=flength/20, rtol=1e-8)
+    #= Stats.jl is host-only: its EnvGrid plan_analytic plans an FFTW transform
+       directly on a copy of the given Eω, so construction needs a host-shaped
+       template, not the device state itself (found here, on real hardware). =#
+    shost = Utils.isdevice(Eω) ? Luna.tohost(Eω) : Eω
+    statsfun = stats ? Stats.default(grid, shost, m, linop, transform; gas) : Output.nostats
+    out = Output.MemoryOutput(0, flength, 3, statsfun)
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, init_dz=flength/20, rtol=1e-8)
     out, transform
 end
 
@@ -93,7 +94,8 @@ end
    only case exercising `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s
    host-buffer branch -- the two pieces which still upload from the host on every stage
    until gpu/23. Fixed steps, so the runs differ only in arithmetic. =#
-function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9)
+function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9,
+                           boundary=:none, stats=false)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
     coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
     m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
@@ -103,11 +105,15 @@ function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=8
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
     Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
                                    device=spec)
-    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
-    output = Utils.isdevice(Eω) ? ToHostM(out) : out
+    #= Stats.jl is host-only: its EnvGrid plan_analytic plans an FFTW transform
+       directly on a copy of the given Eω, so construction needs a host-shaped
+       template, not the device state itself (found here, on real hardware). =#
+    shost = Utils.isdevice(Eω) ? Luna.tohost(Eω) : Eω
+    statsfun = stats ? Stats.default(grid, shost, m, linop, transform; gas) : Output.nostats
+    out = Output.MemoryOutput(0, flength, 3, statsfun)
     dz = flength/20
-    Luna.run(Eω, grid, linop, transform, FT, output;
-             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz)
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, init_dz=dz, min_dz=dz, max_dz=dz)
     out, transform
 end
 
@@ -212,6 +218,21 @@ end
     prop! = RK45.make_prop!(linop, y)
     prop!(y, 0.0, 1e-4)
     @test all(isfinite, Array(y))
+
+    # gpu/11: the boundary kernels. αt/αxy mirrored to Float32 MtlArray, no stray Float64.
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    zmax = 1e-2
+    αt = Boundaries.temporal_rate(grid, zmax)
+    Et = Luna.todevice(MetalSpec, zeros(Float64, length(grid.t)))
+    FT = Utils.plan_ft(Et, 1)
+    Utils.plan_ift(FT)
+    Eωb = Luna.todevice(MetalSpec, rand(ComplexF64, length(grid.ω)))
+    ra = Boundaries.RateAbsorber(αt, Et, FT, (args...; kwargs...) -> nothing, 0.0)
+    ra(Eωb, zmax/20, zmax/20, nothing)
+    @test all(isfinite, Array(Eωb))
+    la = Boundaries.LegacyAbsorber(grid, Et, FT, (args...; kwargs...) -> nothing)
+    la(Eωb, zmax/20, zmax/20, nothing)
+    @test all(isfinite, Array(Eωb))
 end
 
 @testset "mode-averaged Kerr on Metal" begin
@@ -246,10 +267,10 @@ end
 
     href, _ = metalcase(Grid.RealGrid, HostSpec(); pres=0.3)
     dref, dtr = metalcase(Grid.RealGrid, MetalSpec; pres=0.3)
-    Eref = dtr.scaling.Eref
+    # ScaledOutput unscales on the way into the output now: no manual `* Eref` here
     for idx in axes(href["Eω"], 2)
         h = href["Eω"][:, idx]
-        d = ComplexF64.(dref["Eω"][:, idx]) .* Eref
+        d = ComplexF64.(dref["Eω"][:, idx])
         @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
     end
 end
@@ -271,12 +292,81 @@ end
     end
 end
 
-#= Finding 1 of review round 1: loading Metal sets settings["device"] = :auto for the
-   whole process, and the simple interface is not device-capable in this branch. It must
-   therefore give the same answer whatever the setting says, which is what
-   `Interface` passing `device=Luna.HostSpec()` guarantees until gpu/11 plumbs the
-   keywords through. =#
-@testset "the simple interface stays on the CPU" begin
+#= gpu/11's exit criteria: RateAbsorber and the default statistics on Metal, low-level
+   interface, both constant and z-dependent operators. Eω unscaled and on the host
+   already (`Luna.run`'s ScaledOutput); the energy statistic is computed from a host copy
+   on both paths and should agree closely even though it is itself derived from Eω. =#
+@testset "boundaries and default statistics on Metal" begin
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        href, htr = metalcase(GT, DeviceSpec(Array, Float32); boundary=:rate, stats=true)
+        dref, dtr = metalcase(GT, MetalSpec; boundary=:rate, stats=true)
+        for idx in axes(href["Eω"], 2)
+            h = href["Eω"][:, idx]
+            d = dref["Eω"][:, idx]
+            @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+        end
+        @test isapprox(dref["stats"]["energy"], href["stats"]["energy"]; rtol=1e-3)
+        @test length(dref["stats"]["z"]) == length(href["stats"]["z"])
+    end
+
+    hgrad, _ = metalgradientcase(DeviceSpec(Array, Float32); boundary=:rate, stats=true)
+    dgrad, _ = metalgradientcase(MetalSpec; boundary=:rate, stats=true)
+    for idx in axes(hgrad["Eω"], 2)
+        h = hgrad["Eω"][:, idx]
+        d = dgrad["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    end
+    @test isapprox(dgrad["stats"]["energy"], hgrad["stats"]["energy"]; rtol=1e-3)
+end
+
+#= gpu/11's actual exit criterion: `prop_capillary` itself, unmodified apart from the new
+   keywords, runs on the GPU with the boundaries and the default statistics -- constant
+   and gradient pressure, `:auto` (what a plain `using Metal` sets) as well as an explicit
+   `device=MetalSpec`. Compared against the Float32 CPU path (`precision=Float32`, the
+   default `device`), not the Float64 one: what is being tested here is the device path,
+   the precision difference is `test_device.jl`'s "Float32 on the CPU". =#
+@testset "prop_capillary on Metal" begin
+    capkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
+             trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=false)
+
+    href = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; capkw..., precision=Float32)
+    dref = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; capkw..., device=MetalSpec)
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = dref["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    end
+    @test isapprox(dref["stats"]["energy"], href["stats"]["energy"]; rtol=1e-3)
+
+    # a pressure gradient
+    hgrad = Luna.prop_capillary(125e-6, 1e-2, :He, (1.0, 0.0); capkw..., precision=Float32)
+    dgrad = Luna.prop_capillary(125e-6, 1e-2, :He, (1.0, 0.0); capkw..., device=MetalSpec)
+    for idx in axes(hgrad["Eω"], 2)
+        h = hgrad["Eω"][:, idx]
+        d = dgrad["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    end
+    @test isapprox(dgrad["stats"]["energy"], hgrad["stats"]["energy"]; rtol=1e-3)
+
+    # `:auto` (what loading Metal sets) resolves to the same device as the explicit spec
+    old = get(Luna.settings, "device", nothing)
+    try
+        Luna.set_device(:auto)
+        @test Luna.device() === MetalSpec
+        aref = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; capkw...)
+        # Metal defaults to Float32; the saved field is unscaled but stays that precision
+        @test eltype(aref["Eω"]) === ComplexF32
+    finally
+        isnothing(old) ? delete!(Luna.settings, "device") :
+                         (Luna.settings["device"] = old)
+    end
+end
+
+#= `Luna.set_device(:cpu)` opts out, whatever `settings["device"]` is otherwise: this is
+   exit criterion 3. `prop_gnlse` and multimode/radial `prop_capillary` are not
+   device-capable (`_cpu_only!`, `Interface.jl`) and keep giving the CPU, Float64 answer
+   under `:auto` too -- refusing only when the caller explicitly asks for something else. =#
+@testset "Luna.set_device(:cpu) opts out" begin
     old = get(Luna.settings, "device", nothing)
     capargs = (125e-6, 1e-3, :He, 1.0)
     capkw = (; λ0=800e-9, energy=1e-9, τfwhm=10e-15, λlims=(300e-9, 2e-6),
@@ -289,17 +379,32 @@ end
         Luna.set_device(:cpu)
         ocap = Luna.prop_capillary(capargs...; capkw...)
         ognlse = Luna.prop_gnlse(0.1, 1e-3, [0.0, 0.0, -1e-26]; gnlsekw...)
+        @test eltype(ocap["Eω"]) === ComplexF64
+        @test eltype(ognlse["Eω"]) === ComplexF64
 
         Luna.set_device(:auto)
         @test Luna.device() === MetalSpec # the GPU really is selected globally
-        dcap = Luna.prop_capillary(capargs...; capkw...)
+        # prop_gnlse is not device-capable and always refuses anything but the CPU
+        @test_throws ErrorException Luna.prop_gnlse(0.1, 1e-3, [0.0, 0.0, -1e-26];
+                                                     gnlsekw..., device=MetalSpec)
+        # ... but is untouched when device is left at its (CPU-resolving) default
         dgnlse = Luna.prop_gnlse(0.1, 1e-3, [0.0, 0.0, -1e-26]; gnlsekw...)
-
-        # Same answer, on the host, in double precision
-        @test eltype(dcap["Eω"]) === ComplexF64
-        @test dcap["Eω"] == ocap["Eω"]
-        @test eltype(dgnlse["Eω"]) === ComplexF64
         @test dgnlse["Eω"] == ognlse["Eω"]
+
+        # explicitly asking for the CPU under :auto still gives the CPU
+        dcap = Luna.prop_capillary(capargs...; capkw..., device=:cpu)
+        @test dcap["Eω"] == ocap["Eω"]
+
+        #= Multimode propagation is not device-capable and must stay on the CPU by
+           default under :auto too -- it must not turn a working run into an error just
+           because a GPU package happens to be loaded (the bug an earlier version of
+           this branch had: `device`'s default resolved through `:auto` even for paths
+           that can never honour it). =#
+        om = Luna.prop_capillary(capargs...; capkw..., modes=4)
+        @test size(om["Eω"], 2) == 4
+        # ... but an explicit device request for multimode still errors
+        @test_throws ErrorException Luna.prop_capillary(capargs...; capkw..., modes=4,
+                                                         device=MetalSpec)
     finally
         isnothing(old) ? delete!(Luna.settings, "device") :
                          (Luna.settings["device"] = old)
@@ -307,19 +412,15 @@ end
 end
 
 @testset "Metal refuses what it cannot run" begin
-    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
-    m = Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false)
-    aeff(z) = Modes.Aeff(m, z=z)
-    dens = z -> PhysData.density(:He, 1.0)
-    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)
-    linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, 800e-9)
-    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
-    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
-                                   constβ=true, device=MetalSpec)
-    out = ToHostM(Output.MemoryOutput(0, 1e-3, 3, Output.nostats))
-    # The absorbers are host scalar code until gpu/11
-    @test_throws ErrorException Luna.run(Eω, grid, linop, transform, FT, out;
-                                         zmax=1e-3, boundary=:rate)
+    # A response with no `rescale` method is refused in a scaled run (gpu/12's job)
+    @test_throws Exception Nonlinear.rescale(
+        (out, E, ρ) -> nothing, MetalSpec, UNIT_SCALING)
+
+    # multimode propagation is not device-capable through the simple interface either
+    @test_throws ErrorException Luna.prop_capillary(
+        125e-6, 1e-3, :He, 1.0; λ0=800e-9, energy=1e-9, τfwhm=10e-15,
+        λlims=(300e-9, 2e-6), trange=400e-15, saveN=3, plasma=false, shotnoise=false,
+        modes=4, device=MetalSpec)
 end
 
 end # have_metal

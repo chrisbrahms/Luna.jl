@@ -4,19 +4,18 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! warning "Work in progress: the simple interface is not device-capable yet"
-    This page describes what the device model does as of `gpu/10-device-model`, the first
-    branch of the GPU work. At this point only mode-averaged propagation with Kerr
-    responses runs on a device, through the **low-level** interface (`Luna.setup` /
-    `Luna.run`), and with `boundary=:none`.
-
-    `prop_capillary` and `prop_gnlse` deliberately stay on the CPU in double precision
-    whatever `Luna.settings["device"]` says, and give exactly the result they always did,
-    because the absorbing boundaries, the per-step statistics and every response but Kerr
-    are still host code. They gain `device` and `precision` keywords in `gpu/11`, together
-    with the absorbing boundaries and the output wrapper; plasma, Raman, χ⁽²⁾, radial,
-    free-space and multimode propagation follow after that. The page is completed in
-    `gpu/32-docs`.
+!!! warning "Work in progress: only mode-averaged Kerr propagation runs on a device"
+    This page describes what the device model does as of `gpu/11-boundaries-output`.
+    `prop_capillary` and `prop_gnlse` take `device` and `precision` keywords (below), and
+    for mode-averaged propagation with Kerr responses (`modes` a single mode; no plasma,
+    no Raman, no χ⁽²⁾) `prop_capillary` runs end to end on a device: the absorbing
+    boundaries (`boundary=:rate`, the default) and the default per-step statistics both
+    work now. Anything else -- multimode and radial propagation, `prop_gnlse`, and every
+    response but Kerr -- is still host code; `Luna.setup`/`Luna.run` refuse a device or a
+    reduced precision there rather than running it wrongly (or, for the simple interface,
+    error with a message naming the actual limitation). Free space and multimode
+    propagation, and the other nonlinear responses, follow in later branches; the page is
+    completed in `gpu/32-docs`.
 
 ## Enabling it
 
@@ -26,9 +25,9 @@ using Metal      # or: using CUDA
 ```
 
 Loading the GPU package registers the backend and sets `Luna.settings["device"] = :auto`
-**if the key is absent**, so a low-level script which has not said anything about devices
-starts using the GPU. (`prop_capillary` and `prop_gnlse` do not: see the warning above.)
-To opt out:
+**if the key is absent**, so a script which has not said anything about devices starts
+using the GPU -- including a plain `prop_capillary(...)` call, for the cases it can run
+on one (mode-averaged, Kerr only). To opt out:
 
 ```julia
 Luna.set_device(:cpu)
@@ -49,8 +48,26 @@ directly, which is how a non-default precision is requested:
 Luna.set_device(Luna.DeviceSpec(CUDA.CuArray, Float32))
 ```
 
-`Luna.setup` takes `device` and `precision` keywords which override the global setting for
-one run.
+`Luna.setup`, `prop_capillary` and `prop_gnlse` all take `device` and `precision`
+keywords which override the global setting for one call:
+
+```julia
+# Explicit, whatever Luna.settings["device"] says
+out = prop_capillary(125e-6, 0.1, :He, 1.0; λ0=800e-9, τfwhm=10e-15, energy=100e-9,
+                     plasma=false, raman=false, λlims=(200e-9, 3e-6), trange=200e-15,
+                     device=:metal)
+
+# Force the CPU for one call without touching the global setting
+out = prop_capillary(...; device=:cpu)
+```
+
+`prop_gnlse` accepts the same two keywords for a uniform call signature, but is not
+device- or reduced-precision-capable yet: it builds its own normalisation before the unit
+scaling is known, so anything other than the default (the CPU, `Float64`) errors.
+Multimode and radial propagation (`prop_capillary` with `modes` a collection) are the
+same: the keywords are accepted and validated, and a request that cannot be honoured
+errors naming the actual limitation, rather than running silently on the CPU or failing
+with an unrelated `MethodError`.
 
 ### Scans
 
@@ -99,14 +116,42 @@ Metal agrees with the `Float64` CPU path to 2.4e-7.
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-a device run has to use `boundary=:none` and an output which collects no per-step
-statistics; `Luna.run` says so rather than falling back silently.
+plasma, Raman and χ⁽²⁾ responses, and the radial, free-space and multimode transforms:
+`Luna.setup` refuses a device or a reduced precision for them, through the residency
+checks every transform and response makes, rather than running them wrongly.
+
+The absorbing boundaries (`boundary=:rate`, `:legacy` and `:none`) and the default
+statistics *do* run with a device state, for the mode-averaged transform:
+
+- `Boundaries.RateAbsorber`/`LegacyAbsorber` and the transverse collars are broadcasts
+  and reductions over mirrored arrays (`Boundaries.jl`), like everything else per-step.
+- Per-step statistics (`Stats.jl`) are still host code: the field is copied to the host
+  every accepted step to compute them, and `Luna.run` warns once when this happens. Use
+  `stats_period` to reduce how often they run (below), or `Output.nostats` to disable
+  them; device statistics (computing them without the copy) are `gpu/24`'s.
+- The output itself never sees a device array or a scaled one: `Luna.run` wraps it in
+  `Luna.ScaledOutput`, which copies to the host and, for a `Float32` run, unscales, before
+  handing it to `Output.MemoryOutput`/`HDF5Output`. A `Float32` run's saved field is
+  therefore in physical units already, and is `ComplexF32` -- `eltype(y)` is what the
+  output allocates with, not always `ComplexF64`.
 
 A nonlinear response which is a plain closure (the way an ad hoc response is usually
 written) still works on the default CPU path in double precision. On a device or in single
 precision it is refused, because its coefficients cannot be rescaled and its body is
 usually scalar code. The fallback which copies a column block to the host and runs it there
 is `gpu/12`.
+
+### `stats_period`
+
+```julia
+out = prop_capillary(...; stats_period=10)
+```
+
+Collects the default statistics every 10th accepted step instead of every step
+(`Output.PeriodicStats`). The recorded statistics arrays are correspondingly shorter; the
+saved field (`saveN`, `out["Eω"]`) is unaffected. Worth raising on a device, where
+per-step statistics force a host copy every accepted step regardless of how often the
+propagation actually saves the field.
 
 ## Performance
 

@@ -265,7 +265,11 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                    constβ=true, device=spec, precision)
-    statsfun = stats ? Stats.default(grid, Eω, m, linop, transform; gas) : Output.nostats
+    #= Stats.jl is host-only: its EnvGrid plan_analytic builds an FFTW plan directly on
+       a copy of the given Eω, so construction needs a host-shaped template, not the
+       (possibly device) state itself. See Interface.jl's prop_capillary_args. =#
+    shost = Utils.isdevice(Eω) ? Luna.tohost(Eω) : Eω
+    statsfun = stats ? Stats.default(grid, shost, m, linop, transform; gas) : Output.nostats
     out = Output.MemoryOutput(0, flength, 3, statsfun)
     Luna.run(Eω, grid, linop, transform, FT, out;
              zmax=flength, boundary, init_dz=flength/20, rtol=1e-8)

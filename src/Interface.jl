@@ -366,13 +366,16 @@ If `raman` is `true`, then the following options apply:
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
 - `device`: where to run: `:cpu`, `:auto`, `:metal`, `:cuda` or a [`Luna.DeviceSpec`](@ref).
-    Defaults to `Luna.device_request()`, i.e. `Luna.settings["device"]` as the user set
-    it -- `:cpu` if nothing was set and nothing loaded, `:auto` once a GPU package has
-    been `using`d. Only mode-averaged propagation with Kerr responses (`modes` a single
-    mode, no plasma, no Raman, no χ⁽²⁾) can actually run on a device; anything else
-    resolves to the CPU regardless of this keyword, or errors if `device`/`precision` was
-    passed explicitly and cannot be honoured (multimode and radial propagation, and
-    [`prop_gnlse`](@ref)). See the "Running on a GPU" page (`docs/src/gpu.md`).
+    `nothing` (the default) means "not specified": for mode-averaged propagation with
+    Kerr responses (`modes` a single mode, no plasma, no Raman, no χ⁽²⁾ -- the only case
+    that can actually run on a device) it becomes `Luna.device_request()`, i.e.
+    `Luna.settings["device"]` as the user set it (`:cpu` if nothing was set and nothing
+    loaded, `:auto` once a GPU package has been `using`d); for anything else it stays on
+    the CPU, whatever `Luna.settings["device"]` says, exactly as before this keyword
+    existed. An *explicit* `device`/`precision` request which cannot be honoured
+    (multimode and radial propagation, and [`prop_gnlse`](@ref)) errors naming the
+    limitation, rather than being silently narrowed to the CPU or failing with an
+    unrelated `MethodError`. See the "Running on a GPU" page (`docs/src/gpu.md`).
 - `precision`: `Float32` to run in reduced precision (on the CPU or on a device),
     `Float64` for double, `nothing` (default) for whatever `device` resolves to
     normally (`Float64` on the CPU, `Float32` on Metal). A `Float32` run is scaled (see
@@ -437,7 +440,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
                         boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR,
-                        device=Luna.device_request(), precision=nothing, stats_period=1)
+                        device=nothing, precision=nothing, stats_period=1)
 
     # do we have energy in the orthogonal polarisation states, or just the fundamental?
     # if so, we need to treat double the number of modes
@@ -463,9 +466,24 @@ function prop_capillary_args(radius, flength, gas, pressure;
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
     inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
+    #= `device=nothing` means "not specified". For mode-averaged propagation (`mode_s`
+       a single mode, the only device-capable case) that resolves to
+       `Luna.device_request()`, i.e. `Luna.settings["device"]` as the user set it -- so an
+       untouched call follows a loaded GPU package exactly as the low-level interface
+       does. For anything else (multimode, radial) it resolves to the CPU regardless of
+       `Luna.settings["device"]`, exactly as gpu/10 hardcoded, so that loading a GPU
+       package does not turn a silent, working multimode run into an error: only an
+       *explicit* `device`/`precision` request reaches `_cpu_only!`'s check. =#
+    devicereq = if !isnothing(device)
+        device
+    elseif mode_s isa Modes.AbstractMode
+        Luna.device_request()
+    else
+        Luna.HostSpec()
+    end
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
-                                     noise_field, thg, device, precision)
+                                     noise_field, thg, device=devicereq, precision)
     #= Stats.jl is host-only code (out of this branch's scope beyond the host-copy
        warning and PeriodicStats): `Stats.default`/`collect_stats` use their `Eω`
        argument only to size and type their internal buffers at construction, but for an
@@ -959,7 +977,7 @@ end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
                noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.device_request(), precision=nothing)
+               device=Luna.HostSpec(), precision=nothing)
     _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
@@ -971,7 +989,7 @@ end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
                noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.device_request(), precision=nothing)
+               device=Luna.HostSpec(), precision=nothing)
     _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
@@ -1134,8 +1152,13 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
                         boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR,
-                        device=Luna.device_request(), precision=nothing, stats_period=1)
-    #= Unlike `prop_capillary`, `prop_gnlse` builds its own normalisation
+                        device=Luna.HostSpec(), precision=nothing, stats_period=1)
+    #= `device` defaults to the CPU outright (not `Luna.device_request()`): prop_gnlse is
+       never device-capable, so it must keep giving the CPU answer whatever
+       `Luna.settings["device"]` says, exactly as gpu/10 hardcoded, and only refuse when
+       the caller explicitly asks for something else (`_cpu_only!`, just below).
+
+       Unlike `prop_capillary`, `prop_gnlse` builds its own normalisation
        (`norm_mode_average_gnlse`) before the unit scaling is known (`Luna.setup`
        derives it from the peak of the input field, once the transform is built), so it
        cannot yet be handed a `spec`/`scaling` matching a real device or a reduced

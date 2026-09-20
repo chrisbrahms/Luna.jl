@@ -114,7 +114,57 @@ the smallest):
 Unscaled, the 0.3 bar coefficient is subnormal and Metal flushes it to zero; scaled, it is
 eighteen orders of magnitude above the subnormal threshold.
 
-The unscaling happens in one place only, the output wrapper, which is `gpu/11`'s.
+The unscaling happens in one place only, the output boundary.
+
+## The output and statistics boundary
+
+`Output.jl` stays device-unaware: `MemoryOutput`/`HDF5Output` know how to save an array
+and a dictionary, nothing about where the array lives or what units it is in. Two things
+make that possible.
+
+**[`Output.willsave`](@ref)`(o, y, t, dt)`** answers whether calling `o` right now would
+save at least one data point, without saving anything. It exists so that a wrapper can
+decide, cheaply, whether it is worth doing something expensive (a device-to-host copy)
+before the real call.
+
+**[`Luna.ScaledOutput`](@ref)** is that wrapper. `Luna.run` constructs one around the
+output handler whenever the state is on a device or the run is scaled (`E_ref != 1`,
+i.e. every `Float32` run, host or device); on the default CPU `Float64` path the handler
+is passed through unchanged. It holds two reusable host buffers in the state's element
+type (so a `Float32` run saves `Float32`, not `Float64`):
+
+- `ybuf`, the unscaled host copy of the per-step solution `y`, filled when the handler's
+  statistics need it (`Output.nostats` does not) or when an `HDF5Output`'s resume cache
+  does (gated by `willsave`, since the cache is written only on a save step);
+- `ibuf`, the unscaled host copy of a *saved* field, filled lazily inside the closure
+  `Luna.run`'s `stepfun` already passes as `yfun` — so a step which does not save costs
+  nothing, and an `HDF5Output`'s `while save` loop, which can call `yfun` several times
+  in one step, gets a distinct buffer from `ybuf`'s (the two can be needed together with
+  different contents: an `HDF5Output`'s cache write reads the step endpoint `y` after
+  possibly writing several interpolated `yfun(ts)` saves earlier in the same call).
+
+The stepper's own arrays are never modified: `ScaledOutput` only ever copies *into* its
+own buffers before handing them to the wrapped output. Multiplying by `E_ref` happens on
+the host, after the copy, and is skipped entirely when `E_ref == 1`.
+
+`MemoryOutput`/`HDF5Output` allocate their solution array with `eltype(y)`, which by the
+time it reaches them through `ScaledOutput` is the state's own precision (`ComplexF32` or
+`ComplexF64`), not a hardcoded `ComplexF64` — a `Float32` run therefore saves `Float32`.
+`HDF5Output`'s resume cache stores the same host, physical-unit array `ScaledOutput`
+copies for it, so `check_cache`'s result is always in physical units; `Luna.run` rescales
+it (dividing by the *new* run's `E_ref`, deterministic from the same input) before
+uploading it back to the state's array type. `HDF5Output`'s `cachehash` includes
+`eltype(y)`, so resuming a run in a different precision than the cache was written in is
+refused rather than silently misinterpreted.
+
+Per-step statistics (`Stats.jl`) are unchanged host code: they do a full inverse FFT and
+host reductions on whatever `y` `ScaledOutput` hands them, which on a device is a copy
+made every accepted step. `ScaledOutput` warns once per propagation when this happens.
+[`Output.PeriodicStats`](@ref) (`prop_capillary`'s/`prop_gnlse`'s `stats_period` keyword)
+reduces how often that copy and the statistics themselves run, by evaluating the wrapped
+function only every `period`-th accepted step and returning `nothing` in between —
+`MemoryOutput`/`HDF5Output` skip appending a `nothing` result rather than erroring on it.
+Device-capable statistics (skipping the copy) are `gpu/24`'s.
 
 ## The extension and hook mechanism
 
@@ -143,7 +193,9 @@ loaded, so it always precompiles the CPU path.
 - **`test/test_device.jl`** runs the device code paths on `JLArrays` with
   `allowscalar(false)`, against the host. It is part of `Pkg.test()`. Blind spots:
   `JLArrays` interprets its kernels on the host, so a stray `Float64` or a mixed
-  host/device broadcast passes.
+  host/device broadcast passes. `test/test_boundaries.jl` has its own, smaller JLArray
+  testset for `Boundaries.RateAbsorber`/`LegacyAbsorber` built directly (not through a
+  full propagation), gated the same way.
 - **`test/test_metal.jl`** is the hardware test, and the only thing which catches those.
   It is not part of the suite (Metal is never installed with Luna); it has its own CI job,
   which installs Metal into a separate environment.
