@@ -421,12 +421,23 @@ const CASES = Case[
        from the baseline files that the original parameters ionise nothing at all --
        `maximum(stats/electrondensity)` was exactly 0.0 in all four cases and both modes,
        so the plasma response contributed nothing and the cases were blind to every
-       change to it. These parameters give a peak ionised fraction of 0.1-0.8 %, which
-       shows up in the field, and are the ones the review measured (gpu-13-plasma-1.md,
+       change to it. These parameters give a peak ionised fraction of 0.03-0.4 %, and
+       three of the four are the ones the review measured (gpu-13-plasma-1.md,
        "Recommended replacement parameters"). Everything else about the cases -- core
-       radius, length, λ0, λlims, trange, τfwhm -- is unchanged. =#
+       radius, length, λ0, λlims, trange, τfwhm -- is unchanged.
+
+       This one is 175 µJ rather than the review's 300 µJ. At 300 µJ the adaptive run
+       has no reproducible step sequence: a one-ulp perturbation of the input takes it
+       from 92 accepted steps to 98, which the gate reports as a `step count` failure,
+       so no tolerance can be measured for its statistics. Measured on this branch
+       (adaptive steps unperturbed / perturbed by one ulp, peak ionised fraction):
+       300 µJ 92/98, 0.78 %; 250 µJ 77/86, 0.27 %; 200 µJ 48/46, 0.07 %;
+       175 µJ 38/38, 0.03 %; 150 µJ 31/30, 0.01 %; 125 µJ 28/28, 0.003 %;
+       100 µJ 25/25, 0.001 %. 175 µJ is the most strongly ionising energy whose step
+       count is reproducible, and it is reproducible at ±1, ±2 and ±8 ulp and at 1e-14.
+       The other three cases are stable at the review's energies. =#
     capillary_case("modeavg_field_plasma", A_CAP, L_CAP, :Ar, 0.1;
-                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=300e-6,
+                   λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=175e-6,
                    plasma=true, PPT_options=NOCACHE),
 
     capillary_case("modeavg_field_raman", A_CAP, L_CAP, :N2, 0.5;

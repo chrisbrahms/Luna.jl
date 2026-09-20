@@ -22,9 +22,9 @@
      to the operation that produced it, and nothing is excluded from it: the step sequence
      is imposed, so `stats/z` and `stats/dz` must match exactly.
    - `:fixed` mode, `:stats`, above the floor:
-     - `modeavg_field_plasma` 2.2e-12, from `stats/electrondensity`, and
-       `modeavg_field_adk` at the floor. The rates are exponential in the field amplitude,
-       so they amplify a one-ulp change by one to two orders of magnitude.
+     - `modeavg_field_plasma` and `modeavg_field_adk` are both at the floor, from
+       `stats/peak_ionisation_rate` (3.5e-15 and 5.7e-15). The rates are exponential in
+       the field amplitude, so they amplify a one-ulp change by an order of magnitude.
      - `modeavg_field_vector` 8.0e-11 and `multimode_field_plasma` 5.8e-11, from
        `stats/transverse_integral_error_rel`/`_abs`. These are `HCubature`'s own error
        estimates for the modal overlap integral: the adaptive quadrature subdivides
@@ -41,21 +41,18 @@
      quantity every later branch must not move.
    - The four ionising cases (`modeavg_field_plasma`, `modeavg_field_adk`,
      `modeavg_field_vector`, `multimode_field_plasma`, all argon at 0.1 bar since
-     `gpu/int-D`) are the exception in the `:adaptive` mode: ionisation feeds back into the
-     step-size controller, so a one-ulp change at the input moves the field by 4.8e-05
-     (`modeavg_field_plasma`) and 7.3e-07 (`multimode_field_plasma`), and the adaptive
-     tolerances that follow from that constrain nothing. Their `:fixed` mode is what
-     measures them.
-   - **`modeavg_field_plasma` in the `:adaptive` mode does not have a reproducible step
-     sequence at all.** One ulp at the input takes it from 92 accepted steps to 98, so
-     `sensitivity.jl` reports a `step count` failure and `Inf` for that class instead of a
-     number. `Inf` is not usable as a tolerance — it would make the step-count check, which
-     is meant to be a hard failure, pass — so the entry is 7.3e-02, the largest `:adaptive`
-     `:stats` sensitivity of the four ionising cases (`multimode_field_plasma`'s). The
-     consequence is that a branch which moves the plasma arithmetic at rounding level can
-     expect this one row to fail on the step count and has to say so: `gpu/int-D` itself
-     does, against `evanescent` and against `gpu/int-A` (92 steps against their 93). Its
-     `:fixed` mode (2.8e-15 in `Eω`) is unaffected and is the row that measures the case.
+     `gpu/int-D`) are the loose ones in the `:adaptive` mode: ionisation feeds back into
+     the step-size controller, so a one-ulp change at the input moves the field by 9.2e-09
+     to 7.3e-07 and the statistics by up to 7.3e-04. Their `:fixed` mode, where the step
+     sequence is imposed, is at or near the floor and is what measures them.
+   - The energy of `modeavg_field_plasma` is set by the same feedback. At the 300 µJ the
+     `gpu/13-plasma` review recommended, the adaptive step count is not reproducible: one
+     ulp at the input takes it from 92 accepted steps to 98, which is a `step count`
+     failure rather than a measurable sensitivity, and a borrowed tolerance would only
+     hide it (`Inf <= Inf` passes, so the step-count check, which is meant to be a hard
+     failure, would become a no-op). The case runs at 175 µJ instead: the most strongly
+     ionising energy whose adaptive step count is reproducible, at ±1, ±2 and ±8 ulp and
+     at 1e-14. The sweep behind that choice is in `cases.jl` next to the case.
    - Outside the ionising cases the loosest `:Eω` tolerances are `taper_field_kerr`
      8.7e-07 and `gradient_field_kerr` 2.6e-07, the two z-dependent cases: the operator is
      rebuilt at every stage, so where the stepper lands feeds back into the field itself.
@@ -81,8 +78,8 @@ const TOLERANCES = Dict{String, Dict{Symbol, Dict{Symbol, Float64}}}(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
         :adaptive  => Dict(:Eω => 2.3e-12, :stats => 2.1e-04)),
     "modeavg_field_plasma" => Dict(
-        :fixed     => Dict(:Eω => 1.0e-12, :stats => 2.2e-12),
-        :adaptive  => Dict(:Eω => 4.8e-03, :stats => 7.3e-02)),
+        :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
+        :adaptive  => Dict(:Eω => 9.2e-07, :stats => 1.2e-03)),
     "modeavg_field_raman" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
         :adaptive  => Dict(:Eω => 1.0e-12, :stats => 2.4e-09)),
