@@ -57,7 +57,7 @@ GPUArraysCore.allowscalar(false)
    `Boundaries.jl`) has its own testset below, since it is the whole point of this
    branch. =#
 function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
-                   precision=nothing, thg=false, boundary=:none, stats=false)
+                   precision=nothing, thg=false, boundary=:none, stats=false, fixed=false)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15; thg)
@@ -84,9 +84,21 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
        template, not the device state itself (found here, on real hardware). =#
     shost = Utils.isdevice(Eω) ? Luna.tohost(Eω) : Eω
     statsfun = stats ? Stats.default(grid, shost, m, linop, transform; gas) : Output.nostats
-    out = Output.MemoryOutput(0, flength, 3, statsfun)
-    Luna.run(Eω, grid, linop, transform, FT, out;
-             zmax=flength, boundary, init_dz=flength/20, rtol=1e-8)
+    out = Output.MemoryOutput(0, flength, 5, statsfun)
+    #= `fixed=true`: min_dz == max_dz == init_dz bypasses the step-size controller
+       (RK45.steplims!), so every difference between two runs is attributable to the
+       arithmetic rather than to a different sequence of steps -- the same reasoning as
+       the regression gate's own `:fixed` mode. Review round 1, finding 1: needed to keep
+       a tight (1e-4) tolerance meaningful once the state includes boundaries/statistics
+       and the run is long/strong enough for the Kerr effect to be visible. =#
+    dz = flength/20
+    if fixed
+        Luna.run(Eω, grid, linop, transform, FT, out;
+                 zmax=flength, boundary, init_dz=dz, min_dz=dz, max_dz=dz)
+    else
+        Luna.run(Eω, grid, linop, transform, FT, out;
+                 zmax=flength, boundary, init_dz=dz, rtol=1e-8)
+    end
     out, transform
 end
 
@@ -94,15 +106,15 @@ end
    only case exercising `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s
    host-buffer branch -- the two pieces which still upload from the host on every stage
    until gpu/23. Fixed steps, so the runs differ only in arithmetic. =#
-function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9,
-                           boundary=:none, stats=false)
+function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, energy=1e-6, flength=1e-2,
+                           λ0=800e-9, boundary=:none, stats=false, fixed=true)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
     coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
     m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
     aeff(z) = Modes.Aeff(m, z=z)
     resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
     linop, βfun! = LinearOps.make_linop(grid, m, λ0)
-    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
     Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
                                    device=spec)
     #= Stats.jl is host-only: its EnvGrid plan_analytic plans an FFTW transform
@@ -110,10 +122,15 @@ function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=8
        template, not the device state itself (found here, on real hardware). =#
     shost = Utils.isdevice(Eω) ? Luna.tohost(Eω) : Eω
     statsfun = stats ? Stats.default(grid, shost, m, linop, transform; gas) : Output.nostats
-    out = Output.MemoryOutput(0, flength, 3, statsfun)
+    out = Output.MemoryOutput(0, flength, 5, statsfun)
     dz = flength/20
-    Luna.run(Eω, grid, linop, transform, FT, out;
-             zmax=flength, boundary, init_dz=dz, min_dz=dz, max_dz=dz)
+    if fixed
+        Luna.run(Eω, grid, linop, transform, FT, out;
+                 zmax=flength, boundary, init_dz=dz, min_dz=dz, max_dz=dz)
+    else
+        Luna.run(Eω, grid, linop, transform, FT, out;
+                 zmax=flength, boundary, init_dz=dz, rtol=1e-8)
+    end
     out, transform
 end
 
@@ -292,70 +309,169 @@ end
     end
 end
 
+#= The rms spectral width of a save, and the ratio of the last save's to the first's, as
+   evidence that a comparison actually exercises the Kerr nonlinearity rather than mostly
+   linear dispersion (review round 1, finding 1: the original exit-criterion case, at the
+   brief's own parameters, broadens by only ×1.000 -- not visibly nonlinear). A crude,
+   grid-index-based second moment is enough for a ratio between two saves of the same run. =#
+function rmswidth(Eω)
+    p = abs2.(Eω)
+    s = sum(p)
+    idx = 1:length(p)
+    μ = sum(idx .* p)/s
+    sqrt(sum(@. (idx - μ)^2 * p)/s)
+end
+broadening(out) = rmswidth(out["Eω"][:, end])/rmswidth(out["Eω"][:, 1])
+
 #= gpu/11's exit criteria: RateAbsorber and the default statistics on Metal, low-level
-   interface, both constant and z-dependent operators. Eω unscaled and on the host
-   already (`Luna.run`'s ScaledOutput); the energy statistic is computed from a host copy
-   on both paths and should agree closely even though it is itself derived from Eω. =#
+   interface, both constant and z-dependent operators, against genuine CPU Float32 *and*
+   Float64 references (not Metal against itself -- review round 1, finding 1) and at the
+   brief's own fibre length (review round 1, finding 9: `1e-2` was a tenth of it). Fixed
+   steps (`fixed=true`, `min_dz == max_dz`) throughout, so the comparison is of arithmetic
+   and not of a different step sequence; a genuinely nonlinear case (He at 5 bar, 300 µJ,
+   which broadens the spectrum by about ×2, `metalcase`'s `energy`/`pres`) is included
+   alongside the brief's own (weakly nonlinear) parameters, so the boundaries and the
+   statistics are compared with the Kerr response actually doing something. Eω unscaled
+   and on the host already (`Luna.run`'s `ScaledOutput`); the energy statistic is computed
+   from a host copy on both paths and should agree closely even though it is itself
+   derived from Eω. =#
 @testset "boundaries and default statistics on Metal" begin
-    for GT in (Grid.RealGrid, Grid.EnvGrid)
-        href, htr = metalcase(GT, DeviceSpec(Array, Float32); boundary=:rate, stats=true)
-        dref, dtr = metalcase(GT, MetalSpec; boundary=:rate, stats=true)
-        for idx in axes(href["Eω"], 2)
-            h = href["Eω"][:, idx]
-            d = dref["Eω"][:, idx]
-            @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    for GT in (Grid.RealGrid, Grid.EnvGrid), (energy, pres) in ((100e-9, 1.0), (300e-6, 5.0))
+        h32, _ = metalcase(GT, DeviceSpec(Array, Float32);
+                           energy, pres, flength=0.1, boundary=:rate, stats=true, fixed=true)
+        h64, _ = metalcase(GT, HostSpec();
+                           energy, pres, flength=0.1, boundary=:rate, stats=true, fixed=true)
+        dm, _ = metalcase(GT, MetalSpec;
+                          energy, pres, flength=0.1, boundary=:rate, stats=true, fixed=true)
+        if GT === Grid.RealGrid
+            @test broadening(h64) > 1.5 || (energy, pres) == (100e-9, 1.0)
         end
-        @test isapprox(dref["stats"]["energy"], href["stats"]["energy"]; rtol=1e-3)
-        @test length(dref["stats"]["z"]) == length(href["stats"]["z"])
+        for idx in axes(h64["Eω"], 2)
+            @test maximum(abs, dm["Eω"][:, idx] .- h32["Eω"][:, idx]) /
+                  maximum(abs, h32["Eω"][:, idx]) < 1e-4
+            @test maximum(abs, dm["Eω"][:, idx] .- h64["Eω"][:, idx]) /
+                  maximum(abs, h64["Eω"][:, idx]) < 1e-4
+        end
+        @test isapprox(dm["stats"]["energy"], h32["stats"]["energy"]; rtol=1e-3)
+        @test length(dm["stats"]["z"]) == length(h32["stats"]["z"])
     end
 
-    hgrad, _ = metalgradientcase(DeviceSpec(Array, Float32); boundary=:rate, stats=true)
-    dgrad, _ = metalgradientcase(MetalSpec; boundary=:rate, stats=true)
-    for idx in axes(hgrad["Eω"], 2)
-        h = hgrad["Eω"][:, idx]
-        d = dgrad["Eω"][:, idx]
-        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    #= gradient, the brief's own (weak) parameters, fixed steps. A pressure gradient
+       redistributes the nonlinearity along z as the pressure falls, so it needs finer
+       step resolution than a constant-pressure run of the same energy to stay stable: at
+       20 fixed steps over the full 10 cm, both a strongly nonlinear gradient (300 µJ at
+       5 bar -- the same energy/pressure the constant-pressure "visible Kerr" case above
+       resolves cleanly) and the weaker one `metalgradientcase` defaults to previously
+       used produced `NaN`/`Inf` here; that is a resolution problem with the *fixed* step
+       count for that case, not a boundary or device defect -- the adaptive comparison
+       just below, at the same strongly nonlinear parameters and with the controller free
+       to refine the step size, is well behaved. =#
+    hgrad32, _ = metalgradientcase(DeviceSpec(Array, Float32);
+                                   energy=100e-9, pin=1.0, flength=0.1,
+                                   boundary=:rate, stats=true)
+    hgrad64, _ = metalgradientcase(HostSpec();
+                                   energy=100e-9, pin=1.0, flength=0.1,
+                                   boundary=:rate, stats=true)
+    dgrad, _ = metalgradientcase(MetalSpec;
+                                 energy=100e-9, pin=1.0, flength=0.1,
+                                 boundary=:rate, stats=true)
+    @test all(isfinite, hgrad32["Eω"]) && all(isfinite, dgrad["Eω"])
+    for idx in axes(hgrad64["Eω"], 2)
+        @test maximum(abs, dgrad["Eω"][:, idx] .- hgrad32["Eω"][:, idx]) /
+              maximum(abs, hgrad32["Eω"][:, idx]) < 1e-4
+        @test maximum(abs, dgrad["Eω"][:, idx] .- hgrad64["Eω"][:, idx]) /
+              maximum(abs, hgrad64["Eω"][:, idx]) < 1e-4
     end
-    @test isapprox(dgrad["stats"]["energy"], hgrad["stats"]["energy"]; rtol=1e-3)
+    @test isapprox(dgrad["stats"]["energy"], hgrad32["stats"]["energy"]; rtol=1e-3)
+
+    #= A visibly nonlinear gradient (300 µJ, 5 bar), adaptive (the step-size controller
+       genuinely active, `fixed=false`, well-resolved there -- see the comment above) with
+       a documented looser tolerance: review round 1 measured 1.86e-4 for a strongly
+       nonlinear adaptive gradient case (above the 1e-4 the other comparisons here use)
+       because Float32 rounding perturbs the controller's accept/reject decisions, and the
+       two runs can end up at slightly different step counts as well as slightly
+       different arithmetic -- not a device defect, since every fixed-step comparison in
+       this testset agrees to 1e-4. =#
+    hgrad_a, _ = metalgradientcase(DeviceSpec(Array, Float32);
+                                   energy=300e-6, pin=5.0, flength=0.1,
+                                   boundary=:rate, stats=true, fixed=false)
+    dgrad_a, _ = metalgradientcase(MetalSpec;
+                                   energy=300e-6, pin=5.0, flength=0.1,
+                                   boundary=:rate, stats=true, fixed=false)
+    @test all(isfinite, hgrad_a["Eω"]) && all(isfinite, dgrad_a["Eω"])
+    for idx in axes(hgrad_a["Eω"], 2)
+        @test maximum(abs, dgrad_a["Eω"][:, idx] .- hgrad_a["Eω"][:, idx]) /
+              maximum(abs, hgrad_a["Eω"][:, idx]) < 5e-4
+    end
 end
 
 #= gpu/11's actual exit criterion: `prop_capillary` itself, unmodified apart from the new
    keywords, runs on the GPU with the boundaries and the default statistics -- constant
    and gradient pressure, `:auto` (what a plain `using Metal` sets) as well as an explicit
-   `device=MetalSpec`. Compared against the Float32 CPU path (`precision=Float32`, the
-   default `device`), not the Float64 one: what is being tested here is the device path,
-   the precision difference is `test_device.jl`'s "Float32 on the CPU". =#
+   `device=MetalSpec`.
+
+   Review round 1, finding 1: `href` must be built with an *explicit* `device`, never
+   left to resolve through the sentinel -- `test_metal.jl` runs with Metal loaded, so
+   `Luna.settings["device"]` is `:auto` throughout the file except where a testset
+   deliberately overrides it, and `precision=Float32` alone (the original code here) does
+   not select the CPU: it resolves through the same `:auto` and lands on Metal, so the
+   comparison was Metal against itself. Both a genuine CPU Float32 and a genuine CPU
+   Float64 reference are used below. Finding 9: the fibre length is the brief's own
+   (`0.1` m, not a tenth of it). At these parameters (the brief's own: 100 nJ, Kerr only)
+   the spectrum barely broadens (`broadening` above is ~1.00), so this is a weakly
+   nonlinear case by construction; `test_metal.jl`'s "boundaries and default statistics on
+   Metal" carries the case with the Kerr effect clearly visible (×2 broadening) and fixed
+   steps, which is where the tight 1e-4 tolerance is actually exercised by the
+   nonlinearity. The constant-pressure comparisons here measure in the 1e-6-1e-5 range in
+   practice (adaptive stepping, but the nonlinearity is too weak for that to matter at
+   this energy); the gradient one needs a separate, looser, documented tolerance against
+   the Float64 reference specifically -- see the comment at that assertion. =#
 @testset "prop_capillary on Metal" begin
     capkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
              trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=false)
 
-    href = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; capkw..., precision=Float32)
-    dref = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; capkw..., device=MetalSpec)
-    for idx in axes(href["Eω"], 2)
-        h = href["Eω"][:, idx]
-        d = dref["Eω"][:, idx]
-        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    h32 = Luna.prop_capillary(125e-6, 0.1, :He, 1.0; capkw..., device=DeviceSpec(Array, Float32))
+    h64 = Luna.prop_capillary(125e-6, 0.1, :He, 1.0; capkw..., device=HostSpec())
+    dm = Luna.prop_capillary(125e-6, 0.1, :He, 1.0; capkw..., device=MetalSpec)
+    for idx in axes(h64["Eω"], 2)
+        @test maximum(abs, dm["Eω"][:, idx] .- h32["Eω"][:, idx]) /
+              maximum(abs, h32["Eω"][:, idx]) < 1e-4
+        @test maximum(abs, dm["Eω"][:, idx] .- h64["Eω"][:, idx]) /
+              maximum(abs, h64["Eω"][:, idx]) < 1e-4
     end
-    @test isapprox(dref["stats"]["energy"], href["stats"]["energy"]; rtol=1e-3)
+    @test isapprox(dm["stats"]["energy"], h32["stats"]["energy"]; rtol=1e-3)
 
-    # a pressure gradient
-    hgrad = Luna.prop_capillary(125e-6, 1e-2, :He, (1.0, 0.0); capkw..., precision=Float32)
-    dgrad = Luna.prop_capillary(125e-6, 1e-2, :He, (1.0, 0.0); capkw..., device=MetalSpec)
-    for idx in axes(hgrad["Eω"], 2)
-        h = hgrad["Eω"][:, idx]
-        d = dgrad["Eω"][:, idx]
-        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
+    #= a pressure gradient, same parameters. Metal vs CPU Float32 (same precision, the
+       most direct test of the device path) stays at the 1e-4 tolerance; Metal vs CPU
+       Float64 gets a documented, looser one. A pressure gradient makes the adaptive
+       controller's decisions more sensitive to Float32 rounding than a constant-pressure
+       run, `prop_capillary` has no fixed-step option, and Float32 vs Float64 alone (no
+       device involved at all) already sits close to this size for a gradient -- review
+       round 1's own measurement of the same kind of case was 2.74e-4 for CPU Float32 vs
+       CPU Float64. Measured here: Metal vs CPU Float32 agrees to ~1e-5; Metal vs CPU
+       Float64 reaches ~2e-4, i.e. it is the Float32/Float64 gap, not the device, that
+       sets the size of this one. =#
+    hgrad32 = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
+                                  capkw..., device=DeviceSpec(Array, Float32))
+    hgrad64 = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); capkw..., device=HostSpec())
+    dgrad = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); capkw..., device=MetalSpec)
+    for idx in axes(hgrad64["Eω"], 2)
+        @test maximum(abs, dgrad["Eω"][:, idx] .- hgrad32["Eω"][:, idx]) /
+              maximum(abs, hgrad32["Eω"][:, idx]) < 1e-4
+        @test maximum(abs, dgrad["Eω"][:, idx] .- hgrad64["Eω"][:, idx]) /
+              maximum(abs, hgrad64["Eω"][:, idx]) < 3e-4
     end
-    @test isapprox(dgrad["stats"]["energy"], hgrad["stats"]["energy"]; rtol=1e-3)
+    @test isapprox(dgrad["stats"]["energy"], hgrad32["stats"]["energy"]; rtol=1e-3)
 
     # `:auto` (what loading Metal sets) resolves to the same device as the explicit spec
     old = get(Luna.settings, "device", nothing)
     try
         Luna.set_device(:auto)
         @test Luna.device() === MetalSpec
-        aref = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; capkw...)
+        aref = Luna.prop_capillary(125e-6, 0.1, :He, 1.0; capkw...)
         # Metal defaults to Float32; the saved field is unscaled but stays that precision
         @test eltype(aref["Eω"]) === ComplexF32
+        @test aref["Eω"] == dm["Eω"] # the same device, so the same answer as above
     finally
         isnothing(old) ? delete!(Luna.settings, "device") :
                          (Luna.settings["device"] = old)
