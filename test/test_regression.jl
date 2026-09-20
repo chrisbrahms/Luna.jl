@@ -13,8 +13,11 @@
    baseline directory is `ENV["LUNA_REGRESSION_DIR"]` if set, otherwise
    `joinpath(Luna.Utils.cachedir(), "regression", <full sha>)`.
 
+   Two tolerances per case and mode, one for `Eω` and one for the statistics; see
+   `test/regression/tolerances.jl` and `test/regression/README.md`.
+
    This file is deliberately NOT part of `test/runtests.jl`: it needs a baseline, which is
-   never committed. See `test/regression/README.md`.
+   never committed.
 =#
 using Luna
 import FFTW
@@ -65,9 +68,9 @@ isdir(BASEDIR) || error(
 @printf("Regression gate\n")
 @printf("  baseline commit: %s\n", BASE)
 @printf("  baseline dir:    %s\n", BASEDIR)
-@printf("\n%-24s %-9s %12s %12s  %s\n",
-        "case", "mode", "max diff", "tolerance", "worst quantity")
-@printf("%s\n", "-"^80)
+@printf("\n%-24s %-9s %11s %10s %11s %10s  %s\n",
+        "case", "mode", "Eω diff", "Eω tol", "stats diff", "stats tol", "worst quantity")
+@printf("%s\n", "-"^112)
 
 worstoverall = 0.0
 
@@ -84,24 +87,29 @@ worstoverall = 0.0
         continue
     end
     @testset "$mode" for mode in RegressionCases.MODES
-        tol = tolerance(case.name, mode)
+        tols = Dict(c => tolerance(case.name, mode, c) for c in RegressionCompare.CLASSES)
         if !haskey(baseline, string(mode))
-            @printf("%-24s %-9s %12s %12.1e  %s\n",
-                    case.name, mode, "MISSING", tol, "not in the baseline")
+            @printf("%-24s %-9s %11s %10.1e %11s %10.1e  %s\n",
+                    case.name, mode, "MISSING", tols[:Eω], "MISSING", tols[:stats],
+                    "not in the baseline")
             @test false
             continue
         end
         new = rundict(runcase(case, mode))
         diffs = compare(baseline[string(mode)], new; skip=skipstats(mode))
+        wE = RegressionCompare.worst(diffs, :Eω)
+        wS = RegressionCompare.worst(diffs, :stats)
         w = RegressionCompare.worst(diffs)
-        global worstoverall = max(worstoverall, isfinite(w.value) ? w.value : Inf)
-        @printf("%-24s %-9s %12.3e %12.1e  %s%s\n", case.name, mode, w.value, tol, w.what,
-                isempty(w.note) ? "" : " ($(w.note))")
+        global worstoverall = max(worstoverall, w.value)
+        @printf("%-24s %-9s %11.3e %10.1e %11.3e %10.1e  %s\n",
+                case.name, mode, wE.value, tols[:Eω], wS.value, tols[:stats],
+                RegressionCompare.describe(w))
         flush(stdout)
         for d in diffs
+            tol = tols[d.class]
             ok = d.value <= tol
-            ok || @printf("    FAIL %-32s %12.3e > %.1e %s\n",
-                          d.what, d.value, tol, d.note)
+            ok || @printf("    FAIL %-44s %11.3e > %.1e\n",
+                          RegressionCompare.describe(d), d.value, tol)
             @test ok
         end
         flush(stdout)
@@ -109,5 +117,5 @@ worstoverall = 0.0
 end
 end
 
-@printf("%s\n", "-"^80)
+@printf("%s\n", "-"^112)
 @printf("largest difference over all cases and modes: %.3e\n", worstoverall)
