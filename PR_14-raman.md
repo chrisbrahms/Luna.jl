@@ -177,9 +177,11 @@ other agents' jobs on the same machine for part of the time.
 ### The regression gate
 
 Baseline generated with `test/regression/generate.jl 7d72431c` (shared with `gpu/13` and
-`gpu/15`, which were generating the same one).
+`gpu/15`, which were generating the same one), and again against `gpu/int-A`
+(`782f55d1`, the merge base) for the cumulative view.
 
-**460 pass, 0 fail. Every case, both modes, both classes: `0.000e+00`.**
+**460 pass, 0 fail against both baselines. Every case, both modes, both classes:
+`0.000e+00`.**
 
 | case | `:fixed` Eω | `:fixed` stats | `:adaptive` Eω | `:adaptive` stats |
 |---|---:|---:|---:|---:|
@@ -194,7 +196,9 @@ The four this branch touches:
 | `gnlse_raman_shock` | the same, with an `RamanRespIntermediateBroadening` response function | 0 | 0 |
 | `modeavg_field_nothg` | `Kerr_field_nothg` is a struct with `AnalyticSignal`, `1/N` folded into the filter | 0 | 0 |
 
-**Largest difference over all cases and modes: `0.000e+00`.** Step counts unchanged.
+**Largest difference over all cases and modes: `0.000e+00`,** against `7d72431c` and
+against `782f55d1` (`gpu/int-A`). Step counts unchanged (the gate checks them separately
+and fails hard if they move).
 
 ### Bit-identity against the previous implementation
 
