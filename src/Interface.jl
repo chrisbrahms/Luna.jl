@@ -416,22 +416,6 @@ boundary_kwargs(kwargs) = NamedTuple(
     k => v for (k, v) in pairs(kwargs)
     if k in (:boundary, :boundary_N, :boundary_length, :tcollar))
 
-"""
-    prop_capillary_args(radius, flength, gas, pressure; λ0, λlims, trange, kwargs...)
-
-Prepare to simulate pulse propagation in a hollow fibre using the capillary model. This
-function takes the same arguments as `prop_capillary` but instead or running the
-simulation and returning the output, it returns the required arguments for `Luna.run`,
-which is useful for repeated simulations in an indentical fibre with different initial
-conditions.
-
-The propagation length is not among them: run the propagation with
-
-```julia
-Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
-Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
-```
-"""
 #= Error, naming the fix, when an *explicit* `device`/`precision` request cannot be
    honoured because `resp` (mode-averaged only; multimode/radial go through `_cpu_only!`
    instead) contains a response with no `Nonlinear.rescale` method (plasma, Raman, ...).
@@ -450,6 +434,23 @@ function _check_responses_device_capable!(device, precision, resp)
           "instead, or remove the response (e.g. plasma=false, raman=false) for a "*
           "device-capable Kerr-only run.")
 end
+
+"""
+    prop_capillary_args(radius, flength, gas, pressure; λ0, λlims, trange, kwargs...)
+
+Prepare to simulate pulse propagation in a hollow fibre using the capillary model. This
+function takes the same arguments as `prop_capillary` but instead or running the
+simulation and returning the output, it returns the required arguments for `Luna.run`,
+which is useful for repeated simulations in an indentical fibre with different initial
+conditions.
+
+The propagation length is not among them: run the propagation with
+
+```julia
+Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=flength)
+```
+"""
 function prop_capillary_args(radius, flength, gas, pressure;
                         λlims, trange, envelope=false, thg=nothing, δt=1,
                         λ0, τfwhm=nothing, τw=nothing, ϕ=Float64[],
