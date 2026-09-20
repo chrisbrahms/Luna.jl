@@ -365,6 +365,23 @@ If `raman` is `true`, then the following options apply:
 - `boundary_length`: Absorber reference length in metres, overriding `boundary_N`.
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
+- `device`: where to run: `:cpu`, `:auto`, `:metal`, `:cuda` or a [`Luna.DeviceSpec`](@ref).
+    Defaults to `Luna.device_request()`, i.e. `Luna.settings["device"]` as the user set
+    it -- `:cpu` if nothing was set and nothing loaded, `:auto` once a GPU package has
+    been `using`d. Only mode-averaged propagation with Kerr responses (`modes` a single
+    mode, no plasma, no Raman, no χ⁽²⁾) can actually run on a device; anything else
+    resolves to the CPU regardless of this keyword, or errors if `device`/`precision` was
+    passed explicitly and cannot be honoured (multimode and radial propagation, and
+    [`prop_gnlse`](@ref)). See the "Running on a GPU" page (`docs/src/gpu.md`).
+- `precision`: `Float32` to run in reduced precision (on the CPU or on a device),
+    `Float64` for double, `nothing` (default) for whatever `device` resolves to
+    normally (`Float64` on the CPU, `Float32` on Metal). A `Float32` run is scaled (see
+    [`Luna.UnitScaling`](@ref)); the output is unscaled automatically and saved as
+    `ComplexF32`.
+- `stats_period::Integer=1`: collect the default statistics every `stats_period`-th
+    accepted step instead of every step (see [`Output.PeriodicStats`](@ref)). Per-step
+    statistics on a device copy the field to the host, so this is worth raising there;
+    see the warning `Luna.run` gives once per propagation when it does so.
 """
 function prop_capillary(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
@@ -419,7 +436,8 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         saveN=201, filepath=nothing,
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
-                        boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR)
+                        boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR,
+                        device=Luna.device_request(), precision=nothing, stats_period=1)
 
     # do we have energy in the orthogonal polarisation states, or just the fundamental?
     # if so, we need to treat double the number of modes
@@ -447,15 +465,17 @@ function prop_capillary_args(radius, flength, gas, pressure;
     inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
-                                     noise_field, thg)
+                                     noise_field, thg, device, precision)
     stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
+    stats_period > 1 && (stats = Output.PeriodicStats(stats, stats_period))
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
         shotnoise, modes, model, loss, raman, kerr, plasma, PPT_options,
         temperature, saveN, filepath, filename,
-        boundary, boundary_N, boundary_length, tcollar)
+        boundary, boundary_N, boundary_length, tcollar,
+        device, precision, stats_period)
 
     return Eω, grid, linop, transform, FT, output
 end
@@ -877,36 +897,33 @@ linopkw(grid::Grid.RealGrid, thg) = NamedTuple()
 linopkw(grid::Grid.EnvGrid, thg) = (; thg)
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{true}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{true}; noise_field=nothing, thg=LinearOps.thg_default(grid),
+               device=Luna.device_request(), precision=nothing)
     @info("Using mode-averaged propagation.")
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ;
                                                     linopkw(grid, thg)...)
 
     #= The operator is constant, so `βfun!` is too: the normalisation folds it in once at
-       setup instead of calling it on every right-hand side.
-
-       `device=Luna.HostSpec()` is passed explicitly, not left to `Luna.settings`: loading
-       a GPU package sets the global request to `:auto`, and the simple interface is not
-       device-capable yet (the absorbing boundaries, the statistics and every response but
-       Kerr are host code). Until gpu/11 plumbs `device` and `precision` through
-       `prop_capillary`, the simple interface stays on the CPU whatever is loaded, which
-       is what "the simple interface is unchanged" requires. =#
+       setup instead of calling it on every right-hand side. `device`/`precision` are the
+       caller's request (`prop_capillary`'s own keywords, default `Luna.device_request()`
+       so an untouched call reproduces today's behaviour); `Luna.setup` resolves them. =#
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
                                    βfun!, z -> Modes.Aeff(mode, z=z);
-                                   noise_field, constβ=true, device=Luna.HostSpec())
+                                   noise_field, constβ=true, device, precision)
     linop, Eω, transform, FT
 end
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{false}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{false}; noise_field=nothing, thg=LinearOps.thg_default(grid),
+               device=Luna.device_request(), precision=nothing)
     @info("Using mode-averaged propagation.")
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ;
                                         linopkw(grid, thg)...)
 
-    # `device=Luna.HostSpec()`: see the constant-operator branch above
+    # `device`/`precision`: see the constant-operator branch above
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
                                    βfun!, z -> Modes.Aeff(mode, z=z);
-                                   noise_field, device=Luna.HostSpec())
+                                   noise_field, device, precision)
     linop, Eω, transform, FT
 end
 
@@ -914,8 +931,25 @@ needfull(modes) = !all(modes) do mode
     (mode.kind == :HE) && (mode.n == 1)
 end
 
+#= Multimode and radial propagation are not device- or reduced-precision-capable yet
+   (`TransModal`/`TransRadial`, Group E of GPU_PLAN.md): `Luna.setup` for them takes no
+   `device`/`precision` keyword at all. These two methods accept and validate them instead
+   of erroring with an unhelpful "no keyword argument device", so a `device`/`precision`
+   request which does not resolve to the CPU in `Float64` -- the only thing these
+   transforms can produce -- gets a message naming the actual limitation. =#
+function _cpu_only!(device, precision, what)
+    spec = Luna.withprecision(Luna.resolve_device(device), precision)
+    (Luna.arraytype(spec) === Array && Luna.realtype(spec) === Float64) || error(
+        "$what does not run on a device or in reduced precision yet (GPU_PLAN.md Group "*
+        "E); got $(spec). Pass modes=<a single mode> for a device-capable mode-averaged "*
+        "run, or device=Luna.HostSpec() (the default) here.")
+    nothing
+end
+
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               noise_field=nothing, thg=LinearOps.thg_default(grid),
+               device=Luna.device_request(), precision=nothing)
+    _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_const_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
@@ -925,7 +959,9 @@ function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               noise_field=nothing, thg=LinearOps.thg_default(grid),
+               device=Luna.device_request(), precision=nothing)
+    _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
@@ -1039,6 +1075,12 @@ Note that the current GNLSE model is single mode only.
 - `boundary_length`: Absorber reference length in metres, overriding `boundary_N`.
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
+- `device`, `precision`: accepted for symmetry with [`prop_capillary`](@ref), but
+    `prop_gnlse` is not device- or reduced-precision-capable (its normalisation is built
+    before the unit scaling is known); anything other than the default `Luna.HostSpec()`
+    in `Float64` errors.
+- `stats_period::Integer=1`: collect the default statistics every `stats_period`-th
+    accepted step instead of every step (see [`Output.PeriodicStats`](@ref)).
 """
 function prop_gnlse(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_gnlse_args(args...; kwargs...)
@@ -1080,7 +1122,16 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
                         saveN=201, filepath=nothing,
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
-                        boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR)
+                        boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR,
+                        device=Luna.device_request(), precision=nothing, stats_period=1)
+    #= Unlike `prop_capillary`, `prop_gnlse` builds its own normalisation
+       (`norm_mode_average_gnlse`) before the unit scaling is known (`Luna.setup`
+       derives it from the peak of the input field, once the transform is built), so it
+       cannot yet be handed a `spec`/`scaling` matching a real device or a reduced
+       precision the way `Luna.setup`'s own default normalisation is. Refuse rather than
+       build a normalisation silently wrong by a factor of `Pref`/`Eref`; the GNLSE device
+       path is not in this branch's exit criteria (GPU_PLAN.md §6 Group B). =#
+    _cpu_only!(device, precision, "prop_gnlse")
     envelope = true
     thg = false
     polarisation=:linear
@@ -1120,17 +1171,20 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
     inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
 
     norm! = NonlinearRHS.norm_mode_average_gnlse(grid, aeff; shock)
-    # `device=Luna.HostSpec()`: see `setup(grid, mode::Modes.AbstractMode, ...)` above
+    #= `device=Luna.HostSpec()`: `_cpu_only!` above has already refused anything else, so
+       this is not a silent narrowing of the caller's request. =#
     Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
                                    norm!, noise_field, device=Luna.HostSpec())
     stats = Stats.default(grid, Eω, mode_s, linop, transform)
+    stats_period > 1 && (stats = Output.PeriodicStats(stats, stats_period))
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; γ, flength, βs, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
         shotnoise, shock, loss, raman, ramanmodel, fr, τ1, τ2,
         saveN, filepath, filename,
-        boundary, boundary_N, boundary_length, tcollar)
+        boundary, boundary_N, boundary_length, tcollar,
+        device, precision, stats_period)
 
     return Eω, grid, linop, transform, FT, output
 end
