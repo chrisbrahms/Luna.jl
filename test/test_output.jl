@@ -309,7 +309,8 @@ end
     # first call always fires, then every 3rd
     results = [p(nothing, 0.0, 0.0) for _ in 1:7]
     @test [isnothing(r) for r in results] == [false, true, true, false, true, true, false]
-    @test [r["n"] for r in results if !isnothing(r)] == [1, 4, 7]
+    # `calls` only increments when `f` actually runs, i.e. on the 1st, 4th and 7th call
+    @test [r["n"] for r in results if !isnothing(r)] == [1, 2, 3]
     @test_throws ArgumentError Output.PeriodicStats(f, 0)
 
     # MemoryOutput/HDF5Output skip a `nothing` statistics result instead of erroring
