@@ -29,7 +29,7 @@
 import Test: @test, @testset, @test_throws, @test_logs, @inferred
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
-             NonlinearRHS, PhysData, RK45, Stats
+             NonlinearRHS, PhysData, RK45, Stats, Maths, Ionisation
 import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING
 import GPUArraysCore
 import AbstractFFTs
@@ -491,6 +491,258 @@ end
     @test (@inferred NonlinearRHS.Et_to_Pt!(Pb, E, (cb, kf), ρ)) isa AbstractArray
 end
 
+#= A field which actually ionises, and the pieces the plasma tests share. Argon at
+   800 nm: the regression matrix's plasma cases do not ionise at all (He at 1 bar and
+   800 nJ gives an electron density of exactly zero), so nothing there would notice if
+   the plasma response stopped working. =#
+const PLASMA_NT = 512
+const PLASMA_T = collect(range(-60e-15, 60e-15, length=PLASMA_NT))
+const PLASMA_IP = PhysData.ionisation_potential(:Ar)
+const PLASMA_ρ = PhysData.density(:Ar, 1.0)
+
+plasmafield(E0=6e10) = @. E0*exp(-PLASMA_T^2/(2*(10e-15/1.66)^2))*
+                          cos(2π*PhysData.c/800e-9*PLASMA_T)
+
+adkrate() = Ionisation.IonRateADK(:Ar)
+
+#= A tabulated rate with the interface of a cached PPT rate, built here rather than from
+   the shared cache: `IonRatePPTAccel(E, rate)` is the constructor the cache calls, the
+   axis is uniform, and this takes milliseconds where pre-calculating a real PPT table
+   takes minutes. The values are an ADK rate, which is beside the point: what is under
+   test is the spline lookup. =#
+function tablerate()
+    E = collect(range(1e9, 3e11, length=1024))
+    Ionisation.IonRatePPTAccel(E, adkrate().(E))
+end
+
+#= The plasma response as it was before `gpu/13-plasma`: three serial `Maths.cumtrapz!`
+   calls and a branch inside a loop, transcribed from `Nonlinear.PlasmaScalar!` /
+   `PlasmaVector!`. The batched response has to reproduce it to rounding level. =#
+function refplasma(E::AbstractVector, ir, ionpot, δt, ρ)
+    rate = similar(E); fraction = similar(E)
+    phase = similar(E); J = similar(E); P = similar(E)
+    ir(rate, E)
+    Maths.cumtrapz!(fraction, rate, δt)
+    @. fraction = 1 - exp(-fraction)
+    @. phase = fraction * PhysData.e_ratio * E
+    Maths.cumtrapz!(J, phase, δt)
+    for ii in eachindex(E)
+        if abs(E[ii]) > 0
+            J[ii] += ionpot * rate[ii] * (1-fraction[ii])/E[ii]
+        end
+    end
+    Maths.cumtrapz!(P, J, δt)
+    ρ .* P
+end
+
+function refplasma(E::AbstractMatrix, ir, ionpot, δt, ρ)
+    Ex = E[:, 1]; Ey = E[:, 2]
+    Em = @. hypot(Ex, Ey)
+    rate = similar(Em); fraction = similar(Em)
+    phase = similar(E); J = similar(E); P = similar(E)
+    ir(rate, Em)
+    Maths.cumtrapz!(fraction, rate, δt)
+    @. fraction = 1 - exp(-fraction)
+    @. phase = fraction * PhysData.e_ratio * E
+    Maths.cumtrapz!(J, phase, δt)
+    for ii in eachindex(Em)
+        if abs(Em[ii]) > 0
+            pre = ionpot * rate[ii] * (1-fraction[ii])/Em[ii]^2
+            J[ii, 1] += pre*Ex[ii]
+            J[ii, 2] += pre*Ey[ii]
+        end
+    end
+    Maths.cumtrapz!(P, J, δt)
+    ρ .* P
+end
+
+@testset "the trapezoid scan" begin
+    δt = PLASMA_T[2] - PLASMA_T[1]
+    y = plasmafield()
+    ref = similar(y); Maths.cumtrapz!(ref, y, δt)
+    out = similar(y); Maths.cumtrapz_scan!(out, y, δt)
+    @test out[1] == 0                      # the integral starts at zero exactly
+    @test maximum(abs, out .- ref)/maximum(abs, ref) < 1e-13
+    # ... and it is not the same arithmetic: this is the rounding the plasma cases move by
+    @test out != ref
+
+    #= Columns are independent: the same column gives the same answer whether it is
+       passed alone or with others, which is what makes threading them safe. =#
+    Y = hcat(y, 2 .* y, -0.5 .* y)
+    Y3 = reshape(Y, PLASMA_NT, 1, 3)
+    O3 = similar(Y3); Maths.cumtrapz_scan!(O3, Y3, δt)
+    for i in 1:3
+        col = similar(y); Maths.cumtrapz_scan!(col, Y[:, i], δt)
+        @test O3[:, 1, i] == col
+    end
+    # aliasing is refused rather than silently wrong, and so is a shape mismatch
+    @test_throws DimensionMismatch Maths.cumtrapz_scan!(similar(y, 4), y, δt)
+end
+
+@testset "ionisation rates in the run's precision" begin
+    adk = adkrate()
+    tab = tablerate()
+    @test adk isa Ionisation.IonRateADK{Float64}
+    @test Ionisation.device_capable(adk)
+    @test Ionisation.device_capable(tab)
+    @test tab.spline.ifun isa Maths.UniformIndex
+    # the direct PPT rate cannot run in a kernel, and neither can a user's callable
+    @test !Ionisation.device_capable(Ionisation.IonRatePPT(:Ar, 800e-9))
+    @test !Ionisation.device_capable((out, E) -> (out .= 0))
+    #= Nor can a table on a non-uniform axis: `CSpline` falls back to a `FastFinder`,
+       which is mutable and caches the last index it found. =#
+    Enu = [1e9, 2e9, 4e9, 8e9, 1.6e10, 3.2e10]
+    nonuniform = Ionisation.IonRatePPTAccel(Enu, adk.(Enu))
+    @test nonuniform.spline.ifun isa Maths.FastFinder
+    @test !Ionisation.device_capable(nonuniform)
+
+    spec32 = DeviceSpec(Array, Float32)
+    # the default host path is the object itself: nothing is copied and nothing converted
+    @test Ionisation.device_rate(adk, HostSpec()) === adk
+    @test Ionisation.device_rate(tab, HostSpec()) === tab
+    # ... and every rate is refused on a device it has no kernel for, naming the fix
+    err = try Ionisation.device_rate(nonuniform, spec32) catch e; e end
+    @test err isa ErrorException
+    @test occursin("IonRatePPTAccel", err.msg)
+    @test occursin("device=:cpu", err.msg)
+    @test_throws ErrorException Ionisation.device_rate(Ionisation.IonRatePPT(:Ar, 800e-9),
+                                                       spec32)
+
+    #= In Float32 there is no Float64 left anywhere the kernel can reach: the nine ADK
+       constants, the spline's knots, values and coefficients, and the index function's
+       three scalars. =#
+    a32 = Ionisation.device_rate(adk, spec32)
+    @test a32 isa Ionisation.IonRateADK{Float32}
+    @test isbits(a32)
+    @test all(f -> !(getfield(a32, f) isa Float64), fieldnames(typeof(a32)))
+    t32 = Ionisation.device_rate(tab, spec32)
+    @test eltype(t32.spline.x) === Float32
+    @test eltype(t32.spline.y) === Float32
+    @test eltype(t32.spline.D) === Float32
+    @test t32.spline.ifun isa Maths.UniformIndex{Float32}
+    @test t32.Emax isa Float32
+    @test Ionisation.resident_arrays(t32) === (t32.spline.x, t32.spline.y, t32.spline.D)
+    @test Ionisation.resident_arrays(a32) === ()
+
+    #= The values agree to single precision, and the Float64 path is bit-identical to
+       what it was: the array form now goes through `ionrate!`, whose kernel is the same
+       expression. =#
+    E = plasmafield()
+    for (ir, ir32) in ((adk, a32), (tab, t32))
+        r64 = similar(E); Ionisation.ionrate!(r64, ir, E)
+        @test r64 == ir.(E)
+        r32 = zeros(Float32, size(E))
+        Ionisation.ionrate!(r32, ir32, Float32.(E))
+        m = maximum(r64)
+        @test maximum(abs, Float64.(r32) .- r64)/m < 1e-5
+    end
+
+    #= The unit scaling: the rate is not polynomial in the field, so the kernel
+       reconstructs `Eref*e` instead of carrying a power of `Eref` in a coefficient. =#
+    Eref = 2.0^35
+    rscaled = similar(E); Ionisation.ionrate!(rscaled, adk, E ./ Eref, Eref)
+    runscaled = similar(E); Ionisation.ionrate!(runscaled, adk, E)
+    @test rscaled == runscaled # dividing and multiplying by a power of two is exact
+    # a plain callable has no kernel, so it is refused rather than given a scaled field
+    @test_throws ErrorException Ionisation.ionrate!(similar(E), (o, x) -> (o .= 0),
+                                                    E ./ Eref, Eref)
+
+    #= Above the table the host errors, as it always has -- now once per call from a
+       `maximum(abs, E)` check rather than once per element -- while the kernel
+       saturates at the table's last value, because a device kernel cannot throw. =#
+    big = fill(2*tab.Emax, 8)
+    @test_throws ErrorException Ionisation.ionrate!(similar(big), tab, big)
+    @test_throws ErrorException tab(2*tab.Emax)
+    k = Ionisation.ratekernel(tab, 1.0)
+    @test k(2*tab.Emax) == tab(tab.Emax)
+    @test k(tab.Emax/2^20) == 0 # below the table the rate is zero, as it was
+    # the unchecked spline evaluation is the checked one's arithmetic, exactly
+    @test Maths.spline_eval(tab.spline, 1e10) === tab.spline(1e10)
+end
+
+@testset "the plasma response" begin
+    δt = PLASMA_T[2] - PLASMA_T[1]
+    E = plasmafield()
+    Ev = hcat(E, 0.6 .* circshift(E, 7))
+    for (nm, ir) in (("ADK", adkrate()), ("table", tablerate()))
+        #= The physics, against the serial implementation this replaces. The difference
+           is the scan's summation order and nothing else. =#
+        p = Nonlinear.PlasmaCumtrapz(PLASMA_T, E, ir, PLASMA_IP)
+        @test Nonlinear.kind(p) isa Nonlinear.Batched
+        @test Nonlinear.device_capable(p)
+        out = zeros(PLASMA_NT)
+        p(out, E, PLASMA_ρ)
+        ref = refplasma(E, ir, PLASMA_IP, δt, PLASMA_ρ)
+        @test maximum(abs, out .- ref)/maximum(abs, ref) < 1e-11
+        @test maximum(abs, out) > 0 # the field ionises: this is not two zeros agreeing
+
+        pv = Nonlinear.PlasmaCumtrapz(PLASMA_T, Ev, ir, PLASMA_IP)
+        outv = zeros(PLASMA_NT, 2)
+        pv(outv, Ev, PLASMA_ρ)
+        refv = refplasma(Ev, ir, PLASMA_IP, δt, PLASMA_ρ)
+        @test maximum(abs, outv .- refv)/maximum(abs, refv) < 1e-11
+        @test !isnothing(pv.Em) # the magnitude buffer exists only for a vector field
+        @test isnothing(p.Em)
+
+        #= A block of several columns is the same as the columns one at a time, which is
+           what threading them relies on. Exact equality, not a tolerance. =#
+        #= Enough columns to be over `PLASMA_THREAD_MINLEN`, so that with more than one
+           thread this is the threaded path against the serial one. =#
+        ncols = 40
+        E3 = zeros(PLASMA_NT, 1, ncols)
+        for i in 1:ncols; E3[:, 1, i] .= (0.3 + 0.7i/ncols) .* E; end
+        p3 = Nonlinear.rescale(p, HostSpec(), UNIT_SCALING, E3)
+        o3 = zeros(PLASMA_NT, 1, ncols)
+        p3(o3, E3, PLASMA_ρ)
+        for i in 1:ncols
+            col = reshape(E3[:, :, i], PLASMA_NT, 1, 1)
+            pc = Nonlinear.rescale(p, HostSpec(), UNIT_SCALING, col)
+            oc = zeros(PLASMA_NT, 1, 1)
+            pc(oc, col, PLASMA_ρ)
+            @test o3[:, 1, i] == oc[:, 1, 1]
+        end
+        #= ... and that block is big enough to be threaded, so with more than one thread
+           this comparison is the threaded path against the serial one. =#
+        @test Nonlinear._plasma_threaded(E3) == (Threads.nthreads() > 1)
+        @test !Nonlinear._plasma_threaded(E)  # one column: never worth a task
+    end
+
+    #= The buffers are sized for the block, so a batched response handed a block it was
+       not rescaled for says so rather than broadcasting into the wrong shape. =#
+    p = Nonlinear.PlasmaCumtrapz(PLASMA_T, E, adkrate(), PLASMA_IP)
+    @test_throws ErrorException p(zeros(PLASMA_NT, 1, 3), zeros(PLASMA_NT, 1, 3), PLASMA_ρ)
+    # three polarisation components is not a thing
+    p3 = Nonlinear.rescale(p, HostSpec(), UNIT_SCALING, zeros(PLASMA_NT, 3))
+    @test_throws ErrorException p3(zeros(PLASMA_NT, 3), zeros(PLASMA_NT, 3), PLASMA_ρ)
+
+    #= The unit scaling. The plasma response has no single polynomial degree, so each
+       stage carries its own factor; the answer in physical units must not depend on
+       which units the state is in. =#
+    Eref = 2.0^36
+    sc = Luna.UnitScaling(Eref, PhysData.ε_0)
+    ps = Nonlinear.rescale(p, HostSpec(), sc, E)
+    outs = zeros(PLASMA_NT)
+    Nonlinear.batched!(ps, outs, E ./ Eref, PLASMA_ρ, sc)
+    outu = zeros(PLASMA_NT)
+    p(outu, E, PLASMA_ρ)
+    @test maximum(abs, outs .* (PhysData.ε_0*Eref) .- outu)/maximum(abs, outu) < 1e-14
+    @test Nonlinear.coefficients(p, PLASMA_ρ, UNIT_SCALING) ==
+          (1.0, PhysData.e_ratio, PLASMA_IP, PLASMA_ρ)
+
+    #= In Float32 the rate, both integrals and the output coefficient all stay inside the
+       exponent range; see the dynamic-range audit in the developer guide. =#
+    spec32 = DeviceSpec(Array, Float32)
+    E32 = Float32.(E ./ Eref)
+    p32 = Nonlinear.rescale(p, spec32, sc, E32)
+    @test p32.ratedev isa Ionisation.IonRateADK{Float32}
+    @test p32.ratefunc === p.ratefunc # the host rate is kept for `Stats`
+    @test p32.J isa Vector{Float32}
+    out32 = zeros(Float32, PLASMA_NT)
+    Nonlinear.batched!(p32, out32, E32, PLASMA_ρ, sc)
+    @test maximum(abs, Float64.(out32) .- outs)/maximum(abs, outs) < 1e-4
+    @test all(isfinite, out32)
+end
+
 @testset "FFT planner dispatch" begin
     #= The host planner takes Luna's FFTW flags, the device planner must not (device FFT
        libraries reject them), and `plan_ift` splits the inverse into an unnormalised
@@ -559,6 +811,35 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
     out = Output.MemoryOutput(0, flength, 3, statsfun)
     Luna.run(Eω, grid, linop, transform, FT, out;
              zmax=flength, boundary, init_dz=flength/20, rtol=1e-8)
+    out, transform
+end
+
+
+#= Kerr and plasma: the response set `prop_capillary` builds by default for a field-
+   resolved run in a non-Raman gas, at an intensity which ionises (a few percent of
+   argon). Fixed steps, so the two runs differ only in their arithmetic; the tabulated
+   rate is the one which exercises the spline lookup in a kernel. =#
+function plasmacase(spec; gas=:Ar, pres=1.0, energy=150e-6, flength=2e-3, λ0=800e-9,
+                    plasma=true, precision=nothing)
+    grid = Grid.RealGrid(λ0, (200e-9, 3000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, gas, pres, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    if plasma
+        resp = (resp...,
+                Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)), tablerate(),
+                                         PhysData.ionisation_potential(gas)))
+    end
+    linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                                   constβ=true, device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/10
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary=:none, min_dz=h, max_dz=h, init_dz=h)
     out, transform
 end
 
@@ -643,6 +924,17 @@ AbstractFFTs.plan_inv(p::JLPlan) =
 Base.:*(p::JLPlan, x::JLArrays.JLArray) = JLArrays.JLArray(p.hp * Array(x))
 LinearAlgebra.mul!(y::JLArrays.JLArray, p::JLPlan, x::JLArrays.JLArray) =
     (copyto!(y, p.hp * Array(x)); y)
+
+#= Prefix-scan shim for JLArray, for the same reason as the plan shims above: JLArrays
+   provides no `accumulate!`, so Base's generic one runs, which indexes element by
+   element and is refused by `allowscalar(false)`. Metal and CUDA both provide a native
+   scan (GPU_PLAN.md section 2), which is what `Maths.cumtrapz_scan!` is written for; on
+   JLArray it is done on a host copy. =#
+function Base._accumulate!(op, out::JLArrays.JLArray, x::JLArrays.JLArray,
+                           dims::Integer, init::Nothing)
+    copyto!(out, accumulate(op, Array(x); dims=dims))
+    out
+end
 
 const JLArray = JLArrays.JLArray
 const JLSpec = DeviceSpec(JLArray, Float64)
@@ -799,6 +1091,76 @@ end
         JLSpec, UNIT_SCALING)
     @test kt.C isa JLArray
     @test Nonlinear.resident_arrays(kt) === (kt.C,)
+end
+
+#= The plasma response on a device: the three prefix scans, the `ifelse` loss term and
+   the rate lookup, all as whole-array operations with no scalar indexing. This is the
+   first batched response with a kernel of its own (`HostResponse`, the only one before
+   it, runs on the host by design). =#
+@testset "plasma on JLArray" begin
+    E = plasmafield()
+    Ev = hcat(E, 0.6 .* circshift(E, 7))
+    for (nm, ir) in (("ADK", adkrate()), ("table", tablerate())), Eh in (E, Ev)
+        p = Nonlinear.PlasmaCumtrapz(PLASMA_T, Eh, ir, PLASMA_IP)
+        Ph = zeros(size(Eh))
+        p(Ph, Eh, PLASMA_ρ)
+
+        Ed = Luna.todevice(JLSpec, Eh)
+        pd = Nonlinear.rescale(p, JLSpec, UNIT_SCALING, Ed)
+        Pd = Luna.alloc(JLSpec, Float64, size(Eh))
+        Nonlinear.batched!(pd, Pd, Ed, PLASMA_ρ, UNIT_SCALING)
+
+        @test Pd isa JLArray
+        @test pd.J isa JLArray
+        @test maximum(abs, Ph) > 0
+        @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-10
+    end
+
+    #= Every array the response or its rate carries is on the device, and
+       `resident_arrays` names all of them so the transform's assertion covers them. =#
+    pd = Nonlinear.rescale(
+        Nonlinear.PlasmaCumtrapz(PLASMA_T, E, tablerate(), PLASMA_IP),
+        JLSpec, UNIT_SCALING, Luna.todevice(JLSpec, E))
+    @test pd.ratedev.spline.x isa JLArray
+    @test pd.ratefunc.spline.x isa Vector{Float64} # the host rate is untouched
+    @test Luna.all_resident(JLSpec, Nonlinear.resident_arrays(pd)...)
+    @test length(Nonlinear.resident_arrays(pd)) == 8 # 4 buffers, no Em, 3 spline arrays
+
+    #= A block of several columns, which is the shape a radial or free-space transform
+       passes, and the shape the response's buffers are allocated for by `rescale`. =#
+    ncols = 4
+    E3 = zeros(PLASMA_NT, 1, ncols)
+    for i in 1:ncols; E3[:, 1, i] .= (0.4 + i/8) .* E; end
+    ph = Nonlinear.rescale(Nonlinear.PlasmaCumtrapz(PLASMA_T, E, adkrate(), PLASMA_IP),
+                           HostSpec(), UNIT_SCALING, E3)
+    Ph = zeros(PLASMA_NT, 1, ncols); ph(Ph, E3, PLASMA_ρ)
+    Ed = Luna.todevice(JLSpec, E3)
+    pd = Nonlinear.rescale(ph, JLSpec, UNIT_SCALING, Ed)
+    Pd = Luna.alloc(JLSpec, Float64, size(E3))
+    Nonlinear.batched!(pd, Pd, Ed, PLASMA_ρ, UNIT_SCALING)
+    @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-10
+end
+
+#= The exit condition of this branch: the physics `prop_capillary` runs by default for a
+   non-Raman gas -- Kerr and plasma -- end to end on a device, through `Luna.setup` and
+   `Luna.run` rather than by calling the response directly. =#
+@testset "Kerr and plasma propagation on JLArray" begin
+    href, htr = plasmacase(HostSpec())
+    dref, dtr = plasmacase(JLSpec)
+    @test dtr.resp[2] isa Nonlinear.PlasmaCumtrapz
+    @test dtr.resp[2].J isa JLArray
+    @test dtr.resp[2].ratedev.spline.x isa JLArray
+    @test size(dref["Eω"]) == size(href["Eω"])
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = dref["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+    end
+    #= The plasma really contributes: without it the answer differs by far more than the
+       tolerance above, so this is not a comparison of two Kerr-only runs. =#
+    plain, _ = plasmacase(HostSpec(); plasma=false)
+    @test maximum(abs, href["Eω"][:, end] .- plain["Eω"][:, end])/
+          maximum(abs, plain["Eω"][:, end]) > 1e-3
 end
 
 #= The hackability fallback: a user-written columnwise closure, which knows nothing about
