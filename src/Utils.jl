@@ -1,6 +1,8 @@
 module Utils
 import Dates
 import FFTW
+import AbstractFFTs
+import GPUArraysCore
 import Logging
 import LibGit2
 import FileWatching.Pidfile: mkpidlock
@@ -204,6 +206,112 @@ function load_dict_h5(fpath)
         h52dict(file)
     end
 end
+
+#=================================================#
+#===============  ARRAY BACKENDS   ===============#
+#=================================================#
+
+"""
+    Backend
+
+Trait distinguishing host arrays ([`CPUBackend`](@ref)) from device (GPU) arrays
+([`DeviceBackend`](@ref)). A device array is anything subtyping
+`GPUArraysCore.AbstractGPUArray` (`MtlArray`, `CuArray`, `JLArray`, ...), so the trait
+needs no GPU package.
+
+It is used only where the two genuinely differ: FFT planning (FFTW flags and wisdom
+against the generic `AbstractFFTs` planners), the host-copy fallbacks, and residency
+checks. It is never used to select a kernel -- there is one implementation of every
+per-step operation and it runs on both.
+
+Query it with [`backend`](@ref).
+"""
+abstract type Backend end
+
+"Trait value for host (CPU) arrays. See [`Backend`](@ref)."
+struct CPUBackend <: Backend end
+
+"Trait value for device (GPU) arrays. See [`Backend`](@ref)."
+struct DeviceBackend <: Backend end
+
+"""
+    backend(x)
+
+[`CPUBackend()`](@ref CPUBackend) or [`DeviceBackend()`](@ref DeviceBackend) for the
+array (or array type) `x`. Wrappers (`SubArray`, `ReshapedArray`, `PermutedDimsArray`)
+report the backend of their parent, so a view or a reshape of a device array is
+identified correctly.
+
+Anything unrecognised is treated as a host array: mis-classifying an exotic host wrapper
+as CPU is a no-op, whereas the reverse would break it.
+"""
+backend(x) = backend(typeof(x))
+backend(::Type) = CPUBackend()
+backend(::Type{<:GPUArraysCore.AbstractGPUArray}) = DeviceBackend()
+backend(::Type{<:SubArray{T, N, P}}) where {T, N, P} = backend(P)
+backend(::Type{<:Base.ReshapedArray{T, N, P}}) where {T, N, P} = backend(P)
+backend(::Type{<:PermutedDimsArray{T, N, A, B, P}}) where {T, N, A, B, P} = backend(P)
+
+"Whether `x` lives on a device (GPU). See [`backend`](@ref)."
+isdevice(x) = backend(x) isa DeviceBackend
+
+#=================================================#
+#===============  FFT PLANNING   =================#
+#=================================================#
+
+"""
+    plan_ft(x, dims)
+
+Plan the forward time-to-frequency transform of an array like `x` along `dims`: a
+real-to-complex transform if `x` is real (field-resolved grids) and a complex-to-complex
+one if it is complex (envelope grids).
+
+On the host this is FFTW with Luna's configured planning flags, so the wisdom logic of
+[`loadFFTwisdom`](@ref)/[`saveFFTwisdom`](@ref) applies. On a device it is the generic
+`AbstractFFTs` planner, which device FFT libraries implement and which takes no flags.
+
+Device plans work on plain arrays of exactly the planned shape -- Metal's in particular
+reject views -- so `x` must be the buffer the transform will actually be applied to (or
+one just like it).
+"""
+plan_ft(x, dims) = _plan_ft(backend(x), x, dims)
+_plan_ft(::CPUBackend, x::AbstractArray{<:Real}, dims) =
+    FFTW.plan_rfft(x, dims, flags=settings["fftw_flag"])
+_plan_ft(::CPUBackend, x::AbstractArray{<:Complex}, dims) =
+    FFTW.plan_fft(x, dims, flags=settings["fftw_flag"])
+_plan_ft(::DeviceBackend, x::AbstractArray{<:Real}, dims) = AbstractFFTs.plan_rfft(x, dims)
+_plan_ft(::DeviceBackend, x::AbstractArray{<:Complex}, dims) = AbstractFFTs.plan_fft(x, dims)
+
+"""
+    plan_ift(FT)
+
+The explicit inverse of the forward plan `FT`, as an `AbstractFFTs.ScaledPlan` carrying
+the unnormalised backward plan and the `1/N` factor.
+
+Luna holds the inverse plan rather than calling `ldiv!(y, FT, x)`, on every backend, for
+two reasons: `ldiv!` is a multiply followed by a separate scaling pass, and the `1/N` can
+instead be folded into the scale factor the oversampling copy already applies
+([`iscale`](@ref), [`iplan`](@ref)), which removes that pass. The result differs from
+`ldiv!` at rounding level.
+
+For a real-to-complex `FT` the inverse is a `brfft`, which **overwrites its input**.
+"""
+plan_ift(FT) = inv(FT)
+
+"""
+    iplan(IFT)
+    iscale(IFT)
+
+The unnormalised backward plan held by an inverse plan, and its normalisation factor.
+Split apart so that the factor can be folded into the scale of the oversampling copy
+(see [`plan_ift`](@ref)).
+"""
+iplan(p::AbstractFFTs.ScaledPlan) = p.p
+iplan(p) = p
+
+@doc (@doc iplan)
+iscale(p::AbstractFFTs.ScaledPlan) = p.scale
+iscale(p) = 1
 
 function format_elapsed(ms::Dates.Millisecond)
     stot = Dates.value(ms)/1000 # total seconds

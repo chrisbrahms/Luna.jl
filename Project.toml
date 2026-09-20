@@ -4,8 +4,12 @@ version = "0.6.2"
 authors = ["chrisbrahms <38351086+chrisbrahms@users.noreply.github.com>"]
 
 [deps]
-# Adapt and GPUArraysCore are not used yet. They are the two small, GPU-package-free
-# dependencies the device model added in a later branch needs; see GPU_PLAN.md section 3.
+# Adapt, GPUArraysCore and AbstractFFTs are the three small, GPU-package-free
+# dependencies of the device model (GPU_PLAN.md section 3). AbstractFFTs is already an
+# indirect dependency through FFTW; Luna needs it directly for the generic FFT planners
+# a device backend uses (Utils.plan_ft). Metal and CUDA are weak dependencies and are
+# never installed with Luna.
+AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
 BlackBoxOptim = "a134a8b2-14d6-55f6-9291-3336d3ab0209"
@@ -59,7 +63,10 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [compat]
+AbstractFFTs = "1"
 Adapt = "3, 4"
+CUDA = "5"
+Metal = "1"
 ArgParse = "1"
 BlackBoxOptim = "0.6"
 CSV = "0.9, 0.10"
@@ -112,6 +119,14 @@ Statistics = "1.9"
 Test = "1.9"
 Unitful = "1"
 julia = "1.9"
+
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+
+[extensions]
+LunaCUDAExt = "CUDA"
+LunaMetalExt = "Metal"
 
 [extras]
 JLArrays = "27aeb0d3-9eb9-45fb-866b-73c2ecf80fcb"

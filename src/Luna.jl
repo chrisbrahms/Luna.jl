@@ -83,6 +83,7 @@ function __init__()
 end
 
 include("Utils.jl")
+include("Device.jl")
 include("Scans.jl")
 include("Output.jl")
 include("Maths.jl")
