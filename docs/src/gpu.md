@@ -238,6 +238,62 @@ In single precision the Raman coefficients need care: the response function is a
 coefficient so that no factor a kernel sees is subnormal. The developer guide has the
 audit; there is nothing to set.
 
+### Tapers and pressure gradients (`tabulate_linop`)
+
+```julia
+out = prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); ..., tabulate_linop=true)
+```
+
+A capillary whose radius or pressure changes along `z` has a linear operator which changes
+with it. By default that operator is host code — a scalar loop over `Modes.neff` — and it is
+evaluated, in the propagation's own precision, at every stage of every step and copied to
+the device; so are the propagation constant `β(z)` and the effective area `Aeff(z)` the
+mode-averaged nonlinear normalisation needs. Six host evaluations and six copies per step
+serialise a device run against the host and are the slowest thing in it.
+
+`tabulate_linop=true` evaluates all three at setup instead, on `z` nodes placed by adaptive
+bisection, and stores the tables where the state lives. Nothing on the host is touched
+inside the propagation after that. It works for every mode type and for a uniform fibre
+too, where the operator is already constant and only a two-node table of `Aeff` is built.
+
+**It changes the discretisation of the linear step, which is why it is not the default.**
+What is tabulated is the *integrated* operator `Φ(z) = ∫ linop dz'`, and the propagator
+becomes `exp(Φ(t2) − Φ(t1))`: the exact interaction-picture propagator of the linear part
+over the step. The default is `exp(linop(t2)·(t2 − t1))`, a one-point rule, whose error is
+first order in the step size. The two converge to the same solution as the step shrinks,
+but not at the same rate, and the difference between them at a usable step size is not
+small:
+
+| 0.1 m Ar capillary, fixed steps | 20 steps | 80 steps | 320 steps | 1280 steps |
+| --- | --- | --- | --- | --- |
+| pressure gradient, default | 7.5e-2 | 2.0e-2 | 4.9e-3 | 1.1e-3 |
+| pressure gradient, `tabulate_linop=true` | 1.6e-4 | 1.6e-4 | 1.6e-4 | 1.6e-4 |
+| taper 75 → 50 µm, default | 4.1e-1 | 1.0e-1 | 2.5e-2 | 5.6e-3 |
+| taper, `tabulate_linop=true` | 8.0e-4 | 8.0e-4 | 8.0e-4 | 8.0e-4 |
+
+(largest relative difference of `Eω` from a 10240-step run of the same kind, per save;
+gradient 0 → 1 bar, Kerr only, `boundary=:none`.) The tabulated run is at the well resolved
+answer from the coarsest step count tried; the default path needs about a thousand steps to
+get there. The step-size controller does not close this gap on its own: the propagator's
+error is common to both of the embedded Runge–Kutta solutions the error estimate is formed
+from, so it cancels out of the estimate and `rtol` does not see it.
+
+So the two are not comparable element by element, and a result computed with
+`tabulate_linop=true` should not be compared against a stored one computed without it. It
+is off by default so that existing scripts keep producing what they produced before.
+
+`linop_tol` (default `1e-6`) sets how accurate the tables are: absolute, in radians, for the
+integrated operator, and relative for `β` and `Aeff`. The bisection checks the interpolant
+it will actually read back against a directly computed value at each candidate interval's
+midpoint, and refines until it agrees to the tolerance, so a kink — the `1/√z` cusp in the
+density of a gradient filled from vacuum, a junction in a multi-section fill — costs a
+handful of extra intervals where it is rather than a finer grid everywhere. A 0.1 m gradient
+takes about 60 nodes at the default tolerance and a taper about 30. The tables cost
+`2·length(Eω)·nnodes` numbers in the state's precision, which for a mode-averaged run is a
+few megabytes; for a multimode or free-space operator, whose `linop` is the size of the
+whole state, it is `nnodes` times that, so tabulation is worth thinking about before turning
+it on there.
+
 ### `stats_period`
 
 ```julia

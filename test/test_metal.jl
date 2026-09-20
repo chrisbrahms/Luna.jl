@@ -167,18 +167,36 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
     out, transform
 end
 
+#= How many times a piece of host code was called, so that "no host work per stage" can
+   be checked by counting rather than by inspecting types (the same wrapper
+   `test_device.jl` uses). `densityfun` is called exactly once per right-hand side, so it
+   counts the stages. =#
+mutable struct CountCalls{F}
+    f::F
+    n::Int
+end
+CountCalls(f) = CountCalls(f, 0)
+(c::CountCalls)(args...; kwargs...) = (c.n += 1; c.f(args...; kwargs...))
+
 #= A pressure gradient: a z-dependent operator closure and `constβ=false`, which is the
    only case exercising `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s
-   host-buffer branch -- the two pieces which still upload from the host on every stage
-   until gpu/23. Fixed steps, so the runs differ only in arithmetic. =#
+   host-buffer branch -- the two pieces which upload from the host on every stage unless
+   `tabulate_linop=true` replaces them with tables (gpu/23). Fixed steps, so the runs
+   differ only in arithmetic. The third element of the return value counts the host calls
+   the run made. =#
 function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, energy=1e-6, flength=1e-2,
-                           λ0=800e-9, boundary=:none, stats=false, fixed=true)
+                           λ0=800e-9, boundary=:none, stats=false, fixed=true,
+                           tabulate_linop=false,
+                           linop_tol=LinearOps.DEFAULT_LINOP_TOL, nsteps=20, rtol=1e-8)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
-    coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
+    coren, densityfun0 = Capillary.gradient(gas, flength, pin, pout)
     m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
-    aeff(z) = Modes.Aeff(m, z=z)
+    aeff = CountCalls(z -> Modes.Aeff(m, z=z))
+    densityfun = CountCalls(densityfun0)
     resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
-    linop, βfun! = LinearOps.make_linop(grid, m, λ0)
+    linop0, βfun0! = LinearOps.make_linop(grid, m, λ0)
+    linop = CountCalls(linop0)
+    βfun! = CountCalls(βfun0!)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
     Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
                                    device=spec)
@@ -188,15 +206,20 @@ function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, energy=1e-6, flengt
     shost = Utils.isdevice(Eω) ? Luna.tohost(Eω) : Eω
     statsfun = stats ? Stats.default(grid, shost, m, linop, transform; gas) : Output.nostats
     out = Output.MemoryOutput(0, flength, 5, statsfun)
-    dz = flength/20
+    #= `max_dz` does not depend on the step count, so that two runs with different step
+       counts tabulate over the same interval and build the same tables. =#
+    maxdz = flength/20
+    dz = flength/nsteps
     if fixed
         Luna.run(Eω, grid, linop, transform, FT, out;
-                 zmax=flength, boundary, init_dz=dz, min_dz=dz, max_dz=dz)
+                 zmax=flength, boundary, init_dz=dz, min_dz=dz, max_dz=maxdz, rtol,
+                 tabulate_linop, linop_tol)
     else
         Luna.run(Eω, grid, linop, transform, FT, out;
-                 zmax=flength, boundary, init_dz=dz, rtol=1e-8)
+                 zmax=flength, boundary, init_dz=dz, rtol=1e-8,
+                 tabulate_linop, linop_tol)
     end
-    out, transform
+    out, transform, (; linop=linop.n, β=βfun!.n, aeff=aeff.n, rhs=densityfun.n)
 end
 
 @testset "Metal registration" begin
@@ -532,6 +555,24 @@ broadening(out) = rmswidth(out["Eω"][:, end])/rmswidth(out["Eω"][:, 1])
     end
     @test isapprox(dgrad["stats"]["energy"], hgrad32["stats"]["energy"]; rtol=1e-3)
 
+    #= gpu/23: the same gradient with `tabulate_linop=true`, which is the keyword a user
+       passes to run a pressure-graded capillary on the GPU with nothing left on the host
+       inside the step. Metal against CPU Float32 at the same tolerance as the untabulated
+       comparison above: the two runs use the same discretisation as each other, so this
+       is the device path and nothing else. The tabulated answer is *not* compared with
+       the untabulated one -- it is a different discretisation of the linear step, and
+       much better resolved; that difference is measured in `test_device.jl`. =#
+    tgrad32 = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
+                                  capkw..., device=DeviceSpec(Array, Float32),
+                                  tabulate_linop=true)
+    tgrad = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
+                                capkw..., device=MetalSpec, tabulate_linop=true)
+    for idx in axes(tgrad32["Eω"], 2)
+        @test maximum(abs, tgrad["Eω"][:, idx] .- tgrad32["Eω"][:, idx]) /
+              maximum(abs, tgrad32["Eω"][:, idx]) < 1e-4
+    end
+    @test isapprox(tgrad["stats"]["energy"], tgrad32["stats"]["energy"]; rtol=1e-3)
+
     #= A visibly nonlinear gradient (300 µJ, 5 bar), adaptive (the step-size controller
        genuinely active, `fixed=false`, well-resolved there -- see the comment above) with
        a documented looser tolerance: review round 1 measured 1.86e-4 for a strongly
@@ -852,6 +893,69 @@ end
     # ... and it is not the plain Kerr response
     Pk = zeros(size(E)); Nonlinear.Kerr_field(γ3)(Pk, E, ρ)
     @test maximum(abs, Pk .- P64)/maximum(abs, P64) > 0.1
+end
+
+#= gpu/23's exit criterion: a pressure gradient on Metal with `tabulate_linop=true` and
+   no host work inside the propagation. Three things are checked -- that the tables reach
+   the kernels as Float32/ComplexF32 MtlArrays (the only place a stray Float64 in them
+   would show, since Metal refuses one), that the tabulated Metal run agrees with a
+   tabulated CPU Float32 run, and that nothing on the host is evaluated per stage, which
+   is counted rather than inferred. =#
+@testset "tabulated operator on Metal" begin
+    flength = 1e-2
+    h32, htr, _ = metalgradientcase(DeviceSpec(Array, Float32); flength,
+                                    tabulate_linop=true)
+    dm, dtr, dcount = metalgradientcase(MetalSpec; flength, tabulate_linop=true)
+
+    #= `Luna.run` tabulates into a transform of its own and does not modify the caller's,
+       so the tables are inspected by building the same thing here. =#
+    dtab = NonlinearRHS.tabulate(dtr, 0.0, 1.05flength, 1e-6, dtr.Eωo)
+    @test dtab.norm!.β isa LinearOps.TabulatedVector
+    @test dtab.norm!.β.f isa MtlArray{Float32, 2}
+    @test dtab.norm!.β.buf isa MtlArray{Float32, 1}
+    @test dtab.norm!.β(0.3flength) isa MtlArray{Float32, 1}
+    @test dtab.aeff isa LinearOps.TabulatedScalar
+
+    # and the operator's own tables, which the propagator broadcasts over
+    linop0, _ = LinearOps.make_linop(Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15),
+                                     Capillary.MarcatiliMode(
+                                         75e-6, first(Capillary.gradient(:Ar, flength, 1.0, 0.0)),
+                                         loss=false),
+                                     800e-9)
+    proto = Luna.alloc(MetalSpec, ComplexF32, (length(dtr.grid.ω),))
+    tab = LinearOps.TabulatedLinop(linop0, proto, 0.0, 1.05flength; tol=1e-6, quiet=true)
+    @test tab.Φ isa MtlArray{ComplexF32, 2}
+    @test tab.dΦ isa MtlArray{ComplexF32, 2}
+    @test tab.secant isa MtlArray{ComplexF32, 1}
+    # the readback and the propagator are broadcasts over those, with no Float64 anywhere
+    out = similar(proto)
+    LinearOps.phase!(out, tab, 0.4flength)
+    @test all(isfinite, Array(out))
+    y = Luna.todevice(MetalSpec, ones(ComplexF64, length(dtr.grid.ω)))
+    RK45.make_prop!(tab, y)(y, 0.4flength, 0.41flength)
+    @test all(isfinite, Array(y))
+    @test maximum(abs, Array(y)) > 0
+
+    for idx in axes(h32["Eω"], 2)
+        @test maximum(abs, dm["Eω"][:, idx] .- h32["Eω"][:, idx]) /
+              maximum(abs, h32["Eω"][:, idx]) < 1e-4
+    end
+
+    #= No per-stage host work: two runs with different step counts but the same `max_dz`,
+       so the tables span the same interval and cost the same number of evaluations.
+       Anything the stepper evaluated on the host would scale with the stage count, which
+       the right-hand side count shows really did change. =#
+    _, _, fine = metalgradientcase(MetalSpec; flength, tabulate_linop=true,
+                                   nsteps=80, rtol=1e-13)
+    @test fine.rhs > 1.5*dcount.rhs
+    @test fine.linop == dcount.linop
+    @test fine.β == dcount.β
+    @test fine.aeff == dcount.aeff
+    # ... where the untabulated path evaluates and uploads all three at every stage
+    _, _, ecoarse = metalgradientcase(MetalSpec; flength, nsteps=20)
+    _, _, efine = metalgradientcase(MetalSpec; flength, nsteps=80, rtol=1e-13)
+    @test efine.linop > 1.5*ecoarse.linop
+    @test efine.β > 1.5*ecoarse.β
 end
 
 @testset "prop_capillary on Metal" begin

@@ -365,6 +365,15 @@ If `raman` is `true`, then the following options apply:
 - `boundary_length`: Absorber reference length in metres, overriding `boundary_N`.
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
+- `tabulate_linop::Bool=false`: tabulate the z-dependent linear operator, propagation
+    constant and effective area of a tapered or pressure-graded capillary at setup instead
+    of evaluating them on the host at every stage. This is what makes such a propagation
+    run entirely on a device. It changes the discretisation of the linear step (the
+    propagator becomes the exact `exp(∫linop dz)` rather than a one-point rule), so it is
+    opt-in; see [`Luna.run`](@ref). Ignored, apart from a two-node table of `Aeff`, when
+    the fibre is uniform and the operator is already constant.
+- `linop_tol::Real`: the tolerance the tabulation's adaptive nodes are placed to satisfy.
+    See [`Luna.run`](@ref).
 - `device`: where to run: `:cpu`, `:auto`, `:metal`, `:cuda` or a [`Luna.DeviceSpec`](@ref).
     `nothing` (the default) means "not specified": it becomes `Luna.device_request()`,
     i.e. `Luna.settings["device"]` as the user set it (`:cpu` if nothing was set and
@@ -410,13 +419,15 @@ function prop_capillary(args...; status_period=5, kwargs...)
     output
 end
 
-#= Pick the absorbing-boundary options out of the user's keyword arguments so they can be
-   forwarded to Luna.run. They are declared on the *_args functions rather than here so that
+#= Pick the options which belong to Luna.run -- the absorbing boundaries and the
+   tabulation of the linear operator -- out of the user's keyword arguments so they can be
+   forwarded to it. They are declared on the *_args functions rather than here so that
    there is one set of defaults and so that saveargs records them; whatever the user did not
    pass simply falls through to Luna.run's own defaults. =#
 boundary_kwargs(kwargs) = NamedTuple(
     k => v for (k, v) in pairs(kwargs)
-    if k in (:boundary, :boundary_N, :boundary_length, :tcollar))
+    if k in (:boundary, :boundary_N, :boundary_length, :tcollar,
+             :tabulate_linop, :linop_tol))
 
 #= Error, naming the fix, when an *explicit* `device`/`precision` request cannot be
    honoured well because `resp` (mode-averaged only; multimode/radial go through
@@ -479,6 +490,8 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
                         boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR,
+                        tabulate_linop=false,
+                        linop_tol=LinearOps.DEFAULT_LINOP_TOL,
                         device=nothing, precision=nothing, stats_period=1)
 
     # do we have energy in the orthogonal polarisation states, or just the fundamental?
@@ -555,7 +568,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
         shotnoise, modes, model, loss, raman, kerr, plasma, PPT_options,
         temperature, saveN, filepath, filename,
-        boundary, boundary_N, boundary_length, tcollar,
+        boundary, boundary_N, boundary_length, tcollar, tabulate_linop, linop_tol,
         device, precision, stats_period)
 
     return Eω, grid, linop, transform, FT, output

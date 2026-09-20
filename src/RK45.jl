@@ -399,9 +399,12 @@ Make propagator for the case of non-constant linear operator.
 
 `linop!(out, z)` is host code -- the operators in `LinearOps` are scalar loops over
 `Modes.neff` -- so when the state lives on a device the operator is evaluated into a host
-buffer of the state's element type and copied up, once per distinct `t2`. That is the
-interim arrangement for tapers and pressure gradients until `gpu/23` tabulates the
-operator.
+buffer of the state's element type and copied up, once per distinct `t2`.
+
+This is the fallback, and the path a user-supplied `linop!` takes.
+`Luna.run(...; tabulate_linop=true)` replaces the operator with a
+[`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop), which has its own method
+of this function and does no host work per stage.
 """
 function make_prop!(linop!, y0)
     linop_int = similar(y0)

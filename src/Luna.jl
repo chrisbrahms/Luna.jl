@@ -516,6 +516,7 @@ function setup(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid,
 end
 
 linoptype(l::AbstractArray) = "constant"
+linoptype(l::LinearOps.TabulatedLinop) = "tabulated"
 linoptype(l) = "variable"
 
 gridtype(g::Grid.RealGrid) = "field-resolved"
@@ -603,6 +604,34 @@ the absorber reference length (`:rate`) or `max_dz` (`:none`, `:legacy`). See "F
 space" in [`Luna.Boundaries`](@ref) and [`NonlinearRHS.FreeSpaceNorm`](@ref).
 
 See [`Luna.Boundaries`](@ref) for the rationale.
+
+# Tabulating a z-dependent linear operator
+- `tabulate_linop::Bool=false`: tabulate the z-dependent quantities of the propagation --
+    the integrated linear operator `Φ(z) = ∫ linop dz'`
+    ([`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop)), and the
+    propagation constant `β(z)` and effective area `Aeff(z)` of a mode-averaged transform
+    -- on adaptively placed z nodes at setup, instead of evaluating them on the host at
+    every stage of every step. A tapered or pressure-graded run then does no host work
+    inside the right-hand side, which is what a device run needs; on the CPU it replaces
+    the per-stage `Modes.neff` loop with an interpolation.
+
+    It **changes the discretisation**: the propagator becomes `exp(Φ(t2) − Φ(t1))`, the
+    exact interaction-picture propagator of the linear part over the step, where the
+    default is `exp(linop(t2)·(t2 − t1))`, a one-point rule. Both converge to the same
+    solution as the step shrinks and the difference is largest where the operator varies
+    fastest within a step -- the entrance of a `p₀ = 0` pressure gradient. It is off by
+    default for that reason, and a run which uses it is not comparable element by element
+    with one which does not.
+
+    A constant operator is unaffected: it is already exact in the propagator and is not
+    tabulated. The tables are built for the propagation: the `transform` object the caller
+    passed in is not modified, so a statistics function built from `transform.aeff` before
+    the run keeps calling the untabulated one (once per accepted step, on the host, where
+    the statistics already are).
+- `linop_tol::Real=$(LinearOps.DEFAULT_LINOP_TOL)`: the tolerance the nodes are placed to
+    satisfy, in radians for the integrated operator (absolute) and relative for `β` and
+    `Aeff`. The tables cost `2·length(Eω)·nnodes` numbers for the operator, so a tolerance
+    far below the solver's own `rtol` buys nothing and costs memory.
 """
 function run(Eω, grid,
              linop, transform, FT, output;
@@ -611,7 +640,8 @@ function run(Eω, grid,
              status_period=1,
              boundary=:rate, boundary_N=Boundaries.DEFAULT_N, boundary_length=nothing,
              tcollar=Boundaries.DEFAULT_TCOLLAR, kcollar=Boundaries.DEFAULT_KCOLLAR,
-             rcollar=Boundaries.DEFAULT_RCOLLAR)
+             rcollar=Boundaries.DEFAULT_RCOLLAR,
+             tabulate_linop=false, linop_tol=LinearOps.DEFAULT_LINOP_TOL)
 
     isnothing(zmax) && error(
         "Luna.run requires the propagation length as the keyword argument zmax, e.g. "*
@@ -704,10 +734,28 @@ function run(Eω, grid,
 
     #= The linear operator is built on the host, in Float64, and wrapped by
        `Boundaries.setup` -- so the upload has to happen after it. A constant operator is
-       uploaded once, here; a closure is evaluated into a host buffer per stage by
-       `RK45.make_prop!` until gpu/23 tabulates it. On the default CPU path this returns
-       the operator unchanged. =#
+       uploaded once, here; a z-dependent one is either tabulated just below or evaluated
+       into a host buffer per stage by `RK45.make_prop!`. On the default CPU path this
+       returns the operator unchanged. =#
     linop = upload_like(Eω, linop)
+
+    #= Tabulation (GPU_PLAN.md section 4.5 layer 2), opt-in. The table has to cover every
+       z the stepper can ask about: `RK45.solve` runs `while tn <= tmax`, so the last step
+       starts at or before `zmax` and ends up to `max_dz` past it, and that step's stages
+       are what the last saved plane is interpolated from. `max_dz` is the absorber's,
+       which is the one the stepper will be given. Both tabulations happen after
+       `Boundaries.setup`, so the operator includes the absorber and the evanescent clamp.
+
+       A constant operator is already exact in the propagator and is left alone; the
+       transform's own z-dependent quantities are tabulated either way, which for a
+       constant operator is a two-node table and no change to the arithmetic that matters. =#
+    if tabulate_linop
+        ztab = zmax + max_dz
+        transform = NonlinearRHS.tabulate(transform, z0, ztab, linop_tol, Eω)
+        if !(linop isa AbstractArray)
+            linop = LinearOps.TabulatedLinop(linop, Eω, z0, ztab; tol=linop_tol)
+        end
+    end
 
     output(Grid.to_dict(grid), group="grid")
     #= Written once: on a resumed HDF5 propagation it is already in the file. An output
