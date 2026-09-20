@@ -51,12 +51,12 @@ the device-contract tests from `gpu/10-device-model` on. No Metal, no CUDA.
 
 | File | What it is |
 | --- | --- |
-| `cases.jl` | `RegressionCases.CASES`, 15 cases, and `runcase(case, mode)`. |
-| `compare.jl` | Storage format (HDF5) and the difference metric. |
+| `cases.jl` | `RegressionCases.CASES`, 20 cases, and `runcase(case, mode)`. |
+| `compare.jl` | Storage format (HDF5), the difference metric and the tolerance classes. |
 | `run_cases.jl` | Runs everything and writes the HDF5 files. |
 | `generate.jl` | Makes a worktree of a commit and runs `run_cases.jl` in it. |
 | `sensitivity.jl` | The one-ulp sensitivity study. |
-| `tolerances.jl` | Per-case, per-mode tolerances. |
+| `tolerances.jl` | Per-case, per-mode, per-class tolerances. |
 | `README.md` | How to run all of it. |
 
 The cases, all with `shotnoise=false` and `saveN=11`:
@@ -67,17 +67,30 @@ The cases, all with `shotnoise=false` and `saveN=11`:
 | `modeavg_field_plasma` | mode-averaged field, Kerr + PPT plasma (`PPT_options=Dict(:cache=>false)`) |
 | `modeavg_field_raman` | mode-averaged field, Kerr + Raman (N₂, 0.5 bar) |
 | `modeavg_field_mixture` | mode-averaged field, He/Ne mixture, low-level API |
+| `modeavg_field_adk` | mode-averaged field, Kerr + **ADK** plasma (`plasma=:ADK`) |
+| `modeavg_field_vector` | **elliptically polarised** (ε = 0.5) field, vector Kerr + plasma, two polarisation components |
 | `modeavg_env_kerr` | mode-averaged envelope, Kerr only |
 | `modeavg_env_raman` | mode-averaged envelope, Kerr + Raman |
-| `gnlse_sech` | `prop_gnlse`, N = 2 sech soliton |
+| `modeavg_env_thg` | mode-averaged envelope, **`Kerr_env_thg`** (`thg=true`) |
+| `gnlse_sech` | `prop_gnlse`, N = 2 sech soliton, no Raman, no shock |
+| `gnlse_raman_shock` | `prop_gnlse`, **`raman=true, shock=true`** |
 | `multimode_field_plasma` | 4 modes, field, Kerr + plasma |
 | `radial_field_kerr` | radial free space, field |
 | `radial_env_kerr` | radial free space, envelope |
 | `free3d_env_kerr` | 3-D free space, envelope, `FreeGrid(1 mm, 16, 1 mm, 8)` |
 | `free2d_field_chi2` | 2-D free space, field, `Chi2Field` in BBO |
+| `free2d_env_chi2` | 2-D free space, envelope, **`Chi2Env`** in BBO |
 | `gradient_field_kerr` | pressure gradient 2 → 0.1 bar |
 | `taper_field_kerr` | core radius tapered 125 → 93.75 µm |
 | `modeavg_field_legacy` | as `modeavg_field_kerr` but `boundary=:legacy` |
+
+The five in bold were added after review round 1 (finding 8) so that the gate covers the
+responses Groups C and D rewrite: `Kerr_env_thg`, `Chi2Env`, ADK ionisation, the vector
+response path and `prop_gnlse`'s Raman and self-steepening branches.
+
+All four free-space cases now record `z` and `dz` through `Stats.collect_stats(grid, Eω)`,
+so their step sequence is checked too. There is still no `Stats.default` for free-space
+geometries (known gap 1).
 
 Every case runs in two modes:
 
@@ -105,36 +118,40 @@ committed (`*.h5` is gitignored).
 Loads the baseline for `ENV["LUNA_REGRESSION_BASE"]`, or for the merge-base of `HEAD` with
 `evanescent`, runs every case in both modes with the same settings, and asserts
 `maximum(abs, Δ)/maximum(abs, baseline) <= tol` for `Eω`, for the save positions `z` and
-for every compared statistic, per case and per mode. In the `:adaptive` mode `stats/z` and
-`stats/dz` are not compared (see "What is compared in which mode"); in the `:fixed` mode
-everything is. It prints the table of observed maxima whether it passes or not. It
-is deliberately not in `runtests.jl`: it needs a baseline that does not exist on a fresh
-checkout.
+for every compared statistic, per case and per mode. There are two tolerances per case and
+mode, one for `Eω` and one for the statistics (see "Two tolerance classes"). In the
+`:adaptive` mode `stats/z` and `stats/dz` are not compared, but the number of accepted steps
+is checked in both modes. It prints a table of observed maxima whether it passes or not,
+with the (component, save) index the `Eω` maximum came from. It is deliberately not in
+`runtests.jl`: it needs a baseline that does not exist on a fresh checkout.
 
 ### `benchmark/`
 
-`benchmark/Project.toml` (BenchmarkTools, Luna as a `dev` dependency) and `benchmark/run.jl`,
+`benchmark/Project.toml` (BenchmarkTools, and Luna through a relative `[sources]` entry, so
+a bare `Pkg.instantiate()` in `benchmark/` is enough) and `benchmark/run.jl`,
 which for every regression case times one RHS evaluation `transform(nl, Eω, z)`, one
 `RK45.step!` of the preconditioned stepper with the absorbing boundaries folded into the
 operator, and one fixed-step propagation through `Luna.run`.
 
 ## Tests
 
-| What | How | Result |
-| --- | --- | --- |
 | What | Result |
 | --- | --- |
-| `test/test_regression.jl` | **304 pass, 0 fail**. Every case, both modes, difference exactly `0.000e+00`. 66 s |
+| `test/test_regression.jl` | **436 pass, 0 fail**. Every case, both modes, both classes, difference exactly `0.000e+00`. 90 s |
+| `test/test_utils.jl` | **33 pass, 0 fail**, 3.7 s (includes the new `set_fftw_wisdom` testset) |
 | `test/test_output.jl` | pass, 22.4 s |
 | `test/test_interface.jl` | pass, 268.6 s |
 | `test/test_freespace.jl` | pass, 313.9 s |
 | every other `test/test_*.jl` | all 33 files exit 0; table under "Per-file test timings" |
-| `test/regression/generate.jl fdf8dbe3` | baseline written, 15 cases × 2 modes |
-| `test/regression/generate.jl HEAD` | baseline written from a second, unrelated commit — see "Re-baselining" |
-| `LUNA_REGRESSION_BASE=211ab5ed test/test_regression.jl` | **304 pass, 0 fail**, all `0.000e+00` against that second baseline |
+| `test/regression/generate.jl fdf8dbe3` | baseline written, 20 cases × 2 modes |
+| `test/regression/generate.jl <other commit>` | exercised for two further commits — see "Re-baselining" |
 | `test/regression/sensitivity.jl` | table below |
 | `benchmark/run.jl` | table below |
 | `include("docs/make.jl")` | fails, identically to the base commit — see "Known gaps" 5 |
+
+The per-file timings below predate review round 1; only `test_utils.jl` changed since (it
+gained a testset that adds 0.1 s), and `test_regression.jl` went from 66 s to 90 s with the
+five new cases.
 
 Commands:
 
@@ -158,9 +175,10 @@ julia --project=. -t 1 -e 'using Luna, LinearAlgebra
 makes (or reuses) a detached worktree of it under `../baselines/<sha[1:10]>`, copies this
 worktree's `Manifest.toml` and *this branch's* `cases.jl`, `compare.jl` and `run_cases.jl`
 into it, and runs `run_cases.jl` there in a fresh `julia -t 1` process: the old Luna, the
-new case definitions. Exercised here for two different commits — the branch base
-`fdf8dbe3` and the branch head `211ab5ed` — which land in separate directories and can both
-be gated against.
+new case definitions. Exercised for three different commits: the branch base `fdf8dbe3`, an
+intermediate commit `211ab5ed`, and (by the reviewer, independently, into a redirected
+output directory) `da01cb1a`. Each lands in its own directory and can be gated against with
+`LUNA_REGRESSION_BASE`.
 
 To move the gate onto `gpu/int-A` once this branch is merged into it:
 
@@ -187,118 +205,145 @@ Machine: Apple M1 Pro, 10 cores, macOS, Julia 1.13.0. Everything below with `-t 
 running propagations on the same machine throughout, so the wall-clock numbers are upper
 bounds and repeatable only to some tens of percent.
 
+### The metric
+
+Per quantity, `maximum(abs, Δ)/maximum(abs, baseline)`. Elementwise relative differences are
+meaningless in the window tapers and outside `grid.sidx`.
+
+**`Eω` is normalised per component and per save.** `RegressionCompare.fielddiff` reduces the
+frequency axis and any transverse axes away and forms the ratio separately for each (mode or
+polarisation, save) pair; the reported value is the largest, and the gate prints which pair
+it came from. `Eω` is `(Nω, Nz)`, `(Nω, Nm, Nz)`, `(Nω, Npol, Nk, Nz)` or
+`(Nω, Npol, Nkx, Nky, Nz)`, so axis 1 is frequency, the last axis is the save, axis 2 is the
+component when there are more than two axes, and the rest are transverse.
+
+One global normalisation hid weak components. In `multimode_field_plasma` the per-mode
+maxima of `|Eω|` at the last save are `[2.9e5, 1.8e1, 3.2e0, 7.2e-2]`, a spread of 4e6: a
+change that rewrote mode 4 entirely would have sat four million times below a tolerance set
+by mode 1. That case is the only multimode one in the matrix and `gpu/22-modal` rewrites the
+transform it exercises.
+
+**Two tolerance classes.** `RegressionCompare.classof` puts each quantity into `:Eω` or
+`:stats` (the save grid `z`, the statistics, the step-count check), and `tolerances.jl`
+carries one tolerance per (case, mode, class). The statistics are recorded once per accepted
+step and so inherit the step-size controller's sensitivity in the adaptive mode; sharing one
+tolerance with them gave `Eω` up to four orders of magnitude of slack.
+
+**The step count is checked explicitly.** Every statistic is recorded per accepted step, so a
+change in the number of steps would fail every statistic's size check with an uninformative
+`Inf`. `compare` checks `length(stats["z"])` first and, if it differs, reports a single
+`"step count"` entry (`changed: N steps, baseline M`) and compares no statistics. Hard
+failure in both modes.
+
+**`stats/z` and `stats/dz` are excluded in `:adaptive` only.** They record the step sequence,
+not the field, and the controller responds to a one-ulp change far more strongly than the
+field does; with them in, the tolerance for `modeavg_env_kerr` came out at 0.73. In `:fixed`
+they are compared and must be exact, which is also the check that the step sequence really
+was imposed. Nothing is excluded from what the baseline *stores*, so the choice can be
+revisited without regenerating.
+
 ### Regression gate against `fdf8dbe3`
 
-Every case, both modes: `0.000e+00`, in every run. Largest difference over all cases and
-modes: `0.000e+00`. Per-case deltas, `:fixed`/`:adaptive`, against the tolerances in
-`tolerances.jl`:
+**436 pass, 0 fail.** Every case, every mode, every class: `0.000e+00`. Largest difference
+over all cases and modes: `0.000e+00`. The tolerances are from `tolerances.jl`; Δ is the
+observed difference.
 
-| Case | `:fixed` Δ | tol | `:adaptive` Δ | tol |
+| Case | `:fixed` Eω Δ / tol | `:fixed` stats Δ / tol | `:adaptive` Eω Δ / tol | `:adaptive` stats Δ / tol |
 | --- | --- | --- | --- | --- |
-| `modeavg_field_kerr` | 0 | 1.0e-12 | 0 | 5.9e-07 |
-| `modeavg_field_plasma` | 0 | 2.5e-12 | 0 | 7.3e-06 |
-| `modeavg_field_raman` | 0 | 1.0e-12 | 0 | 2.4e-09 |
-| `modeavg_field_mixture` | 0 | 1.0e-12 | 0 | 1.5e-10 |
-| `modeavg_env_kerr` | 0 | 1.0e-12 | 0 | 5.3e-04 |
-| `modeavg_env_raman` | 0 | 1.0e-12 | 0 | 4.2e-04 |
-| `gnlse_sech` | 0 | 1.0e-12 | 0 | 1.6e-09 |
-| `multimode_field_plasma` | 0 | 2.9e-07 | 0 | 7.7e-06 |
-| `radial_field_kerr` | 0 | 1.0e-12 | 0 | 1.2e-08 |
-| `radial_env_kerr` | 0 | 1.0e-12 | 0 | 8.2e-09 |
-| `free3d_env_kerr` | 0 | 1.0e-12 | 0 | 1.0e-12 |
-| `free2d_field_chi2` | 0 | 1.0e-12 | 0 | 7.4e-12 |
-| `gradient_field_kerr` | 0 | 1.0e-12 | 0 | 1.6e-04 |
-| `taper_field_kerr` | 0 | 1.0e-12 | 0 | 3.1e-05 |
-| `modeavg_field_legacy` | 0 | 1.0e-12 | 0 | 7.8e-08 |
+| `modeavg_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 5.9e-07 |
+| `modeavg_field_plasma` | 0 / 1.0e-12 | 0 / 2.5e-12 | 0 / 1.0e-12 | 0 / 7.3e-06 |
+| `modeavg_field_raman` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.4e-09 |
+| `modeavg_field_mixture` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.5e-10 |
+| `modeavg_field_adk` | 0 / 1.0e-12 | 0 / 2.3e-11 | 0 / 1.0e-12 | 0 / 3.8e-05 |
+| `modeavg_field_vector` | 0 / 1.0e-12 | 0 / 1.8e-09 | 0 / 1.0e-12 | 0 / 9.8e-05 |
+| `modeavg_env_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 5.6e-12 | 0 / 5.3e-04 |
+| `modeavg_env_raman` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.9e-12 | 0 / 4.2e-04 |
+| `modeavg_env_thg` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.3e-07 |
+| `gnlse_sech` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 3.6e-11 | 0 / 1.6e-09 |
+| `gnlse_raman_shock` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.9e-10 | 0 / 1.2e-08 |
+| `multimode_field_plasma` | 0 / 1.2e-11 | 0 / 2.9e-07 | 0 / 1.8e-07 | 0 / 7.7e-06 |
+| `radial_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.2e-08 | 0 / 1.0e-12 |
+| `radial_env_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 8.2e-09 | 0 / 1.0e-12 |
+| `free3d_env_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.0e-12 |
+| `free2d_field_chi2` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 7.4e-12 | 0 / 1.0e-12 |
+| `free2d_env_chi2` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 5.0e-12 | 0 / 1.0e-12 |
+| `gradient_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 2.6e-07 | 0 / 1.6e-04 |
+| `taper_field_kerr` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 8.7e-07 | 0 / 3.1e-05 |
+| `modeavg_field_legacy` | 0 / 1.0e-12 | 0 / 1.0e-12 | 0 / 1.3e-11 | 0 / 7.8e-08 |
 
-Exact zero, not "below tolerance", is a stronger statement than the brief asks for and it
+Exact zero, not "below tolerance", is a stronger statement than the brief asks for, and it
 also confirms that the baseline generator reproduces the run environment exactly: the
 baseline came from a separate Julia process, in a separate worktree, from a separate
-checkout. The same holds against a baseline generated from a second commit (`211ab5ed`, the
-branch head): 326/326, all `0.000e+00`.
+checkout. The same held for the two other baseline commits it has been run against
+(`211ab5ed` and, by the reviewer, `da01cb1a`), before the five new cases were added.
 
 ### One-ulp sensitivity
 
-Initial `Eω` multiplied by `1 + eps()`; the number is the gate's metric maximised over
-`Eω`, the save positions `z` and every compared statistic — which in the `:adaptive` mode
-excludes `stats/z` and `stats/dz`, see "What is compared in which mode" below.
+Initial `Eω` multiplied by `1 + eps()`; the numbers are the gate's metric maximised over
+each tolerance class, using the gate's own comparison (`:adaptive` excludes `stats/z` and
+`stats/dz`). Tolerances are 100× these, floored at 1e-12.
 
-| Case | `:fixed` | driven by | `:adaptive` | driven by |
-| --- | --- | --- | --- | --- |
-| `modeavg_field_kerr` | 1.59e-15 | `peakpower` | 5.89e-09 | `peakintensity` |
-| `modeavg_field_plasma` | 2.50e-14 | `peak_ionisation_rate` | 7.29e-08 | `peak_ionisation_rate` |
-| `modeavg_field_raman` | 1.59e-15 | `peakpower` | 2.38e-11 | `peakintensity` |
-| `modeavg_field_mixture` | 1.32e-15 | `Eω` | 1.48e-12 | `peakpower` |
-| `modeavg_env_kerr` | 1.09e-15 | `peakintensity` | 5.34e-06 | `peakpower` |
-| `modeavg_env_raman` | 1.87e-15 | `peakintensity` | 4.24e-06 | `peakintensity` |
-| `gnlse_sech` | 2.11e-15 | `peakintensity` | 1.64e-11 | `peakintensity` |
-| `multimode_field_plasma` | 2.95e-09 | `transverse_integral_error_rel` | 7.74e-08 | `peak_ionisation_rate` |
-| `radial_field_kerr` | 2.05e-15 | `Eω` | 1.24e-10 | `Eω` |
-| `radial_env_kerr` | 2.25e-15 | `Eω` | 8.18e-11 | `Eω` |
-| `free3d_env_kerr` | 9.30e-16 | `Eω` | 1.25e-15 | `Eω` |
-| `free2d_field_chi2` | 8.48e-16 | `Eω` | 7.37e-14 | `Eω` |
-| `gradient_field_kerr` | 1.59e-15 | `peakpower` | 1.61e-06 | `zdw` |
-| `taper_field_kerr` | 1.27e-15 | `Eω` | 3.06e-07 | `zdw` |
-| `modeavg_field_legacy` | 1.87e-15 | `peakintensity` | 7.77e-10 | `peakpower` |
+| Case | `:fixed` Eω | `:fixed` stats | driven by | `:adaptive` Eω | `:adaptive` stats | driven by |
+| --- | --- | --- | --- | --- | --- | --- |
+| `modeavg_field_kerr` | 8.60e-16 | 1.59e-15 | `peakpower` | 1.45e-15 | 5.89e-09 | `peakintensity` |
+| `modeavg_field_plasma` | 1.40e-15 | 2.50e-14 | `peak_ionisation_rate` | 2.20e-15 | 7.29e-08 | `peak_ionisation_rate` |
+| `modeavg_field_raman` | 1.41e-15 | 1.59e-15 | `peakpower` | 2.26e-15 | 2.38e-11 | `peakintensity` |
+| `modeavg_field_mixture` | 1.32e-15 | 9.52e-16 | `Eω` | 2.86e-15 | 1.48e-12 | `peakpower` |
+| `modeavg_field_adk` | 1.40e-15 | 2.27e-13 | `peak_ionisation_rate` | 2.20e-15 | 3.81e-07 | `peak_ionisation_rate` |
+| `modeavg_field_vector` | 1.24e-15 | 1.84e-11 | `transverse_integral_error_rel` | 1.79e-15 | 9.78e-07 | `peak_ionisation_rate` |
+| `modeavg_env_kerr` | 8.84e-16 | 1.09e-15 | `peakintensity` | 5.61e-14 | 5.34e-06 | `peakpower` |
+| `modeavg_env_raman` | 1.15e-15 | 1.87e-15 | `peakintensity` | 2.92e-14 | 4.24e-06 | `peakintensity` |
+| `modeavg_env_thg` | 1.58e-15 | 1.79e-15 | `peakpower` | 1.92e-15 | 2.26e-09 | `peakpower` |
+| `gnlse_sech` | 8.14e-16 | 2.11e-15 | `peakintensity` | 3.61e-13 | 1.64e-11 | `peakintensity` |
+| `gnlse_raman_shock` | 9.65e-16 | 1.87e-15 | `peakintensity` | 1.90e-12 | 1.25e-10 | `peakintensity` |
+| `multimode_field_plasma` | 1.16e-13 | 2.95e-09 | `transverse_integral_error_rel` | 1.80e-09 | 7.74e-08 | `peak_ionisation_rate` |
+| `radial_field_kerr` | 2.05e-15 | 0 | `Eω` | 1.24e-10 | 0 | `Eω` |
+| `radial_env_kerr` | 2.25e-15 | 0 | `Eω` | 8.18e-11 | 0 | `Eω` |
+| `free3d_env_kerr` | 9.30e-16 | 0 | `Eω` | 1.25e-15 | 0 | `Eω` |
+| `free2d_field_chi2` | 1.24e-15 | 0 | `Eω` | 7.38e-14 | 0 | `Eω` |
+| `free2d_env_chi2` | 1.13e-15 | 0 | `Eω` | 5.04e-14 | 0 | `Eω` |
+| `gradient_field_kerr` | 1.24e-15 | 1.59e-15 | `peakpower` | 2.58e-09 | 1.61e-06 | `zdw` |
+| `taper_field_kerr` | 1.28e-15 | 1.10e-15 | `Eω` | 8.72e-09 | 3.06e-07 | `zdw` |
+| `modeavg_field_legacy` | 1.02e-15 | 1.87e-15 | `peakintensity` | 1.29e-13 | 7.77e-10 | `peakpower` |
 
-Tolerances in `tolerances.jl` are 100× these, floored at 1e-12.
+"driven by" is the quantity that sets the `stats` number; the free-space cases record only
+`z` and `dz`, which are exact in `:fixed` and excluded in `:adaptive`, so their `stats`
+sensitivity is zero and the case is carried entirely by `Eω`.
 
-### What is compared in which mode
+Every `:fixed` number above the 1e-12 floor, as the brief asks:
 
-`RegressionCompare.skipstats(mode)` decides. In the `:fixed` mode nothing is excluded: the
-step sequence is imposed, so `stats/z` and `stats/dz` must match exactly, and checking them
-also confirms that it really was imposed.
+- **`multimode_field_plasma`, Eω 1.16e-13, in mode 4 of 4 at save 8.** With the old global
+  normalisation this was invisible; the per-component metric measures it. The four modes'
+  maxima span 4e6, so mode 4 is where any modal-transform change will show first.
+- **`modeavg_field_plasma` 2.50e-14 and `modeavg_field_adk` 2.27e-13, `peak_ionisation_rate`.**
+  Both ionisation rates are exponential in the field amplitude. ADK amplifies about ten
+  times more than PPT, which goes through a spline.
+- **`modeavg_field_vector` 1.84e-11 and `multimode_field_plasma` 2.95e-09,
+  `transverse_integral_error_rel`/`_abs`.** `HCubature`'s own error estimates for the modal
+  overlap integral: the adaptive quadrature subdivides differently when the integrand moves
+  in its last bits, so the error *estimate* moves far more than the integral. In
+  `multimode_field_plasma` the next largest statistic is `mode_reconstruction_error` at
+  2.74e-13.
 
-In the `:adaptive` mode `stats/z` and `stats/dz` (`RegressionCompare.STEP_STATS`) are
-excluded. They record the step sequence, not the field. The controller's accept/reject
-decision and its PI update respond to a one-ulp change far more strongly than the field
-does, and the response compounds over the steps it takes to ramp `init_dz` up to `max_dz`.
-With them in, the `:adaptive` sensitivity was set by `dz` in eight of the fifteen cases and
-by `z` in a ninth, and the resulting tolerances were 7.3e-01 for `modeavg_env_kerr` and
-5.9e-01 for `modeavg_env_raman` — no constraint on anything, applied to `Eω` as well.
-Excluding them drops the loosest adaptive tolerance by a factor of about 1400, to 5.3e-04,
-and leaves the numbers set by `Eω` and the physical statistics:
+In the `:adaptive` mode the `stats` class is loose by design (up to 5.34e-06 raw, 5.3e-04 as
+a tolerance) because every statistic is recorded per accepted step. The `Eω` class is two to
+four orders of magnitude tighter, which is the point of splitting the classes; the loosest
+are the two z-dependent cases, `taper_field_kerr` 8.72e-09 and `gradient_field_kerr`
+2.58e-09, where the operator is rebuilt at every stage so the step positions feed back into
+the field itself.
+
+### What review round 1 changed here
+
+Before the changes below, `Eω` and the statistics shared one tolerance per (case, mode), and
+`Eω` was normalised by the maximum over the whole array including the save axis.
 
 | | before | after |
 | --- | --- | --- |
-| loosest adaptive tolerance | 7.3e-01 (`modeavg_env_kerr`) | 5.3e-04 (`modeavg_env_kerr`) |
-| next loosest | 5.9e-01 (`modeavg_env_raman`) | 4.2e-04 (`modeavg_env_raman`) |
-| median adaptive tolerance | 1.6e-06 | 6.0e-08 |
-| assertions in the gate | 326 | 304 |
-
-`rundict`'s top-level `"z"` is a different thing — the save grid, fixed by
-`Output.GridCondition` — and is compared in both modes. Nothing is excluded from what the
-baseline *stores*, so the choice can be revisited without regenerating anything.
-
-The two loosest adaptive cases, `gradient_field_kerr` (1.6e-04) and `taper_field_kerr`
-(3.1e-05), are now set by `stats/zdw` and, for the gradient, `stats/density` and
-`stats/pressure`. Those are properties of the medium at whatever z the stepper landed on,
-so they inherit part of the step sequence's sensitivity indirectly, but they are not
-step-sequence records and would catch a real change in the density or taper function, so
-they stay in. `Eω` in those two cases is 2.6e-09 and 8.6e-09.
-
-Cases above 1e-12 in the `:fixed` mode, as the brief asks:
-
-- **`modeavg_field_plasma`, 2.50e-14, `stats/peak_ionisation_rate`.** The PPT rate is
-  exponential in the field amplitude, so it amplifies a one-ulp change in the field by
-  about an order of magnitude. `Eω` itself is at 1.4e-15.
-- **`multimode_field_plasma`, 2.95e-09, `stats/transverse_integral_error_rel` and `_abs`.**
-  These are `HCubature`'s own error estimates for the modal overlap integral in
-  `TransModal`. The adaptive quadrature subdivides differently when the integrand changes
-  in its last bits, so the error *estimate* moves by far more than the integral does. The
-  next largest quantity in that case is `stats/mode_reconstruction_error` at 2.7e-13 and
-  everything else is at rounding level.
-
-In the `:adaptive` mode the number is set by `stats/dz` in eight of the fifteen cases and by
-`stats/z` (the running sum of `dz`) in a ninth; the four free-space cases record no
-statistics, so theirs is `Eω` itself, and it is at 1e-10 or below. The step-size
-controller's accept/reject decision and its PI update respond to a one-ulp change far more
-strongly than the field does, and the response compounds over the steps it takes to ramp
-`init_dz` up to `max_dz`. `Eω` is three to six orders of magnitude tighter than the
-whole-case number: for `modeavg_field_kerr` the case number is 8.2e-06 while
-`peakintensity`, the largest non-step quantity, is 5.9e-09.
-
-**This is the weak point of the gate as specified** — see "Open questions" below.
+| loosest `Eω` tolerance, `:adaptive` | 5.3e-04 (shared with `stats`) | 8.7e-07 |
+| `Eω` tolerance, `gradient_field_kerr` `:adaptive` | 1.6e-04 | 2.6e-07 |
+| `Eω` sensitivity, `multimode_field_plasma` `:fixed` | not separately measured; whole-array metric dominated by mode 1 | 1.16e-13, located in mode 4 |
+| assertions in the gate | 304 | 436 |
+| cases | 15 | 20 |
 
 ### Benchmarks (`benchmark/run.jl`)
 
@@ -311,14 +356,19 @@ whole-case number: for `modeavg_field_kerr` the case number is 8.2e-06 while
 | `modeavg_field_plasma` | 2049 | 112 µs | 927 µs | 5.60 s |
 | `modeavg_field_raman` | 2049 | 251 µs | 1.76 ms | 72.9 ms |
 | `modeavg_field_mixture` | 2049 | 42.5 µs | 580 µs | 39.5 ms |
+| `modeavg_field_adk` | 2049 | 133 µs | 1.04 ms | 55.0 ms |
+| `modeavg_field_vector` | 4098 | 5.03 ms | 31.2 ms | 6.09 s |
 | `modeavg_env_kerr` | 2048 | 21.1 µs | 366 µs | 31.1 ms |
 | `modeavg_env_raman` | 2048 | 91.8 µs | 815 µs | 45.5 ms |
+| `modeavg_env_thg` | 2048 | 40.3 µs | 467 µs | 35.6 ms |
 | `gnlse_sech` | 2048 | 20.7 µs | 516 µs | 31.4 ms |
+| `gnlse_raman_shock` | 2048 | 77.4 µs | 864 µs | 42.2 ms |
 | `multimode_field_plasma` | 8196 | 4.86 ms | 30.5 ms | 6.47 s |
 | `radial_field_kerr` | 4128 | 156 µs | 1.68 ms | 63.3 ms |
 | `radial_env_kerr` | 4096 | 126 µs | 1.54 ms | 56.2 ms |
 | `free3d_env_kerr` | 16384 | 319 µs | 5.19 ms | 133 ms |
 | `free2d_field_chi2` | 16448 | 1.87 ms | 14.4 ms | 508 ms |
+| `free2d_env_chi2` | 32768 | 3.28 ms | 25.6 ms | 828 ms |
 | `gradient_field_kerr` | 2049 | 80.8 µs | 1.16 ms | 235 ms |
 | `taper_field_kerr` | 2049 | 309 µs | 3.65 ms | 101 ms |
 | `modeavg_field_legacy` | 2049 | 41.1 µs | 496 µs | 35.2 ms |
@@ -333,6 +383,15 @@ Notes on the numbers:
   every `prepare()`, about 5 s. 20 steps of `modeavg_field_plasma` is 19 ms.
 - `gradient_field_kerr` and `taper_field_kerr` are slower per step than the constant case
   because their operator is z-dependent: it is rebuilt at every stage.
+- `modeavg_field_vector` costs as much as the four-mode case despite having two components:
+  elliptical polarisation turns a mode-averaged run into a two-mode `TransModal`, so it pays
+  the adaptive modal integral. Its `prop` is setup-dominated for the same PPT reason as the
+  other plasma cases.
+- `free2d_env_chi2` has twice the state of `free2d_field_chi2` because the envelope grid is
+  built with `thg=true`, and costs about 1.8x as much per step.
+- The ten cases whose numbers are unchanged from the pre-review run were re-measured for
+  two of them (`modeavg_env_kerr` 21.2 µs / 358 µs / 32.5 ms, `free2d_field_chi2` 1.85 ms /
+  14.1 ms / 496 ms) to confirm the boundary-keyword fix changed nothing.
 - `multimode_field_plasma`'s RHS is two orders of magnitude above the mode-averaged cases:
   it is the adaptive `HCubature` modal integral at every evaluation, and it is the main
   target of §4.4.
@@ -391,27 +450,65 @@ it. **This did not reproduce here.** FFTW.jl v1.10.0, `fftw_provider == "fftw"`,
 No workaround adopted, as instructed. If it does appear later it will most likely be
 platform- or FFTW-build-dependent, so it is worth re-checking on the Linux CI runners.
 
+## Changes made after review round 1
+
+Review: `reviews/gpu-00-harness-1.md`, verdict "approve with minor fixes". All eleven
+actionable findings addressed; findings 12 and 13 were report-only and are reflected in the
+FFTW and documentation sections above.
+
+| # | Finding | What changed |
+| --- | --- | --- |
+| 1 | `Eω` normalised by the global maximum, so weak modes were unchecked | `RegressionCompare.fielddiff`: normalise per component and per save, report the index. `multimode_field_plasma`'s `:fixed` `Eω` sensitivity is now measurable at 1.16e-13, in mode 4 |
+| 2 | one tolerance per (case, mode) left `Eω` orders of magnitude of slack | two tolerance classes, `:Eω` and `:stats`, keyed per case and mode; `sensitivity.jl` measures and prints both |
+| 3 | a change in the step count would fail every statistic with an uninformative `Inf` | `compare` checks `length(stats["z"])` first and reports one named `"step count"` failure; hard failure in both modes. README now states how few controller steps the adaptive mode really exercises |
+| 4 | `loadFFTwisdom`'s early return also skipped `FFTW.set_num_threads` | moved above the guard, docstring updated |
+| 5 | `Scans` workers do not inherit the setting | said so in the `set_fftw_wisdom` docstring, for all three settings |
+| 6 | no test for `set_fftw_wisdom` | new testset in `test/test_utils.jl`: default, both functions return `nothing`, cache mtime unchanged, no pidlock, restore |
+| 7 | free-space cases recorded no statistics, so their step sequence was unchecked | all five now use `Stats.collect_stats(grid, Eω)`, recording `z` and `dz` |
+| 8 | response coverage gaps before Groups C and D | five new cases: `gnlse_raman_shock`, `modeavg_env_thg`, `free2d_env_chi2`, `modeavg_field_adk`, `modeavg_field_vector` |
+| 9 | `benchmark/run.jl` dropped all boundary keywords but `:boundary` | all four mapped onto `Boundaries.setup`; unused `linop`/`dz` bindings removed |
+| 10 | `Project.toml` and PR staleness | `JLArrays = "0.1, 0.2, 0.3"` (current release 0.3.3); stale "branch head", the 326-vs-304 paragraph and the duplicated table header fixed |
+| 11 | nits | `-` printed when the maximum is zero; soliton comment corrected (N = 2 is second order, `GNLSE_LENGTH` is 0.2 soliton periods); `runcase` now suppresses `Info` and below rather than everything, so warnings reach the gate output; `benchmark/Project.toml` carries a relative `[sources]` entry |
+
+On finding 11's `jldoctest` note: `set_fftw_mode`'s docstring contains a doctest that
+Documenter will execute now that the function is in a `@docs` block, mutating
+`settings["fftw_flag"]` during the docs build. It should pass (it asserts `0x00000020`,
+`FFTW.PATIENT`, which is the default). It could not be confirmed, because the docs build
+fails earlier on the pre-existing cross-reference errors in known gap 5. No change made.
+
+Everything in this section is in the commits after `1effca40`. The gate is still exactly
+zero, on a baseline regenerated from `fdf8dbe3` with the new `cases.jl` and `compare.jl`.
+
 ## Known gaps and deviations from GPU_PLAN.md
 
-1. **The free-space cases record no statistics.** The brief asks for "default statistics
-   on" for every case. There is no `Stats.default` method for free-space geometries —
-   `Stats.default` dispatches on `Modes.AbstractMode` and `Modes.ModeCollection` only — and
-   the individual stats functions do not all work on a 3-D `Eω`: `Stats.ω0`'s `squeeze`
-   has methods for 1- and 2-dimensional arrays only, and `Stats.energy` indexes `Eω[:, i]`.
-   The four free-space cases (`radial_field_kerr`, `radial_env_kerr`, `free3d_env_kerr`,
-   `free2d_field_chi2`) therefore compare `Eω` and `z` only, which is what the free-space
-   examples do (their `Stats.collect_stats` lines are commented out). Adding free-space
-   statistics is a change to `Stats.jl` and out of scope here; it would strengthen the gate
-   and is worth a separate issue.
+1. **The free-space cases record only `z` and `dz`, not physical statistics.** The brief
+   asks for "default statistics on" for every case. There is no `Stats.default` method for
+   free-space geometries — it dispatches on `Modes.AbstractMode` and `Modes.ModeCollection`
+   only — and the individual functions do not work on a 3- or 4-dimensional `Eω`:
+   `Stats.ω0`'s `squeeze` has 1- and 2-dimensional methods only, and `Stats.energy` and
+   `Stats.peakpower` index `Eω[:, i]`. Since review round 1 the five free-space cases do use
+   `Stats.collect_stats(grid, Eω)`, which appends `Stats.zdz!` and works on all three
+   geometries, so they now record `z` and `dz` — enough for the fixed-step check that the
+   step sequence was imposed and for the step-count check in the adaptive mode. Energy,
+   peak power and beam size are still not checked there. Adding them is a change to
+   `Stats.jl`, out of scope here, and worth a separate issue.
 
-2. **The `:adaptive` mode does not compare `stats/z` and `stats/dz`.** This is a deviation
-   from the brief, made deliberately and on instruction. With them in, the rule "one
-   tolerance per case per mode, 100× the measured sensitivity" produced adaptive tolerances
-   of 0.73 and 0.59 for the two envelope Kerr cases, which constrained nothing. They are
-   still compared, and must be exact, in the `:fixed` mode. See "What is compared in which
-   mode". The residual looseness is `stats/zdw`/`density`/`pressure` in the gradient and
-   taper cases, which are medium properties sampled at the step positions; they are kept
-   because they would catch a real change in the density or taper function.
+2. **The `:adaptive` mode does not compare `stats/z` and `stats/dz`, and the tolerances are
+   keyed by class rather than by quantity.** Both are deviations from the brief, made
+   deliberately and on instruction. With the step diagnostics in, the rule "one tolerance
+   per case per mode, 100× the measured sensitivity" produced adaptive tolerances of 0.73
+   and 0.59 for the two envelope Kerr cases, which constrained nothing. They are still
+   compared, and must be exact, in `:fixed`, and the step *count* is a hard failure in both
+   modes. The residual looseness in the `:stats` class is `stats/zdw`/`density`/`pressure`
+   in the gradient and taper cases, which are medium properties sampled at the step
+   positions; they are kept because they would catch a real change in the density or taper
+   function, and they no longer contaminate the `Eω` tolerance.
+
+   Still outstanding: the `:adaptive` `Eω` tolerances for `taper_field_kerr` (8.7e-07) and
+   `gradient_field_kerr` (2.6e-07) are two to three orders of magnitude looser than the
+   rest. That is a real property of those cases — the operator is rebuilt at every stage, so
+   the step positions feed into the field — not an artefact of the metric, and the `:fixed`
+   mode holds both to 1e-12.
 
 3. **`Luna.prop_capillary_args` does not exist** under that name: the `*_args` functions
    live in `Luna.Interface` and are not re-exported (only `prop_capillary` and `prop_gnlse`
@@ -435,10 +532,12 @@ platform- or FFTW-build-dependent, so it is worth re-checking on the Linux CI ru
    bugs, do not fix them outside the brief) — worth an issue, because it means the docs
    have not built on `evanescent` for a while.
 
-6. **`benchmark/Project.toml` has no `[sources]` entry.** `Pkg.develop(path=".")` adds one
-   with an absolute path, which is machine-specific; the file says so and the committed
-   version does not contain it. Consequence: a bare `Pkg.instantiate()` in `benchmark/`
-   without the `develop` step first would resolve Luna from the registry. The documented
+6. **`benchmark/Project.toml` now carries a relative `[sources]` entry** (`Luna = {path = ".."}`),
+   so a bare `Pkg.instantiate()` in `benchmark/` is enough and nothing writes an absolute
+   path into a tracked file. That form needs Julia >= 1.11, which is why the benchmark
+   environment's `julia` compat is 1.11 while Luna's stays at 1.9; the benchmark environment
+   is a developer tool and is not part of what `Pkg.add("Luna")` resolves. Verified by
+   deleting `benchmark/Manifest.toml` and instantiating from scratch. The older documented
    setup line does the `develop` first.
 
 7. **`benchmark/` has no `SUITE`/PkgBenchmark layout.** `CLAUDE.md` in the main working
@@ -448,12 +547,16 @@ platform- or FFTW-build-dependent, so it is worth re-checking on the Linux CI ru
 
 ## Open questions
 
-- **Per-quantity tolerances.** Still one tolerance per (case, mode), as the brief
-  specifies. Excluding the step diagnostics from the `:adaptive` comparison has made that
-  good enough — the loosest tolerance is 5.3e-04 and the median 6.0e-08 — so a `Dict`
-  keyed by quantity as well is no longer needed. It would still be the way to tighten
-  `gradient_field_kerr` and `taper_field_kerr`, whose numbers are set by `stats/zdw` rather
-  than by the field.
+- **Per-quantity tolerances.** Two classes now, not one number and not one per quantity.
+  That is enough for `Eω`, which is what matters; the remaining candidate for a third class
+  would be the `HCubature` error estimates (`transverse_integral_error_*`), which set the
+  `:fixed` `stats` tolerance for the two modal cases at 1.8e-09 and 2.9e-07 while everything
+  else in those cases is at rounding level. Worth doing if `gpu/22-modal` turns out to move
+  them.
+- **Response coverage.** Finding 8 is addressed for `Kerr_env_thg`, `Chi2Env`, ADK, the
+  vector path and GNLSE Raman/shock. `Kerr_field_nothg` is still uncovered: it is what
+  `prop_capillary` selects for a `RealGrid` with `thg=false`, and adding a case for it is
+  one line if Group D wants it.
 - **Re-baselining.** `gpu/int-A` has to re-baseline for `gpu/01-zmax`'s changed signatures.
   `generate.jl` takes the commit as an argument and `cases.jl` is copied from the branch
   under test, so the mechanism is there, but `cases.jl` itself will need its `Luna.run` and
