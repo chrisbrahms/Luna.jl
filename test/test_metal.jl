@@ -49,6 +49,14 @@ const MetalSpec = DeviceSpec(MtlArray, Float32)
 # per step may do it.
 GPUArraysCore.allowscalar(false)
 
+#= A user-written columnwise response: a plain closure over the contract Luna has always
+   had, with no knowledge of devices, precision or units. On a device run
+   `Nonlinear.HostResponse` is what has to make it work, and this is the only place that
+   is checked on real hardware. =#
+usercubic(s) = let s = s
+    (out, E, ρ) -> (out .+= (ρ*s) .* E.^3)
+end
+
 #= The same mode-averaged Kerr propagation on whichever spec is asked for. `Luna.run`
    wraps the output in `ScaledOutput` itself now (gpu/11), so this test file never needs
    its own host-copy wrapper the way it did under gpu/10 -- `out`, the plain
@@ -57,7 +65,8 @@ GPUArraysCore.allowscalar(false)
    `Boundaries.jl`) has its own testset below, since it is the whole point of this
    branch. =#
 function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
-                   precision=nothing, thg=false, boundary=:none, stats=false, fixed=false)
+                   precision=nothing, thg=false, boundary=:none, stats=false, fixed=false,
+                   extraresp=())
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15; thg)
@@ -74,6 +83,7 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
     else
         (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
     end
+    resp = (resp..., extraresp...)
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0;
                                                     (GT === Grid.EnvGrid ? (; thg) : ())...)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
@@ -180,39 +190,50 @@ end
     ρ = PhysData.density(:He, 1.0)
     sc = Luna.UnitScaling(1024.0, PhysData.ε_0)
 
-    # Kerr, real field, scalar and vector
+    #= The responses go through `Et_to_Pt!`, which is how a transform reaches them: the
+       fused broadcast is the kernel, and its scalar coefficients are what must not be
+       Float64. The response structs themselves keep their physical `Float64` constants
+       and never enter a kernel (gpu/12). =#
     kf = Nonlinear.rescale(Nonlinear.Kerr_field(PhysData.γ3_gas(:He)), MetalSpec, sc)
-    @test kf isa Nonlinear.KerrField{Float32}
+    @test kf isa Nonlinear.KerrField{Float64}
     E = Luna.todevice(MetalSpec, rand(n))
     out = Luna.alloc(MetalSpec, Float32, (n,))
-    kf(out, E, ρ)
+    @test Nonlinear.pointwise_kernel(kf, out, ρ, sc)(1f0) isa Float32
+    NonlinearRHS.Et_to_Pt!(out, E, (kf,), ρ; scaling=sc)
     @test all(isfinite, Array(out))
+    @test !all(iszero, Array(out)) # the scaled coefficient is not flushed to zero
     Ev = Luna.todevice(MetalSpec, rand(n, 2))
     outv = Luna.alloc(MetalSpec, Float32, (n, 2))
-    kf(outv, Ev, ρ)
+    NonlinearRHS.Et_to_Pt!(outv, Ev, (kf,), ρ; scaling=sc)
     @test all(isfinite, Array(outv))
+    @test !all(iszero, Array(outv))
 
     # Kerr, envelope, scalar and vector
     ke = Nonlinear.rescale(Nonlinear.Kerr_env(PhysData.γ3_gas(:He)), MetalSpec, sc)
-    @test ke isa Nonlinear.KerrEnv{Float32}
     Ec = Luna.todevice(MetalSpec, rand(ComplexF64, n))
     outc = Luna.alloc(MetalSpec, ComplexF32, (n,))
-    ke(outc, Ec, ρ)
+    NonlinearRHS.Et_to_Pt!(outc, Ec, (ke,), ρ; scaling=sc)
     @test all(isfinite, Array(outc))
     Ecv = Luna.todevice(MetalSpec, rand(ComplexF64, n, 2))
     outcv = Luna.alloc(MetalSpec, ComplexF32, (n, 2))
-    ke(outcv, Ecv, ρ)
+    NonlinearRHS.Et_to_Pt!(outcv, Ecv, (ke,), ρ; scaling=sc)
     @test all(isfinite, Array(outcv))
+    @test !all(iszero, Array(outcv))
+
+    # Two pointwise responses in one fused broadcast
+    fill!(outv, 0)
+    NonlinearRHS.Et_to_Pt!(outv, Ev, (kf, Nonlinear.Kerr_field(2PhysData.γ3_gas(:He))),
+                           ρ; scaling=sc)
+    @test all(isfinite, Array(outv))
 
     # Kerr with THG: carries an array, so it also has an Adapt rule
     t = collect(range(0, 1e-13, length=n))
     kt = Nonlinear.rescale(Nonlinear.Kerr_env_thg(PhysData.γ3_gas(:He), 2.35e15, t),
                            MetalSpec, sc)
     @test kt.C isa MtlArray{ComplexF32, 1}
-    @test kt.γ3 isa Float32
-    fill!(outc, 0)
-    kt(outc, Ec, ρ)
+    NonlinearRHS.Et_to_Pt!(outc, Ec, (kt,), ρ; scaling=sc)
     @test all(isfinite, Array(outc))
+    @test !all(iszero, Array(outc))
     @test Adapt.adapt(MtlArray, kt).C isa MtlArray
 
     # The RK45 per-step kernels
@@ -426,6 +447,61 @@ end
    practice (adaptive stepping, but the nonlinearity is too weak for that to matter at
    this energy); the gradient one needs a separate, looser, documented tolerance against
    the Float64 reference specifically -- see the comment at that assertion. =#
+@testset "vector pointwise responses on Metal" begin
+    n = 512
+    ρ = PhysData.density(:He, 1.0)
+    γ3 = PhysData.γ3_gas(:He)
+    sc = Luna.UnitScaling(1024.0, PhysData.ε_0)
+    hspec = DeviceSpec(Array, Float32)
+    for (resp, T) in ((Nonlinear.Kerr_field(γ3), Float32),
+                      (Nonlinear.Kerr_env(γ3), ComplexF32))
+        Eh = T <: Complex ? randn(ComplexF32, n, 2) : randn(Float32, n, 2)
+        Ph = zeros(T, n, 2)
+        NonlinearRHS.Et_to_Pt!(Ph, Eh, (Nonlinear.rescale(resp, hspec, sc),), ρ;
+                               scaling=sc)
+        Ed = Luna.todevice(MetalSpec, Eh)
+        Pd = Luna.alloc(MetalSpec, T, (n, 2))
+        NonlinearRHS.Et_to_Pt!(Pd, Ed, (Nonlinear.rescale(resp, MetalSpec, sc),), ρ;
+                               scaling=sc)
+        @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-5
+    end
+end
+
+#= The hackability fallback on real hardware: a user-written columnwise closure, which
+   knows nothing about devices or units, run through `HostResponse` in a Metal
+   propagation. Correct but slow by construction. =#
+@testset "a user closure response through HostResponse on Metal" begin
+    cw = usercubic(PhysData.ε_0*PhysData.γ3_gas(:He)/10)
+    href32, htr32 = metalcase(Grid.RealGrid, DeviceSpec(Array, Float32);
+                              extraresp=(cw,), fixed=true)
+    href64, _ = metalcase(Grid.RealGrid, HostSpec(); extraresp=(cw,), fixed=true)
+    mref, mtr = metalcase(Grid.RealGrid, MetalSpec; extraresp=(cw,), fixed=true)
+
+    @test htr32.resp[2] isa Nonlinear.HostResponse
+    @test mtr.resp[2] isa Nonlinear.HostResponse
+    @test Nonlinear.kind(mtr.resp[2]) isa Nonlinear.Batched
+    @test mtr.resp[2].resp === cw
+    @test eltype(mref["Eω"]) === ComplexF32
+
+    for (ref, tol) in ((href32, 1e-4), (href64, 1e-4))
+        d = 0.0
+        for idx in axes(ref["Eω"], 2)
+            h = ComplexF64.(ref["Eω"][:, idx])
+            m = ComplexF64.(mref["Eω"][:, idx])
+            d = max(d, maximum(abs, m .- h)/maximum(abs, h))
+        end
+        @test d < tol
+    end
+
+    # The closure really contributes
+    plain, _ = metalcase(Grid.RealGrid, HostSpec(); fixed=true)
+    @test maximum(abs, href64["Eω"][:, end] .- plain["Eω"][:, end])/
+          maximum(abs, plain["Eω"][:, end]) > 1e-6
+
+    # It says so, once, at setup
+    @test_logs (:info,) match_mode=:any Nonlinear.rescale(cw, MetalSpec, UNIT_SCALING)
+end
+
 @testset "prop_capillary on Metal" begin
     capkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
              trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=false)
@@ -528,9 +604,16 @@ end
 end
 
 @testset "Metal refuses what it cannot run" begin
-    # A response with no `rescale` method is refused in a scaled run (gpu/12's job)
-    @test_throws Exception Nonlinear.rescale(
-        (out, E, ρ) -> nothing, MetalSpec, UNIT_SCALING)
+    #= A columnwise response is wrapped in a `HostResponse` rather than refused
+       (gpu/12); what is refused is one which claims a device kernel for arrays nothing
+       has converted. =#
+    @test Nonlinear.rescale((out, E, ρ) -> nothing, MetalSpec, UNIT_SCALING) isa
+          Nonlinear.HostResponse
+    # An unwrapped columnwise response applied to a device array is refused, not run
+    Pd = Luna.alloc(MetalSpec, Float32, (16,))
+    Ed = Luna.todevice(MetalSpec, randn(16))
+    @test_throws ErrorException NonlinearRHS.Et_to_Pt!(
+        Pd, Ed, ((out, E, ρ) -> nothing,), 1.0)
 
     # multimode propagation is not device-capable through the simple interface either
     @test_throws ErrorException Luna.prop_capillary(

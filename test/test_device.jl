@@ -45,6 +45,39 @@ struct DummyGPUArray{T, N} <: GPUArraysCore.AbstractGPUArray{T, N}
 end
 Base.size(x::DummyGPUArray) = size(x.a)
 
+#= A second pointwise response, so that the fused broadcast can be checked against the
+   sum of two terms and the protocol can be seen to be writable from outside
+   `Nonlinear.jl`. A kind, a `coefficients` and a `pointwise_kernel` are all a new scalar
+   pointwise response needs; this is the worked example in
+   `docs/src/developer/device_model.md`. Physically it is a toy quadratic response. =#
+struct SquareResponse{T}
+    c::T
+end
+Nonlinear.kind(::SquareResponse) = Nonlinear.Pointwise()
+Nonlinear.coefficients(r::SquareResponse, ρ, scaling) = ρ*r.c*Luna.polscale(scaling, 2)
+Nonlinear.pointwise_kernel(r::SquareResponse, E, ρ, scaling) =
+    _square(Luna.scalar(E, Nonlinear.coefficients(r, ρ, scaling)))
+_square(fac) = e -> fac*e^2
+(r::SquareResponse)(out, E, ρ) =
+    (f = _square(Luna.scalar(E, Nonlinear.coefficients(r, ρ, UNIT_SCALING)));
+     @. out += f(E))
+
+#= A response which claims a device kernel and carries an array, but never said how the
+   array moves: `rescale` must refuse it rather than leave a host array in a device
+   kernel. (A pointwise response with no arrays needs no `rescale` method.) =#
+struct BadPointwise{V}
+    C::V
+end
+Nonlinear.kind(::BadPointwise) = Nonlinear.Pointwise()
+Nonlinear.resident_arrays(r::BadPointwise) = (r.C,)
+
+#= A user-written columnwise response: a plain closure over the contract Luna has always
+   had, with no knowledge of devices, precision or units. On a device run this is what
+   `Nonlinear.HostResponse` has to make work. =#
+usercubic(s) = let s = s
+    (out, E, ρ) -> (out .+= (ρ*s) .* E.^3)
+end
+
 @testset "backend trait" begin
     host = zeros(ComplexF64, 4, 3, 2)
     dev = DummyGPUArray(host)
@@ -206,6 +239,142 @@ end
     @test Luna.unitscaling(Float32, [0.0, 0.0], PhysData.ε_0).Eref == 1.0
 end
 
+@testset "response kinds and the fused broadcast" begin
+    γ3 = PhysData.γ3_gas(:He)
+    ρ = PhysData.density(:He, 1.0)
+    n = 128
+    t = collect(range(0, 1e-13, length=n))
+    kf = Nonlinear.Kerr_field(γ3)
+    ke = Nonlinear.Kerr_env(γ3)
+    kt = Nonlinear.Kerr_env_thg(γ3, 2.35e15, t)
+    sq = SquareResponse(1e-40)
+    cw = usercubic(1e-52)
+
+    # The traits
+    @test Nonlinear.kind(cw) isa Nonlinear.Columnwise
+    @test Nonlinear.kind(kf) isa Nonlinear.Pointwise
+    @test Nonlinear.kind(kf, Val(1)) isa Nonlinear.Pointwise
+    @test Nonlinear.kind(kf, Val(2)) isa Nonlinear.VectorPointwise
+    @test Nonlinear.kind(kf, 2) isa Nonlinear.VectorPointwise
+    @test Nonlinear.kind(ke, Val(2)) isa Nonlinear.VectorPointwise
+    # THG is elementwise in every index, including the polarisation one
+    @test Nonlinear.kind(kt, Val(2)) isa Nonlinear.Pointwise
+    @test Nonlinear.device_capable(kf)
+    @test !Nonlinear.device_capable(cw)
+
+    #= `coefficients` is the one place the physical constants, the density and the unit
+       scaling meet. =#
+    sc = UnitScaling(1024.0, PhysData.ε_0)
+    @test Nonlinear.coefficients(kf, ρ, UNIT_SCALING) == ρ*PhysData.ε_0*γ3
+    @test Nonlinear.coefficients(kf, ρ, sc) ==
+          ρ*PhysData.ε_0*γ3*(1024.0^2/PhysData.ε_0)
+    @test Luna.polscale(UNIT_SCALING, 3) == 1
+    @test Luna.polscale(UNIT_SCALING, 2) == 1
+    @test Luna.polscale(sc, 2) == 1024.0/PhysData.ε_0
+
+    #= The fused broadcast is exactly the responses applied one after another: the terms
+       are summed in tuple order, left-associated, in the same arithmetic. =#
+    E = randn(n)
+    P = zeros(n)
+    Pref = zeros(n)
+    NonlinearRHS.Et_to_Pt!(P, E, (kf, sq), ρ)
+    kf(Pref, E, ρ)
+    sq(Pref, E, ρ)
+    @test P == Pref
+
+    # One pointwise response on its own
+    fill!(Pref, 0)
+    NonlinearRHS.Et_to_Pt!(P, E, (kf,), ρ)
+    kf(Pref, E, ρ)
+    @test P == Pref
+
+    # Vector forms, field and envelope
+    Ev = randn(n, 2)
+    Pv = zeros(n, 2)
+    Pvref = zeros(n, 2)
+    NonlinearRHS.Et_to_Pt!(Pv, Ev, (kf, sq), ρ)
+    kf(Pvref, Ev, ρ)
+    sq(Pvref, Ev, ρ)
+    @test Pv == Pvref
+
+    Ec = randn(ComplexF64, n, 2)
+    Pc = zeros(ComplexF64, n, 2)
+    Pcref = zeros(ComplexF64, n, 2)
+    NonlinearRHS.Et_to_Pt!(Pc, Ec, (ke,), ρ)
+    ke(Pcref, Ec, ρ)
+    @test Pc == Pcref
+
+    # A pointwise response which carries a per-sample array
+    Ee = randn(ComplexF64, n)
+    Pe = zeros(ComplexF64, n)
+    Peref = zeros(ComplexF64, n)
+    NonlinearRHS.Et_to_Pt!(Pe, Ee, (kt,), ρ)
+    kt(Peref, Ee, ρ)
+    @test Pe == Peref
+
+    #= A gas mixture: a tuple of tuples and a vector of densities. The per-gas terms fuse
+       into the same broadcast, each with its own density. =#
+    ρ2 = PhysData.density(:Ne, 1.0)
+    mix = ((Nonlinear.Kerr_field(γ3),), (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ne)),))
+    dens = [ρ, ρ2]
+    Pm = zeros(n)
+    Pmref = zeros(n)
+    NonlinearRHS.Et_to_Pt!(Pm, E, mix, dens)
+    for ii in eachindex(dens), r in mix[ii]
+        r(Pmref, E, dens[ii])
+    end
+    @test Pm == Pmref
+
+    #= A columnwise response after a pointwise one: the pointwise group is written first,
+       the columnwise one accumulates on top, in tuple order. =#
+    Pu = zeros(n)
+    Puref = zeros(n)
+    NonlinearRHS.Et_to_Pt!(Pu, E, (kf, cw), ρ)
+    kf(Puref, E, ρ)
+    cw(Puref, E, ρ)
+    @test Pu == Puref
+
+    # ... and the other way round, where `Pt` has to be zero-filled first
+    fill!(Puref, 0)
+    NonlinearRHS.Et_to_Pt!(Pu, E, (cw, kf), ρ)
+    cw(Puref, E, ρ)
+    kf(Puref, E, ρ)
+    @test Pu == Puref
+
+    # A multi-column block with `idcs`, as the radial and free-space transforms use
+    E3 = randn(n, 2, 5)
+    P3 = zeros(n, 2, 5)
+    P3ref = zeros(n, 2, 5)
+    idcs = CartesianIndices((5,))
+    NonlinearRHS.Et_to_Pt!(P3, E3, (kf, cw), ρ, idcs)
+    for i in idcs
+        kf(view(P3ref, :, :, i), view(E3, :, :, i), ρ)
+        cw(view(P3ref, :, :, i), view(E3, :, :, i), ρ)
+    end
+    @test P3 == P3ref
+
+    #= The scaled state gives the same physical polarisation. Eref is a power of two, so
+       dividing the field by it is exact and only the coefficients differ. =#
+    Es = E ./ sc.Eref
+    Ps = zeros(n)
+    NonlinearRHS.Et_to_Pt!(Ps, Es, (kf, sq), ρ; scaling=sc)
+    fill!(Pref, 0)
+    kf(Pref, E, ρ)
+    sq(Pref, E, ρ)
+    @test maximum(abs, Ps .* (sc.Pref*sc.Eref) .- Pref)/maximum(abs, Pref) < 1e-14
+
+    # A response collection which is not a tuple keeps the historical loop
+    Pl = zeros(n)
+    NonlinearRHS.Et_to_Pt!(Pl, E, Any[kf, cw], ρ)
+    @test Pl == Puref || Pl == Pu # same terms, one order or the other
+    @test_throws ErrorException NonlinearRHS.Et_to_Pt!(Pl, E, Any[kf], ρ; scaling=sc)
+
+    # The dispatch is resolved at compile time, so it costs nothing per step
+    @test (@inferred NonlinearRHS.Et_to_Pt!(P, E, (kf, sq), ρ)) isa AbstractArray
+    @test (@inferred NonlinearRHS.Et_to_Pt!(Pv, Ev, (kf, sq), ρ)) isa AbstractArray
+    @test (@inferred NonlinearRHS.Et_to_Pt!(Pu, E, (kf, cw), ρ)) isa AbstractArray
+end
+
 @testset "FFT planner dispatch" begin
     #= The host planner takes Luna's FFTW flags, the device planner must not (device FFT
        libraries reject them), and `plan_ift` splits the inverse into an unnormalised
@@ -248,7 +417,7 @@ end
    it built -- already on the host, already unscaled. `boundary=:none` by default: the
    `:rate` case, which exercises `Boundaries.RateAbsorber`, has its own testset below. =#
 function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
-                  precision=nothing, boundary=:none, stats=false)
+                  precision=nothing, boundary=:none, stats=false, extraresp=())
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15)
@@ -261,6 +430,7 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
     resp = GT === Grid.RealGrid ?
         (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),) :
         (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
+    resp = (resp..., extraresp...)
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
@@ -486,6 +656,62 @@ end
    it is called with is host, unscaled data whatever device the state lives on), run on a
    device end to end through `Luna.run`, with no explicit host-copy wrapper from the
    caller -- `ScaledOutput` is automatic. =#
+@testset "pointwise responses on JLArray" begin
+    γ3 = PhysData.γ3_gas(:He)
+    ρ = PhysData.density(:He, 1.0)
+    n = 128
+    sq = SquareResponse(1e-40)
+    cases = ((Nonlinear.Kerr_field(γ3), Float64),
+             (Nonlinear.Kerr_env(γ3), ComplexF64),
+             (Nonlinear.Kerr_env_thg(γ3, 2.35e15, collect(range(0, 1e-13, length=n))),
+              ComplexF64))
+    for (resp, T) in cases, npol in (1, 2)
+        dims = npol == 1 ? (n,) : (n, 2)
+        Eh = randn(T, dims)
+        Ph = zeros(T, dims)
+        NonlinearRHS.Et_to_Pt!(Ph, Eh, (resp, sq), ρ)
+        rd = Nonlinear.rescale(resp, JLSpec, UNIT_SCALING)
+        Ed = Luna.todevice(JLSpec, Eh)
+        Pd = Luna.alloc(JLSpec, T, dims)
+        NonlinearRHS.Et_to_Pt!(Pd, Ed, (rd, sq), ρ)
+        @test Pd isa JLArray
+        @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-10
+    end
+    # The array a response carries is moved to the device by `rescale`
+    kt = Nonlinear.rescale(
+        Nonlinear.Kerr_env_thg(γ3, 2.35e15, collect(range(0, 1e-13, length=n))),
+        JLSpec, UNIT_SCALING)
+    @test kt.C isa JLArray
+    @test Nonlinear.resident_arrays(kt) === (kt.C,)
+end
+
+#= The hackability fallback: a user-written columnwise closure, which knows nothing about
+   devices, run through `HostResponse` on a JLArray propagation. =#
+@testset "a user closure response through HostResponse on JLArray" begin
+    cw = usercubic(PhysData.ε_0*PhysData.γ3_gas(:He)/10)
+    href, htr = kerrcase(Grid.RealGrid, HostSpec(); extraresp=(cw,))
+    dref, dtr = kerrcase(Grid.RealGrid, JLSpec; extraresp=(cw,))
+
+    # The host run keeps the closure itself; the device run wraps it
+    @test htr.resp[2] === cw
+    @test dtr.resp[2] isa Nonlinear.HostResponse
+    @test Nonlinear.kind(dtr.resp[2]) isa Nonlinear.Batched
+    @test dtr.resp[2].resp === cw
+
+    @test size(dref["Eω"]) == size(href["Eω"])
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = dref["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+    end
+
+    #= The closure really contributes: without it the answer is different by much more
+       than the tolerance above. =#
+    plain, _ = kerrcase(Grid.RealGrid, HostSpec())
+    @test maximum(abs, href["Eω"][:, end] .- plain["Eω"][:, end])/
+          maximum(abs, plain["Eω"][:, end]) > 1e-6
+end
+
 @testset "boundaries and default statistics on JLArray" begin
     for GT in (Grid.RealGrid, Grid.EnvGrid)
         href, htr = kerrcase(GT, HostSpec(); boundary=:rate, stats=true)
@@ -575,9 +801,26 @@ end
         grid, βfun!, aeff; spec=s32, scaling=Luna.UnitScaling(1024.0, PhysData.ε_0))
     @test NonlinearRHS.check_norm(
         rightunits, s32, Luna.UnitScaling(1024.0, PhysData.ε_0)) === nothing
-    # A response with no `rescale` method is refused in a scaled run
+    #= A columnwise response is no longer refused: it is wrapped in a `HostResponse`,
+       which is batched and runs it on the host (gpu/12). =#
+    wrapped = Nonlinear.rescale(usercubic(1e-52), DeviceSpec(Array, Float32), UNIT_SCALING)
+    @test wrapped isa Nonlinear.HostResponse
+    @test Nonlinear.kind(wrapped) isa Nonlinear.Batched
+    @test Nonlinear.device_capable(wrapped)
+    # ... and it says so, once, at setup
+    @test_logs (:info,) match_mode=:any Nonlinear.rescale(
+        usercubic(1e-52), JLSpec, Luna.UnitScaling(1024.0, PhysData.ε_0))
+    #= What is still refused is a response which declares a device kind but has no
+       `rescale` method: it claims a kernel whose arrays nothing has converted. =#
     @test_throws ErrorException Nonlinear.rescale(
-        (out, E, ρ) -> nothing, DeviceSpec(Array, Float32), UNIT_SCALING)
+        BadPointwise(zeros(4)), DeviceSpec(Array, Float32), UNIT_SCALING)
+    # ... while one whose coefficients are all scalars needs no `rescale` method at all
+    @test Nonlinear.rescale(SquareResponse(1e-40), DeviceSpec(Array, Float32),
+                            UNIT_SCALING) isa SquareResponse
+    # An unwrapped columnwise response applied to a device array is refused, not run
+    Pd = Luna.alloc(JLSpec, Float64, (16,))
+    Ed = Luna.todevice(JLSpec, randn(16))
+    @test_throws ErrorException NonlinearRHS.Et_to_Pt!(Pd, Ed, (usercubic(1e-52),), 1.0)
 end
 
 isnothing(SCALAR_WAS) ? delete!(task_local_storage(), :ScalarIndexing) :
@@ -606,8 +849,15 @@ end # have_jlarrays
     @test tr32.scaling.Eref > 1
     @test log2(tr32.scaling.Eref) == round(log2(tr32.scaling.Eref))
     @test tr32.scaling.Pref == PhysData.ε_0
-    # The scaled coefficient is a normal Float32 with room to spare
-    @test floatmin(Float32) < abs(tr32.resp[1].γ3*ρ*PhysData.ε_0) < floatmax(Float32)
+    #= The response struct keeps its physical `γ3`: it never enters a kernel. What does
+       is the scalar `coefficients` returns, combined in Float64 and converted once -- and
+       that is a normal Float32 with room to spare, where the unscaled coefficient above
+       does not exist in Float32 at all. =#
+    @test tr32.resp[1] isa Nonlinear.KerrField{Float64}
+    @test tr32.resp[1].γ3 === PhysData.γ3_gas(:He)
+    c32 = Luna.scalar(tr32.Eto, Nonlinear.coefficients(tr32.resp[1], ρ, tr32.scaling))
+    @test c32 isa Float32
+    @test floatmin(Float32) < abs(c32) < floatmax(Float32)
 
     #= `ScaledOutput` unscales on the way into the output and `Output.MemoryOutput` now
        allocates with `eltype(y)`, so the saved field is `ComplexF32`, in physical units,
