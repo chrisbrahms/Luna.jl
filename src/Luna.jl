@@ -627,7 +627,10 @@ function run(Eω, grid,
     Eωc, zc, dzc = Output.check_cache(output, Eω, z0, init_dz)
     if zc > z0
         Logging.@info("Found cached propagation. Resuming...")
-        Eω, z0, init_dz = Eωc, zc, dzc
+        #= `check_cache` reads the cached field back from the file as a host array, so it
+           has to be put back on the state's array type and precision. On the default CPU
+           path this returns the array it was given. =#
+        Eω, z0, init_dz = upload_like(Eω, Eωc), zc, dzc
     end
 
     #= NOTE: this must come after check_cache, which can move z0 and init_dz: the temporal
@@ -644,10 +647,11 @@ function run(Eω, grid,
        so nothing can put anything back; all this removes is the numerical dust the input
        transform leaves outside the band. Not for :legacy, which must reproduce the
        historical scheme exactly -- its per-step `ωwin` multiply does the same job from the
-       first step anyway. =#
-    #= One masked broadcast rather than logical indexing, so it runs on any array type.
-       `ifelse` leaves the in-band elements untouched and writes an exact zero elsewhere,
-       which is what the indexed assignment did. =#
+       first step anyway.
+
+       One masked broadcast rather than logical indexing, so that it runs on any array
+       type. `ifelse` leaves the in-band elements untouched and writes an exact zero
+       elsewhere, which is what the indexed assignment did. =#
     if boundary !== :legacy
         sidx = reshape(mask_like(Eω, grid.sidx), :, ntuple(_ -> 1, ndims(Eω) - 1)...)
         z0c = zero(eltype(Eω))

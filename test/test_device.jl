@@ -222,7 +222,10 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15)
     m = Capillary.MarcatiliMode(75e-6, gas, pres, loss=false)
     aeff(z) = Modes.Aeff(m, z=z)
-    dens = z -> PhysData.density(gas, pres)
+    #= Precomputed: `PhysData.density` goes through CoolProp and costs more per call
+       than the whole right-hand side. =#
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
     resp = GT === Grid.RealGrid ?
         (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),) :
         (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)

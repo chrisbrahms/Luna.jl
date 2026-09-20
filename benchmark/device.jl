@@ -61,7 +61,11 @@ function prepare(spec, trange)
         grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), trange)
         m = Capillary.MarcatiliMode(75e-6, GAS, PRES, loss=false)
         aeff(z) = Modes.Aeff(m, z=z)
-        dens = z -> PhysData.density(GAS, PRES)
+        #= The density is constant here, and `PhysData.density` goes through CoolProp,
+           which costs ~85 us a call -- more than the whole right-hand side. The simple
+           interface precomputes it the same way. =#
+        ρ = PhysData.density(GAS, PRES)
+        dens = z -> ρ
         resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(GAS)),)
         linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
         inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
