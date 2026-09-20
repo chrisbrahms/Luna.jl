@@ -2,7 +2,7 @@ module RK45
 import Dates
 import Logging
 import Printf: @sprintf
-import Luna.Utils: format_elapsed
+import Luna.Utils: format_elapsed, isdevice
 
 #Get Butcher tableau etc from separate file (for convenience of changing if wanted)
 include("dopri.jl")
@@ -27,10 +27,12 @@ end
 function solve(s, tmax; stepfun=donothing!, output=false, outputN=201,
                         status_period=1, repeat_limit=10)
     if output
+        #= The saved array is always a host array, whatever the solution lives on, and
+           `_saveto!` copies device to host. =#
         yout = Array{eltype(s.y)}(undef, (size(s.y)..., outputN))
         tout = range(s.t, stop=tmax, length=outputN)
         saved = 1
-        yout[fill(:, ndims(s.y))..., 1] = s.y
+        _saveto!(yout, 1, s.y)
     end
 
     steps = 0
@@ -62,7 +64,7 @@ function solve(s, tmax; stepfun=donothing!, output=false, outputN=201,
             if output
                 while (saved<outputN) && tout[saved+1] < s.tn
                     ti = tout[saved+1]
-                    yout[fill(:, ndims(s.y))..., saved+1] .= interpolate(s, ti)
+                    _saveto!(yout, saved+1, interpolate(s, ti))
                     saved += 1
                 end
             end
@@ -83,9 +85,17 @@ function solve(s, tmax; stepfun=donothing!, output=false, outputN=201,
 
     if output
         return collect(tout), yout, steps
-    else      
+    else
         return nothing
     end
+end
+
+#= Write one save into the host output array. A device solution is copied down first;
+   `Array(y)` is a no-op test plus a return on the host, and `solve(output=true)` is a
+   low-level entry point which is not on the per-step path. =#
+function _saveto!(yout, idx, y)
+    selectdim(yout, ndims(yout), idx) .= y isa Array ? y : Array(y)
+    nothing
 end
 
 
@@ -157,7 +167,10 @@ function PreconStepper(f!, linop, y0, t, dt;
     prop! = make_prop!(linop, y0)
     fbar! = make_fbar!(f!, prop!, y0)
     k1 = similar(y0)
-    fbar!(k1, y0, t, t)
+    #= fbar! propagates its second argument in place, so the first RHS evaluation is made
+       on a scratch copy rather than on the caller's initial condition. =#
+    y0c = copy(y0)
+    fbar!(k1, y0c, t, t)
     ks = (k1, similar(k1), similar(k1), similar(k1), similar(k1), similar(k1), similar(k1))
     yerr = similar(y0)
 
@@ -184,15 +197,9 @@ function step!(s)
     # so this does not depend on the RHS leaving its input array alone. For locextrap the
     # two are bit-identical anyway: b5[1:6] == B[6], b5[7] == 0, same accumulation order.
     bprop = s.locextrap ? b5 : b4
-    s.yn .= s.y
-    for jj = 1:7
-        bprop[jj] == 0 || (s.yn .+= s.dt*bprop[jj].*s.ks[jj])
-    end
+    combine!(s.yn, s.y, s.ks, s.dt, bprop)
 
-    fill!(s.yerr, 0)
-    for ii = 1:7
-        errest[ii] == 0 || (@. s.yerr += s.dt*s.ks[ii]*errest[ii])
-    end
+    errorestimate!(s.yerr, s.ks, s.dt)
     s.err = s.norm(s.yerr, s.y, s.yn, s.rtol, s.atol)
     s.ok = s.err <= 1
     stepcontrolPI!(s)
@@ -205,6 +212,82 @@ function step!(s)
     return s.ok
 end
 
+#= Every per-step combination of the stage derivatives is one fused broadcast over the
+   whole array rather than a sequence of `.+=` passes. The n-ary `+` in a broadcast is
+   left-associated and the terms are written in the tableau's order, with each
+   coefficient formed as `dt*b` on the host exactly as the sequential version did, so on
+   the CPU in double precision the result is bit-for-bit what the loop produced. The
+   scalars are converted to the state's real element type first: nothing reachable from a
+   kernel argument may hold a Float64 (Metal's compiler rejects it), and for Float64 the
+   conversion is the identity. =#
+
+#= Which weights of the tableau are exactly zero. The sequential accumulation skipped
+   those terms, and the fused combines below skip the same ones, so the two agree
+   bitwise. Asserted rather than assumed, so that a different tableau cannot silently
+   change which terms are dropped. =#
+@assert all(all(!iszero, B[ii]) for ii = 1:5)
+@assert iszero(B[6][2]) && !iszero(B[6][1]) && all(!iszero, B[6][3:6])
+@assert iszero(b5[2]) && iszero(b5[7]) && all(!iszero, b5[[1, 3, 4, 5, 6]])
+@assert iszero(b4[2]) && all(!iszero, b4[[1, 3, 4, 5, 6, 7]])
+@assert iszero(errest[2]) && all(!iszero, errest[[1, 3, 4, 5, 6, 7]])
+
+"""
+    combine!(yn, y, ks, dt, b, n=7)
+
+`yn = y + Σⱼ dt bⱼ kⱼ` over the first `n` stages, in one fused pass. `n < 7` is a
+Butcher stage (`b = B[n]`); `n == 7` is the propagation, with `b` either `b5` or `b4`.
+"""
+function combine!(yn, y, ks, dt, b, n=7)
+    R = real(eltype(yn))
+    k1, k2, k3, k4, k5, k6, k7 = ks
+    if n == 1
+        c1 = convert(R, dt*b[1])
+        @. yn = y + c1*k1
+    elseif n == 2
+        c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2])
+        @. yn = y + c1*k1 + c2*k2
+    elseif n == 3
+        c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2]); c3 = convert(R, dt*b[3])
+        @. yn = y + c1*k1 + c2*k2 + c3*k3
+    elseif n == 4
+        c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2]); c3 = convert(R, dt*b[3])
+        c4 = convert(R, dt*b[4])
+        @. yn = y + c1*k1 + c2*k2 + c3*k3 + c4*k4
+    elseif n == 5
+        c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2]); c3 = convert(R, dt*b[3])
+        c4 = convert(R, dt*b[4]); c5 = convert(R, dt*b[5])
+        @. yn = y + c1*k1 + c2*k2 + c3*k3 + c4*k4 + c5*k5
+    elseif n == 6
+        c1 = convert(R, dt*b[1]); c3 = convert(R, dt*b[3]); c4 = convert(R, dt*b[4])
+        c5 = convert(R, dt*b[5]); c6 = convert(R, dt*b[6])
+        @. yn = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6
+    else
+        c1 = convert(R, dt*b[1]); c3 = convert(R, dt*b[3]); c4 = convert(R, dt*b[4])
+        c5 = convert(R, dt*b[5]); c6 = convert(R, dt*b[6])
+        if iszero(b[7]) # b5 is FSAL and does not use k7; b4 does
+            @. yn = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6
+        else
+            c7 = convert(R, dt*b[7])
+            @. yn = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6 + c7*k7
+        end
+    end
+    yn
+end
+
+"""
+Embedded error estimate `Σᵢ dt kᵢ eᵢ` in one pass. `errest[2] == 0`, which the sequential
+accumulation also skipped; `dt*kᵢ*eᵢ` keeps that association so the result is unchanged.
+"""
+function errorestimate!(yerr, ks, dt)
+    R = real(eltype(yerr))
+    d = convert(R, dt)
+    k1, k2, k3, k4, k5, k6, k7 = ks
+    e1 = convert(R, errest[1]); e3 = convert(R, errest[3]); e4 = convert(R, errest[4])
+    e5 = convert(R, errest[5]); e6 = convert(R, errest[6]); e7 = convert(R, errest[7])
+    @. yerr = 0 + d*k1*e1 + d*k3*e3 + d*k4*e4 + d*k5*e5 + d*k6*e6 + d*k7*e7
+    yerr
+end
+
 function evaluate!(s::Stepper)
     # Set new time and stepsize values -- this happens at the beginning because
     # the interpolant still requires the old values after the step has finished
@@ -212,10 +295,7 @@ function evaluate!(s::Stepper)
     s.t = s.tn
     s.y .= s.yn
     for ii = 1:6
-        s.yn .= s.y
-        for jj = 1:ii
-            B[ii][jj] == 0 || (s.yn .+= s.dt*B[ii][jj].*s.ks[jj])
-        end
+        combine!(s.yn, s.y, s.ks, s.dt, B[ii], ii)
         s.f!(s.ks[ii+1], s.yn, s.t+nodes[ii]*s.dt)
     end
 end
@@ -228,18 +308,29 @@ function evaluate!(s::PreconStepper)
     s.dt = s.dtn
     s.t = s.tn
     for ii = 1:6
-        s.yn .= s.y
-        for jj = 1:ii
-            B[ii][jj] == 0 || (s.yn .+= s.dt*B[ii][jj].*s.ks[jj])
-        end
+        combine!(s.yn, s.y, s.ks, s.dt, B[ii], ii)
         s.fbar!(s.ks[ii+1], s.yn, s.t, s.t+nodes[ii]*s.dt)
     end
+    #= The last stage's `fbar!` propagated (clobbered) `yn` in place. That does not
+       matter: `step!` rebuilds `yn` from `y` and the weight vector before anything reads
+       it. =#
 end
 
 prop!_maybe(s::PreconStepper) = s.prop!(s.yn, s.t, s.tn)
 prop!_maybe(s) = nothing
 
-"Interpolate solution, aka dense output."
+"""
+    interpolate(s, ti)
+
+The dense-output solution at `ti`, as one fused broadcast into the stepper's own
+interpolant buffer `s.yi`.
+
+!!! note
+    The returned array is the stepper's buffer, not a fresh one: it is overwritten by the
+    next call to `interpolate` and by the next step. Copy it if you need to keep it. (At
+    `ti == s.t` and `ti == s.tn` the stepper's own `y`/`yn` are returned, which has always
+    been the case.)
+"""
 function interpolate(s::Stepper, ti::Float64)
     if ti > s.tn
         error("Attempting to extrapolate!")
@@ -249,17 +340,10 @@ function interpolate(s::Stepper, ti::Float64)
     elseif ti == s.tn
         return s.yn
     end
-    σ = (ti - s.t)/s.dt
-    σp = map(p -> σ^p, range(1, stop=4))
-    b = sum(σp.*interpC, dims=1)
-    fill!(s.yi, 0)
-    for ii = 1:7
-         s.yi .+= s.ks[ii].*b[ii]
-    end
-    return @. s.y + s.dt.*s.yi
+    interpolant!(s, ti)
 end
 
-"Interpolate solution, aka dense output."
+@doc (@doc interpolate)
 function interpolate(s::PreconStepper, ti::Float64)
     if ti > s.tn
         error("Attempting to extrapolate!")
@@ -269,100 +353,156 @@ function interpolate(s::PreconStepper, ti::Float64)
     elseif ti == s.tn
         return s.yn
     end
+    interpolant!(s, ti)
+    s.prop!(s.yi, s.t, ti)
+    return s.yi
+end
+
+#= `y + dt*(Σᵢ bᵢ kᵢ)` in one pass. The inner sum is left-associated over all seven
+   stages in order, including the zero-weight k2 term, which is what the sequential
+   fill!/.+= accumulation did, so on the CPU in double precision this is bit-identical. =#
+function interpolant!(s, ti::Float64)
     σ = (ti - s.t)/s.dt
     σp = map(p -> σ^p, range(1, stop=4))
     b = sum(σp.*interpC, dims=1)
-    fill!(s.yi, 0)
-    for ii = 1:7
-         s.yi .+= s.ks[ii].*b[ii]
-    end
-    out =  @. s.y + s.dt.*s.yi
-    s.prop!(out, s.t, ti)
-    return out
+    R = real(eltype(s.y))
+    d = convert(R, s.dt)
+    w1 = convert(R, b[1]); w2 = convert(R, b[2]); w3 = convert(R, b[3])
+    w4 = convert(R, b[4]); w5 = convert(R, b[5]); w6 = convert(R, b[6])
+    w7 = convert(R, b[7])
+    k1, k2, k3, k4, k5, k6, k7 = s.ks
+    y = s.y
+    @. s.yi = y + d*(0 + k1*w1 + k2*w2 + k3*w3 + k4*w4 + k5*w5 + k6*w6 + k7*w7)
+    return s.yi
 end
 
 "Make propagator for the case of constant linear operator"
 function make_prop!(linop::AbstractArray, y0)
     prop! = let linop=linop
         function prop!(y, t1, t2, bwd=false)
-            if bwd
-                @. y *= exp(linop*(t1-t2))
-            else
-                @. y *= exp(linop*(t2-t1))
-            end
+            dt = convert(real(eltype(y)), bwd ? (t1-t2) : (t2-t1))
+            @. y *= exp(linop*dt)
         end
     end
 end
 
-"Make propagator for the case of non-constant linear operator"
+"""
+Make propagator for the case of non-constant linear operator.
+
+`linop!(out, z)` is host code -- the operators in `LinearOps` are scalar loops over
+`Modes.neff` -- so when the state lives on a device the operator is evaluated into a host
+buffer of the state's element type and copied up, once per distinct `t2`. That is the
+interim arrangement for tapers and pressure gradients until `gpu/23` tabulates the
+operator.
+"""
 function make_prop!(linop!, y0)
     linop_int = similar(y0)
-    lastt2 = [typemin(Float64)]
-    function prop!(y, t1, t2, bwd=false)
-        #= linop is always evaluated at later time, even for backward propagation
-            therefore, linop is often evaluated at the same t2 twice in a row=#
-        (lastt2[1] != t2) && linop!(linop_int, t2)
-        lastt2[1] = t2
-        dt = bwd ? (t1-t2) : (t2-t1)
-        @. y *= exp(linop_int*dt)
+    hostbuf = isdevice(y0) ? Array{eltype(y0)}(undef, size(y0)) : nothing
+    lastt2 = Ref(typemin(Float64))
+    prop! = let linop! = linop!, linop_int = linop_int, hostbuf = hostbuf, lastt2 = lastt2
+        function prop!(y, t1, t2, bwd=false)
+            #= linop is always evaluated at later time, even for backward propagation
+                therefore, linop is often evaluated at the same t2 twice in a row=#
+            if lastt2[] != t2
+                if isnothing(hostbuf)
+                    linop!(linop_int, t2)
+                else
+                    linop!(hostbuf, t2)
+                    copyto!(linop_int, hostbuf)
+                end
+            end
+            lastt2[] = t2
+            dt = convert(real(eltype(y)), bwd ? (t1-t2) : (t2-t1))
+            @. y *= exp(linop_int*dt)
+        end
     end
     return prop!
 end
 
-"Make closure for the pre-conditioned RHS function."
+"""
+Make closure for the pre-conditioned RHS function.
+
+!!! note
+    `fbar!(out, ybar, t1, t2)` propagates `ybar` to `t2` **in place**, so the caller must
+    not rely on its contents afterwards. `evaluate!(::PreconStepper)` rebuilds `yn` from
+    `y` before every stage and `step!` rebuilds it afterwards, so this is safe there and
+    saves one field-sized buffer.
+"""
 function make_fbar!(f!, prop!, y0)
-    y = similar(y0)
-    fbar! = let f! = f!, prop! = prop!, y=y
+    fbar! = let f! = f!, prop! = prop!
         function fbar!(out, ybar, t1, t2)
-            y .= ybar
-            prop!(y, t1, t2) # propagate to t2
-            f!(out, y, t2) # evaluate RHS function
+            prop!(ybar, t1, t2) # propagate to t2 (in place)
+            f!(out, ybar, t2) # evaluate RHS function
             prop!(out, t1, t2, true) # propagate back to t1
         end
     end
 end
 
+#= The error norms are single reductions over the state arrays rather than scalar loops,
+   so that they run on every backend. The accumulator is initialised in the state's real
+   element type so that no Float64 reaches a device kernel; `rtol` and `atol` are
+   converted for the same reason where they appear inside the reduction, while the final
+   scalar arithmetic stays in Float64.
+
+   A norm which indexes its arguments elementwise still works on the CPU, and a
+   user-supplied one is called with the materialised error estimate exactly as before. =#
+
+"""
+One reduction over several arrays, as `op` folded over `f` applied elementwise.
+
+The arrays are combined into a lazy `Broadcast.Broadcasted` rather than passed to
+`mapreduce` directly, which matters on both backends. With an explicit `init` Base
+reduces a `Broadcasted` with `mapfoldl`: a serial fold in index order, which allocates
+nothing and performs the same operations in the same order as the scalar loops these
+replace, so the result is bit-identical on the CPU. Base's *multi-array* `mapreduce`, by
+contrast, materialises `map(f, As...)` first, which is a field-sized allocation per step.
+`GPUArrays` has a `mapreduce` method for a `Broadcasted` of its own style, so on a device
+this is its tree reduction -- whose summation order differs, as a parallel reduction's
+must.
+"""
+@inline _zipreduce(f, op, init, arrs...) = mapreduce(
+    identity, op, Broadcast.instantiate(Broadcast.broadcasted(f, arrs...)); init=init)
+
+@inline _add3(a, b) = (a[1]+b[1], a[2]+b[2], a[3]+b[3])
+@inline _max2(a, b) = (max(a[1], b[1]), max(a[2], b[2]))
+@inline _maxmap(yerr, y, yn) = (abs(yerr), max(abs(y), abs(yn)))
+@inline _abs2map(y, yn, yerr) = (abs2(y), abs2(yn), abs2(yerr))
+
 "Max-ish norm (from Dane Austin's code, no idea where he got it from)."
 function maxnorm(yerr, y, yn, rtol, atol)
-    maxerr = 0
-    maxy = 0
-    for ii in eachindex(yerr)
-        maxerr = max(maxerr, abs(yerr[ii]))
-        maxy = max(maxy, max(abs(y[ii]), abs(yn[ii])))
-    end
+    R = real(eltype(yerr))
+    maxerr, maxy = _zipreduce(_maxmap, _max2, (zero(R), zero(R)), yerr, y, yn)
     return maxerr/(atol + rtol*maxy)
 end
 
 "Alternative form of max-ish norm."
 function maxnorm_ratio(yerr, y, yn, rtol, atol)
-    m = 0
-    for ii in eachindex(yerr)
-        den = atol + rtol*max(abs(y[ii]), abs(yn[ii]))
-        m = max(abs(yerr[ii])/den, m)
+    R = real(eltype(yerr))
+    at = convert(R, atol)
+    rt = convert(R, rtol)
+    f = @inline function (e, a, b)
+        abs(e)/(at + rt*max(abs(a), abs(b)))
     end
-    return m
+    return _zipreduce(f, max, zero(R), yerr, y, yn)
 end
 
 "Semi-norm as used in DifferentialEquations.jl, see Hairer, Solving Ordinary Differential
 Equations: Nonstiff Problems, eq. (4.11) (p.168 of the second revised edition)."
 function normnorm(yerr, y, yn, rtol, atol)
-    s = 0
-    for ii in eachindex(yerr)
-        s += abs2(yerr[ii]/(atol + rtol*max(abs(y[ii]), abs(yn[ii]))))
+    R = real(eltype(yerr))
+    at = convert(R, atol)
+    rt = convert(R, rtol)
+    f = @inline function (e, a, b)
+        abs2(e/(at + rt*max(abs(a), abs(b))))
     end
+    s = _zipreduce(f, +, zero(R), yerr, y, yn)
     sqrt(s/length(yerr))
 end
 
 "'Weak' norm as used in fnfep."
 function weaknorm(yerr, y, yn, rtol, atol)
-    sy = 0
-    syn = 0
-    syerr = 0
-    for ii in eachindex(yerr)
-        sy += abs2(y[ii])
-        syn += abs2(yn[ii])
-        syerr += abs2(yerr[ii])
-    end
+    R = real(eltype(yerr))
+    sy, syn, syerr = _zipreduce(_abs2map, _add3, (zero(R), zero(R), zero(R)), y, yn, yerr)
     errwt = max(max(sqrt(sy), sqrt(syn)), atol)
     return sqrt(syerr)/rtol/errwt
 end
