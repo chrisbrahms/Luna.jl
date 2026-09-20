@@ -18,8 +18,12 @@
 module RegressionCases
 
 using Luna
-import Luna: Boundaries, Capillary, Fields, Grid, Hankel, Interface, LinearOps, Modes,
+import Luna: Boundaries, Capillary, Fields, Grid, Interface, LinearOps, Modes,
              Nonlinear, NonlinearRHS, Output, PhysData, Stats
+#= Hankel is a direct dependency of Luna, so import it directly rather than as `Luna.Hankel`:
+   `src/Luna.jl` keeps an `import Hankel` only so that existing scripts still resolve
+   `Luna.Hankel`, and a later branch removing that dead import must not break the gate. =#
+import Hankel
 import Logging
 
 export CASES, overrides, runcase
@@ -58,6 +62,12 @@ const HAS_RADIALGRID = isdefined(Grid, :RadialGrid)
 
 `Grid.RealGrid`/`Grid.EnvGrid` with or without the leading `zmax` argument, whichever the
 loaded Luna wants. `GT` is `Grid.RealGrid` or `Grid.EnvGrid`.
+
+Do not pass `δt` as a keyword while `evanescent` is still a baseline commit: there
+`RealGrid` takes it as its fifth *positional* argument (`EnvGrid` takes it as a keyword on
+both sides), so `δt=...` would reach the deprecated `RealGrid` method as an unsupported
+keyword. No case needs it; `thg`, which the BBO envelope case does pass, is a keyword on
+both sides and goes through `kwargs...` unchanged.
 """
 makegrid(GT, zmax, referenceλ, λ_lims, trange; kwargs...) =
     GRID_HAS_ZMAX ? GT(zmax, referenceλ, λ_lims, trange; kwargs...) :

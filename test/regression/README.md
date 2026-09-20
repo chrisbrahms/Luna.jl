@@ -141,7 +141,7 @@ Every case runs twice.
   return the same step every time, so the step-size controller is bypassed and every
   difference is attributable to the arithmetic rather than to a different sequence of
   steps. The 20 steps are chosen so that the step equals the `:rate` absorber's reference
-  length `grid.zmax/boundary_N`, which is what `Luna.run` would otherwise cap `max_dz` at.
+  length `zmax/boundary_N`, which is what `Luna.run` would otherwise cap `max_dz` at.
 - `:adaptive` — the default controller, started from `init_dz = zmax/1000`. This is the
   sanity check that the controller still takes the same decisions.
 
@@ -236,6 +236,15 @@ precompilation) silently changes the plan an `:estimate` run gets, and with it t
 the floating-point operations. On an older commit, which has no `set_fftw_wisdom`,
 `run_cases.jl` redefines `Luna.Utils.loadFFTwisdom`/`saveFFTwisdom` to do nothing and calls
 `FFTW.forget_wisdom()`.
+
+The stored baselines were generated under Julia 1.13.0 with the `Manifest.toml` of the
+worktree that generated them, which `generate.jl` copies into the baseline worktree so that
+both sides use the same package versions. That is what makes an *exact* zero reproducible:
+a different Julia, a different stdlib or a different set of JLLs -- OpenBLAS and FFTW above
+all -- changes the order of the floating-point operations, and the gate then reports
+rounding-level differences everywhere rather than zeros. If that happens, regenerate the
+baseline in the environment the gate is being run in before concluding anything about the
+branch.
 
 ## Tolerances
 

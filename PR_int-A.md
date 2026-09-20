@@ -112,11 +112,14 @@ of them in code `gpu/02-radialgrid` added:
 3. `src/Luna.jl`: the `rcollar` entry of `run`'s docstring still called the radial transverse
    grid a `QDHT`. It now points at `Grid.RadialGrid`.
 
-Nothing else remains: the only `.zmax` in the tree is a comment in `src/Luna.jl` explaining
-why `run` does `float(zmax)`, and the only calls to the deprecated grid constructors are the
-ones in `test/test_grid.jl` that test the deprecation and the docstrings in `src/Grid.jl`
-that document it. `test/runtests.jl` carries both branches' new entries — `test_grid.jl`
-(line 23) and `test_radialgrid.jl` (line 122).
+Nothing else remains. As the branch now stands, `.zmax` appears in seven places and none of
+them is a grid field: a comment in `src/Luna.jl:565` explaining why `run` does
+`float(zmax)`; `c.zmax` three times in `test/regression/cases.jl` and `case.zmax` twice in
+`benchmark/run.jl`, which are the `zmax` field of the regression `Case` struct, not of a
+grid; and one line of `test/regression/README.md`. The only calls to the deprecated grid
+constructors are the ones in `test/test_grid.jl` that test the deprecation and the
+docstrings in `src/Grid.jl` that document it. `test/runtests.jl` carries both branches' new
+entries — `test_grid.jl` (line 23) and `test_radialgrid.jl` (line 122).
 
 Nothing in the ~35 `examples/` lines the `gpu/01-zmax` reviewer counted on `gpu/02-radialgrid`
 needed fixing after the merge: all the example files 02 touched are ones 01 touched too, so
@@ -147,8 +150,8 @@ const HAS_RADIALGRID = isdefined(Grid, :RadialGrid)     # true from gpu/02-radia
 and four helpers built on them: `makegrid(GT, zmax, referenceλ, λ_lims, trange; kwargs...)`,
 `runkw(zmax)` (which returns `(; zmax)` or an empty `NamedTuple` for splatting into
 `Luna.run`), `radialgrid(R, N)` and `absorber_setup(...)` (used by `benchmark/run.jl`, which
-builds an absorber outside `Luna.run`). Eleven call sites in `cases.jl` and one in
-`benchmark/run.jl` use them; `compare.jl`, `run_cases.jl`, `generate.jl`, `sensitivity.jl`,
+builds an absorber outside `Luna.run`). Nine call sites in `cases.jl` (six `makegrid`, two
+`radialgrid`, one `runkw`) and one in `benchmark/run.jl` use them; `compare.jl`, `run_cases.jl`, `generate.jl`, `sensitivity.jl`,
 `tolerances.jl` and `test/test_regression.jl` needed no change, because they go through
 `runcase`.
 
@@ -164,7 +167,8 @@ which base a branch should compare against.
 ## Regression: Group A against `evanescent`
 
 `LUNA_REGRESSION_BASE=fdf8dbe3`, the baseline the `gpu/00-harness` implementer generated
-with 21 cases, not regenerated. **460 pass, 0 fail, 88 s.** Δ is the observed
+with 21 cases, not regenerated. **460 pass, 0 fail, 88 s** (wall clock, with other agents'
+jobs on the same 10-core machine, so an upper bound). Δ is the observed
 `maximum(abs, Δ)/maximum(abs, baseline)` (per component and per save for `Eω`); tol is from
 `tolerances.jl`. The four non-zero entries are in bold.
 
@@ -224,9 +228,9 @@ This table is the Group A regression record against `evanescent`.
 ## Regression: `gpu/int-A` against itself
 
 Baseline generated from this branch's `ff716000` (`test/regression/generate.jl ff716000`),
-gate run with `LUNA_REGRESSION_BASE=ff716000`: **460 pass, 0 fail, 88 s, every case, both
-modes, both classes exactly `0.000e+00`.** Largest difference over all cases and modes:
-`0.000e+00`.
+gate run with `LUNA_REGRESSION_BASE=ff716000`: **460 pass, 0 fail, every case, both modes,
+both classes exactly `0.000e+00`.** Largest difference over all cases and modes:
+`0.000e+00`. 88 s, again under contention.
 
 That is the baseline Group B onwards compares against
 (`LUNA_REGRESSION_BRANCH=gpu/int-A`), and it also confirms that the generator reproduces the
@@ -273,6 +277,10 @@ Rerun after the `gpu/00-harness` merge and the shim, on the `gpu/00-harness` `Ma
 | `test/test_regression.jl` vs `fdf8dbe3` | 460 pass | 88.4 s |
 | `test/test_regression.jl` vs `ff716000` (self) | 460 pass | 88.0 s |
 
+Every time in both tables was measured with other agents' propagations running on the same
+10-core machine, so all of them are upper bounds; only the pass counts and the differences
+are exact.
+
 `test_utils.jl` covers `gpu/00-harness`'s new `set_fftw_wisdom` testset and passes
 unchanged at its 33 assertions.
 
@@ -289,8 +297,11 @@ which is within run-to-run noise of `PR_00-harness.md`'s numbers for the same tw
 `evanescent` (156 µs / 1.68 ms / 63.3 ms and 126 µs / 1.54 ms / 56.2 ms): `Grid.RadialGrid`
 did not change the per-step cost of a radial run.
 
-All 129 `.jl` files under `src/`, `test/` and `examples/` parse (`Meta.parseall` on the file
-contents, walking the result for `:error`/`:incomplete` nodes).
+All 139 tracked `.jl` files parse — `src/` (31), `test/` (43), `examples/` (62),
+`benchmark/` (1), `docs/` (1), `deps/` (1) — checked with `Meta.parseall` on the file
+contents, walking the result for `:error`/`:incomplete` nodes. (The stage-1 figure of 129
+was `src/`, `test/` and `examples/` only, before `gpu/00-harness` added the regression and
+benchmark scripts.)
 
 Examples, run with the plotting sections cut off and (for the free-space ones) the grid sizes
 reduced so each run takes seconds:
