@@ -1064,6 +1064,181 @@ end
     end
 end
 
+#= ---------------------------------------------------------------- the radial transform =#
+
+#= A small radially symmetric free-space propagation on Metal. `boundary=:rate` so that
+   `Boundaries.RadialCollar`, the k-space absorber and the evanescent source taper run
+   too; fixed steps, so two runs differ only in their arithmetic; `boundary_N` small
+   enough that the absorber's reference length does not cap `max_dz` and undo that. =#
+function metalradialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3,
+                         λ0=800e-9, R=1e-3, N=24, w0=200e-6, plasma=false, raman=false,
+                         precision=nothing, boundary=:rate)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (400e-9, 2000e-9), 100e-15) :
+        Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
+    rg = Grid.RadialGrid(R, N)
+    nfunλ = PhysData.ref_index_fun(gas, pres)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    linop = LinearOps.make_const_linop(grid, rg, nfun)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = GT === Grid.RealGrid ?
+        Any[Nonlinear.Kerr_field(PhysData.γ3_gas(gas))] :
+        Any[Nonlinear.Kerr_env(PhysData.γ3_gas(gas))]
+    plasma && push!(resp, Nonlinear.PlasmaCumtrapz(
+        grid.to, zeros(length(grid.to)), metal_tablerate(),
+        PhysData.ionisation_potential(gas)))
+    if raman
+        rr = Raman.raman_response(grid.to, gas)
+        push!(resp, GT === Grid.RealGrid ? Nonlinear.RamanPolarField(grid.to, rr) :
+                                           Nonlinear.RamanPolarEnv(grid.to, rr))
+    end
+    normfun = NonlinearRHS.const_norm_radial(grid, rg, nfun)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
+    Eω, transform, FT = Luna.setup(grid, rg, dens, normfun, Tuple(resp), inputs;
+                                   device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/8
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, boundary_N=4, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= Per save, normalised by the largest `|Eω|` in that save: an elementwise relative
+   difference is meaningless in the k-channels the evanescent taper has emptied. =#
+function radialdiff(a, b)
+    A, B = a["Eω"], b["Eω"]
+    size(A) == size(B) || return Inf
+    worst = 0.0
+    for isave in axes(A, ndims(A))
+        h = ComplexF64.(selectdim(A, ndims(A), isave))
+        d = ComplexF64.(selectdim(B, ndims(B), isave))
+        m = maximum(abs, h)
+        m == 0 && continue
+        worst = max(worst, maximum(abs, d .- h)/m)
+    end
+    worst
+end
+
+#= The Hankel step is one GEMM on the block reshaped to `(nto*npol, nr)`. On Metal that
+   matters twice over: MPSGraph's matmul needs plain zero-offset operands of equal element
+   type, which a `view` is not (it becomes an `MtlMatrixOperand` and falls back to a
+   scalar kernel for complex), and `ComplexF32 x ComplexF32` is the least-exercised of the
+   paths Luna uses (GPU_PLAN.md section 8). Checked against the host product here rather
+   than only through a propagation. =#
+@testset "the Hankel GEMM on Metal" begin
+    rg = Grid.RadialGrid(1e-3, 32)
+    for np in (1, 2), TT in (Float32, ComplexF32)
+        A = TT <: Complex ? complex.(randn(Float32, 64, np, rg.N),
+                                     randn(Float32, 64, np, rg.N)) :
+                            randn(Float32, 64, np, rg.N)
+        Tm = convert(Matrix{TT}, rg.Tfwd)
+        href = similar(A)
+        Grid.radial_matmul!(href, A, Tm)
+        dA = MtlArray(A)
+        dT = MtlArray(Tm)
+        # The operands the GEMM actually sees: plain matrices, no view, no offset
+        @test reshape(dA, :, rg.N) isa MtlArray{TT, 2}
+        @test eltype(dT) === eltype(dA)
+        dout = similar(dA)
+        Grid.radial_matmul!(dout, dA, dT)
+        @test maximum(abs, Array(dout) .- href)/maximum(abs, href) < 1e-5
+        # out === A: `radial_matmul!` copies, which works on a device too
+        Grid.radial_matmul!(dA, dA, dT)
+        @test maximum(abs, Array(dA) .- href)/maximum(abs, href) < 1e-5
+    end
+end
+
+#= The stray-Float64 smoke test for the radial pieces: the transform's own buffers and
+   mirrors, the free-space normalisation (whose kernel carries `c`, `μ₀`, `κmax` and `ℓ`
+   as captured scalars) and the transverse collar. Metal refuses a `Float64` array and its
+   kernel compiler rejects any `double` which survives optimisation, so an element type
+   here which is not `Float32`/`ComplexF32`/`Bool` is the failure this file exists for. =#
+@testset "no stray Float64 in the radial kernels" begin
+    #= A fine transverse grid over a small aperture, so that the largest k⊥ on the grid
+       exceeds k(ω) at the long-wavelength end and the evanescent branch of the kernel --
+       the one which takes the taper -- is actually reached. =#
+    grid = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 100e-15)
+    rg = Grid.RadialGrid(100e-6, 64)
+    nfunλ = PhysData.ref_index_fun(:Ar, 1.0)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    nrm = NonlinearRHS.const_norm_radial(grid, rg, nfun; spec=MetalSpec)
+    @test nrm.out isa MtlArray{ComplexF32, 3}
+    @test nrm.kperp2m isa MtlArray{Float32}
+    @test nrm.kwinm isa MtlArray{Float32}
+    @test nrm.sidxm isa MtlArray{Bool}
+    @test nrm.ωm isa MtlArray{Float32}
+    @test nrm.nm.stage isa Vector{Float32}
+    @test nrm.nm.dev isa MtlArray{Float32, 1}
+    out = nrm(0.0) # compiles and runs the fill kernel on the GPU
+    @test out isa MtlArray{ComplexF32, 3}
+    @test all(isfinite, Array(out))
+    # the physics, on both sides of cutoff, against the host at the same parameters
+    hnrm = NonlinearRHS.const_norm_radial(grid, rg, nfun)
+    hout = hnrm(0.0)
+    @test maximum(abs, ComplexF64.(Array(out)) .- hout)/maximum(abs, hout) < 1e-5
+    @test any(x -> imag(x) != 0, hout) # there really are evanescent channels here
+
+    #= The taper branch of the kernel: `reflength!` sets `ℓ`, `κmax` and the k-window and
+       invalidates the mirror, which the next fill rebuilds. =#
+    kwin = Boundaries.kprofile(rg, 0.1)
+    before = copy(Array(out))
+    NonlinearRHS.reflength!(nrm, 1e-3; κmax=1e4, kwin)
+    NonlinearRHS.reflength!(hnrm, 1e-3; κmax=1e4, kwin)
+    @test !nrm.mirrored
+    out2 = nrm(0.0)
+    @test nrm.mirrored
+    hout2 = hnrm(0.0)
+    @test maximum(abs, ComplexF64.(Array(out2)) .- hout2)/maximum(abs, hout2) < 1e-5
+    @test maximum(abs, Array(out2) .- before) > 0 # the taper did something
+
+    # the transverse collar, built the way `Boundaries.setup` builds it
+    Et = Luna.alloc(MetalSpec, Float32, (length(grid.t), 1, rg.N))
+    αr = Boundaries.rate(Boundaries.rprofile(rg, 0.1), 1e-3)
+    collar = Boundaries.spatialcollar(rg, αr, grid, Et)
+    @test collar isa Boundaries.RadialCollar
+    @test collar.Tfwd isa MtlArray{ComplexF32, 2}
+    @test collar.Tbwd isa MtlArray{ComplexF32, 2}
+    @test collar.αr isa MtlArray{Float32, 1}
+    @test collar.weight isa MtlArray{Float32, 1}
+    @test collar.fac isa MtlArray{Float32, 1}
+    @test collar.buf isa MtlArray{ComplexF32, 3}
+    Eωd = Luna.todevice(MetalSpec, rand(ComplexF64, length(grid.ω), 1, rg.N))
+    Boundaries.apply_kspace!(collar, Eωd, 1e-4)
+    @test all(isfinite, Array(Eωd))
+    @test collar.reference[] > 0
+    @test isfinite(collar.removed[])
+end
+
+@testset "radial propagation on Metal" begin
+    #= Metal against the CPU at the same precision and the same scaling: what is under
+       test is the device path, not single precision. =#
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        href, htr = metalradialcase(GT, DeviceSpec(Array, Float32))
+        dref, dtr = metalradialcase(GT, MetalSpec)
+
+        @test dtr.Eto_r isa MtlArray
+        @test dtr.Eto_k isa MtlArray
+        @test dtr.Eωo isa MtlArray{ComplexF32, 3}
+        @test dtr.Tfwd isa MtlArray{eltype(dtr.Eto_r), 2}
+        @test dtr.Tbwd isa MtlArray{eltype(dtr.Eto_r), 2}
+        @test dtr.prefac isa MtlArray{ComplexF32, 1}
+        @test dtr.gv.towin isa MtlArray{Float32}
+        @test dtr.normfun.out isa MtlArray{ComplexF32, 3}
+        @test dtr.scaling.Eref == htr.scaling.Eref
+        @test eltype(dref["Eω"]) === ComplexF32
+
+        @test size(dref["Eω"]) == size(href["Eω"])
+        @test radialdiff(href, dref) < 1e-4
+    end
+end
+
+@testset "radial Kerr on Metal against the Float64 CPU path" begin
+    href, _ = metalradialcase(Grid.RealGrid, HostSpec())
+    dref, _ = metalradialcase(Grid.RealGrid, MetalSpec)
+    @test radialdiff(href, dref) < 1e-4
+end
+
 @testset "Metal refuses what it cannot run" begin
     #= A columnwise response is wrapped in a `HostResponse` rather than refused
        (gpu/12); what is refused is one which claims a device kernel for arrays nothing
