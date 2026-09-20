@@ -1,5 +1,6 @@
 module Stats
-import Luna: Maths, Grid, Modes, Utils, settings, PhysData, Fields, Processing
+import Luna
+import Luna: Maths, Grid, Modes, Utils, settings, PhysData, Fields, Processing, Ionisation
 import Luna.PhysData: wlfreq, c, ε_0
 import Luna.NonlinearRHS: TransModal, TransModeAvg, Erω_to_Prω!
 import Luna.Nonlinear: PlasmaCumtrapz
@@ -9,19 +10,213 @@ import LinearAlgebra: mul!
 import Printf: @sprintf
 import Logging: @warn
 
+#=================================================#
+#==========  THE STATISTICS PROTOCOL  ============#
+#=================================================#
+
+#= Every statistic is a callable with the signature `(d, Eω, Et, z, dz)` which mutates the
+   dictionary `d`. The ones Luna ships are callable structs rather than closures so that
+   they can carry the three traits below; a user statistic is usually a closure, for which
+   the fallbacks apply.
+
+   Each struct has two branches: the host branch, which is the code Luna has always run and
+   is kept arithmetically identical to it, and the device branch, one or more reductions
+   and broadcasts over the state as the stepper holds it. Which one runs is decided by
+   `Utils.isdevice`, not by precision, so a `Float32` run on the host is also unchanged.
+
+   On a device the state is *scaled* (`e = E/E_ref`, `Luna.UnitScaling`), because nothing
+   has unscaled it: `Luna.ScaledOutput` only unscales into a host buffer, which is the copy
+   these statistics exist to avoid. The device branches therefore apply `E_ref` themselves,
+   always to the scalar result of a reduction and in `Float64`, never to the field. See
+   `StatsContext`. =#
+
+"""
+    device_capable(f) -> Bool
+
+Whether the statistics function `f` can be evaluated on the propagating state as the
+stepper holds it: a device array, in the scaled units of [`Luna.UnitScaling`](@ref).
+
+`false` for anything Luna does not know about, in particular a user-written closure, which
+is why a statistics set containing one makes `Luna.ScaledOutput` copy the state to the host
+on every step whose statistics fire.
+
+The trait is structural: it does not depend on the array type a statistic was prepared
+for, only on whether its algorithm has a device form. `fwhm_r` and
+`mode_reconstruction_error` are the two statistics in the default sets which do not.
+"""
+device_capable(f) = false
+
+"""
+    needs_time(f) -> Bool
+
+Whether the statistics function `f` reads the time-domain field `Et`.
+[`collect_stats`](@ref) does the inverse transform which produces `Et` only when at least
+one of its statistics does. `true` for anything Luna does not know about, so a user
+statistic always gets a valid `Et`.
+"""
+needs_time(f) = true
+
+"""
+    statlabel(f) -> String
+
+A short name for the statistics function `f`, used in the one-time warning
+`Luna.ScaledOutput` emits when a statistic forces a device-to-host copy. The type's name
+for a callable struct; for an anonymous closure this is the gensym Julia gave it, which is
+the best available.
+"""
+statlabel(f) = string(nameof(typeof(f)))
+
+"""
+    prepare(f, ctx::StatsContext)
+
+The statistics function `f` with its buffers allocated for the run described by `ctx` (the
+state's array type and precision, and the unit scaling it is expressed in). Called by
+[`collect_stats`](@ref) on every statistic it is given; the fallback returns `f`
+unchanged, which is what a user closure needs.
+"""
+prepare(f, ctx) = f
+
+"""
+    StatsContext(grid, Eω, Eref=1.0)
+
+What a statistic has to know about the run it is being built for:
+
+- `grid`, the frequency/time grid;
+- `proto`, a prototype of the propagating state (its array type, element type and shape);
+- `spec`, the [`Luna.DeviceSpec`](@ref) derived from `proto`, which is what mirrors and
+  buffers are allocated with;
+- `Eref`, the field unit the state is expressed in ([`Luna.UnitScaling`](@ref)). `1.0` for
+  every `Float64` run. **It applies to the device branches only**: on the host the state
+  has already been unscaled by `Luna.ScaledOutput` before the statistics see it.
+
+[`collect_stats`](@ref) builds one and passes it to [`prepare`](@ref).
+"""
+struct StatsContext{G, A, S}
+    grid::G
+    proto::A
+    spec::S
+    Eref::Float64
+end
+
+StatsContext(grid, Eω, Eref=1.0) = StatsContext(grid, Eω, _specof(Eω), Float64(Eref))
+
+#= The `DeviceSpec` a state array belongs to. `Luna.todevice`/`Luna.alloc` are written
+   against a spec rather than an array, and the statistics are the only place which has
+   the array but not the spec. `.wrapper` strips the element type and dimensionality from
+   the array type (`MtlArray{ComplexF32, 1, ...}` -> `MtlArray`), which is what
+   `DeviceSpec` holds. =#
+_specof(x::AbstractArray) = Luna.DeviceSpec(_arraytype(x), real(eltype(x)))
+_arraytype(::Array) = Array
+_arraytype(x::AbstractArray) = Base.typename(typeof(x)).wrapper
+
+"The number of time-domain samples the analytic field has on `grid` (see `plan_analytic`)."
+_ntime(grid::Grid.RealGrid) = (length(grid.ω) - 1)*2
+_ntime(grid::Grid.EnvGrid) = length(grid.ω)
+
+"The shape of the time-domain buffer for a state shaped like `ctx.proto`."
+_timedims(ctx::StatsContext) = (_ntime(ctx.grid), size(ctx.proto)[2:end]...)
+
+#=================================================#
+#===========  SPECTRAL-DOMAIN WEIGHTS  ===========#
+#=================================================#
+
+#= `Fields.energyfuncs(grid)[2]` integrates |Eω|^2 over the frequency axis with
+   `NumericalIntegration`'s `SimpsonEven` (a `RealGrid`) or a plain `sum` (an `EnvGrid`).
+   `SimpsonEven` is the alternative extended Simpson rule: every sample with weight 1
+   except the first four and last four, which carry 17/48, 59/48, 43/48 and 49/48. As a
+   weight vector that is one fused reduction on any array type, where the library's
+   version is a scalar loop over a host `Vector`.
+
+   The weights are only ever used on a device; the host branch calls `energyfun_ω` itself,
+   so the default CPU path is bit-for-bit what it was. =#
+function _spectral_weights(grid::Grid.RealGrid)
+    nω = length(grid.ω)
+    nω >= 8 || return nothing # fewer samples than the rule has distinct weights
+    w = ones(nω)
+    w[1] = w[nω] = 17/48
+    w[2] = w[nω-1] = 59/48
+    w[3] = w[nω-2] = 43/48
+    w[4] = w[nω-3] = 49/48
+    prefac = 2π/(grid.ω[end]^2) * (grid.ω[2] - grid.ω[1])
+    (w, prefac)
+end
+
+function _spectral_weights(grid::Grid.EnvGrid)
+    nω = length(grid.ω)
+    δω = grid.ω[2] - grid.ω[1]
+    Δω = nω*δω
+    (ones(nω), 2π*δω/(Δω^2))
+end
+
+_spectral_weights(grid) = nothing
+
+#= A deterministic probe spectrum, so that the check below neither touches the global RNG
+   nor depends on it. =#
+function _probespectrum(nω)
+    n = 1:nω
+    @. exp(-((n - nω/3)/(nω/7))^2) * cis(0.37*n) + 1e-3*cis(1.1*n)
+end
+
+"""
+    _devenergy(grid, energyfun_ω)
+
+`(weights, prefactor)` such that `prefactor*sum(weights .* abs2.(Eω))` is
+`energyfun_ω(Eω)`, or `nothing` if there is no such pair for this grid or if
+`energyfun_ω` is not the grid's own spectral energy functional.
+
+The agreement is *checked* on a probe spectrum rather than assumed, because
+[`energy`](@ref) and [`energy_window`](@ref) take the functional as an argument: a caller
+who passes something else (`Fields.energyfuncs(grid, spacegrid)[2]`, or their own) gets a
+host-only statistic rather than a silently different quantity.
+"""
+function _devenergy(grid, energyfun_ω)
+    ws = _spectral_weights(grid)
+    isnothing(ws) && return nothing
+    w, prefac = ws
+    Ep = _probespectrum(length(w))
+    ref = try
+        energyfun_ω(Ep)
+    catch
+        return nothing
+    end
+    (ref isa Real && isfinite(ref) && ref > 0) || return nothing
+    abs(prefac*sum(w .* abs2.(Ep)) - ref) <= 1e-10*ref || return nothing
+    (w, prefac)
+end
+
+#=================================================#
+#===============  THE STATISTICS  ================#
+#=================================================#
+
 """
     ω0(grid)
 
 Create stats function to calculate the centre of mass (first moment) of the spectral power
 density.
 """
-function ω0(grid)
-    addstat! = let ω=grid.ω
-        function addstat!(d, Eω, Et, z, dz)
-            d["ω0"] = squeeze(Maths.moment(ω, abs2.(Eω); dim=1))
-        end
+struct CentreOfMass{V, W}
+    ω::V        # the frequency axis, as `Maths.moment` takes it (host)
+    ωd::W       # the same on the state's array type and precision
+end
+
+ω0(grid) = CentreOfMass(grid.ω, grid.ω)
+
+prepare(f::CentreOfMass, ctx::StatsContext) =
+    CentreOfMass(f.ω, Luna.todevice(ctx.spec, f.ω))
+
+device_capable(::CentreOfMass) = true
+needs_time(::CentreOfMass) = false
+
+function (f::CentreOfMass)(d, Eω, Et, z, dz)
+    if Utils.isdevice(Eω)
+        #= One fused reduction for each of the two sums `Maths.moment` takes, instead of
+           materialising `abs2.(Eω)`. The ratio does not depend on the unit scaling. =#
+        num = Array(sum(f.ωd .* abs2.(Eω); dims=1))
+        den = Array(sum(abs2.(Eω); dims=1))
+        d["ω0"] = squeeze(Float64.(num) ./ Float64.(den))
+    else
+        d["ω0"] = squeeze(Maths.moment(f.ω, abs2.(Eω); dim=1))
     end
-    return addstat!
 end
 
 squeeze(ω0::Array{T, 1}) where T = ω0[1]
@@ -31,16 +226,54 @@ squeeze(ω0::Array{T, 2}) where T = ω0[1, :]
     energy(grid, energyfun_ω)
 
 Create stats function to calculate the total energy.
+
+On a device the integral is the same rule as `energyfun_ω`'s written as one weighted
+reduction (see `Stats._devenergy`); the scalar prefactor and the square of the unit
+scaling are applied to the result, in `Float64`.
 """
-function energy(grid, energyfun_ω)
-    function addstat!(d, Eω, Et, z, dz)
-        if ndims(Eω) > 1
-            d["energy"] = [energyfun_ω(Eω[:, i]) for i=1:size(Eω, 2)]
-        else
-            d["energy"] = energyfun_ω(Eω)
-        end
+struct SpectralEnergy{F, W}
+    energyfun_ω::F
+    w::W            # spectral weights on the state's array type, or `nothing`
+    prefac::Float64
+    Eref2::Float64  # E_ref^2: the energy is quadratic in the field
+    key::String
+end
+
+energy(grid, energyfun_ω) = SpectralEnergy(energyfun_ω, nothing, 1.0, 1.0, "energy")
+
+function prepare(f::SpectralEnergy, ctx::StatsContext)
+    we = _devenergy(ctx.grid, f.energyfun_ω)
+    isnothing(we) && return SpectralEnergy(f.energyfun_ω, nothing, 1.0, 1.0, f.key)
+    w, prefac = we
+    SpectralEnergy(f.energyfun_ω, Luna.todevice(ctx.spec, w), prefac, ctx.Eref^2, f.key)
+end
+
+device_capable(f::SpectralEnergy) = !isnothing(f.w)
+needs_time(::SpectralEnergy) = false
+statlabel(f::SpectralEnergy) = f.key
+
+function (f::SpectralEnergy)(d, Eω, Et, z, dz)
+    if Utils.isdevice(Eω)
+        d[f.key] = _weightedenergy(f.w, f.prefac*f.Eref2, Eω)
+    elseif ndims(Eω) > 1
+        d[f.key] = [f.energyfun_ω(Eω[:, i]) for i=1:size(Eω, 2)]
+    else
+        d[f.key] = f.energyfun_ω(Eω)
     end
-    return addstat!
+end
+
+#= One fused reduction along the frequency axis. The prefactors are applied on the host,
+   in Float64, to the result: in a scaled Float32 run the field is deliberately of order
+   one and the physical units (up to 1e20 apart) would not survive being put back on it. =#
+function _weightedenergy(w, fac, Eω)
+    isnothing(w) && error(
+        "this energy statistic was built from an energy functional with no device form, "*
+        "so it cannot be evaluated on a $(typeof(Eω)).")
+    if ndims(Eω) > 1
+        s = Array(sum(w .* abs2.(Eω); dims=1))
+        return [fac*Float64(s[1, i]) for i in axes(s, 2)]
+    end
+    fac*Float64(sum(w .* abs2.(Eω)))
 end
 
 """
@@ -66,16 +299,42 @@ end
 Create stats function to calculate the energy filtered by a `window`. The stats dataset will
 be named `energy_[label]`.
 """
-function energy_window(grid, energyfun_ω, window; label)
-    key = "energy_$label"
-    function addstat!(d, Eω, Et, z, dz)
-        if ndims(Eω) > 1
-            d[key] = [energyfun_ω(Eω[:, i].*window) for i=1:size(Eω, 2)]
-        else
-            d[key] = energyfun_ω(Eω.*window)
-        end
+struct SpectralEnergyWindow{F, V, W}
+    energyfun_ω::F
+    window::V       # the host window, as given
+    w::W            # spectral weights times window^2, on the state's array type
+    prefac::Float64
+    Eref2::Float64
+    key::String
+end
+
+energy_window(grid, energyfun_ω, window::Vector{<:Real}; label) =
+    SpectralEnergyWindow(energyfun_ω, window, nothing, 1.0, 1.0, "energy_$label")
+
+function prepare(f::SpectralEnergyWindow, ctx::StatsContext)
+    we = _devenergy(ctx.grid, f.energyfun_ω)
+    isnothing(we) &&
+        return SpectralEnergyWindow(f.energyfun_ω, f.window, nothing, 1.0, 1.0, f.key)
+    w, prefac = we
+    #= The window multiplies the field, so it enters the reduction squared and folds into
+       the weights: one vector and one fused reduction, no windowed copy of the field. =#
+    SpectralEnergyWindow(f.energyfun_ω, f.window,
+                         Luna.todevice(ctx.spec, w .* abs2.(f.window)),
+                         prefac, ctx.Eref^2, f.key)
+end
+
+device_capable(f::SpectralEnergyWindow) = !isnothing(f.w)
+needs_time(::SpectralEnergyWindow) = false
+statlabel(f::SpectralEnergyWindow) = f.key
+
+function (f::SpectralEnergyWindow)(d, Eω, Et, z, dz)
+    if Utils.isdevice(Eω)
+        d[f.key] = _weightedenergy(f.w, f.prefac*f.Eref2, Eω)
+    elseif ndims(Eω) > 1
+        d[f.key] = [f.energyfun_ω(Eω[:, i].*f.window) for i=1:size(Eω, 2)]
+    else
+        d[f.key] = f.energyfun_ω(Eω.*f.window)
     end
-    return addstat!
 end
 
 """
@@ -83,18 +342,34 @@ end
 
 Create stats function to calculate the peak power.
 """
-function peakpower(grid)
-    function addstat!(d, Eω, Et, z, dz)
+struct PeakPower{V}
+    t::V
+    Eref2::Float64
+end
+
+peakpower(grid) = PeakPower(grid.t, 1.0)
+
+prepare(f::PeakPower, ctx::StatsContext) = PeakPower(f.t, ctx.Eref^2)
+
+device_capable(::PeakPower) = true
+
+function (f::PeakPower)(d, Eω, Et, z, dz)
+    if Utils.isdevice(Et)
         if ndims(Et) > 1
-            d["peakpower"] = dropdims(maximum(abs2.(Et), dims=1), dims=1)
-            d["peakpower_allmodes"] = maximum(eachindex(grid.t)) do ii
-                sum(abs2, Et[ii, :])
-            end
+            pp = Array(maximum(abs2.(Et), dims=1))
+            d["peakpower"] = [f.Eref2*Float64(pp[1, i]) for i in axes(pp, 2)]
+            d["peakpower_allmodes"] = f.Eref2*Float64(maximum(sum(abs2.(Et), dims=2)))
         else
-            d["peakpower"] = maximum(abs2, Et)
+            d["peakpower"] = f.Eref2*Float64(maximum(abs2, Et))
         end
+    elseif ndims(Et) > 1
+        d["peakpower"] = dropdims(maximum(abs2.(Et), dims=1), dims=1)
+        d["peakpower_allmodes"] = maximum(eachindex(f.t)) do ii
+            sum(abs2, Et[ii, :])
+        end
+    else
+        d["peakpower"] = maximum(abs2, Et)
     end
-    return addstat!
 end
 
 """
@@ -103,6 +378,9 @@ end
 Create stats function to calculate the peak power within a frequency range defined by the
 window function `window`. `window` must have the same length as `grid.ω`. The stats
 dataset is labeled as `peakpower_[label]`.
+
+Host-only: it plans its own inverse transform and holds its own buffers, which are built
+for the `Eω` given here.
 """
 function peakpower(grid, Eω, window::Vector{<:Real}; label)
     Etbuf, analytic! = plan_analytic(grid, Eω) # output buffer and function for inverse FT
@@ -147,53 +425,122 @@ end
 Create stats function to calculate the mode-averaged peak intensity given the effective area
 `aeff(z)`.
 """
-function peakintensity(grid, aeff)
-    function addstat!(d, Eω, Et, z, dz)
-        d["peakintensity"] = maximum(abs2, Et)/aeff(z)
+struct PeakIntensityAeff{A}
+    aeff::A
+    Eref2::Float64
+end
+
+peakintensity(grid, aeff) = PeakIntensityAeff(aeff, 1.0)
+
+prepare(f::PeakIntensityAeff, ctx::StatsContext) = PeakIntensityAeff(f.aeff, ctx.Eref^2)
+
+device_capable(::PeakIntensityAeff) = true
+
+function (f::PeakIntensityAeff)(d, Eω, Et, z, dz)
+    if Utils.isdevice(Et)
+        d["peakintensity"] = f.Eref2*Float64(maximum(abs2, Et))/f.aeff(z)
+    else
+        d["peakintensity"] = maximum(abs2, Et)/f.aeff(z)
     end
 end
 
 """
-    peakintensity(grid, mode)
+    peakintensity(grid, modes; components=:y)
 
 Create stats function to calculate the peak intensity for several modes.
+
+Device-capable for a single mode, where projecting onto the transverse plane is a scalar
+factor per polarisation component and comes out of the reduction.
 """
+struct PeakIntensityModes{T, B}
+    tospace::T
+    Et0::B          # host buffer for the projected field
+    Eref2::Float64
+end
+
 function peakintensity(grid, modes::Modes.ModeCollection; components=:y)
     tospace = Modes.ToSpace(modes, components=components)
-    npol = tospace.npol
-    Et0 = zeros(ComplexF64, (length(grid.t), npol))
-    function addstat!(d, Eω, Et, z, dz)
-        Modes.to_space!(Et0, Et, (0, 0), tospace; z=z)
-        if npol > 1
-            d["peakintensity"] = c*ε_0/2 * maximum(eachindex(grid.t)) do ii
-                sum(abs2, Et0[ii, :])
+    Et0 = zeros(ComplexF64, (length(grid.t), tospace.npol))
+    PeakIntensityModes(tospace, Et0, 1.0)
+end
+
+prepare(f::PeakIntensityModes, ctx::StatsContext) =
+    PeakIntensityModes(f.tospace, f.Et0, ctx.Eref^2)
+
+device_capable(f::PeakIntensityModes) = f.tospace.nmodes == 1
+
+function (f::PeakIntensityModes)(d, Eω, Et, z, dz)
+    if Utils.isdevice(Et)
+        d["peakintensity"] = c*ε_0/2 * f.Eref2 * _onaxisfactor(f.tospace, z) *
+                             Float64(maximum(abs2, Et))
+    else
+        tospace = f.tospace
+        Modes.to_space!(f.Et0, Et, (0, 0), tospace; z=z)
+        if tospace.npol > 1
+            d["peakintensity"] = c*ε_0/2 * maximum(axes(f.Et0, 1)) do ii
+                sum(abs2, f.Et0[ii, :])
             end
         else
-            d["peakintensity"] = c*ε_0/2 * maximum(abs2, Et0)
+            d["peakintensity"] = c*ε_0/2 * maximum(abs2, f.Et0)
         end
     end
+end
+
+#= The single mode's on-axis field, summed in quadrature over the polarisation components
+   kept. `Modes.to_space!` multiplies the field by that mode field sample by sample; with
+   one mode the modulus squared of the result is a constant times `abs2(Et)` and the
+   constant comes out of the maximum. Evaluated per step on the host because the mode's
+   transverse profile can depend on z; it is a handful of scalar operations. =#
+function _onaxisfactor(ts::Modes.ToSpace, z)
+    ts.nmodes == 1 || error(
+        "the on-axis peak intensity of $(ts.nmodes) modes does not reduce to a scalar "*
+        "factor and has no device form.")
+    E = Modes.Exy(ts.ms[1], (0, 0), z=z)[ts.indices]
+    sum(abs2, E)
 end
 
 """
     fwhm_t(grid)
 
 Create stats function to calculate the temporal FWHM (pulse duration) for mode average.
+
+On a device only `|E|^2` is copied to the host; the FWHM itself is then found by the same
+root-finding on the same samples as on the host.
 """
-function fwhm_t(grid)
-    function addstat!(d, Eω, Et, z, dz)
-        Pt = abs2.(Et)
-        if ndims(Et) > 1
-            Ptsum = dropdims(sum(Pt; dims=2); dims=2)
-            d["fwhm_t_min"] = [Maths.fwhm(grid.t, Pt[:, i], method=:linear)
-                              for i=1:size(Et, 2)]
-            d["fwhm_t_max"] = [Maths.fwhm(grid.t, Pt[:, i], method=:linear, minmax=:max)
-                              for i=1:size(Et, 2)]
-            d["fwhm_t_min_allmodes"] = Maths.fwhm(grid.t, Ptsum, method=:linear)
-            d["fwhm_t_max_allmodes"] = Maths.fwhm(grid.t, Ptsum, method=:linear, minmax=:max)
-        else
-            d["fwhm_t_min"] = Maths.fwhm(grid.t, Pt, method=:linear, minmax=:min)
-            d["fwhm_t_max"] = Maths.fwhm(grid.t, Pt, method=:linear, minmax=:max)
-        end
+struct FWHMt{V, B, H}
+    t::V
+    Pd::B       # |Et|^2 on the state's array type
+    Ph::H       # the same on the host
+end
+
+fwhm_t(grid) = FWHMt(grid.t, nothing, nothing)
+
+function prepare(f::FWHMt, ctx::StatsContext)
+    Pd = Luna.alloc(ctx.spec, Luna.realtype(ctx.spec), _timedims(ctx))
+    FWHMt(f.t, Pd, Array{Luna.realtype(ctx.spec)}(undef, size(Pd)))
+end
+
+device_capable(::FWHMt) = true
+
+function (f::FWHMt)(d, Eω, Et, z, dz)
+    Pt = if Utils.isdevice(Et)
+        f.Pd .= abs2.(Et)
+        copyto!(f.Ph, f.Pd)
+        f.Ph
+    else
+        abs2.(Et)
+    end
+    if ndims(Pt) > 1
+        Ptsum = dropdims(sum(Pt; dims=2); dims=2)
+        d["fwhm_t_min"] = [Maths.fwhm(f.t, Pt[:, i], method=:linear)
+                          for i=1:size(Pt, 2)]
+        d["fwhm_t_max"] = [Maths.fwhm(f.t, Pt[:, i], method=:linear, minmax=:max)
+                          for i=1:size(Pt, 2)]
+        d["fwhm_t_min_allmodes"] = Maths.fwhm(f.t, Ptsum, method=:linear)
+        d["fwhm_t_max_allmodes"] = Maths.fwhm(f.t, Ptsum, method=:linear, minmax=:max)
+    else
+        d["fwhm_t_min"] = Maths.fwhm(f.t, Pt, method=:linear, minmax=:min)
+        d["fwhm_t_max"] = Maths.fwhm(f.t, Pt, method=:linear, minmax=:max)
     end
 end
 
@@ -201,19 +548,31 @@ end
     fwhm_r(grid, modes; components=:y)
 
 Create stats function to calculate the radial FWHM (aka beam size) in a modal propagation.
+
+Host-only: the beam size is found by root-finding on a function of the radius, each
+evaluation of which projects the whole spectrum onto one transverse point. There is no
+reduction over the state to move to a device, and the modal transform which produces such
+a state is host-only in any case.
 """
+struct FWHMr{T, B}
+    tospace::T
+    Eω0::B
+end
+
 function fwhm_r(grid, modes; components=:y)
     tospace = Modes.ToSpace(modes, components=components)
-    npol = tospace.npol
-    Eω0 = zeros(ComplexF64, (length(grid.ω), npol))
+    FWHMr(tospace, zeros(ComplexF64, (length(grid.ω), tospace.npol)))
+end
 
-    function addstat!(d, Eω, Et, z, dz)
-        function f(r)
-            Modes.to_space!(Eω0, Eω, (r, 0), tospace; z=z)
-            sum(abs2, Eω0)
-        end
-        d["fwhm_r"] = 2*Maths.hwhm(f)
+device_capable(::FWHMr) = false
+needs_time(::FWHMr) = false
+
+function (f::FWHMr)(d, Eω, Et, z, dz)
+    function g(r)
+        Modes.to_space!(f.Eω0, Eω, (r, 0), f.tospace; z=z)
+        sum(abs2, f.Eω0)
     end
+    d["fwhm_r"] = 2*Maths.hwhm(g)
 end
 
 """
@@ -224,28 +583,79 @@ Create stats function to calculate the maximum electron density in mode average.
 If oversampling > 1, the field is oversampled before the calculation
 !!! warning
     Oversampling can lead to a significant performance hit
+
+Device-capable when `oversampling == 1` and the rate has a device kernel
+([`Ionisation.device_capable`](@ref Luna.Ionisation.device_capable)). The device branch
+evaluates the rate straight off the state, with the intensity conversion and the unit
+scaling folded into the field reference the kernel multiplies each sample by, and takes
+the ionisation integral as one weighted reduction: only the end point of the cumulative
+integral is ever read, and that end point is the trapezoid rule over the whole window.
 """
+struct ElectronDensityAeff{R, RD, D, A, V, B, W}
+    ratefunc::R     # the rate as given: host, physical units
+    ratedev::RD     # the same in the run's precision and array type
+    dfun::D
+    aeff::A
+    oversampling::Int
+    t::V            # the time axis of the grid, host (what `oversample` is given)
+    δt::Float64     # the step of the *oversampled* axis
+    frac::Vector{Float64}   # host buffer: the rate, then the ionisation fraction
+    rate::B         # device buffer for the rate
+    w::W            # trapezoid weights on the state's array type
+    Eref::Float64
+end
+
 function electrondensity(grid::Grid.RealGrid, ionrate!, dfun, aeff; oversampling=1)
-    to, Eto = Maths.oversample(grid.t, complex(grid.t), factor=oversampling)
-    δt = to[2] - to[1]
-    # ionfrac! stores the time-dependent ionisation fraction in out and returns the max
-    # ionisation rate
-    function ionfrac!(out, Et)
-        ionrate!(out, Et)
-        ratemax = maximum(out)
-        Maths.cumtrapz!(out, δt) # in-place cumulative integration
-        @. out = 1 - exp(-out)
-        return ratemax
-    end
-    frac = similar(to)
-    function addstat!(d, Eω, Et, z, dz)
+    to, _ = Maths.oversample(grid.t, complex(grid.t), factor=oversampling)
+    ElectronDensityAeff(ionrate!, ionrate!, dfun, aeff, oversampling, grid.t,
+                        to[2]-to[1], similar(to), nothing, nothing, 1.0)
+end
+
+function prepare(f::ElectronDensityAeff, ctx::StatsContext)
+    device_capable(f) || return f
+    n = length(f.frac)
+    w = ones(n)
+    w[1] = w[n] = 0.5
+    ElectronDensityAeff(f.ratefunc, Ionisation.device_rate(f.ratefunc, ctx.spec),
+                        f.dfun, f.aeff, f.oversampling, f.t, f.δt, f.frac,
+                        Luna.alloc(ctx.spec, Luna.realtype(ctx.spec), (n,)),
+                        Luna.todevice(ctx.spec, w), ctx.Eref)
+end
+
+device_capable(f::ElectronDensityAeff) =
+    f.oversampling == 1 && Ionisation.device_capable(f.ratefunc)
+
+function (f::ElectronDensityAeff)(d, Eω, Et, z, dz)
+    if Utils.isdevice(Et)
+        #= `Eref/sqrt(...)` is what the kernel multiplies each sample by: it takes the
+           scaled state to the physical field and the physical field to the one which
+           drives the rate. The host branch divides the field itself instead. =#
+        Erate = f.Eref/sqrt(ε_0*c*f.aeff(z)/2)
+        rk = Ionisation.ratekernel(f.ratedev, Luna.scalar(f.rate, Erate))
+        f.rate .= rk.(real.(Et))
+        ratemax = Float64(maximum(f.rate))
+        intg = f.δt*Float64(sum(f.w .* f.rate))
+        d["electrondensity"] = (1 - exp(-intg))*f.dfun(z)
+        d["peak_ionisation_rate"] = ratemax
+    else
         # note: oversampling returns its arguments without any work done if factor==1
-        to, Eto = Maths.oversample(grid.t, Et, factor=oversampling)
-        @. Eto /= sqrt(ε_0*c*aeff(z)/2)
-        ratemax = ionfrac!(frac, real(Eto))
-        d["electrondensity"] = frac[end]*dfun(z)
+        _, Eto = Maths.oversample(f.t, Et, factor=f.oversampling)
+        @. Eto /= sqrt(ε_0*c*f.aeff(z)/2)
+        ratemax = _ionfrac!(f.frac, f.ratefunc, real(Eto), f.δt)
+        d["electrondensity"] = f.frac[end]*f.dfun(z)
         d["peak_ionisation_rate"] = ratemax
     end
+end
+
+#= `out` holds the time-dependent ionisation fraction on return; the maximum ionisation
+   rate is the return value. The serial `Maths.cumtrapz!` is deliberate: this is the host
+   branch, and it is the arithmetic Luna has always done here. =#
+function _ionfrac!(out, ionrate!, Et, δt)
+    ionrate!(out, Et)
+    ratemax = maximum(out)
+    Maths.cumtrapz!(out, δt) # in-place cumulative integration
+    @. out = 1 - exp(-out)
+    return ratemax
 end
 
 """
@@ -256,37 +666,44 @@ Create stats function to calculate the maximum electron density for multimode si
 If oversampling > 1, the field is oversampled before the calculation
 !!! warning
     Oversampling can lead to a significant performance hit
+
+Host-only: the field has to be projected onto the transverse plane first, and the modal
+transform which produces the state is host-only in any case.
 """
+struct ElectronDensityModes{R, D, T, V, B}
+    ratefunc::R
+    dfun::D
+    tospace::T
+    oversampling::Int
+    t::V            # the time axis of the grid, host (what `oversample` is given)
+    δt::Float64     # the step of the *oversampled* axis
+    frac::Vector{Float64}
+    Et0::B
+end
+
 function electrondensity(grid::Grid.RealGrid, ionrate!, dfun,
                          modes::Modes.ModeCollection;
                          components=:y, oversampling=1)
-    to, Eto = Maths.oversample(grid.t, complex(grid.t), factor=oversampling)
-    δt = to[2] - to[1]
-    # ionfrac! stores the time-dependent ionisation fraction in out and returns the max
-    # ionisation rate
-    function ionfrac!(out, Et)
-        ionrate!(out, Et)
-        ratemax = maximum(out)
-        Maths.cumtrapz!(out, δt) # in-place cumulative integration
-        @. out = 1 - exp(-out)
-        return ratemax
-    end
+    to, _ = Maths.oversample(grid.t, complex(grid.t), factor=oversampling)
     tospace = Modes.ToSpace(modes, components=components)
-    frac = similar(to)
-    npol = tospace.npol
-    Et0 = zeros(ComplexF64, (length(to), npol))
-    function addstat!(d, Eω, Et, z, dz)
-        # note: oversampling returns its arguments without any work done if factor==1
-        to, Eto = Maths.oversample(grid.t, Et, factor=oversampling)
-        Modes.to_space!(Et0, Eto, (0, 0), tospace; z=z)
-        if npol > 1
-            ratemax = ionfrac!(frac, hypot.(real(Et0[:, 1]), real(Et0[:, 2])))
-        else
-            ratemax = ionfrac!(frac, real(Et0[:, 1]))
-        end
-        d["electrondensity"] = frac[end]*dfun(z)
-        d["peak_ionisation_rate"] = ratemax
+    ElectronDensityModes(ionrate!, dfun, tospace, oversampling, grid.t, to[2]-to[1],
+                         similar(to), zeros(ComplexF64, (length(to), tospace.npol)))
+end
+
+device_capable(::ElectronDensityModes) = false
+
+function (f::ElectronDensityModes)(d, Eω, Et, z, dz)
+    # note: oversampling returns its arguments without any work done if factor==1
+    _, Eto = Maths.oversample(f.t, Et, factor=f.oversampling)
+    Modes.to_space!(f.Et0, Eto, (0, 0), f.tospace; z=z)
+    if f.tospace.npol > 1
+        ratemax = _ionfrac!(f.frac, f.ratefunc,
+                            hypot.(real(f.Et0[:, 1]), real(f.Et0[:, 2])), f.δt)
+    else
+        ratemax = _ionfrac!(f.frac, f.ratefunc, real(f.Et0[:, 1]), f.δt)
     end
+    d["electrondensity"] = f.frac[end]*f.dfun(z)
+    d["peak_ionisation_rate"] = ratemax
 end
 
 """
@@ -294,116 +711,150 @@ end
 
 Create a stats function to calculate and collect the mode reconstruction error in the
 induced polarisation on axis at every step.
+
+Host-only: it evaluates the modal transform itself, which is host code.
 """
+struct ModeReconstructionError{T, A, B}
+    t::T
+    Prω_recon::A
+    difference::A
+    nl::B
+end
+
 function mode_reconstruction_error(t::TransModal)
     Prω_recon = similar(t.Prω)
-    difference = similar(Prω_recon)
-    nl = similar(t.Emω)
-    function addstat!(d, Eω, Et, z, dz)
-        t(nl, Eω, z)
-        x = (0.0, 0.0) # on-axis coordinate
-        # reconstruct 
-        Modes.to_space!(Prω_recon, nl, x, t.ts, z=z)
-        # in going to modes and back we've picked up two factors of the mode normalisation
-        Prω_recon .*= 1/2*sqrt(PhysData.ε_0/PhysData.μ_0)
-        Erω_to_Prω!(t, x)
-        difference .= Prω_recon .- t.Prω
-        d["mode_reconstruction_error"] = sqrt(sum(abs2, difference))/sqrt(sum(abs2, Prω_recon))
-        d["transverse_points"] = float(t.ncalls) # convert to Float64 to enable NaN padding
-        d["transverse_integral_error_abs"] = sqrt(sum(abs2, t.err)/length(t.err))
-        d["transverse_integral_error_rel"] = d["transverse_integral_error_abs"]/sqrt(sum(abs2, nl)/length(nl))
-    end
+    ModeReconstructionError(t, Prω_recon, similar(Prω_recon), similar(t.Emω))
 end
+
+device_capable(::ModeReconstructionError) = false
+needs_time(::ModeReconstructionError) = false
+
+function (f::ModeReconstructionError)(d, Eω, Et, z, dz)
+    t = f.t
+    t(f.nl, Eω, z)
+    x = (0.0, 0.0) # on-axis coordinate
+    # reconstruct
+    Modes.to_space!(f.Prω_recon, f.nl, x, t.ts, z=z)
+    # in going to modes and back we've picked up two factors of the mode normalisation
+    f.Prω_recon .*= 1/2*sqrt(PhysData.ε_0/PhysData.μ_0)
+    Erω_to_Prω!(t, x)
+    f.difference .= f.Prω_recon .- t.Prω
+    d["mode_reconstruction_error"] =
+        sqrt(sum(abs2, f.difference))/sqrt(sum(abs2, f.Prω_recon))
+    d["transverse_points"] = float(t.ncalls) # convert to Float64 to enable NaN padding
+    d["transverse_integral_error_abs"] = sqrt(sum(abs2, t.err)/length(t.err))
+    d["transverse_integral_error_rel"] =
+        d["transverse_integral_error_abs"]/sqrt(sum(abs2, f.nl)/length(f.nl))
+end
+
+#= The statistics which read nothing but `z`: they never touch the state, so they run
+   wherever it lives. =#
 
 """
     density(dfun)
 
 Create stats function to capture the gas density as defined by `dfun(z)`
 """
-function density(dfun)
-    function addstat!(d, Eω, Et, z, dz)
-        d["density"] = dfun(z)
-    end
+struct Density{D}
+    dfun::D
 end
+
+density(dfun) = Density(dfun)
+device_capable(::Density) = true
+needs_time(::Density) = false
+(f::Density)(d, Eω, Et, z, dz) = d["density"] = f.dfun(z)
 
 """
     pressure(dfun, gas)
 
 Create stats function to capture the pressure. Like [`density`](@ref) but converts to
-pressure.
+pressure. A `Tuple` of gases (a mixture) records one dataset per component.
 """
-function pressure(dfun, gas)
-    function addstat!(d, Eω, Et, z, dz)
-        d["pressure"] = PhysData.pressure(gas, dfun(z))
-    end
+struct Pressure{D, G}
+    dfun::D
+    gas::G
 end
 
-function pressure(dfun, gases::Tuple)
-    function addstat!(d, Eω, Et, z, dz)
-        dens = dfun(z)
-        for (di, gi) in zip(dens, gases)
-            d["pressure_$gi"] = PhysData.pressure(gi, di)
-        end
+pressure(dfun, gas) = Pressure(dfun, gas)
+device_capable(::Pressure) = true
+needs_time(::Pressure) = false
+
+(f::Pressure)(d, Eω, Et, z, dz) = d["pressure"] = PhysData.pressure(f.gas, f.dfun(z))
+
+function (f::Pressure{D, <:Tuple})(d, Eω, Et, z, dz) where {D}
+    dens = f.dfun(z)
+    for (di, gi) in zip(dens, f.gas)
+        d["pressure_$gi"] = PhysData.pressure(gi, di)
     end
 end
 
 """
     core_radius(a)
 
-Create stats function to capture core radius as defined by `a` (either a `Number` or a 
+Create stats function to capture core radius as defined by `a` (either a `Number` or a
 callable `a(z)`)
 """
-function core_radius(a::Number)
-    function addstat!(d, Eω, Et, z, dz)
-        d["core_radius"] = a
-    end
+struct CoreRadius{A}
+    a::A
 end
 
-function core_radius(afun)
-    function addstat!(d, Eω, Et, z, dz)
-        d["core_radius"] = afun(z)
-    end
-end
+core_radius(a) = CoreRadius(a)
+device_capable(::CoreRadius) = true
+needs_time(::CoreRadius) = false
+
+(f::CoreRadius{<:Number})(d, Eω, Et, z, dz) = d["core_radius"] = f.a
+(f::CoreRadius)(d, Eω, Et, z, dz) = d["core_radius"] = f.a(z)
 
 """
-    zdw(mode)
+    zdw(mode; λmin, λmax)
 
-Create stats function to capture the zero-dispersion wavelength (ZDW).
+Create stats function to capture the zero-dispersion wavelength (ZDW) of one mode or of
+each of several modes. The previous step's ZDW is the starting guess for the next.
 
 !!! warning
     Since [`Modes.zdw`](@ref) is based on root-finding of a derivative, this can be slow!
 """
+mutable struct ZDW{M, L}
+    mode_s::M
+    λ00::L      # the last ZDW found, as the next root-finding guess
+end
+
 function zdw(mode::Modes.AbstractMode; λmin=100e-9, λmax=3000e-9)
     λ00 = Modes.zdw(mode; λmin=λmin, λmax=λmax, z=0)
-    function addstat!(d, Eω, Et, z, dz)
-        d["zdw"] = missnan(Modes.zdw(mode, λ00; z=z))
-        λ00 = d["zdw"]
-    end
+    ZDW(mode, ismissing(λ00) ? λmin : λ00)
 end
 
-"""
-    zdw(mode)
-
-Create stats function to capture the zero-dispersion wavelength (ZDW).
-
-!!! warning
-    Since [`Modes.zdw`](@ref) is based on root-finding of a derivative, this can be slow!
-"""
 function zdw(modes; λmin=100e-9, λmax=3000e-9)
     λ00 = zeros(length(modes))
     for (ii, mode) in enumerate(modes)
         tmp = Modes.zdw(mode; λmin=λmin, λmax=λmax, z=0)
-        if ismissing(tmp)
-            λ00[ii] = λmin
-        else
-            λ00[ii] = tmp
-        end
+        λ00[ii] = ismissing(tmp) ? λmin : tmp
     end
-    function addstat!(d, Eω, Et, z, dz)
-        d["zdw"] = [missnan(Modes.zdw(modes[ii], λ00[ii]; z=z)) for ii in eachindex(modes)]
-        λ00 .= d["zdw"]
-    end
+    ZDW(modes, λ00)
 end
+
+device_capable(::ZDW) = true
+needs_time(::ZDW) = false
+
+function (f::ZDW{<:Modes.AbstractMode})(d, Eω, Et, z, dz)
+    d["zdw"] = missnan(Modes.zdw(f.mode_s, f.λ00; z=z))
+    f.λ00 = d["zdw"]
+end
+
+function (f::ZDW)(d, Eω, Et, z, dz)
+    d["zdw"] = [missnan(Modes.zdw(f.mode_s[ii], f.λ00[ii]; z=z))
+                for ii in eachindex(f.mode_s)]
+    f.λ00 = d["zdw"]
+end
+
+"A ZDW which does not depend on `z`, which is what a constant linear operator implies."
+struct ConstZDW{T}
+    zdw::T
+end
+
+device_capable(::ConstZDW) = true
+needs_time(::ConstZDW) = false
+(f::ConstZDW)(d, Eω, Et, z, dz) = d["zdw"] = f.zdw
 
 # convert missing to NaN
 missnan(x) = ismissing(x) ? NaN : x
@@ -413,18 +864,27 @@ function zdz!(d, Eω, Et, z, dz)
     d["dz"] = dz
 end
 
+device_capable(::typeof(zdz!)) = true
+needs_time(::typeof(zdz!)) = false
+
+#=================================================#
+#===========  THE ANALYTIC TRANSFORM  ============#
+#=================================================#
+
 """
     plan_analytic(grid, Eω)
 
 Plan a transform from the frequency-domain field `Eω` to the analytic time-domain field.
 
 Returns both a buffer for the analytic field and a closure to do the transform.
+
+The buffers and the plan are of `Eω`'s own array type and precision, so this is one
+inverse FFT on whatever the state lives on. On a device the result is in the state's own
+(scaled) units; the statistics which read it apply `E_ref` to their scalar results.
 """
 function plan_analytic(grid::Grid.EnvGrid, Eω)
     Eta = similar(Eω)
-    Utils.loadFFTwisdom()
-    iFT = FFTW.plan_ifft(copy(Eω), 1, flags=settings["fftw_flag"])
-    Utils.saveFFTwisdom()
+    iFT = _plan_ifft(Eω, copy(Eω))
     function analytic!(Eta, Eω)
         mul!(Eta, iFT, Eω) # for envelope fields, we only need to do the inverse transform
     end
@@ -434,37 +894,44 @@ end
 function plan_analytic(grid::Grid.RealGrid, Eω)
     s = collect(size(Eω))
     s[1] = (length(grid.ω) - 1)*2 # e.g. for 4097 rFFT samples, we need 8192 FFT samples
-    Eta = Array{ComplexF64, ndims(Eω)}(undef, Tuple(s))
+    Eta = similar(Eω, Tuple(s))
     Eωa = zero(Eta)
-    idxhi = CartesianIndices(size(Eω)[2:end]) # index over all other dimensions
-    Utils.loadFFTwisdom()
-    iFT = FFTW.plan_ifft(Eωa, 1, flags=settings["fftw_flag"])
-    Utils.saveFFTwisdom()
+    iFT = _plan_ifft(Eω, Eωa)
+    #= The rFFT has a sample at +fs/2 and the FFT does not, so the copy stops one short of
+       the end of the rFFT axis; the rest of `Eωa` is zero and is never written. One
+       masked broadcast rather than the scalar loop this used to be. =#
+    n = size(Eω, 1) - 1
+    hi = ntuple(_ -> Colon(), ndims(Eω) - 1)
+    two = Luna.scalar(Eωa, 2.0)
     function analytic!(Eta, Eω)
-        copyto_fft!(Eωa, Eω, idxhi) # copy across to FFT-sampled buffer
+        # copy across to the FFT-sampled buffer, doubling for the analytic signal
+        view(Eωa, 1:n, hi...) .= two .* view(Eω, 1:n, hi...)
         mul!(Eta, iFT, Eωa) # now do the inverse transform
     end
     return Eta, analytic!
 end
 
-"""
-    copyto_fft!(Eωa, Eω, idxhi)
-
-Copy the rFFT-sampled field `Eω` to the FFT-sampled buffer `Eωa`, ready for inverse FFT
-"""
-function copyto_fft!(Eωa, Eω, idxhi)
-    n = size(Eω, 1)-1 # rFFT has sample at +fs/2, but FFT does not (only at -fs/2)
-    for idx in idxhi
-        for i in 1:n
-            Eωa[i, idx] = 2*Eω[i, idx]
-        end
-    end
+#= The inverse complex transform, planned on `buf` (which is of the state's array type).
+   On the host this is `FFTW.plan_ifft` as it always was, with the wisdom logic and Luna's
+   planning flags; on a device it is the generic `AbstractFFTs` planner, which is what
+   `Utils.plan_ft`/`Utils.plan_ift` choose between. `inv` of a forward complex plan is the
+   same `ScaledPlan` that `plan_ifft` returns, so the host arithmetic is unchanged. =#
+function _plan_ifft(Eω, buf)
+    Utils.isdevice(Eω) && return Utils.plan_ift(Utils.plan_ft(buf, 1))
+    Utils.loadFFTwisdom()
+    iFT = FFTW.plan_ifft(buf, 1, flags=settings["fftw_flag"])
+    Utils.saveFFTwisdom()
+    iFT
 end
 
-"""
-    collect_stats(grid, Eω, funcs...)
+#=================================================#
+#==============  THE COLLECTOR  ==================#
+#=================================================#
 
-Create a closure which collects statistics from the individual functions in `funcs`.
+"""
+    collect_stats(grid, Eω, funcs...; Eref=1.0)
+
+Create a callable which collects statistics from the individual functions in `funcs`.
 
 Each function given will be called with the arguments `(d, Eω, Et, z, dz)`, where
 - d -> dictionary to store statistics values. each `func` should **mutate** this
@@ -472,26 +939,81 @@ Each function given will be called with the arguments `(d, Eω, Et, z, dz)`, whe
 - Et -> analytic time-domain field
 - z -> current propagation distance
 - dz -> current stepsize
+
+`Eω` is a prototype of the propagating state: its array type, element type and shape are
+what the buffers and the inverse transform are built for, and every statistic is
+[`prepare`](@ref)d for it. `Eref` is the field unit the state is expressed in
+([`Luna.UnitScaling`](@ref)), which is `1.0` for every `Float64` run and is applied by the
+device branches only -- on the host the state is in physical units by the time the
+statistics see it. [`default`](@ref) takes it from the transform.
+
+The inverse transform which produces `Et` is done once per call, and only when at least
+one of `funcs` reads it ([`needs_time`](@ref)).
 """
-function collect_stats(grid, Eω, funcs...)
+struct StatsCollector{F, B, A}
+    funcs::F
+    Et::B
+    analytic!::A
+    needtime::Bool
+    devicecapable::Bool
+    hostlist::Vector{String}
+end
+
+function collect_stats(grid, Eω, funcs...; Eref=1.0)
     # make sure z and dz are recorded
     if !(zdz! in funcs)
         funcs = (funcs..., zdz!)
     end
+    ctx = StatsContext(grid, Eω, Eref)
+    funcs = map(f -> prepare(f, ctx), funcs)
     Et, analytic! = plan_analytic(grid, Eω)
-    f = let funcs=funcs
-        function collect_stats(Eω, z, dz)
-            d = Dict{String, Any}()
-            analytic!(Et, Eω)
-            for func in funcs
-                func(d, Eω, Et, z, dz)
-            end
-            return d
-        end
-    end
-    return f
+    StatsCollector(funcs, Et, analytic!,
+                   any(needs_time, funcs),
+                   all(device_capable, funcs),
+                   String[statlabel(f) for f in funcs if !device_capable(f)])
 end
 
+function (c::StatsCollector)(Eω, z, dz)
+    d = Dict{String, Any}()
+    c.needtime && c.analytic!(c.Et, Eω)
+    for func in c.funcs
+        func(d, Eω, c.Et, z, dz)
+    end
+    return d
+end
+
+device_capable(c::StatsCollector) = c.devicecapable
+statlabel(::StatsCollector) = "statistics"
+
+"""
+    host_statistics(f) -> Vector{String}
+
+The names of the statistics in `f` which have no device form, so cannot be evaluated on
+the propagating state where it lives. Empty for a statistics set which runs entirely on a
+device. `Luna.ScaledOutput` names them in the warning it emits when they force a
+device-to-host copy of the state on every step.
+"""
+host_statistics(f) = device_capable(f) ? String[] : String[statlabel(f)]
+host_statistics(c::StatsCollector) = c.hostlist
+
+# The hooks `Luna.ScaledOutput` reaches the two traits above through; see `Device.jl`.
+Luna.stats_device_capable(c::StatsCollector) = device_capable(c)
+Luna.stats_host_list(c::StatsCollector) = host_statistics(c)
+
+#=================================================#
+#=============  THE DEFAULT SETS  ================#
+#=================================================#
+
+"""
+    default(grid, Eω, mode_s, linop, transform; kwargs...)
+
+The default statistics set for a mode-averaged (`mode_s::Modes.AbstractMode`) or
+multimode (`mode_s::Modes.ModeCollection`) propagation.
+
+`Eω` is the propagating state itself, not a host copy of it: the statistics are built for
+its array type and precision, and the unit scaling they have to undo is taken from
+`transform`.
+"""
 function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
                  windows=nothing, gas=nothing, onaxis=false, userfuns=Any[])
     _, energyfunω = Fields.energyfuncs(grid)
@@ -508,7 +1030,6 @@ function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
     end
     for resp in transform.resp
         if resp isa PlasmaCumtrapz
-            ir = resp.ratefunc
             if onaxis
                 push!(funs, electrondensity(grid, resp.ratefunc, transform.densityfun, (mode,)))
             else
@@ -528,9 +1049,10 @@ function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
             push!(funs, uf)
         end
     end
-    collect_stats(grid, Eω, funs...)
+    collect_stats(grid, Eω, funs...; Eref=Luna.runscaling(transform).Eref)
 end
 
+@doc (@doc default)
 function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
                  windows=nothing, gas=nothing, mode_error=true, userfuns=Any[])
     _, energyfunω = Fields.energyfuncs(grid)
@@ -547,7 +1069,6 @@ function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
     end
     for resp in transform.resp
         if resp isa PlasmaCumtrapz
-            ir = resp.ratefunc
             ed = electrondensity(grid, resp.ratefunc, transform.densityfun, modes,
                                  components=pol)
             push!(funs, ed)
@@ -565,19 +1086,15 @@ function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
             push!(funs, uf)
         end
     end
-    collect_stats(grid, Eω, funs...)
+    collect_stats(grid, Eω, funs...; Eref=Luna.runscaling(transform).Eref)
 end
 
 # For constant linop, ZDW is also constant
-function zdw_linop(mode::Modes.AbstractMode, linop::AbstractArray)
-    zdw = missnan(Modes.zdw(mode))
-    (d, Eω, Et, z, dz) -> d["zdw"] = zdw
-end
+zdw_linop(mode::Modes.AbstractMode, linop::AbstractArray) =
+    ConstZDW(missnan(Modes.zdw(mode)))
 
-function zdw_linop(modes, linop::AbstractArray)
-    zdw = [missnan(Modes.zdw(mode)) for mode in modes]
-    (d, Eω, Et, z, dz) -> d["zdw"] = zdw
-end
+zdw_linop(modes, linop::AbstractArray) =
+    ConstZDW([missnan(Modes.zdw(mode)) for mode in modes])
 
 zdw_linop(mode_s, linop) = zdw(mode_s)
 

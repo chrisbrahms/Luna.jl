@@ -393,10 +393,11 @@ If `raman` is `true`, then the following options apply:
     step (see [`Output.PeriodicStats`](@ref) and [`Output.maybe_periodic`](@ref)). An
     integer (the default, `1`) collects every `stats_period`-th accepted step; a
     non-integer value collects every time the propagation distance has advanced by at
-    least `stats_period` metres. Per-step statistics on a device copy the field to the
-    host on every step whose statistics will actually be computed (skipped on the others
-    when `stats_period != 1`), so this is worth raising there; see the warning
-    `Luna.run` gives once per propagation when a device copy is needed.
+    least `stats_period` metres. The default statistics are evaluated on the device, so
+    raising this only saves their own cost; a statistics function added through
+    `stats_kwargs[:userfuns]` has no device form and makes every step whose statistics
+    fire copy the field to the host, which is where raising it matters. `Luna.run` warns
+    once per propagation, naming the statistics responsible, when a copy is needed.
 """
 function prop_capillary(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
@@ -536,18 +537,11 @@ function prop_capillary_args(radius, flength, gas, pressure;
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
                                      noise_field, thg, device=devicereq, precision)
-    #= Stats.jl is host-only code (out of this branch's scope beyond the host-copy
-       warning and PeriodicStats): `Stats.default`/`collect_stats` use their `Eω`
-       argument only to size and type their internal buffers at construction, but for an
-       EnvGrid `Stats.plan_analytic` builds those buffers with `similar(Eω)` and plans an
-       FFTW transform directly on a copy of it, which only works when `Eω` is a host
-       array (found on Metal hardware: FFTW cannot plan on a device array's private
-       memory; a RealGrid's `plan_analytic` always allocates a host buffer regardless and
-       does not show this). The statistics function itself is called at every step with
-       the real, already-host `y` `Luna.ScaledOutput` provides, so a host-shaped
-       *template* is all construction needs. =#
-    stats = Stats.default(grid, Luna.isdevice(Eω) ? Luna.tohost(Eω) : Eω, mode_s, linop,
-                          transform; gas=gas, stats_kwargs...)
+    #= The state itself, not a host copy of it: `Stats.default` builds its buffers and
+       plans its inverse transform for the array type and precision `Eω` has, and takes
+       the unit scaling from `transform`, so that the default statistics run on the
+       device with the state left where it is. =#
+    stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
     stats = Output.maybe_periodic(stats, stats_period)
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 

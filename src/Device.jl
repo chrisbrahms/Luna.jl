@@ -576,12 +576,14 @@ requests through `yfun`), and therefore needs it on the host, in physical units.
 
 True whenever `o`'s statistics function is not `Output.nostats` and, if it is an
 [`Output.PeriodicStats`](@ref), will actually fire this step ([`Output.willfire`](@ref)):
-[`Stats.collect_stats`](@ref Luna.Stats.collect_stats) does a full inverse FFT and host
-reductions, so a device run has to copy the state down on every step whose statistics are
-really computed -- but not on a step `PeriodicStats` is going to skip, which is the whole
-point of `stats_period` on a device. [`ScaledOutput`](@ref) warns once when this forces a
-device-to-host copy. Conservatively `true` for an output whose statistics function cannot
-be inspected this way.
+a statistic which cannot be evaluated where the state lives has to have it copied down on
+every step whose statistics are really computed -- but not on a step `PeriodicStats` is
+going to skip, which is the whole point of `stats_period` on a device. Conservatively
+`true` for an output whose statistics function cannot be inspected this way.
+
+Whether the copy is needed at all is the second question, answered by
+[`stats_device_capable`](@ref): a statistics set which runs on the state as the stepper
+holds it needs no copy on any step.
 """
 needs_host_y(o, t) = true
 needs_host_y(o::Output.MemoryOutput, t) = _stats_will_run(o.statsfun, t)
@@ -589,6 +591,39 @@ needs_host_y(o::Output.HDF5Output, t) = _stats_will_run(o.statsfun, t)
 
 _stats_will_run(f, t) = f !== Output.nostats
 _stats_will_run(p::Output.PeriodicStats, t) = Output.willfire(p, t)
+
+"""
+    stats_device_capable(x) -> Bool
+
+Whether the statistics `x` stands for can be evaluated on the propagating state as the
+stepper holds it: a device array, in the scaled units of [`UnitScaling`](@ref). `x` is
+either an output handler or a statistics function.
+
+The default sets [`Stats.default`](@ref Luna.Stats.default) builds answer this through
+[`Stats.device_capable`](@ref Luna.Stats.device_capable); anything else -- a user-written
+closure, a statistics function from somewhere else -- is `false`, which is what makes
+[`ScaledOutput`](@ref) copy the state to the host every step. `Output.nostats` is
+trivially capable: it reads nothing.
+"""
+stats_device_capable(x) = false
+stats_device_capable(o::Output.MemoryOutput) = stats_device_capable(o.statsfun)
+stats_device_capable(o::Output.HDF5Output) = stats_device_capable(o.statsfun)
+stats_device_capable(p::Output.PeriodicStats) = stats_device_capable(p.f)
+stats_device_capable(::typeof(Output.nostats)) = true
+
+"""
+    stats_host_list(x) -> Vector{String}
+
+The names of the statistics in `x` which are not [`stats_device_capable`](@ref), for the
+one-time warning [`ScaledOutput`](@ref) emits. `x` is either an output handler or a
+statistics function. Extended by
+[`Stats.host_statistics`](@ref Luna.Stats.host_statistics) for the sets `Stats.default`
+builds; the fallback is a single entry naming the type of the statistics function.
+"""
+stats_host_list(x) = stats_device_capable(x) ? String[] : [string(nameof(typeof(x)))]
+stats_host_list(o::Output.MemoryOutput) = stats_host_list(o.statsfun)
+stats_host_list(o::Output.HDF5Output) = stats_host_list(o.statsfun)
+stats_host_list(p::Output.PeriodicStats) = stats_host_list(p.f)
 
 """
     needs_host_cache(o) -> Bool
