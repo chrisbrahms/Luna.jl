@@ -57,6 +57,19 @@ usercubic(s) = let s = s
     (out, E, ρ) -> (out .+= (ρ*s) .* E.^3)
 end
 
+#= A user-written *two-component* columnwise response: a toy χ⁽²⁾ crystal written the way a
+   user would write one, with scalar indexing, in physical SI units and Float64. Nothing
+   about it can run on a Metal array. =#
+userchi2(d) = let d = d
+    (out, E, ρ) -> begin
+        for i in axes(E, 1)
+            @inbounds out[i, 1] += d*2*E[i, 1]*E[i, 2]
+            @inbounds out[i, 2] += d*(E[i, 1]^2 - E[i, 2]^2)
+        end
+        out
+    end
+end
+
 #= The same mode-averaged Kerr propagation on whichever spec is asked for. `Luna.run`
    wraps the output in `ScaledOutput` itself now (gpu/11), so this test file never needs
    its own host-copy wrapper the way it did under gpu/10 -- `out`, the plain
@@ -465,6 +478,70 @@ end
                                scaling=sc)
         @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-5
     end
+end
+
+#= The χ⁽²⁾ responses on Metal. The free-space transforms which use them are host-only
+   until Group E, so this is the block path: one fused pair of component broadcasts over an
+   `(nt, 2, ncols)` device array. This is the only place a stray Float64 in the crystal
+   matrices or in the carrier phase would show up -- Metal's kernel compiler rejects any
+   `double` which survives optimisation, and `MtlArray{Float64}` does not exist. =#
+@testset "χ⁽²⁾ responses on Metal" begin
+    nt, ncols = 256, 3
+    θ, ϕ = deg2rad(29.2), deg2rad(30)
+    sc = Luna.UnitScaling(1024.0, PhysData.ε_0)
+    hspec = DeviceSpec(Array, Float32)
+    to = collect(range(0, 1e-13, length=nt))
+    for (c, T) in ((Nonlinear.Chi2Field(θ, ϕ, PhysData.χ2(:BBO)), Float32),
+                   (Nonlinear.Chi2Env(θ, ϕ, PhysData.χ2(:BBO), PhysData.wlfreq(800e-9),
+                                      to), ComplexF32))
+        Eh = randn(T, nt, 2, ncols)
+        Ph = zeros(T, nt, 2, ncols)
+        NonlinearRHS.Et_to_Pt!(Ph, Eh, (Nonlinear.rescale(c, hspec, sc),), 1.0; scaling=sc)
+        Ed = Luna.todevice(MetalSpec, Eh)
+        rd = Nonlinear.rescale(c, MetalSpec, sc)
+        Pd = Luna.alloc(MetalSpec, T, (nt, 2, ncols))
+        NonlinearRHS.Et_to_Pt!(Pd, Ed, (rd,), 1.0; scaling=sc)
+        # the crystal matrices and the carrier phase reach the kernel in Float32
+        @test eltype(rd.χ2_toLab) === Float32
+        @test eltype(rd.toCrystal) === Float32
+        if c isa Nonlinear.Chi2Env
+            @test eltype(rd.C) === ComplexF32
+        end
+        @test maximum(abs, Ph) > 0
+        @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-5
+    end
+end
+
+#= The χ⁽²⁾ case of the hackability fallback on real hardware: a two-component response a
+   user wrote as a Float64 closure with scalar indexing, applied to a Metal block through
+   `HostResponse` alongside a χ⁽²⁾ response which has a kernel. =#
+@testset "a user χ⁽²⁾ closure through HostResponse on Metal" begin
+    nt, ncols = 256, 2
+    sc = Luna.UnitScaling(1024.0, PhysData.ε_0)
+    hspec = DeviceSpec(Array, Float32)
+    #= `d` is of the order of ε₀χ⁽²⁾ for BBO, so that the closure and the response with a
+       kernel contribute comparably. =#
+    cw = userchi2(1e-23)
+    c = Nonlinear.Chi2Field(deg2rad(29.2), deg2rad(30), PhysData.χ2(:BBO))
+    Eh = randn(Float32, nt, 2, ncols)
+    Ph = zeros(Float32, nt, 2, ncols)
+    NonlinearRHS.Et_to_Pt!(Ph, Eh,
+                           (Nonlinear.rescale(c, hspec, sc),
+                            Nonlinear.rescale(cw, hspec, sc, Eh)), 1.0; scaling=sc)
+
+    Ed = Luna.todevice(MetalSpec, Eh)
+    hr = @test_logs (:info,) match_mode=:any Nonlinear.rescale(cw, MetalSpec, sc, Ed)
+    @test hr isa Nonlinear.HostResponse
+    @test Nonlinear.kind(hr) isa Nonlinear.Batched
+    Pd = Luna.alloc(MetalSpec, Float32, (nt, 2, ncols))
+    NonlinearRHS.Et_to_Pt!(Pd, Ed, (Nonlinear.rescale(c, MetalSpec, sc), hr), 1.0;
+                           scaling=sc)
+    @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-5
+
+    # the closure really contributes
+    Pc = zeros(Float32, nt, 2, ncols)
+    NonlinearRHS.Et_to_Pt!(Pc, Eh, (Nonlinear.rescale(c, hspec, sc),), 1.0; scaling=sc)
+    @test maximum(abs, Pc .- Ph)/maximum(abs, Ph) > 1e-2
 end
 
 #= The hackability fallback on real hardware: a user-written columnwise closure, which
