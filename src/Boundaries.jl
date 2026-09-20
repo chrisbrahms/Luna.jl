@@ -103,7 +103,9 @@ module Boundaries
 import ..Maths
 import ..Grid
 import ..NonlinearRHS
-import LinearAlgebra: mul!, ldiv!
+import ..Utils
+import Luna: upload_like, scalar
+import LinearAlgebra: mul!
 import Logging
 import Printf: @sprintf
 
@@ -371,6 +373,32 @@ function evanescent(linop, transform, ℓ; kwin=nothing)
 end
 
 """
+    _absorbed(E, F)
+
+`Σ |e|²(1 - f²)` over corresponding elements of `E` and the broadcast factor `F` -- the
+power an absorbing multiply `E .*= F` removes, in one pass and without needing `E` before
+and after. Shared by every collar's energy bookkeeping ([`RateAbsorber`](@ref),
+[`RadialCollar`](@ref), [`CartesianCollar`](@ref)).
+
+The arrays are combined into a lazy `Broadcast.Broadcasted` rather than passed to
+`mapreduce` directly, for the same reason as `RK45._zipreduce`: a multi-array `mapreduce`
+materialises `map(f, args...)` first (a field-sized allocation every step), while a
+`Broadcasted` is reduced by `mapfoldl` on the host (a serial, allocation-free fold) and by
+`GPUArrays`' own `mapreduce` method for a `Broadcasted` on a device (a tree reduction).
+Where `F` is exactly 1 -- the whole array outside the collar, since the absorber profiles
+reach exactly 1 in their flat interior -- the summand is exactly zero, so this needs no
+mask to be correct; a mask would only save arithmetic, not change the answer, and the
+collar is a small enough fraction of the grid that the extra `exp`/multiply is cheap on
+every backend this runs on.
+"""
+function _absorbed(E, F)
+    z = zero(real(eltype(E)))
+    mapreduce(identity, +, Broadcast.instantiate(Broadcast.broadcasted(_absorbedmap, E, F));
+              init=z)
+end
+_absorbedmap(e, f) = abs2(e)*(1 - f^2)
+
+"""
     RadialCollar(rgrid, αr, Eω)
 
 Transverse absorbing boundary for radially symmetric propagation: the power rate `αr` over
@@ -381,15 +409,19 @@ one forward Hankel transform along the last axis, into the buffer `buf` sized li
 
 `Tfwd` and `Tbwd` are copies of `rgrid`'s transform matrices in the element type of `Eω`,
 so that both operands of the matrix multiplication have the same element type; `weight` is
-a copy of its real-space integration weights. Nothing else of the grid is needed per step,
-so the grid itself is not kept.
+a copy of its real-space integration weights, in the real precision of `Eω`. Nothing else
+of the grid is needed per step, so the grid itself is not kept.
+
+`TransRadial` does not take a `device` keyword yet (Group E of GPU_PLAN.md), so `Eω` here
+is always a host array; `Tfwd`/`Tbwd`/`αr`/`weight` are adapted to its *precision* (for a
+`Float32` radial run) with `convert` rather than `Luna.todevice`, since a real-to-complex
+conversion (`Tfwd`/`Tbwd`) is not one `todevice` performs.
 """
-struct RadialCollar{mT, bT}
+struct RadialCollar{mT, rT, bT}
     Tfwd::Matrix{mT}
     Tbwd::Matrix{mT}
-    αr::Vector{Float64}
-    ridcs::Vector{Int} # only the collar is ever ≠ 1
-    weight::Vector{Float64} # radial integration weights, to measure what is removed
+    αr::Vector{rT}
+    weight::Vector{rT} # radial integration weights, to measure what is removed
     buf::bT
     removed::Base.RefValue{Float64}
     reference::Base.RefValue{Float64}
@@ -398,26 +430,32 @@ end
 
 function RadialCollar(rgrid::Grid.RadialGrid, αr, Eω)
     TT = eltype(Eω)
+    RT = real(TT)
     RadialCollar(convert(Matrix{TT}, rgrid.Tfwd), convert(Matrix{TT}, rgrid.Tbwd),
-                 αr, findall(>(0), αr), copy(rgrid.wr), similar(Eω),
+                 convert(Vector{RT}, αr), convert(Vector{RT}, rgrid.wr), similar(Eω),
                  Ref(0.0), Ref(0.0), Ref(false))
 end
+
+_wabs2map(e, w) = w*abs2(e)
+_wabsorbedmap(e, f, w) = w*_absorbedmap(e, f)
 
 # applied before the temporal collar, in (ω, k⊥) space
 function apply_kspace!(c::RadialCollar, Eω, Δz)
     Grid.radial_matmul!(c.buf, Eω, c.Tbwd) # (ω, pol, k) -> (ω, pol, r)
     d = ndims(c.buf)
+    ones_d = ntuple(_ -> 1, d - 1)
+    wB = reshape(c.weight, ones_d..., :)
+    z = zero(real(eltype(c.buf)))
     if c.reference[] == 0
-        c.reference[] = sum(i -> c.weight[i]*sum(abs2, selectdim(c.buf, d, i)), axes(c.buf, d))
+        c.reference[] = Float64(mapreduce(identity, +,
+            Broadcast.instantiate(Broadcast.broadcasted(_wabs2map, c.buf, wB)); init=z))
     end
-    removed = 0.0
-    for i in c.ridcs
-        fac = exp(-c.αr[i]*Δz/2)
-        s = selectdim(c.buf, d, i)
-        removed += c.weight[i]*sum(abs2, s)*(1 - fac^2)
-        s .*= fac
-    end
-    c.removed[] += removed
+    halfΔz = scalar(c.buf, Δz/2)
+    fac = @. exp(-c.αr * halfΔz)
+    facB = reshape(fac, ones_d..., :)
+    c.removed[] += Float64(mapreduce(identity, +,
+        Broadcast.instantiate(Broadcast.broadcasted(_wabsorbedmap, c.buf, facB, wB)); init=z))
+    c.buf .*= facB
     Grid.radial_matmul!(Eω, c.buf, c.Tfwd)
     nothing
 end
@@ -430,29 +468,36 @@ Transverse absorbing boundary for the Cartesian free-space grids: the power rate
 the spatial axes `(Nx,)` or `(Nx, Ny)`, applied as `exp(-αxy Δz/2)` per accepted step. The
 Fourier transform of those grids is joint in `(t, x[, y])`, so the collar is applied in
 the same real-space pass as the temporal collar, at no extra transform cost.
+
+Tested on the host only in this branch: `TransFree`/`TransFree2D` have no device path yet
+(`gpu/21`), so `αxy` is always a host `Array{Float64}`, matched to `Et`'s real precision
+by `Luna.upload_like` at construction (the identity on the default CPU path).
 """
-struct CartesianCollar{N}
-    αxy::Array{Float64, N}
-    idcs::Vector{CartesianIndex{N}} # only the collar is ever ≠ 1
+struct CartesianCollar{N, AT<:AbstractArray}
+    αxy::AT # real precision of the state, host array type until gpu/21
     removed::Base.RefValue{Float64}
     reference::Base.RefValue{Float64}
     warned::Base.RefValue{Bool}
 end
 
-CartesianCollar(αxy) = CartesianCollar(
-    αxy, vec(collect(CartesianIndices(αxy)))[vec(αxy .> 0)], Ref(0.0), Ref(0.0), Ref(false))
+#= `Et` (the state's own real precision) is what `αxy` should be mirrored to; this is
+   called once, at `Boundaries.setup`, with the same `Et` the `RateAbsorber` that will
+   apply this collar shares. =#
+function CartesianCollar(αxy::Array{Float64, N}, Et) where {N}
+    αd = upload_like(Et, αxy)
+    CartesianCollar{N, typeof(αd)}(αd, Ref(0.0), Ref(0.0), Ref(false))
+end
 
 # applied after the temporal collar, in (t, x[, y]) space
-function apply_realspace!(c::CartesianCollar, Et, Δz)
-    c.reference[] == 0 && (c.reference[] = sum(abs2, Et))
-    removed = 0.0
-    for J in c.idcs
-        fac = exp(-c.αxy[J]*Δz/2)
-        s = view(Et, :, :, J)
-        removed += sum(abs2, s)*(1 - fac^2)
-        s .*= fac
-    end
-    c.removed[] += removed
+function apply_realspace!(c::CartesianCollar{N}, Et, Δz) where {N}
+    d = ndims(Et)
+    ones_d = ntuple(_ -> 1, d - N)
+    αxyB = reshape(c.αxy, ones_d..., size(c.αxy)...)
+    c.reference[] == 0 && (c.reference[] = Float64(sum(abs2, Et)))
+    halfΔz = scalar(Et, Δz/2)
+    fac = @. exp(-αxyB * halfΔz)
+    c.removed[] += Float64(_absorbed(Et, fac))
+    Et .*= fac
     nothing
 end
 apply_realspace!(c, Et, Δz) = nothing
@@ -465,7 +510,7 @@ space. `grid` and `Et` size the buffer the radial collar needs.
 """
 spatialcollar(rg::Grid.RadialGrid, αr, grid, Et) = RadialCollar(
     rg, αr, zeros(ComplexF64, (length(grid.ω), size(Et)[2:end]...)))
-spatialcollar(sg::Union{Grid.Free2DGrid, Grid.FreeGrid}, αr, grid, Et) = CartesianCollar(αr)
+spatialcollar(sg::Union{Grid.Free2DGrid, Grid.FreeGrid}, αr, grid, Et) = CartesianCollar(αr, Et)
 
 # --------------------------------------------------------------------------- application
 
@@ -487,12 +532,12 @@ In free space `spatial` is the transverse collar ([`RadialCollar`](@ref) or
 [`CartesianCollar`](@ref)), applied in the same step; the k-space absorber rides the
 propagator like the spectral one.
 """
-struct RateAbsorber{tT, fT, oT, sT}
-    αt::Vector{Float64}
-    tidcs::Vector{Int} # only the collar is ever ≠ 1, so only those need touching each step
-    tfac::Vector{Float64}
+struct RateAbsorber{vT, tT, fT, iT, oT, sT}
+    αt::vT # power rate over t, in the state's real precision and array type
+    tfac::vT # scratch: exp(-αt*Δz/2), recomputed every step
     Et::tT
     FT::fT
+    IFT::iT # explicit inverse plan (see Utils.plan_ift); mul! rather than ldiv! on every backend
     output::oT
     spatial::sT
     zprev::Base.RefValue{Float64}
@@ -502,32 +547,34 @@ struct RateAbsorber{tT, fT, oT, sT}
     warnfrac::Float64
 end
 
-RateAbsorber(αt, Et, FT, output, z0; warnfrac=DEFAULT_WARNFRAC, spatial=nothing) = RateAbsorber(
-    αt, findall(>(0), αt), ones(Float64, length(αt)), Et, FT, output, spatial, Ref(float(z0)),
-    Ref(0.0), Ref(0.0), Ref(false), warnfrac)
+#= `αt` is mirrored to `Et`'s array type and real precision with `upload_like`, which is
+   the identity on the default CPU path (`Et` a host `Array{Float64}`) -- no copy, same
+   object. `tfac` is a same-shaped scratch buffer, recomputed by a plain broadcast every
+   step rather than only at the collar indices (`Boundaries.jl`'s GPU_PLAN.md §4.2 note):
+   the profile is exactly 1 outside the collar, so this does more arithmetic there than
+   the historical index loop but no scalar indexing and no gather, on every backend. =#
+function RateAbsorber(αt, Et, FT, output, z0; warnfrac=DEFAULT_WARNFRAC, spatial=nothing)
+    αtd = upload_like(Et, αt)
+    RateAbsorber(αtd, similar(αtd), Et, FT, Utils.plan_ift(FT), output, spatial,
+                 Ref(float(z0)), Ref(0.0), Ref(0.0), Ref(false), warnfrac)
+end
 
 function (b::RateAbsorber)(Eω, z, dz, interpolant)
     Δz = z - b.zprev[]
     b.zprev[] = z
     if Δz > 0
         apply_kspace!(b.spatial, Eω, Δz) # radial collar: transforms to r and back itself
-        @inbounds for i in b.tidcs
-            b.tfac[i] = exp(-b.αt[i]*Δz/2) # αt is a power coefficient, tfac hits the field
-        end
-        #= An inverse real FFT overwrites its input, so between these two lines Eω holds
-           whatever FFTW left there and must not be read; the forward transform refills it. =#
-        ldiv!(b.Et, b.FT, Eω)
-        b.reference[] == 0 && (b.reference[] = sum(abs2, b.Et))
-        #= Apply the collar and measure what it took out, in one pass. Only the collar can
-           change, so this also does less work than multiplying the whole array. The trailing
-           index covers every field shape: none for mode-averaged, modes, or transverse. =#
-        removed = 0.0
-        @inbounds for J in CartesianIndices(size(b.Et)[2:end]), i in b.tidcs
-            before = abs2(b.Et[i, J])
-            b.Et[i, J] *= b.tfac[i]
-            removed += before - abs2(b.Et[i, J])
-        end
-        b.removed[] += removed
+        halfΔz = scalar(b.Et, Δz/2)
+        @. b.tfac = exp(-b.αt*halfΔz) # αt is a power coefficient, tfac hits the field
+        mul!(b.Et, b.IFT, Eω) # explicit inverse plan; Eω is free to reuse once this returns
+        tfacB = reshape(b.tfac, :, ntuple(_ -> 1, ndims(b.Et) - 1)...)
+        #= Measured before the multiply, in one fused reduction; see `_absorbed`. The
+           trailing singleton dims broadcast `tfacB` over whatever else `Et` carries
+           (modes, polarisation, or nothing for mode-averaged). =#
+        removed = _absorbed(b.Et, tfacB)
+        b.reference[] == 0 && (b.reference[] = Float64(mapreduce(abs2, +, b.Et)))
+        b.removed[] += Float64(removed)
+        b.Et .*= tfacB
         apply_realspace!(b.spatial, b.Et, Δz) # Cartesian collar: Et is already (t, x[, y])
         mul!(Eω, b.FT, b.Et)
         warn_maybe(b, z)
@@ -585,17 +632,28 @@ warn_maybe(c::Nothing, z, warnfrac) = nothing
 The historical scheme: multiply the solution by the fixed profiles once per accepted step.
 Kept only so that results from before rate semantics can be reproduced exactly.
 """
-struct LegacyAbsorber{gT, tT, fT, oT}
-    grid::gT
+struct LegacyAbsorber{gT, wT, tT, fT, iT, oT}
+    grid::gT # kept only for metadata; the windows used per step are the mirrors below
+    ωwin::wT # grid.ωwin, mirrored to Et's real precision and array type
+    twin::wT # grid.twin, likewise
     Et::tT
     FT::fT
+    IFT::iT # explicit inverse plan, mul! rather than ldiv!, on every backend
     output::oT
 end
 
+#= `ωwin`/`twin` are real-valued, so mirroring them to Et's real precision (rather than
+   Eω's complex one) is enough: `Complex .* Real` promotes elementwise regardless. On the
+   default CPU path `upload_like` returns the grid's own vectors unchanged. =#
+function LegacyAbsorber(grid, Et, FT, output)
+    LegacyAbsorber(grid, upload_like(Et, grid.ωwin), upload_like(Et, grid.twin),
+                   Et, FT, Utils.plan_ift(FT), output)
+end
+
 function (b::LegacyAbsorber)(Eω, z, dz, interpolant)
-    Eω .*= b.grid.ωwin
-    ldiv!(b.Et, b.FT, Eω) # destroys Eω, see RateAbsorber
-    b.Et .*= b.grid.twin
+    Eω .*= b.ωwin
+    mul!(b.Et, b.IFT, Eω)
+    b.Et .*= b.twin
     mul!(Eω, b.FT, b.Et)
     b.output(Eω, z, dz, interpolant)
 end
