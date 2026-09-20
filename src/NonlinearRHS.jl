@@ -950,31 +950,48 @@ end
 
 Transform E(ω) -> Pₙₗ(ω) for radially symmetric free-space propagation.
 
+Parametric in its buffer array type: every buffer, grid mirror and transform matrix is
+allocated with [`Luna.alloc`](@ref)/[`Luna.todevice`](@ref) from the run's
+[`Luna.DeviceSpec`](@ref), so the same code runs on the host, in reduced precision and on
+a device.
+
 # Fields
+- `rgrid`: the transverse grid ([`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid)), kept for
+  metadata; the per-step code uses `Tfwd`/`Tbwd` instead.
+- `gv`: mirror of the grid vectors the kernels broadcast against.
+- `Tfwd`, `Tbwd`: the grid's transform matrices in the *time-domain* element type, so that
+  both operands of the Hankel GEMM have the same element type (Metal's accelerated matrix
+  multiply requires that).
+- `prefac`: the z-independent part of the frequency-domain normalisation,
+  `ωwin·(-iω)·Pref`, precombined on the host.
 - `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, nr)`
   for the modified shot-noise model, or `nothing`.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
+- `scaling`: the [`Luna.UnitScaling`](@ref) the state and the polarisation are in.
 """
-struct TransRadial{TT, RGT, FTT, IFTT, nT, rT, gT, dT, iT, eT, nlT}
+struct TransRadial{TT, ωT, RGT, FTT, IFTT, nT, rT, gT, gvT, dT, iT, mT, pT, eT, nlT}
     rgrid::RGT # transverse grid (Grid.RadialGrid: space to k-space)
     FT::FTT # Fourier transform (time to frequency)
     IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
     normfun::nT # Function which returns normalisation factor
     resp::rT # nonlinear responses (tuple of callables)
-    grid::gT # time grid
+    grid::gT # host grid, for metadata and for anything not in a kernel
+    gv::gvT # mirror of the grid vectors the kernels broadcast against
     densityfun::dT # callable which returns density
-    Pto_r::Array{TT, 3} # Buffer array for NL polarisation on oversampled time grid
-    Pto_k::Array{TT, 3} # Buffer array for NL polarisation on oversampled time grid
-    Eto_r::Array{TT, 3} # Buffer array for field on oversampled time grid
-    Eto_k::Array{TT, 3} # Buffer array for field on oversampled time grid
-    Eωo::Array{ComplexF64, 3} # Buffer array for field on oversampled frequency grid
-    Pωo::Array{ComplexF64, 3} # Buffer array for NL polarisation on oversampled frequency grid
+    Pto_r::TT # Buffer array for NL polarisation on oversampled time grid
+    Pto_k::TT # Buffer array for NL polarisation on oversampled time grid
+    Eto_r::TT # Buffer array for field on oversampled time grid
+    Eto_k::TT # Buffer array for field on oversampled time grid
+    Eωo::ωT # Buffer array for field on oversampled frequency grid
+    Pωo::ωT # Buffer array for NL polarisation on oversampled frequency grid
     idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
-    Tfwd::Matrix{TT} # forward Hankel transform matrix
-    Tbwd::Matrix{TT} # backward Hankel transform matrix
+    Tfwd::mT # forward Hankel transform matrix, in the time-domain element type
+    Tbwd::mT # backward Hankel transform matrix, in the time-domain element type
+    prefac::pT # ωwin*(-im*ω)*Pref: the z-independent normalisation factor
     Et_noise::eT # time-domain noise for modified shot-noise model, or nothing
     Et_nl::nlT # buffer for field+noise passed to Et_to_Pt!, or nothing
+    scaling::UnitScaling # units the state and the polarisation are expressed in
 end
 
 function show(io::IO, t::TransRadial)
@@ -988,43 +1005,61 @@ function show(io::IO, t::TransRadial)
 end
 
 """
-    TransRadial(TT, grid, rgrid, FT, responses, densityfun, normfun; noise_field=nothing)
+    TransRadial(TT, grid, rgrid, FT, responses, densityfun, normfun, pol=false; kwargs...)
 
 Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisation.
-`rgrid` is a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid).
+`rgrid` is a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid). `TT` is the time-domain
+element type (`Float64`/`Float32` on a `RealGrid`, complex on an `EnvGrid`); the
+two-argument forms taking the grid pick it.
 
 # Keyword arguments
-- `noise_field=nothing`: optional `(nω, nk)` frequency/k-space noise field for the modified
-  shot-noise model. When provided, it is converted to the real-space time domain `(nto, nr)`
-  via inverse FFT and inverse Hankel transform, and stored as `Et_noise`.
+- `noise_field=nothing`: optional `(nω, npol, nk)` frequency/k-space noise field for the
+  modified shot-noise model. When provided, it is converted to the real-space time domain
+  `(nto, npol, nr)` via inverse FFT and inverse Hankel transform, and stored as `Et_noise`.
   Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `spec=HostSpec()`: the [`Luna.DeviceSpec`](@ref) the buffers, mirrors and responses live
+  on.
+- `scaling=UNIT_SCALING`: the [`Luna.UnitScaling`](@ref) the state and the nonlinear
+  polarisation are expressed in. The responses are converted to it with
+  [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale), the noise field is divided by `Eref`
+  and `Pref` is folded into `prefac`.
 """
 function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun, normfun,
                      pol=false; noise_field=nothing, spec=HostSpec(),
                      scaling=UNIT_SCALING)
     np = pol ? 2 : 1
     N = rgrid.N
+    CT = Complex{realtype(spec)}
     IFT = Utils.plan_ift(FT)
-    Eωo = zeros(ComplexF64, (length(grid.ωo), np, N))
-    Eto_r = zeros(TT, (length(grid.to), np, N))
+    Eωo = alloc(spec, CT, (length(grid.ωo), np, N))
+    Eto_r = alloc(spec, TT, (length(grid.to), np, N))
     Pto_r = similar(Eto_r)
     Eto_k = similar(Eto_r)
     Pto_k = similar(Eto_r)
     Pωo = similar(Eωo)
     idcs = CartesianIndices(size(Pto_r)[3:end])
+    gv = gridvectors(grid, spec)
     #= Our own copies of the grid's transform matrices in the type we multiply: a GEMM
-       needs both operands in the same element type (and on devices it is required). =#
-    Tfwd = convert(Matrix{TT}, rgrid.Tfwd)
-    Tbwd = convert(Matrix{TT}, rgrid.Tbwd)
+       needs both operands in the same element type (and on devices it is required).
+       `convert` first, on the host, because a real-to-complex conversion is not one
+       `todevice` performs. =#
+    Tfwd = todevice(spec, convert(Matrix{TT}, rgrid.Tfwd))
+    Tbwd = todevice(spec, convert(Matrix{TT}, rgrid.Tbwd))
+    #= The z-independent part of the frequency-domain normalisation, precombined on the
+       host in Float64 as one vector (GPU_PLAN.md 4.1). `Pref` converts the polarisation
+       buffer's units back to physical ones and is 1 on every Float64 run, so this is
+       exactly the vector the per-step expression used to rebuild every call. =#
+    prefac = todevice(spec, @. grid.ωwin * (-im*grid.ω) * scaling.Pref)
     #= Precompute time-domain noise in real space: ω→t via to_time!, then k→r. This is
        Grid.to_rspace! done with our own Tbwd, so that the noise passes through exactly
-       the same matrix as the field does on every step. =#
+       the same matrix as the field does on every step. The noise is a state-unit
+       quantity, so it carries the same 1/Eref the state does. =#
     if !isnothing(noise_field)
-        Eωo_noise = zeros(ComplexF64, (length(grid.ωo), np, N))
-        Et_noise = zeros(TT, (length(grid.to), np, N))
-        to_time!(Et_noise, noise_field, Eωo_noise, IFT)
+        Eωo_noise = alloc(spec, CT, (length(grid.ωo), np, N))
+        Et_noise = alloc(spec, TT, (length(grid.to), np, N))
+        to_time!(Et_noise, todevice(spec, noise_field ./ scaling.Eref), Eωo_noise, IFT)
         Grid.radial_matmul!(Et_noise, Et_noise, Tbwd)
-        Et_nl = zeros(TT, (length(grid.to), np, N))
+        Et_nl = alloc(spec, TT, (length(grid.to), np, N))
     else
         Et_noise = nothing
         Et_nl = nothing
@@ -1032,13 +1067,18 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
     #= Responses are given the prototype of the block they will be called with, so that
        a batched one has its buffers in the right shape, and as a `Tuple`, because a
        batched response cannot be applied by the legacy per-response loop (see
-       `_refuse_batched_legacy`). Every fallback returns the response unchanged on the
-       host Float64 path, which is the only one this transform runs today; `spec` and
-       `scaling` are threaded through so that Group E, which gives it a device path,
-       changes the caller and not this line. =#
+       `_refuse_batched_legacy`). =#
     responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto_r)
-    TransRadial(rgrid, FT, IFT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
-                Tfwd, Tbwd, Et_noise, Et_nl)
+    check_norm(normfun, spec, scaling)
+    #= Every mirror the transform holds and every array its responses carry, not only the
+       ones this transform's own kernels touch. =#
+    resparrays = Nonlinear.resident_arrays_all(responses)
+    assert_resident(spec, Eωo, Pωo, Eto_r, Eto_k, Pto_r, Pto_k, Tfwd, Tbwd, prefac,
+                    gv.ω, gv.ωwin, gv.twin, gv.towin, gv.sidx, Et_noise, Et_nl,
+                    resparrays...)
+    TransRadial(rgrid, FT, IFT, normfun, responses, grid, gv, densityfun,
+                Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
+                Tfwd, Tbwd, prefac, Et_noise, Et_nl, scaling)
 end
 
 # accept a Hankel.QDHT as before, converting it (with a deprecation warning)
@@ -1046,12 +1086,12 @@ function TransRadial(TT::Type, grid, q::Grid.HankelTransform, args...; kwargs...
     TransRadial(TT, grid, Grid.RadialGrid(q), args...; kwargs...)
 end
 
-function TransRadial(grid::Grid.RealGrid, args...; kwargs...)
-    TransRadial(Float64, grid, args...; kwargs...)
+function TransRadial(grid::Grid.RealGrid, args...; spec=HostSpec(), kwargs...)
+    TransRadial(realtype(spec), grid, args...; spec, kwargs...)
 end
 
-function TransRadial(grid::Grid.EnvGrid, args...; kwargs...)
-    TransRadial(ComplexF64, grid, args...; kwargs...)
+function TransRadial(grid::Grid.EnvGrid, args...; spec=HostSpec(), kwargs...)
+    TransRadial(Complex{realtype(spec)}, grid, args...; spec, kwargs...)
 end
 
 """
@@ -1059,31 +1099,39 @@ end
 
 Calculate the reciprocal-domain (ω-k-space) nonlinear response due to the field `Eω` and
 place the result in `nl`
+
+The two Hankel steps are **one** matrix multiply each, on the block reshaped to
+`(nto·npol, nr)` ([`Grid.radial_matmul!`](@ref Luna.Grid.radial_matmul!)), rather than one
+per polarisation component on a view: a device's accelerated matrix multiply needs plain
+zero-offset operands of equal element type, which a view is not.
 """
 function (t::TransRadial)(nl, Eω, z)
     to_time!(t.Eto_k, Eω, t.Eωo, t.IFT) # transform ω -> t
-    # transform Eto k -> r
-    # iterate over polarisation directions (either 1:2 or just 1)
-    for ip in axes(t.Eto_k, 2)
-        mul!(view(t.Eto_r, :, ip, :), view(t.Eto_k, :, ip, :), t.Tbwd)
-    end
+    Grid.radial_matmul!(t.Eto_r, t.Eto_k, t.Tbwd) # transform Eto k -> r
     # Modified shot-noise: compute field+noise in separate buffer (Et_nl) so the
     # propagating field is never contaminated.
     # Note that if noise_field is nothing, we pass t.Eto_r straight without copying
     # to the buffer t.Et_nl first
     if !isnothing(t.Et_noise)
         @. t.Et_nl = t.Eto_r + t.Et_noise
-        Et_to_Pt!(t.Pto_r, t.Et_nl, t.resp, t.densityfun(z), t.idcs)
+        Et_to_Pt!(t.Pto_r, t.Et_nl, t.resp, t.densityfun(z), t.idcs; scaling=t.scaling)
     else
-        Et_to_Pt!(t.Pto_r, t.Eto_r, t.resp, t.densityfun(z), t.idcs)
+        Et_to_Pt!(t.Pto_r, t.Eto_r, t.resp, t.densityfun(z), t.idcs; scaling=t.scaling)
     end
-    @. t.Pto_r *= t.grid.towin # apodisation
-    # transform Pto r -> k
-    for ip in axes(t.Pto_k, 2)
-        mul!(view(t.Pto_k, :, ip, :), view(t.Pto_r, :, ip, :), t.Tfwd)
-    end
+    @. t.Pto_r *= t.gv.towin # apodisation
+    Grid.radial_matmul!(t.Pto_k, t.Pto_r, t.Tfwd) # transform Pto r -> k
     to_freq!(nl, t.Pωo, t.Pto_k, t.FT) # transform t -> ω
-    nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
+    fsnorm!(nl, t.prefac, t.normfun(z))
+end
+
+#= The frequency-domain normalisation of the free-space transforms, as one fused
+   broadcast over the precombined `pre` (which carries `ωwin`, `-iω` and `Pref`) and the
+   normalisation array. Written with the same association as the expression it replaces,
+   `pre ./ (2 .* norm)`, so the Float64 path is unchanged; the `2` goes through
+   `Luna.scalar` so that nothing reachable from a kernel is a `Float64` or an `Int`. =#
+function fsnorm!(nl, pre, nrm)
+    two = scalar(nl, 2.0)
+    @. nl *= pre/(two*nrm)
 end
 
 #=================================================#
@@ -1138,12 +1186,23 @@ taper: the factor is the pure physics, which is only usable with steps `Δz ≲ 
 - `nfun`: refractive index, either `nfun(ω; z)` returning one index or a tuple (one per
   polarisation), or a tuple `(nfunx, nfuny)` of crystal-optics functions
   `nfunx(λ, δθ; z)`, `nfuny(λ; z)` (see [`Luna.PhysData.crystal_internal_angle`](@ref))
-- `kperp2`, `kidcs`: squared transverse wavevector and the indices of the k axes
-- `out`: the normalisation array (`ComplexF64`, since ``\\beta_z`` is complex below cutoff)
-- `ℓ`, `κmax`, `kwin`: taper parameters (see above)
+- `kperp2`, `kidcs`: squared transverse wavevector and the indices of the k axes, on the
+  host (the crystal-optics fill is host scalar code)
+- `out`: the normalisation array (complex, since ``\\beta_z`` is complex below cutoff), on
+  the run's array type and precision
+- `ℓ`, `κmax`, `kwin`: taper parameters (see above), on the host
 - `constant`: if `true`, `out` is computed once and reused (the index does not depend on `z`)
+- `spec`: the [`Luna.DeviceSpec`](@ref) `out` and the mirrors live on
+- `kperp2m`, `kwinm`, `sidxm`, `ωm`: mirrors of the vectors the isotropic fill broadcasts
+  against, in the run's array type and precision. `kwinm` is refilled from `kwin` on the
+  first `fillnorm!` after [`reflength!`](@ref) (which is called *after* construction, by
+  `Boundaries.setup`), which is what `mirrored` tracks.
+- `nm`: host mirror of the `(Nω, Npol)` refractive-index table, evaluated by host scalar
+  code and uploaded once per `fillnorm!`
+- `ohost`: host staging buffer for the crystal-optics fill, or `nothing` when `out` is
+  already a host array of the right precision
 """
-mutable struct FreeSpaceNorm{gT, sT, nT, kT, iT, oT, wT}
+mutable struct FreeSpaceNorm{gT, sT, nT, kT, iT, oT, wT, ST, dT, mT, xT, nmT, hT}
     grid::gT
     spacegrid::sT
     nfun::nT
@@ -1155,17 +1214,71 @@ mutable struct FreeSpaceNorm{gT, sT, nT, kT, iT, oT, wT}
     kwin::wT
     constant::Bool
     filled::Bool
+    spec::ST
+    kperp2m::dT
+    kwinm::dT
+    sidxm::mT
+    ωm::xT
+    nm::nmT
+    ohost::hT
+    mirrored::Bool
 end
 
 npol(nfun::Tuple, grid) = 2 # crystal optics: (nfunx, nfuny)
 npol(nfun, grid) = length(nfun(grid.ω[findfirst(grid.sidx)]; z=0)) # 1 if single index, 2 if nx, ny
 
-function FreeSpaceNorm(grid, spacegrid, nfun; constant)
+function FreeSpaceNorm(grid, spacegrid, nfun; constant, spec=HostSpec())
     kperp2, kidcs = transverse_k2(spacegrid)
     np = npol(nfun, grid)
-    out = zeros(ComplexF64, (length(grid.ω), np, size(kidcs)...))
+    nω = length(grid.ω)
+    T = realtype(spec)
+    out = alloc(spec, Complex{T}, (nω, np, size(kidcs)...))
     kwin = ones(Float64, size(kidcs))
-    FreeSpaceNorm(grid, spacegrid, nfun, kperp2, kidcs, out, 0.0, Inf, kwin, constant, false)
+    #= The k-space quantities are broadcast against `out`, whose first two axes are ω and
+       polarisation, so they are mirrored already reshaped to `(1, 1, Nk...)`. =#
+    kshape = (1, 1, size(kidcs)...)
+    kperp2m = todevice(spec, reshape(convert(Array{Float64}, kperp2), kshape))
+    kwinm = todevice(spec, reshape(copy(kwin), kshape))
+    ohost = (arraytype(spec) === Array && T === Float64) ? nothing :
+            zeros(ComplexF64, size(out))
+    FreeSpaceNorm(grid, spacegrid, nfun, kperp2, kidcs, out, 0.0, Inf, kwin, constant,
+                  false, spec, kperp2m, kwinm, todevice(spec, grid.sidx),
+                  todevice(spec, grid.ω), HostMirror(spec, nω*np), ohost, false)
+end
+
+"""
+    retarget(normfun, spec)
+
+The same normalisation with its arrays on `spec`'s array type and precision: `normfun`
+itself when they already are, and a fresh [`FreeSpaceNorm`](@ref) otherwise, carrying over
+whatever [`reflength!`](@ref) has already set.
+
+`Luna.setup` calls this because the free-space normalisations are built by the caller,
+before the run's device is known, and every low-level radial script (and every example)
+builds one with no `spec`. Anything which is not a `FreeSpaceNorm` cannot be retargeted
+and is accepted only for the default host `Float64` path.
+"""
+function retarget(nf::FreeSpaceNorm, spec)
+    all_resident(spec, nf.out) && return nf
+    new = FreeSpaceNorm(nf.grid, nf.spacegrid, nf.nfun; constant=nf.constant, spec)
+    new.ℓ = nf.ℓ
+    new.κmax = nf.κmax
+    new.kwin .= nf.kwin
+    new
+end
+
+retarget(normfun, spec) =
+    (arraytype(spec) === Array && realtype(spec) === Float64) ? normfun : error(
+        "the normalisation $(typeof(normfun)) is host Float64 code, so it cannot be used "*
+        "for a run on $(spec). Build it with `NonlinearRHS.norm_radial`/`norm_free`/"*
+        "`norm_free2D` (or the `const_` variants), which `Luna.setup` retargets itself.")
+
+function check_norm(nf::FreeSpaceNorm, spec, scaling)
+    #= The unit scaling is not the normalisation's: `βz/(μ0 ω)` is physics, and `Pref` is
+       folded into the transform's own `prefac`. Only residency is checked here. =#
+    all_resident(spec, nf.out, nf.kperp2m, nf.kwinm, nf.sidxm, nf.ωm, nf.nm.dev) ||
+        _normerror(nf, spec, scaling)
+    nothing
 end
 
 function (nf::FreeSpaceNorm)(z)
@@ -1194,6 +1307,9 @@ function reflength!(nf::FreeSpaceNorm, ℓ; κmax=Inf, kwin=nothing)
     nf.κmax = κmax
     isnothing(kwin) ? fill!(nf.kwin, 1) : (nf.kwin .= kwin)
     nf.filled = false
+    #= `Boundaries.setup` calls this after the transform exists, so the k-window mirror is
+       stale from here until the next `fillnorm!` rebuilds it. =#
+    nf.mirrored = false
     nf
 end
 
@@ -1216,31 +1332,85 @@ function normfactor(nf::FreeSpaceNorm, βsq, ω, wk)
     βz(βsq)/(PhysData.μ_0*ω)/W
 end
 
-# isotropic: nfun(ω; z) -> n or (nx, ny), the same k⊥ for every polarisation
-function fillnorm!(nf::FreeSpaceNorm, z)
+#= `LinearOps.βz` written so that the result is `Complex{T}` for a `T` argument without an
+   `im` literal (which is a `Complex{Int}` and would put a 64-bit integer into a kernel).
+   `-im*sqrt(x)` is `Complex(0.0*x, -1.0*x)`, i.e. exactly this, so the Float64 path is
+   unchanged. =#
+_βzc(βsq::T) where {T} = βsq < 0 ? complex(zero(T), -sqrt(-βsq)) : complex(sqrt(βsq), zero(T))
+
+#= [`normfactor`](@ref) as a broadcast kernel: the same expression, with every constant
+   converted to the element type so that nothing reachable from a device kernel is a
+   `Float64`. `inband` is `grid.sidx`; out of band, and at ω = 0, the factor is 1, which is
+   what the loop's `out[iω, :, ii] .= 1` wrote. =#
+function _normelem(n::T, ω::T, kperp2::T, wk::T, inband::Bool, c::T, μ0::T,
+                   κmax::T, ℓ::T) where {T}
+    unity = complex(one(T))
+    (inband && ω != zero(T)) || return unity
+    βsq = (n*ω/c)^2 - kperp2
+    βsq == zero(T) && return unity
+    W = wk
+    if βsq < zero(T)
+        W *= exp(-min(sqrt(-βsq), κmax)*ℓ)
+    end
+    _βzc(βsq)/(μ0*ω)/W
+end
+
+#= The k-space window is set by `reflength!` after the norm is built, so its mirror is
+   refilled on the first `fillnorm!` which follows. Everything else the isotropic kernel
+   broadcasts against is fixed at construction. =#
+function _mirrors!(nf::FreeSpaceNorm)
+    nf.mirrored && return nothing
+    T = realtype(nf.spec)
+    copyto!(nf.kwinm, T === Float64 ? nf.kwin : convert(Array{T}, nf.kwin))
+    nf.mirrored = true
+    nothing
+end
+
+#= The refractive index is host scalar code (a Sellmeier equation, or a user's function),
+   so it is evaluated on the host into the `(Nω, Npol)` mirror and uploaded once per call.
+   Out of band it is left at 1: `nfun` is not evaluated there -- the loop this replaces did
+   not either, and an index function need not be defined outside the simulation band. =#
+function _fillindex!(nf::FreeSpaceNorm, z)
     ω = nf.grid.ω
-    out = nf.out
-    for ii in nf.kidcs
-        for iω in eachindex(ω)
-            if ω[iω] == 0 || !nf.grid.sidx[iω]
-                out[iω, :, ii] .= 1
-                continue
-            end
-            for (ip, n) in enumerate(nf.nfun(ω[iω]; z))
-                βsq = (real(n)*ω[iω]/PhysData.c)^2 - nf.kperp2[ii]
-                out[iω, ip, ii] = normfactor(nf, βsq, ω[iω], nf.kwin[ii])
-            end
+    np = size(nf.out, 2)
+    M = reshape(nf.nm.host, length(ω), np)
+    fill!(M, 1.0)
+    for iω in eachindex(ω)
+        (ω[iω] == 0 || !nf.grid.sidx[iω]) && continue
+        ns = nf.nfun(ω[iω]; z)
+        for ip in 1:np
+            M[iω, ip] = real(ns[ip])
         end
     end
+    reshape(upload!(nf.nm), length(ω), np)
+end
+
+# isotropic: nfun(ω; z) -> n or (nx, ny), the same k⊥ for every polarisation
+function fillnorm!(nf::FreeSpaceNorm, z)
+    _mirrors!(nf)
+    nd = _fillindex!(nf, z)
+    T = realtype(nf.spec)
+    c = convert(T, PhysData.c)
+    μ0 = convert(T, PhysData.μ_0)
+    κmax = convert(T, nf.κmax)
+    ℓ = convert(T, nf.ℓ)
+    #= One broadcast over the whole `(Nω, Npol, Nk...)` array: `nd` is `(Nω, Npol)`, the
+       grid mirrors are `(Nω,)` and the k-space mirrors are `(1, 1, Nk...)`. =#
+    @. nf.out = _normelem(nd, nf.ωm, nf.kperp2m, nf.kwinm, nf.sidxm, c, μ0, κmax, ℓ)
+    nf.out
 end
 
 #= crystal optics: nfunx(λ, δθ; z) depends on the internal angle, which depends on kx only,
    so the angle is found once per (ω, kx) and reused along ky. For Free2DGrid the k axes are
-   (Nkx,) and the trailing ky index below is the (allowed) singleton 1. =#
+   (Nkx,) and the trailing ky index below is the (allowed) singleton 1.
+
+   The root-finding for the internal angle is host scalar code with no kernel, so this fill
+   stays on the host and its result is uploaded (GPU_PLAN.md 4.4). `ohost` is `nothing`, and
+   the copy is skipped, whenever `out` is already a host `ComplexF64` array. =#
 function fillnorm!(nf::FreeSpaceNorm{<:Any, <:Any, <:Tuple}, z)
     nfunx, nfuny = nf.nfun
     ω = nf.grid.ω
-    out = nf.out
+    out = isnothing(nf.ohost) ? nf.out : nf.ohost
     kx = nf.spacegrid.kx
     for iω in eachindex(ω)
         if ω[iω] == 0 || !nf.grid.sidx[iω]
@@ -1261,6 +1431,9 @@ function fillnorm!(nf::FreeSpaceNorm{<:Any, <:Any, <:Tuple}, z)
             end
         end
     end
+    out === nf.out ||
+        copyto!(nf.out, convert(Array{eltype(nf.out)}, out))
+    nf.out
 end
 
 """
@@ -1276,10 +1449,14 @@ or a tuple of indices (one per polarisation). For crystal optics (`norm_free`,
 `norm_free2D` only) pass a tuple `(nfunx, nfuny)` with `nfunx(λ, δθ; z)` and `nfuny(λ; z)`,
 as for [`LinearOps.make_const_linop`](@ref).
 """
-norm_radial(grid, rg::Grid.RadialGrid, nfun) = FreeSpaceNorm(grid, rg, nfun; constant=false)
-norm_radial(grid, q::Grid.HankelTransform, nfun) = norm_radial(grid, Grid.RadialGrid(q), nfun)
-norm_free(grid, xygrid::Grid.FreeGrid, nfun) = FreeSpaceNorm(grid, xygrid, nfun; constant=false)
-norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun) = FreeSpaceNorm(grid, xgrid, nfun; constant=false)
+norm_radial(grid, rg::Grid.RadialGrid, nfun; spec=HostSpec()) =
+    FreeSpaceNorm(grid, rg, nfun; constant=false, spec)
+norm_radial(grid, q::Grid.HankelTransform, nfun; kwargs...) =
+    norm_radial(grid, Grid.RadialGrid(q), nfun; kwargs...)
+norm_free(grid, xygrid::Grid.FreeGrid, nfun; spec=HostSpec()) =
+    FreeSpaceNorm(grid, xygrid, nfun; constant=false, spec)
+norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun; spec=HostSpec()) =
+    FreeSpaceNorm(grid, xgrid, nfun; constant=false, spec)
 
 """
     const_norm_radial(grid, q, nfun)
@@ -1290,10 +1467,14 @@ Make the normalisation factor ([`FreeSpaceNorm`](@ref)) for a `z`-independent re
 index, computed once and reused. `nfun(λ)` takes wavelength; for crystal optics pass
 `(nfunx, nfuny)` with `nfunx(λ, δθ)` and `nfuny(λ)`.
 """
-const_norm_radial(grid, rg::Grid.RadialGrid, nfun) = FreeSpaceNorm(grid, rg, _zfun(nfun); constant=true)
-const_norm_radial(grid, q::Grid.HankelTransform, nfun) = const_norm_radial(grid, Grid.RadialGrid(q), nfun)
-const_norm_free(grid, xygrid::Grid.FreeGrid, nfun) = FreeSpaceNorm(grid, xygrid, _zfun(nfun); constant=true)
-const_norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun) = FreeSpaceNorm(grid, xgrid, _zfun(nfun); constant=true)
+const_norm_radial(grid, rg::Grid.RadialGrid, nfun; spec=HostSpec()) =
+    FreeSpaceNorm(grid, rg, _zfun(nfun); constant=true, spec)
+const_norm_radial(grid, q::Grid.HankelTransform, nfun; kwargs...) =
+    const_norm_radial(grid, Grid.RadialGrid(q), nfun; kwargs...)
+const_norm_free(grid, xygrid::Grid.FreeGrid, nfun; spec=HostSpec()) =
+    FreeSpaceNorm(grid, xygrid, _zfun(nfun); constant=true, spec)
+const_norm_free2D(grid, xgrid::Grid.Free2DGrid, nfun; spec=HostSpec()) =
+    FreeSpaceNorm(grid, xgrid, _zfun(nfun); constant=true, spec)
 
 # wrap a z-independent index function in the (ω; z) / (λ, δθ; z), (λ; z) forms
 _zfun(nfun) = (ω; z) -> nfun(wlfreq(ω))

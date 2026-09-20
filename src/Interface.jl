@@ -1012,12 +1012,14 @@ needfull(modes) = !all(modes) do mode
     (mode.kind == :HE) && (mode.n == 1)
 end
 
-#= Multimode and radial propagation are not device- or reduced-precision-capable yet
-   (`TransModal`/`TransRadial`, Group E of GPU_PLAN.md): `Luna.setup` for them takes no
-   `device`/`precision` keyword at all. These two methods accept and validate them instead
-   of erroring with an unhelpful "no keyword argument device", so a `device`/`precision`
-   request which does not resolve to the CPU in `Float64` -- the only thing these
-   transforms can produce -- gets a message naming the actual limitation. =#
+#= Multimode propagation is not device- or reduced-precision-capable yet (`TransModal`,
+   Group E of GPU_PLAN.md): `Luna.setup` for it takes no `device`/`precision` keyword at
+   all. These two methods accept and validate them instead of erroring with an unhelpful
+   "no keyword argument device", so a `device`/`precision` request which does not resolve
+   to the CPU in `Float64` -- the only thing that transform can produce -- gets a message
+   naming the actual limitation. `prop_capillary`/`prop_gnlse` never build a radial run,
+   so `TransRadial`'s device path (gpu/20) is reached through the low-level interface
+   only. =#
 function _cpu_only!(device, precision, what)
     spec = Luna.withprecision(Luna.resolve_device(device), precision)
     (Luna.arraytype(spec) === Array && Luna.realtype(spec) === Float64) || error(

@@ -196,13 +196,14 @@ timetype(::Grid.EnvGrid, ::Type{T}) where {T} = Complex{T}
     runscaling(transform)
 
 The [`UnitScaling`](@ref) `transform` was built with, or `UNIT_SCALING` (the
-identity) for a transform which does not carry one. Only `NonlinearRHS.TransModeAvg` does
-so far; the other transforms are not device- or reduced-precision-capable yet (Group E of
-GPU_PLAN.md) and always run at `E_ref = 1`. Used by [`run`](@ref) to decide whether the
-output needs [`ScaledOutput`](@ref).
+identity) for a transform which does not carry one. `NonlinearRHS.TransModeAvg` and
+`NonlinearRHS.TransRadial` do; the other transforms are not device- or
+reduced-precision-capable yet (Group E of GPU_PLAN.md) and always run at `E_ref = 1`. Used
+by [`run`](@ref) to decide whether the output needs [`ScaledOutput`](@ref).
 """
 runscaling(transform) = UNIT_SCALING
 runscaling(transform::NonlinearRHS.TransModeAvg) = transform.scaling
+runscaling(transform::NonlinearRHS.TransRadial) = transform.scaling
 
 function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
                             norm! = nothing, noise_field=nothing, constβ=false,
@@ -344,71 +345,82 @@ end
    the six-argument mode-averaged `setup(grid::RealGrid, densityfun, responses, inputs,
    βfun!, aeff)`, which is exactly the call a legacy radial script makes. =#
 function setup(grid::Grid.RealGrid, q::Grid.HankelTransform,
-               densityfun, normfun, responses, inputs; noise_field=nothing)
-    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; noise_field)
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; kwargs...)
 end
 
 function setup(grid::Grid.EnvGrid, q::Grid.HankelTransform,
-               densityfun, normfun, responses, inputs; noise_field=nothing)
-    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; noise_field)
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup(grid, Grid.RadialGrid(q), densityfun, normfun, responses, inputs; kwargs...)
 end
 
+"""
+    setup(grid, rg::Grid.RadialGrid, densityfun, normfun, responses, inputs; kwargs...)
+
+Set up a radially symmetric free-space propagation: plan the transforms, build the initial
+`(ω, polarisation, k⊥)` field from `inputs`, and return `(Eωk, transform, FT)`.
+
+# Keyword arguments
+- `noise_field=nothing`: `(nω, npol, nk)` frequency/k-space noise field for the modified
+  shot-noise model.
+- `device`, `precision`: where and in what precision to run; see the mode-averaged
+  [`setup`](@ref) for the meaning. `normfun` is built by the caller, before the device is
+  known, so it is retargeted here with
+  [`NonlinearRHS.retarget`](@ref Luna.NonlinearRHS.retarget).
+
+The input fields are built on the host in `Float64` (`Fields` is host scalar code), so the
+transform they need is planned on the host whatever the run uses; the returned `FT` is the
+plan on the *state's* array type, which is what the absorbing boundaries apply.
+"""
 function setup(grid::Grid.RealGrid, rg::Grid.RadialGrid,
-               densityfun, normfun, responses, inputs; noise_field=nothing)
-    Logging.@info("Setting up and planning FFTs...")
-    flush(stderr)
-    Utils.loadFFTwisdom()
-    np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
-    tshape = (length(grid.t), np, rg.N)
-    ωshape = (length(grid.ω), np, rg.N)
-    xt = zeros(Float64, tshape)
-    FT = FFTW.plan_rfft(xt, 1, flags=settings["fftw_flag"])
-    Eω = zeros(ComplexF64, ωshape)
-    Eωk = Grid.to_kspace(rg, Eω)
-    # plan FFT for xy polarisation for field creation
-    tshape_xy = (length(grid.t), 2, rg.N)
-    xt_xy = zeros(Float64, tshape_xy)
-    FT_xy = FFTW.plan_rfft(xt_xy, 1, flags=settings["fftw_flag"])
-    doinputs_fs!(Eωk, grid, rg, FT_xy, inputs)
-    oshape = tshape[2:end]
-    xo = Array{Float64}(undef, length(grid.to), oshape...)
-    FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransRadial(
-        grid, rg, FTo, responses, densityfun, normfun, np > 1;
-        noise_field)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
-    Utils.saveFFTwisdom()
-    Logging.@info("Setup finished.")
-    flush(stderr)
-    Eωk, transform, FT
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup_radial(Float64, grid, rg, densityfun, normfun, responses, inputs; kwargs...)
 end
 
+@doc (@doc setup)
 function setup(grid::Grid.EnvGrid, rg::Grid.RadialGrid,
-               densityfun, normfun, responses, inputs; noise_field=nothing)
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup_radial(ComplexF64, grid, rg, densityfun, normfun, responses, inputs; kwargs...)
+end
+
+function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
+                      densityfun, normfun, responses, inputs;
+                      noise_field=nothing, device=device_request(),
+                      precision=nothing) where {TH}
+    spec = withprecision(resolve_device(device), precision)
+    T = realtype(spec)
+    log_device(spec, device)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
+    #= The normalisation is built by the caller (it is a positional argument), so it does
+       not know the device; move it before anything asks it for its shape. =#
+    normfun = NonlinearRHS.retarget(normfun, spec)
     np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
     tshape = (length(grid.t), np, rg.N)
     ωshape = (length(grid.ω), np, rg.N)
-    xt = zeros(Float64, tshape)
-    FT = FFTW.plan_fft(xt, 1, flags=settings["fftw_flag"])
-    Eω = zeros(ComplexF64, ωshape)
-    Eωk = Grid.to_kspace(rg, Eω)
+    # host plans and buffers: the input fields are built in Float64 on the host
+    FTh = Utils.plan_ft(zeros(TH, tshape), 1)
+    Eωk = Grid.to_kspace(rg, zeros(ComplexF64, ωshape))
     # plan FFT for xy polarisation for field creation
-    tshape_xy = (length(grid.t), 2, rg.N)
-    xt_xy = zeros(Float64, tshape_xy)
-    FT_xy = FFTW.plan_fft(xt_xy, 1, flags=settings["fftw_flag"])
+    FT_xy = Utils.plan_ft(zeros(TH, (length(grid.t), 2, rg.N)), 1)
     doinputs_fs!(Eωk, grid, rg, FT_xy, inputs)
-    oshape = tshape[2:end]
-    xo = Array{ComplexF64}(undef, length(grid.to), oshape...)
-    FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
+    #= The unit scaling needs the peak of the physical time-domain field, which for a
+       radial run is the input taken back to (t, pol, r). Only evaluated for Float32. =#
+    #= `copy` because a real inverse FFTW plan overwrites its input, and `Eωk` is the
+       state. Only evaluated at all for a Float32 run. =#
+    scaling = unitscaling(T, () -> Grid.to_rspace(rg, FTh \ copy(Eωk)), PhysData.ε_0)
+    xo = alloc(spec, timetype(grid, T), (length(grid.to), np, rg.N))
+    FTo = Utils.plan_ft(xo, 1)
+    FT = (arraytype(spec) === Array && T === Float64) ? FTh :
+         Utils.plan_ft(alloc(spec, timetype(grid, T), tshape), 1)
+    Utils.plan_ift(FT) # create inverse FT plans now, so wisdom is saved
+    Utils.plan_ift(FTh)
+    Utils.plan_ift(FTo)
     transform = NonlinearRHS.TransRadial(
         grid, rg, FTo, responses, densityfun, normfun, np > 1;
-        noise_field)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
+        noise_field, spec, scaling)
+    Eωk = todevice(spec, isunity(scaling) ? Eωk : Eωk ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
     flush(stderr)
@@ -635,9 +647,9 @@ function run(Eω, grid,
     #= Absorbing boundaries used to be host scalar code, so a device run needed
        boundary=:none. `Boundaries.RateAbsorber`/`LegacyAbsorber` are now broadcasts and
        reductions over mirrored arrays (see `Boundaries.jl`), so every `boundary` mode
-       works on a device -- for the mode-averaged transform, the only one which can
-       produce a device `Eω` at all: `TransRadial`/`TransModal`/`TransFree*` do not take a
-       `device` keyword yet (Group E of GPU_PLAN.md) and always build a host array. =#
+       works on a device. `TransModeAvg` and `TransRadial` are the transforms which can
+       produce a device `Eω`; `TransModal`/`TransFree*` do not take a `device` keyword yet
+       (Group E of GPU_PLAN.md) and always build a host array. =#
 
     #= Et is the time-domain buffer the absorbers and the transverse collar work on --
        nothing about its *contents* matters here, only its shape and element type, since
