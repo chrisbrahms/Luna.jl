@@ -12,7 +12,7 @@ exist on a fresh checkout.
 
 | File | What it is |
 | --- | --- |
-| `cases.jl` | The case matrix: `RegressionCases.CASES`, a `Vector{Case}`, and `runcase(case, mode)`. Self-contained, so it can be `include`d on an older commit. |
+| `cases.jl` | The case matrix: `RegressionCases.CASES`, a `Vector{Case}`, and `runcase(case, mode)`. Self-contained, so it can be `include`d on an older commit; a compatibility shim at the top of it keeps it running on both sides of the Group A signature changes (see "The compatibility shim"). |
 | `compare.jl` | `rundict`, `saverun`, `loadcase`, `compare`: the storage format, the difference metric and the tolerance classes. Also copied to the older commit. |
 | `run_cases.jl` | Runs every case in every mode and writes the HDF5 files. Copes with a Luna that has no `set_fftw_wisdom`. |
 | `generate.jl` | Makes a git worktree of a given commit, copies the Manifest and the three files above into it, and runs `run_cases.jl` there. |
@@ -52,6 +52,52 @@ The gate uses, in order:
 2. otherwise the merge-base of `HEAD` with `ENV["LUNA_REGRESSION_BRANCH"]` (default
    `evanescent`).
 
+#### Which base a GPU-project branch should use
+
+From Group B on, a branch's own base is `gpu/int-A` or a descendant of it, and the question
+it has to answer is "did *this branch* change the output". That is
+
+```
+LUNA_REGRESSION_BRANCH=gpu/int-A julia --project=$PWD -t 1 test/test_regression.jl
+```
+
+which takes the merge-base of `HEAD` with `gpu/int-A`, so a branch cut from `gpu/int-A` and
+a branch cut from a later integration branch each compare against their own starting point
+and every case must come back exactly `0.000e+00` unless the branch states otherwise.
+Generate that baseline once with `test/regression/generate.jl gpu/int-A`.
+
+The other question — "how far has the whole project moved from where it started" — is
+
+```
+LUNA_REGRESSION_BASE=fdf8dbe3 julia --project=$PWD -t 1 test/test_regression.jl
+```
+
+which compares against `evanescent` and accumulates every branch's deltas. That comparison
+is what the per-group summary records. It works because `cases.jl` still runs on
+`evanescent` through the shim below; when that stops being true, this form goes away and
+the per-group record becomes the chain of merge-base comparisons.
+
+Baselines from different commits live in different directories, so both forms can be run
+without regenerating anything.
+
+### The compatibility shim in `cases.jl`
+
+`generate.jl` copies `cases.jl` into a worktree of the baseline commit, so the same file has
+to build the same propagations on `evanescent` and on the branch under test. Group A changed
+two APIs it uses: `gpu/01-zmax` took `zmax` out of the grid constructors and the grid struct
+and made it a required keyword of `Luna.run` (and a positional argument of
+`Boundaries.setup`), and `gpu/02-radialgrid` replaced `Hankel.QDHT` with `Grid.RadialGrid`.
+
+The block at the top of `cases.jl` detects which of the two APIs is loaded — from the API
+itself (`hasfield(Grid.RealGrid, :zmax)`, `isdefined(Grid, :RadialGrid)`), not from a commit
+or a version — and the cases call `makegrid`, `runkw`, `radialgrid` and `absorber_setup`
+instead of the API directly. On `evanescent` each of those reduces to exactly the call the
+pre-Group-A `cases.jl` made: regenerating the `fdf8dbe3` baseline with the shimmed file
+reproduces the original one bit for bit, over all 21 cases, both modes and 502 datasets.
+
+The block is marked in the file and should be deleted, with its call sites, once no baseline
+in use predates `gpu/int-A`.
+
 ## Re-baselining onto a new base branch
 
 `generate.jl` takes any revision `git rev-parse` accepts — a branch name, a tag, a SHA,
@@ -65,12 +111,9 @@ branch).
 When a branch's base moves — for example when `gpu/00-harness` is merged into `gpu/int-A`
 and the branches after it use `gpu/int-A` as their base:
 
-1. Make sure `cases.jl` still runs against the new base commit. It may not: `gpu/01-zmax`
-   moves `zmax` out of the grids and `gpu/02-radialgrid` replaces `Hankel.QDHT` with
-   `Grid.RadialGrid`, so the `Grid.RealGrid(...)`/`Grid.EnvGrid(...)` constructor calls,
-   `grid.zmax`, the `Luna.run` signature and `Hankel.QDHT(R_FREE, 32, dim=3)` in `cases.jl`
-   all have to be updated at that point. Once they are, `cases.jl` no longer runs against
-   `evanescent`, which is expected and is why the baseline commit is an argument.
+1. Make sure `cases.jl` still runs against the new base commit. Through Group A it does,
+   because of the shim described above; a later branch that changes an API `cases.jl` uses
+   has to extend the shim the same way, or drop the older base.
 2. Generate the new baseline:
 
    ```
@@ -89,8 +132,6 @@ and the branches after it use `gpu/int-A` as their base:
    deltas, for instance) has to state which case moved and by how much, and that number can
    only be measured across the re-baselining.
 
-Baselines from different commits live in different directories, so old and new can coexist
-and both gates can be run.
 
 ## The two run modes
 

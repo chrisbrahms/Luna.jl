@@ -60,11 +60,14 @@ function prepare(case)
            to `Luna.run`. `:boundary` is positional to `Boundaries.setup` and the other three
            are keywords under different names, so they are mapped rather than splatted. =#
         kw = case.runkwargs
-        absorber = Boundaries.setup(get(kw, :boundary, :rate),
-                                    grid, transform, linop, Et, FT, output, 0.0, dz, dz;
-                                    N=get(kw, :boundary_N, Boundaries.DEFAULT_N),
-                                    ℓ=get(kw, :boundary_length, nothing),
-                                    collar=get(kw, :tcollar, Boundaries.DEFAULT_TCOLLAR))
+        #= Through the shim in `cases.jl`: `gpu/01-zmax` gave `Boundaries.setup` a `zmax`
+           positional argument after `z0`, in place of the `grid.zmax` it used to read. =#
+        absorber = RegressionCases.absorber_setup(
+            get(kw, :boundary, :rate),
+            grid, transform, linop, Et, FT, output, 0.0, case.zmax, dz, dz;
+            N=get(kw, :boundary_N, Boundaries.DEFAULT_N),
+            ℓ=get(kw, :boundary_length, nothing),
+            collar=get(kw, :tcollar, Boundaries.DEFAULT_TCOLLAR))
         (Eω, absorber.linop, transform, min(dz, absorber.max_dz))
     end
 end

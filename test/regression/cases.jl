@@ -12,16 +12,98 @@
    This file is `include`d both by the gate (`test/test_regression.jl`), which runs it
    against the working tree, and by `test/regression/run_cases.jl`, which the baseline
    generator copies into a worktree of an older commit. It must therefore only use API that
-   exists on the oldest commit it will ever be run against.
+   exists on the oldest commit it will ever be run against, or go through the compatibility
+   shim below.
 =#
 module RegressionCases
 
 using Luna
-import Luna: Capillary, Fields, Grid, Hankel, Interface, LinearOps, Modes,
+import Luna: Boundaries, Capillary, Fields, Grid, Hankel, Interface, LinearOps, Modes,
              Nonlinear, NonlinearRHS, Output, PhysData, Stats
 import Logging
 
 export CASES, overrides, runcase
+
+# =======================================================================================
+# COMPATIBILITY SHIM
+#
+# `generate.jl` copies this file into a worktree of the baseline commit, so the same
+# `cases.jl` has to build the same propagations on `evanescent` (fdf8dbe3) and on the
+# Group A branches, which changed two APIs:
+#
+#   gpu/01-zmax      `Grid.RealGrid`/`Grid.EnvGrid` lose their leading `zmax` argument and
+#                    their `zmax` field; `Luna.run` takes `zmax` as a required keyword;
+#                    `Boundaries.setup` takes it as a positional argument after `z0`.
+#   gpu/02-radialgrid `Grid.RadialGrid` replaces `Hankel.QDHT` as the radial transverse
+#                    grid.
+#
+# The branch is detected from the API itself, not from a version or a commit, so nothing
+# here has to be updated when a branch is merged. Every helper reduces to exactly the call
+# the pre-Group-A `cases.jl` made when the old API is what is present, so a baseline
+# generated with this file from `evanescent` is bit-identical to one generated with the
+# original file.
+#
+# REMOVE THIS BLOCK, and the calls to it, once `evanescent` is no longer a comparison base
+# for the regression gate -- i.e. once every baseline in use is from `gpu/int-A` or later.
+# =======================================================================================
+
+"`true` when `Grid.RealGrid` still carries a `zmax` field, i.e. before `gpu/01-zmax`."
+const GRID_HAS_ZMAX = hasfield(Grid.RealGrid, :zmax)
+
+"`true` when `Grid.RadialGrid` exists, i.e. from `gpu/02-radialgrid` on."
+const HAS_RADIALGRID = isdefined(Grid, :RadialGrid)
+
+"""
+    makegrid(GT, zmax, referenceλ, λ_lims, trange; kwargs...)
+
+`Grid.RealGrid`/`Grid.EnvGrid` with or without the leading `zmax` argument, whichever the
+loaded Luna wants. `GT` is `Grid.RealGrid` or `Grid.EnvGrid`.
+"""
+makegrid(GT, zmax, referenceλ, λ_lims, trange; kwargs...) =
+    GRID_HAS_ZMAX ? GT(zmax, referenceλ, λ_lims, trange; kwargs...) :
+                    GT(referenceλ, λ_lims, trange; kwargs...)
+
+"""
+    runkw(zmax)
+
+The `zmax` keyword for `Luna.run` as a `NamedTuple`: `(; zmax)` from `gpu/01-zmax` on, and
+empty before it, where `Luna.run` reads the length off the grid and rejects the keyword.
+"""
+runkw(zmax) = GRID_HAS_ZMAX ? NamedTuple() : (; zmax=zmax)
+
+"""
+    radialgrid(R, N)
+
+The radial transverse grid: `Grid.RadialGrid(R, N)` from `gpu/02-radialgrid` on, and
+`Hankel.QDHT(R, N, dim=3)` before it. `dim=3` is the axis Luna's free-space arrays put the
+radial coordinate on; a `RadialGrid` always transforms along the last dimension.
+"""
+radialgrid(R, N) = HAS_RADIALGRID ? Grid.RadialGrid(R, N) : Hankel.QDHT(R, N, dim=3)
+
+#= The cases store `Eω` exactly as `Luna.run` produces it, in k-space, and the gate compares
+   it there, so nothing here needs the inverse transform (`Grid.to_rspace` after
+   `gpu/02-radialgrid`, `q \\ Eω` before it). =#
+
+"""
+    absorber_setup(boundary, grid, transform, linop, Et, FT, output, z0, zmax, max_dz,
+                   init_dz; kwargs...)
+
+`Boundaries.setup` with `zmax` in the positional list from `gpu/01-zmax` on, and without it
+before, where `Boundaries.setup` reads the length off the grid. Used by `benchmark/run.jl`,
+which builds an absorber outside `Luna.run`.
+"""
+function absorber_setup(boundary, grid, transform, linop, Et, FT, output, z0, zmax,
+                        max_dz, init_dz; kwargs...)
+    if GRID_HAS_ZMAX
+        Boundaries.setup(boundary, grid, transform, linop, Et, FT, output, z0,
+                         max_dz, init_dz; kwargs...)
+    else
+        Boundaries.setup(boundary, grid, transform, linop, Et, FT, output, z0, zmax,
+                         max_dz, init_dz; kwargs...)
+    end
+end
+
+# ============================ end of the compatibility shim ============================
 
 "Number of steps in the fixed-step mode. Must be at least `Boundaries.DEFAULT_N` so that
  the `:rate` absorber does not reduce `max_dz` below the requested step."
@@ -85,7 +167,8 @@ function runcase(c::Case, mode::Symbol; perturb=0.0)
         Eω, grid, linop, transform, FT, output = c.prepare()
         perturb == 0 || (Eω .*= (1 + perturb))
         Luna.run(Eω, grid, linop, transform, FT, output;
-                 status_period=STATUS_PERIOD, c.runkwargs..., overrides(c, mode)...)
+                 status_period=STATUS_PERIOD, runkw(c.zmax)...,
+                 c.runkwargs..., overrides(c, mode)...)
         output
     end
 end
@@ -144,7 +227,7 @@ function setup_mixture()
     gases = (:He, :Ne)
     pressures = (1.0, 1.0)
     L = 0.02
-    grid = Grid.RealGrid(L, Λ0, ΛLIMS, TRANGE)
+    grid = makegrid(Grid.RealGrid, L, Λ0, ΛLIMS, TRANGE)
     m = Capillary.MarcatiliMode(a, gases, pressures; loss=false)
     aeff(z) = Modes.Aeff(m; z=z)
     dens = [PhysData.density(g, p) for (g, p) in zip(gases, pressures)]
@@ -157,7 +240,7 @@ function setup_mixture()
     linop, βfun!, β1, αfun = LinearOps.make_const_linop(grid, m, Λ0)
     Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, βfun!, aeff)
     statsfun = Stats.default(grid, Eω, m, linop, transform; gas=gases)
-    output = Output.MemoryOutput(0, grid.zmax, SAVEN, statsfun)
+    output = Output.MemoryOutput(0, L, SAVEN, statsfun)
     Eω, grid, linop, transform, FT, output
 end
 
@@ -181,13 +264,13 @@ const ΛLIMS_FREE = (400e-9, 2000e-9)
 const TRANGE_FREE = 0.1e-12
 
 """
-    setup_free(grid, sg, normfun, responses)
+    setup_free(grid, zmax, sg, normfun, responses)
 
 Kerr-only free-space propagation of a Gaussian beam focusing from `propz = -L_FREE`, on the
-transverse grid `sg` (a `Hankel.QDHT` or a `Grid.FreeGrid`) with the matching `normfun` and
-nonlinear `responses`.
+transverse grid `sg` (a radial grid or a `Grid.FreeGrid`) with the matching `normfun` and
+nonlinear `responses`. `zmax` is the propagation length, which the grid no longer carries.
 """
-function setup_free(grid, sg, normfun, responses)
+function setup_free(grid, zmax, sg, normfun, responses)
     nfunλ = PhysData.ref_index_fun(GAS_FREE, P_FREE)
     nfun = (λ; z=0.0) -> nfunλ(λ)
     #= `thg` defaults to `true` for a `RealGrid` (required) and `false` for an `EnvGrid`,
@@ -200,34 +283,34 @@ function setup_free(grid, sg, normfun, responses)
     inputs = Fields.GaussGaussField(;λ0=Λ0, τfwhm=ΤFWHM, energy=1e-12,
                                      w0=W0_FREE, propz=-L_FREE)
     Eω, transform, FT = Luna.setup(grid, sg, densityfun, normfun, responses, inputs)
-    output = Output.MemoryOutput(0, grid.zmax, SAVEN, freestats(grid, Eω))
+    output = Output.MemoryOutput(0, zmax, SAVEN, freestats(grid, Eω))
     Eω, grid, linop, transform, FT, output
 end
 
 function setup_radial_field()
-    grid = Grid.RealGrid(L_FREE, Λ0, ΛLIMS_FREE, TRANGE_FREE)
-    q = Hankel.QDHT(R_FREE, 32, dim=3)
+    grid = makegrid(Grid.RealGrid, L_FREE, Λ0, ΛLIMS_FREE, TRANGE_FREE)
+    q = radialgrid(R_FREE, 32)
     nfunλ = PhysData.ref_index_fun(GAS_FREE, P_FREE)
     nfun = (λ; z=0.0) -> nfunλ(λ)
-    setup_free(grid, q, NonlinearRHS.const_norm_radial(grid, q, nfun),
+    setup_free(grid, L_FREE, q, NonlinearRHS.const_norm_radial(grid, q, nfun),
                (Nonlinear.Kerr_field(PhysData.γ3_gas(GAS_FREE)),))
 end
 
 function setup_radial_env()
-    grid = Grid.EnvGrid(L_FREE, Λ0, ΛLIMS_FREE, TRANGE_FREE)
-    q = Hankel.QDHT(R_FREE, 32, dim=3)
+    grid = makegrid(Grid.EnvGrid, L_FREE, Λ0, ΛLIMS_FREE, TRANGE_FREE)
+    q = radialgrid(R_FREE, 32)
     nfunλ = PhysData.ref_index_fun(GAS_FREE, P_FREE)
     nfun = (λ; z=0.0) -> nfunλ(λ)
-    setup_free(grid, q, NonlinearRHS.const_norm_radial(grid, q, nfun),
+    setup_free(grid, L_FREE, q, NonlinearRHS.const_norm_radial(grid, q, nfun),
                (Nonlinear.Kerr_env(PhysData.γ3_gas(GAS_FREE)),))
 end
 
 function setup_free3d_env()
-    grid = Grid.EnvGrid(L_FREE, Λ0, ΛLIMS_FREE, TRANGE_FREE)
+    grid = makegrid(Grid.EnvGrid, L_FREE, Λ0, ΛLIMS_FREE, TRANGE_FREE)
     sg = Grid.FreeGrid(R_FREE, 16, R_FREE, 8)
     nfunλ = PhysData.ref_index_fun(GAS_FREE, P_FREE)
     nfun = (λ; z=0.0) -> nfunλ(λ)
-    setup_free(grid, sg, NonlinearRHS.const_norm_free(grid, sg, nfun),
+    setup_free(grid, L_FREE, sg, NonlinearRHS.const_norm_free(grid, sg, nfun),
                (Nonlinear.Kerr_env(PhysData.γ3_gas(GAS_FREE)),))
 end
 
@@ -257,17 +340,17 @@ function setup_bbo(grid, response)
     inputs = Fields.GaussGaussField(;λ0=BBO_λ0, τfwhm=BBO_τFWHM,
                                      energy=BBO_ENERGY/(sqrt(π/2)*BBO_W0), w0=BBO_W0)
     Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, (response,), inputs)
-    output = Output.MemoryOutput(0, grid.zmax, SAVEN, freestats(grid, Eω))
+    output = Output.MemoryOutput(0, BBO_THICKNESS, SAVEN, freestats(grid, Eω))
     Eω, grid, linop, transform, FT, output
 end
 
 function setup_bbo_field()
-    grid = Grid.RealGrid(BBO_THICKNESS, BBO_λ0, (250e-9, 2e-6), 120e-15)
+    grid = makegrid(Grid.RealGrid, BBO_THICKNESS, BBO_λ0, (250e-9, 2e-6), 120e-15)
     setup_bbo(grid, Nonlinear.Chi2Field(BBO_θ, BBO_ϕ, PhysData.χ2(:BBO)))
 end
 
 function setup_bbo_env()
-    grid = Grid.EnvGrid(BBO_THICKNESS, BBO_λ0, (250e-9, 2e-6), 120e-15; thg=true)
+    grid = makegrid(Grid.EnvGrid, BBO_THICKNESS, BBO_λ0, (250e-9, 2e-6), 120e-15; thg=true)
     setup_bbo(grid, Nonlinear.Chi2Env(BBO_θ, BBO_ϕ, PhysData.χ2(:BBO), grid.ω0, grid.to))
 end
 
