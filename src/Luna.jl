@@ -82,10 +82,16 @@ function __init__()
     set_fftw_threads()
 end
 
+#= Device.jl is included after Output.jl (rather than right after Utils.jl, where its
+   core -- DeviceSpec, alloc, todevice -- would also work) because it defines
+   `ScaledOutput`, the device/precision boundary `Luna.run` wraps an output in, and that
+   needs `Output.MemoryOutput`, `Output.HDF5Output`, `Output.willsave` and
+   `Output.check_cache` to already exist. Nothing between here and there needs Device.jl's
+   own definitions. =#
 include("Utils.jl")
-include("Device.jl")
 include("Scans.jl")
 include("Output.jl")
+include("Device.jl")
 include("Maths.jl")
 include("PhysData.jl")
 include("Grid.jl")
@@ -185,6 +191,18 @@ end
 "The time-domain element type for a grid at real precision `T`."
 timetype(::Grid.RealGrid, ::Type{T}) where {T} = T
 timetype(::Grid.EnvGrid, ::Type{T}) where {T} = Complex{T}
+
+"""
+    runscaling(transform)
+
+The [`UnitScaling`](@ref) `transform` was built with, or [`UNIT_SCALING`](@ref) (the
+identity) for a transform which does not carry one. Only `NonlinearRHS.TransModeAvg` does
+so far; the other transforms are not device- or reduced-precision-capable yet (Group E of
+GPU_PLAN.md) and always run at `E_ref = 1`. Used by [`run`](@ref) to decide whether the
+output needs [`ScaledOutput`](@ref).
+"""
+runscaling(transform) = UNIT_SCALING
+runscaling(transform::NonlinearRHS.TransModeAvg) = transform.scaling
 
 function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
                             norm! = nothing, noise_field=nothing, constβ=false,
@@ -614,28 +632,49 @@ function run(Eω, grid,
             "the same length to both.")
     end
 
-    #= Absorbing boundaries and per-step statistics are host code (scalar loops over the
-       collar, host reductions), so a device run needs boundary=:none until gpu/11. The
-       check is here rather than in `Boundaries` so that the message names the keyword
-       the caller passed. =#
-    if Utils.isdevice(Eω) && boundary !== :none
-        error("boundary=:$boundary is not available on a device yet: the absorbers run "*
-              "on the host. Use boundary=:none, or run on the CPU "*
-              "(`Luna.set_device(:cpu)`).")
-    end
+    #= Absorbing boundaries used to be host scalar code, so a device run needed
+       boundary=:none. `Boundaries.RateAbsorber`/`LegacyAbsorber` are now broadcasts and
+       reductions over mirrored arrays (see `Boundaries.jl`), so every `boundary` mode
+       works on a device -- for the mode-averaged transform, the only one which can
+       produce a device `Eω` at all: `TransRadial`/`TransModal`/`TransFree*` do not take a
+       `device` keyword yet (Group E of GPU_PLAN.md) and always build a host array. =#
 
-    #= Et is the time-domain field the absorbers and the transverse collar work on. A
-       device run only reaches here with boundary=:none, which uses neither. =#
-    Et = Utils.isdevice(Eω) ? nothing : FT \ Eω
+    #= Et is the time-domain buffer the absorbers and the transverse collar work on --
+       nothing about its *contents* matters here, only its shape and element type, since
+       every absorber overwrites it before reading it back. Building it with `similar`
+       rather than an actual inverse transform means this costs nothing and needs no
+       `\` on the state's plan (which the generic device planners do not define; see
+       `Utils.plan_ift`). =#
+    Et = similar(Eω, timetype(grid, real(eltype(Eω))), (length(grid.t), size(Eω)[2:end]...))
+
+    #= The unit scaling the state and the polarisation are expressed in (`Luna.jl`'s
+       `unitscaling`, GPU_PLAN.md 4.1): the identity for every transform which does not
+       carry one (only `NonlinearRHS.TransModeAvg` does, so far). Needed here only to
+       decide whether the output needs unscaling. =#
+    scaling = runscaling(transform)
+
+    #= `Output.jl` stays device-unaware (`ScaledOutput`'s docstring): wrap whenever the
+       state lives on a device or the run is scaled (`E_ref != 1`, every `Float32` run,
+       host or device). The default CPU path in `Float64` is untouched -- `output` is the
+       same object it always was. Must happen after the zmax/save_cond check above,
+       which needs the wrapped output's own `save_cond` field, and before `check_cache`
+       and `Boundaries.setup`, both of which now see host, physical-unit data whenever
+       they read `y` off the wrapped output. =#
+    if isdevice(Eω) || !isunity(scaling)
+        output = ScaledOutput(output, Eω, scaling.Eref)
+    end
 
     # check_cache does nothing except for HDF5Outputs
     Eωc, zc, dzc = Output.check_cache(output, Eω, z0, init_dz)
     if zc > z0
         Logging.@info("Found cached propagation. Resuming...")
-        #= `check_cache` reads the cached field back from the file as a host array, so it
-           has to be put back on the state's array type and precision. On the default CPU
-           path this returns the array it was given. =#
-        Eω, z0, init_dz = upload_like(Eω, Eωc), zc, dzc
+        #= `check_cache` reads the cached field back from the file as a host array in
+           physical units (`ScaledOutput` never touches the cache write itself, only
+           gates when it happens) -- so it has to be rescaled and put back on the state's
+           array type and precision. On the default CPU path this returns the array it
+           was given and `isunity(scaling)` skips the division. =#
+        Eωr = isunity(scaling) ? Eωc : Eωc ./ scaling.Eref
+        Eω, z0, init_dz = upload_like(Eω, Eωr), zc, dzc
     end
 
     #= NOTE: this must come after check_cache, which can move z0 and init_dz: the temporal

@@ -535,3 +535,127 @@ function upload!(m::HostMirror)
     copyto!(m.dev, m.stage)
     m.dev
 end
+
+#=================================================#
+#===========  OUTPUT (DEVICE BOUNDARY)  ==========#
+#=================================================#
+
+#= `Output.jl` stays device-unaware -- it knows how to save an array and a dictionary,
+   nothing about where the array lives or what units it is in. This section is what
+   `Luna.run` wraps an output handler in when it needs to. It comes after Output.jl in
+   Luna.jl's include list so that it can dispatch on `Output.MemoryOutput`/
+   `Output.HDF5Output` and extend `Output.willsave`/`Output.check_cache`/`Output.hasdata`
+   for the new wrapper type. =#
+
+"""
+    needs_host_y(o) -> Bool
+
+Whether the output handler `o` inspects the *per-step* solution `y` (as opposed to only
+the interpolated values it requests through `yfun`), and therefore needs it on the host,
+in physical units, every accepted step.
+
+True whenever `o`'s statistics function is not `Output.nostats`:
+[`Stats.collect_stats`](@ref Luna.Stats.collect_stats) does a full inverse FFT and host
+reductions, so a device run has to copy the state down regardless of whether this step
+saves anything. [`ScaledOutput`](@ref) warns once when this forces a device-to-host copy.
+Conservatively `true` for an output whose statistics function cannot be inspected.
+"""
+needs_host_y(o) = true
+needs_host_y(o::Output.MemoryOutput) = o.statsfun !== Output.nostats
+needs_host_y(o::Output.HDF5Output) = o.statsfun !== Output.nostats
+
+"""
+    needs_host_cache(o) -> Bool
+
+Whether `o` is an `Output.HDF5Output` with `cache=true`: it writes the raw per-step `y`
+into the file's resume cache (not only the interpolated saves), and that write needs a
+host array in physical units. Gated by [`Output.willsave`](@ref) in `ScaledOutput`, since
+the cache is only written on a save step.
+"""
+needs_host_cache(o) = false
+needs_host_cache(o::Output.HDF5Output) = o.cache
+
+"""
+    ScaledOutput(o, y)
+
+Wrap the output handler `o` so that it receives host arrays in physical units, whatever
+units and array type the propagating state `y` is in. Constructed by [`Luna.run`](@ref)
+whenever the state is on a device or the run is scaled (`E_ref != 1`, i.e. every `Float32`
+run, host or device); `Output.jl` itself never sees a device array or a scaled one.
+
+Two reusable host buffers, in `y`'s element type (so a `Float32` run saves `Float32`):
+
+- `ybuf` holds the unscaled, host copy of the per-step `y`, used for statistics and for an
+  `HDF5Output`'s resume cache. Only filled when [`needs_host_y`](@ref) or
+  ([`needs_host_cache`](@ref) and [`Output.willsave`](@ref)) says it is needed this step
+  -- so a device run with `Output.nostats` and no HDF5 cache never pays for it, and an
+  `HDF5Output` with caching pays only on a save step.
+- `ibuf` holds the unscaled, host copy of a **saved** field. It is filled lazily, inside
+  the closure `o` calls as `yfun`, so it costs nothing on a step which does not save
+  (`o`'s own save condition decides whether to call it at all) and it is a different
+  buffer from `ybuf` because the two can be needed in the same call with different
+  contents (an `HDF5Output` reads its cache value `y` -- the step endpoint -- after
+  writing possibly several interpolated saves at earlier `yfun(ts)`).
+
+Multiplying by `E_ref` happens on the host, after the copy, in `y`'s own precision, and is
+skipped entirely when `E_ref == 1` (every `Float64` run): the stepper's own arrays are
+never modified, only these two buffers.
+"""
+mutable struct ScaledOutput{O, A<:AbstractArray}
+    o::O
+    Eref::Float64
+    needy::Bool         # `o`'s statistics need the host `y` every step
+    needcache::Bool     # `o` is an HDF5Output with a resumable cache
+    ybuf::A
+    ibuf::A
+    warned::Base.RefValue{Bool}
+end
+
+function ScaledOutput(o, y::AbstractArray, Eref::Real)
+    A = Array{eltype(y), ndims(y)}
+    ScaledOutput{typeof(o), A}(o, Float64(Eref), needs_host_y(o), needs_host_cache(o),
+                               A(undef, size(y)), A(undef, size(y)), Ref(false))
+end
+
+#= Device-to-host copy plus, when the run is scaled, the unscaling multiply, into the
+   reusable buffer `buf`. A plain host-to-host copy on the default CPU path (`Eref == 1`,
+   `y` already an `Array`) still has to happen: `buf` must not alias the stepper's own
+   arrays or the interpolant's, which are reused every call. =#
+function _tohost_unscale!(buf::AbstractArray, y::AbstractArray, Eref::Float64)
+    copyto!(buf, y)
+    Eref == 1.0 && return buf
+    buf .*= Eref
+    buf
+end
+
+function _warn_host_stats!(so::ScaledOutput, y)
+    so.warned[] && return nothing
+    isdevice(y) || return nothing
+    so.warned[] = true
+    Logging.@warn(
+        "Per-step statistics run on the host: the propagating field is copied to the "*
+        "device every accepted step to compute them. Pass `stats_period` (or "*
+        "`Output.PeriodicStats`) to run them less often, or `Output.nostats` to disable "*
+        "them. Device statistics are `gpu/24`'s. (Reported once.)")
+    nothing
+end
+
+function (so::ScaledOutput)(y, t, dt, yfun)
+    needcache = so.needcache && Output.willsave(so.o, y, t, dt)
+    if so.needy || needcache
+        yh = _tohost_unscale!(so.ybuf, y, so.Eref)
+        so.needy && _warn_host_stats!(so, y)
+    else
+        yh = y # nothing inspects it: pass the state through untouched, no copy
+    end
+    so.o(yh, t, dt, ts -> _tohost_unscale!(so.ibuf, yfun(ts), so.Eref))
+end
+
+# Metadata and any other call (e.g. `output(dict; group=...)`) pass straight through.
+(so::ScaledOutput)(args...; kwargs...) = so.o(args...; kwargs...)
+
+Base.getindex(so::ScaledOutput, args...) = getindex(so.o, args...)
+Base.haskey(so::ScaledOutput, key) = haskey(so.o, key)
+Output.hasdata(so::ScaledOutput, key) = Output.hasdata(so.o, key)
+Output.willsave(so::ScaledOutput, y, t, dt) = Output.willsave(so.o, y, t, dt)
+Output.check_cache(so::ScaledOutput, y, t, dt) = Output.check_cache(so.o, y, t, dt)
