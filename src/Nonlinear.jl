@@ -643,11 +643,11 @@ resident_arrays(k::KerrEnvTHG) = (k.C,)
 #===========  SECOND-ORDER RESPONSES  ============#
 #=================================================#
 
-#= The χ⁽²⁾ responses are [`VectorPointwise`](@ref): the contraction at one time sample
-   couples the two lab-frame polarisation components and nothing else. The matrices the
-   kernel contracts with are `StaticArrays`/`Rotations` matrices, which are `isbits` and
-   travel inside the closure a broadcast compiles, so no buffer and no host array is
-   involved -- that is what makes them run wherever the block does. =#
+#= The χ⁽²⁾ responses are vector-pointwise: the contraction at one time sample couples the
+   two lab-frame polarisation components and nothing else. Everything the kernel contracts
+   with is a `StaticArrays`/`Rotations` matrix, which is `isbits` and travels inside the
+   closure a broadcast compiles, so there is no buffer and no host array -- that is what
+   makes them run wherever the block does. =#
 
 """
     Chi2Field(θ, ϕ, χ2)
@@ -740,9 +740,10 @@ _chi2rescale(::Type{T}, c::Chi2Field) where {T} =
     Chi2Field(SMatrix{3, 6, T}(c.χ2), RotMatrix3{T}(c.toCrystal),
               RotMatrix3{T}(c.toLab), SMatrix{3, 6, T}(c.χ2_toLab))
 
-#= Every field is an `isbits` static matrix, so `Adapt` has nothing to move; the rule
-   exists so that adapting a container which holds a response is not a no-op by accident.
-   Precision is `rescale`'s job: `Adapt` does not know the target element type. =#
+#= Every field is an `isbits` static matrix, so there is nothing for `Adapt` to move; the
+   rule is written out anyway, so that the struct adapts field by field like every other
+   response and a field added later is not silently left behind. Precision is `rescale`'s
+   job -- `Adapt` does not know the target element type. =#
 Adapt.adapt_structure(to, c::Chi2Field) =
     Chi2Field(Adapt.adapt(to, c.χ2), Adapt.adapt(to, c.toCrystal),
               Adapt.adapt(to, c.toLab), Adapt.adapt(to, c.χ2_toLab))
@@ -810,6 +811,9 @@ struct Chi2Env{T, cT}
     C::cT # carrier phase exp(iω0t) on the (oversampled) time grid
 end
 
+#= This takes as many arguments as the struct has fields, but the two cannot be confused:
+   the default constructor's second argument is a `RotMatrix3`, which `ϕ` never is, and it
+   is the more specific of the two methods wherever it applies. =#
 Chi2Env(θ, ϕ, χ2, ω0, t) = Chi2Env(_chi2matrices(θ, ϕ, χ2)..., exp.(1im*ω0.*t))
 
 kind(::Chi2Env) = VectorPointwise()
