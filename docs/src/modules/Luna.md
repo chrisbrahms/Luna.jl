@@ -56,6 +56,10 @@ Luna.HostMirror
 Luna.upload!
 Luna.log_device
 Luna.setup
+Luna.runscaling
+Luna.ScaledOutput
+Luna.needs_host_y
+Luna.needs_host_cache
 ```
 
 ```@docs

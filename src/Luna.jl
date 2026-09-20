@@ -195,7 +195,7 @@ timetype(::Grid.EnvGrid, ::Type{T}) where {T} = Complex{T}
 """
     runscaling(transform)
 
-The [`UnitScaling`](@ref) `transform` was built with, or [`UNIT_SCALING`](@ref) (the
+The [`UnitScaling`](@ref) `transform` was built with, or `UNIT_SCALING` (the
 identity) for a transform which does not carry one. Only `NonlinearRHS.TransModeAvg` does
 so far; the other transforms are not device- or reduced-precision-capable yet (Group E of
 GPU_PLAN.md) and always run at `E_ref = 1`. Used by [`run`](@ref) to decide whether the

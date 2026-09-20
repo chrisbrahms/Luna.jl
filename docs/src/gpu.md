@@ -113,6 +113,16 @@ the saves:
 At 0.3 bar -- the case whose unscaled coefficient does not exist in `Float32` at all --
 Metal agrees with the `Float64` CPU path to 2.4e-7.
 
+With the absorbing boundaries (`boundary=:rate`, the default) and the default
+statistics, Metal vs CPU `Float32` for the same propagation is 3.9e-6 (field-resolved)
+and 4.4e-6 (envelope) -- still three orders of magnitude inside the exit-criterion
+tolerance, the extra digit coming from the collar broadcasts and the host round trip the
+statistics need. `prop_capillary` itself, at the exit criterion's own parameters (100 nJ,
+1 cm, Kerr only), agrees exactly: at that pulse energy the nonlinear phase is far below
+`Float32`'s precision floor, so the right-hand side rounds to zero on both backends and
+the propagation is the linear operator's `exp`, which has no backend-dependent
+summation order.
+
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
