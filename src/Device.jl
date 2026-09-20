@@ -583,7 +583,8 @@ going to skip, which is the whole point of `stats_period` on a device. Conservat
 
 Whether the copy is needed at all is the second question, answered by
 [`stats_device_capable`](@ref): a statistics set which runs on the state as the stepper
-holds it needs no copy on any step.
+holds it needs no copy on any step. [`ScaledOutput`](@ref) asks both, and warns once,
+naming the statistics responsible, when a copy is forced.
 """
 needs_host_y(o, t) = true
 needs_host_y(o::Output.MemoryOutput, t) = _stats_will_run(o.statsfun, t)
@@ -651,7 +652,9 @@ Two reusable host buffers, in `y`'s element type (so a `Float32` run saves `Floa
   step, so `Output.PeriodicStats` skips the copy on a step it is not going to fire on) or
   ([`needs_host_cache`](@ref) and [`Output.willsave`](@ref)) says it is needed this step
   -- so a device run with `Output.nostats` and no HDF5 cache never pays for it, and an
-  `HDF5Output` with caching pays only on a save step.
+  `HDF5Output` with caching pays only on a save step. Statistics need it only when they
+  are not [`stats_device_capable`](@ref) (`devstats` below), which the default sets are:
+  a device run with the default statistics does no per-step copy at all.
 - `ibuf` holds the unscaled, host copy of a **saved** field. It is filled lazily, inside
   the closure `o` calls as `yfun`, so it costs nothing on a step which does not save
   (`o`'s own save condition decides whether to call it at all) and it is a different
@@ -667,14 +670,21 @@ mutable struct ScaledOutput{O, A<:AbstractArray}
     o::O
     Eref::Float64
     needcache::Bool     # `o` is an HDF5Output with a resumable cache
+    devstats::Bool      # the statistics read the state where it is: no copy for them
     ybuf::A
     ibuf::A
     warned::Base.RefValue{Bool}
 end
 
+#= `devstats` is decided once, here: the statistics function is fixed for the propagation
+   and so is where the state lives. It is only ever true for a state on a device -- a
+   scaled host run (`Float32` on the CPU) still copies, because the statistics would
+   otherwise see the scaled field and the host branches of `Stats.jl` are the unscaled,
+   physical-unit code Luna has always run. =#
 function ScaledOutput(o, y::AbstractArray, Eref::Real)
     A = Array{eltype(y), ndims(y)}
     ScaledOutput{typeof(o), A}(o, Float64(Eref), needs_host_cache(o),
+                               isdevice(y) && stats_device_capable(o),
                                A(undef, size(y)), A(undef, size(y)), Ref(false))
 end
 
@@ -693,16 +703,19 @@ function _warn_host_stats!(so::ScaledOutput, y)
     so.warned[] && return nothing
     isdevice(y) || return nothing
     so.warned[] = true
+    names = stats_host_list(so.o)
+    which = isempty(names) ? "" : " ("*join(names, ", ")*")"
     Logging.@warn(
-        "Per-step statistics run on the host: the propagating field is copied to the "*
-        "device every accepted step to compute them. Pass `stats_period` (or "*
-        "`Output.PeriodicStats`) to run them less often, or `Output.nostats` to disable "*
-        "them. Device statistics are `gpu/24`'s. (Reported once.)")
+        "Per-step statistics run on the host: the propagating field is copied from the "*
+        "device every accepted step to compute them, because these statistics have no "*
+        "device form$which. Pass `stats_period` (or `Output.PeriodicStats`) to run them "*
+        "less often, or `Output.nostats` to disable them. The default statistics run on "*
+        "the device. (Reported once.)")
     nothing
 end
 
 function (so::ScaledOutput)(y, t, dt, yfun)
-    needy = needs_host_y(so.o, t)
+    needy = !so.devstats && needs_host_y(so.o, t)
     needcache = so.needcache && Output.willsave(so.o, y, t, dt)
     if needy || needcache
         yh = _tohost_unscale!(so.ybuf, y, so.Eref)
