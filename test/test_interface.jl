@@ -464,6 +464,17 @@ mismatch 2β1ω0 and the third harmonic (almost) vanishes.
 end
 
 ##
+#= A columnwise response whose type carries a long parameter list. gpu/12-response-traits
+   guarantees that `Interface._check_responses_device_capable!` names the response with
+   `nameof(typeof(r))` rather than with its full type -- a plasma response's parameters
+   run to several hundred characters and would bury the fix past a wrapped paragraph. The
+   fixture that test uses otherwise is a closure, whose `nameof` is a gensym, so the
+   guarantee is only checkable against a named struct. =#
+struct LongParameterResponse{A, B, C, D}
+    c::Float64
+end
+(r::LongParameterResponse)(out, E, ρ) = (out .+= (ρ*r.c) .* E.^3)
+
 @testset "device, precision and stats_period keywords" begin
     import Luna: DeviceSpec, Output
     args = (125e-6, 1e-2, :He, 1.0)
@@ -530,6 +541,25 @@ end
     # ... and the same responses at the default device and precision are not refused
     @test Interface._check_responses_device_capable!(Luna.HostSpec(), nothing,
                                                      resp_nokernel) === nothing
+    #= The message names the response type, not its parameters (gpu/12-response-traits).
+       `LongParameterResponse`'s full type is four times the length of its name, and none
+       of the parameter list may appear in the message. =#
+    longresp = LongParameterResponse{Vector{ComplexF64}, Matrix{Float64},
+                                     NTuple{8, Float64}, typeof(sin)}(1e-52)
+    @test !Nonlinear.device_capable(longresp)
+    @test length(string(typeof(longresp))) > 4*length("LongParameterResponse")
+    err = try
+        Interface._check_responses_device_capable!(DeviceSpec(Array, Float32), nothing,
+                                                   (longresp,))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("LongParameterResponse", err.msg)
+    @test !occursin("NTuple", err.msg)
+    @test !occursin("ComplexF64", err.msg)
+
     # ... nor is a device request whose responses all have kernels
     @test Interface._check_responses_device_capable!(
         DeviceSpec(Array, Float32), nothing,

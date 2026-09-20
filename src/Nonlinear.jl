@@ -3,11 +3,10 @@ import Luna
 import Luna.PhysData: ε_0, e_ratio
 import Luna: Maths, Utils
 import Adapt
-import FFTW
 import Logging
-import LinearAlgebra: mul!, ldiv!
+import LinearAlgebra: mul!
 import Rotations: RotZY, RotYZ, RotMatrix, RotMatrix3
-import StaticArrays: SMatrix, SVector, MArray
+import StaticArrays: SMatrix, SVector
 
 #=================================================#
 #=============  RESPONSE PROTOCOL  ===============#
@@ -390,7 +389,8 @@ side. `device_capable` is therefore about performance, not possibility.
 `Interface.jl` uses it to decide, for an *unspecified* `device` request, whether a
 mode-averaged `prop_capillary` call can follow `Luna.settings["device"]` (every response
 it built is device-capable) or must stay on the CPU regardless of the global setting (at
-least one is not, e.g. plasma or Raman) -- so that loading a GPU package does not turn a
+least one is not -- after Group D that means a response the user wrote, since every
+response Luna ships has a kernel) -- so that loading a GPU package does not turn a
 default, field-resolved `prop_capillary` call into a slow one.
 """
 device_capable(r) = !(kind(r) isa Columnwise)
