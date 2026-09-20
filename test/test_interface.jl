@@ -464,4 +464,62 @@ mismatch 2β1ω0 and the third harmonic (almost) vanishes.
 end
 
 ##
+@testset "device, precision and stats_period keywords" begin
+    import Luna: DeviceSpec, Output
+    args = (125e-6, 1e-2, :He, 1.0)
+    kwargs = (λ0=800e-9, energy=100e-9, τfwhm=10e-15, trange=400e-15,
+              λlims=(300e-9, 2000e-9), shotnoise=false, plasma=false, raman=false,
+              saveN=5)
+
+    # An untouched call is unaffected: `device`'s default (Luna.device_request()) is
+    # :cpu unless a GPU package is loaded, exactly what prop_capillary always gave.
+    oref = prop_capillary(args...; kwargs...)
+    odefault = prop_capillary(args...; kwargs..., device=Luna.device_request())
+    @test odefault["Eω"] == oref["Eω"]
+    @test eltype(oref["Eω"]) === ComplexF64
+
+    # precision=Float32 on the CPU: unscaled automatically, saved as ComplexF32
+    o32 = prop_capillary(args...; kwargs..., precision=Float32)
+    @test eltype(o32["Eω"]) === ComplexF32
+    for idx in axes(oref["Eω"], 2)
+        h = oref["Eω"][:, idx]
+        d = ComplexF64.(o32["Eω"][:, idx])
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
+    end
+
+    # device=<a DeviceSpec>: the low-level array-type test (JLArray, Metal) is
+    # test_device.jl's/test_metal.jl's; here only the plumbing, at Float64 so the
+    # comparison is exact bar the FFT/reduction order the array type changes.
+    ohost = prop_capillary(args...; kwargs..., device=DeviceSpec(Array, Float64))
+    @test ohost["Eω"] == oref["Eω"]
+
+    # stats_period shortens the recorded statistics but not the propagation itself
+    o3 = prop_capillary(args...; kwargs..., stats_period=3)
+    @test length(o3["stats"]["z"]) < length(oref["stats"]["z"])
+    @test o3["z"] == oref["z"]
+
+    # a pressure gradient still runs (the z-dependent operator branch)
+    ograd = prop_capillary(125e-6, 1e-2, :He, (1.0, 0.0); kwargs...)
+    @test size(ograd["Eω"]) == size(oref["Eω"])
+
+    # multimode/radial propagation is not device-capable: refused, not silently ignored
+    @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
+                                               device=DeviceSpec(Array, Float32))
+    # ... but unaffected at the default device
+    om = prop_capillary(args...; kwargs..., modes=4)
+    @test size(om["Eω"], 2) == 4
+
+    # prop_gnlse: same keywords, but only the CPU/Float64 default is honoured
+    gargs = (0.1, 1e-3, [0.0, 0.0, -1e-26])
+    gkwargs = (λ0=835e-9, τfwhm=100e-15, power=1e3, pulseshape=:sech,
+               λlims=(450e-9, 2e-6), trange=1e-12, saveN=3, raman=false,
+               shotnoise=false)
+    ognlse = prop_gnlse(gargs...; gkwargs..., device=Luna.device_request())
+    @test_throws ErrorException prop_gnlse(gargs...; gkwargs...,
+                                           device=DeviceSpec(Array, Float32))
+    ognlse3 = prop_gnlse(gargs...; gkwargs..., stats_period=2)
+    @test length(ognlse3["stats"]["z"]) < length(ognlse["stats"]["z"])
+end
+
+##
 Logging.global_logger(old_logger)

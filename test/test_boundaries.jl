@@ -480,3 +480,79 @@ b = Boundaries.setup(:rate, cgrid, transform, linop, FT \ Eω, FT, dummy, 0.0, 0
 @test isnothing(b.stepfun.spatial)
 @test b.linop == Boundaries.addloss(linop, Boundaries.spectral_rate(cgrid, 0.3))
 end
+
+#= gpu/11: RateAbsorber and LegacyAbsorber are broadcasts and reductions over mirrored
+   arrays now, so they should run on any array type. Skipped without JLArrays, which is
+   not part of the main test environment (see test_device.jl for the same gate). =#
+have_jlarrays = try
+    @eval import JLArrays
+    true
+catch
+    false
+end
+
+if !have_jlarrays
+    @warn "JLArrays is not available; the JLArray boundaries tests are skipped. Run "*
+          "through `Pkg.test()` or add JLArrays to the environment."
+else
+
+import AbstractFFTs
+import GPUArraysCore
+
+#= The same host-backed AbstractFFTs shim test_device.jl defines: JLArrays has no FFT
+   plans of its own. Duplicated rather than shared, since the two test files are
+   `include`d independently and neither depends on the other. =#
+mutable struct BoundaryJLPlan{T, N, P} <: AbstractFFTs.Plan{T}
+    hp::P
+    sz::NTuple{N, Int}
+    dims::Any
+    pinv::AbstractFFTs.ScaledPlan
+    BoundaryJLPlan{T, N, P}(hp, sz, dims) where {T, N, P} = new{T, N, P}(hp, sz, dims)
+end
+BoundaryJLPlan(hp, sz::NTuple{N, Int}, dims, T=ComplexF64) where {N} =
+    BoundaryJLPlan{T, N, typeof(hp)}(hp, sz, dims)
+Base.size(p::BoundaryJLPlan) = p.sz
+Base.eltype(::BoundaryJLPlan{T}) where {T} = T
+AbstractFFTs.plan_fft(x::JLArrays.JLArray{ComplexF64}, dims) =
+    BoundaryJLPlan(FFTW.plan_fft(Array(x), dims), size(x), dims)
+AbstractFFTs.plan_rfft(x::JLArrays.JLArray{Float64}, dims) =
+    BoundaryJLPlan(FFTW.plan_rfft(Array(x), dims), size(x), dims, Float64)
+AbstractFFTs.plan_inv(p::BoundaryJLPlan) =
+    AbstractFFTs.ScaledPlan(BoundaryJLPlan(inv(p.hp).p, p.sz, p.dims, ComplexF64),
+                            AbstractFFTs.normalization(Float64, p.sz, p.dims))
+Base.:*(p::BoundaryJLPlan, x::JLArrays.JLArray) = JLArrays.JLArray(p.hp * Array(x))
+mul!(y::JLArrays.JLArray, p::BoundaryJLPlan, x::JLArrays.JLArray) =
+    (copyto!(y, p.hp * Array(x)); y)
+
+const BJLArray = JLArrays.JLArray
+
+_bnoop(args...; kwargs...) = nothing
+
+@testset "RateAbsorber and LegacyAbsorber on JLArray" begin
+    GPUArraysCore.allowscalar(false)
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    zmax = 1e-2
+    dz = zmax/20
+    αt = Boundaries.temporal_rate(grid, zmax)
+    Nt = length(grid.t)
+    Eω0 = randn(ComplexF64, length(grid.ω))
+
+    Et_h = zeros(Float64, Nt)
+    FT_h = FFTW.plan_rfft(Et_h, 1)
+    Et_d = BJLArray(zeros(Float64, Nt))
+    FT_d = AbstractFFTs.plan_rfft(Et_d, 1)
+
+    for (absorber_h, absorber_d) in (
+            (Boundaries.RateAbsorber(αt, Et_h, FT_h, _bnoop, 0.0),
+             Boundaries.RateAbsorber(αt, Et_d, FT_d, _bnoop, 0.0)),
+            (Boundaries.LegacyAbsorber(grid, Et_h, FT_h, _bnoop),
+             Boundaries.LegacyAbsorber(grid, Et_d, FT_d, _bnoop)))
+        Eω_h = copy(Eω0)
+        absorber_h(Eω_h, dz, dz, nothing)
+        Eω_d = BJLArray(copy(Eω0))
+        absorber_d(Eω_d, dz, dz, nothing)
+        @test maximum(abs, Array(Eω_d) .- Eω_h)/maximum(abs, Eω_h) < 1e-10
+    end
+end
+
+end # have_jlarrays

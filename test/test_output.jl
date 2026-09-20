@@ -276,3 +276,137 @@ fpath = joinpath(homedir(), ".luna", "output_test", "test.h5")
 end
 rm(fpath, force=true)
 rm(splitdir(fpath)[1], force=true)
+
+@testset "willsave" begin
+    # GridCondition's own points: 0, 0.25, 0.5, 0.75, 1.0. `willsave` does not itself
+    # save, so it has to be interleaved with real saves to track `o.saved` correctly,
+    # exactly as `Luna.ScaledOutput` interleaves it with the real per-step call.
+    o = Output.MemoryOutput(0, 1.0, 5, Output.nostats)
+    y = randn(ComplexF64, 8)
+    @test Output.willsave(o, y, 0.0, 0.1) == true # the first point, t = 0, is reached
+    o(y, 0.0, 0.1, _ -> y)
+    @test o.saved == 1
+    @test Output.willsave(o, y, 0.1, 0.1) == false # next point (0.25) not reached yet
+    @test Output.willsave(o, y, 0.25, 0.1) == true # now it is
+
+    h = Output.HDF5Output(joinpath(tempname(), "willsave.h5"), 0, 1.0, 5, Output.nostats)
+    @test Output.willsave(h, y, 0.0, 0.1) == true
+    h(y, 0.0, 0.1, _ -> y)
+    @test Output.willsave(h, y, 0.1, 0.1) == false
+    @test Output.willsave(h, y, 0.25, 0.1) == true
+    rm(dirname(h.fpath), recursive=true, force=true)
+
+    # A save condition willsave does not know how to inspect falls back to `true`
+    @test Output.willsave(Output.MemoryOutput(Output.always, "Eω", "z"), y, 0.3, 0.1) == true
+    # Any other kind of output (a bare function, say) is conservatively `true`
+    @test Output.willsave((args...; kwargs...) -> nothing, y, 0.3, 0.1) == true
+end
+
+@testset "PeriodicStats" begin
+    calls = Ref(0)
+    f(y, t, dt) = (calls[] += 1; Dict("n" => calls[]))
+    p = Output.PeriodicStats(f, 3)
+    # first call always fires, then every 3rd
+    results = [p(nothing, 0.0, 0.0) for _ in 1:7]
+    @test [isnothing(r) for r in results] == [false, true, true, false, true, true, false]
+    @test [r["n"] for r in results if !isnothing(r)] == [1, 4, 7]
+    @test_throws ArgumentError Output.PeriodicStats(f, 0)
+
+    # MemoryOutput/HDF5Output skip a `nothing` statistics result instead of erroring
+    o = Output.MemoryOutput(0, 1.0, 4, Output.PeriodicStats((y, t, dt) -> Dict("s" => t), 2))
+    y0 = randn(ComplexF64, 4)
+    for t in (0.0, 1/3, 2/3, 1.0)
+        o(y0, t, 0.1, _ -> y0)
+    end
+    @test o.data["stats"]["s"] == [0.0, 2/3] # only the 1st and 3rd calls collected stats
+end
+
+@testset "Float32 output eltype" begin
+    using Luna
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    dens = z -> PhysData.density(:He, 1.0)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)
+    linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, 800e-9)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
+
+    Eω64, transform64, FT64 = Luna.setup(grid, dens, resp, inputs, βfun!, aeff; constβ=true)
+    out64 = Output.MemoryOutput(0, 1e-2, 3, Output.nostats)
+    Luna.run(Eω64, grid, linop, transform64, FT64, out64;
+             zmax=1e-2, boundary=:rate, init_dz=5e-4, rtol=1e-8)
+
+    Eω32, transform32, FT32 = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                                         constβ=true, precision=Float32)
+    out32 = Output.MemoryOutput(0, 1e-2, 3, Output.nostats)
+    Luna.run(Eω32, grid, linop, transform32, FT32, out32;
+             zmax=1e-2, boundary=:rate, init_dz=5e-4, rtol=1e-8)
+
+    # ScaledOutput unscales and Output allocates with eltype(y): Float32 saves Float32
+    @test eltype(out32["Eω"]) === ComplexF32
+    @test eltype(out64["Eω"]) === ComplexF64
+    for idx in axes(out64["Eω"], 2)
+        h = out64["Eω"][:, idx]
+        d = ComplexF64.(out32["Eω"][:, idx])
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
+    end
+end
+
+@testset "HDF5 resume of a Float32 run" begin
+    using Luna
+    import HDF5
+    fdir = tempname()
+    fpath = joinpath(fdir, "resume32.h5")
+
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    dens = z -> PhysData.density(:He, 1.0)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)
+    linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, 800e-9)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
+
+    # Run with an arbitrary failure partway through, so the file is left with a cache
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                                   constβ=true, precision=Float32)
+    output = Output.HDF5Output(fpath, 0, 1e-2, 11, Output.nostats)
+    function stepfun(Eω, z, dz, interpolant)
+        output(Eω, z, dz, interpolant)
+        z > 6e-3 && error("interrupted")
+    end
+    # Luna.run treats its 6th argument as the output object for metadata, willsave and
+    # check_cache too, so this stand-in must forward everything else to the real one.
+    stepfun(args...; kwargs...) = output(args...; kwargs...)
+    try
+        Luna.run(Eω, grid, linop, transform, FT, stepfun;
+                 zmax=1e-2, boundary=:rate, init_dz=5e-4, rtol=1e-8)
+    catch e
+        e isa ErrorException || rethrow()
+    end
+
+    # Resume: check_cache reads the cache back (host, physical units, ComplexF32) and
+    # Luna.run rescales and reuploads it -- on the CPU that upload is the identity, but
+    # the rescale (dividing by the *new* run's E_ref, which is deterministic from the
+    # same input and therefore the same as the interrupted run's) is not.
+    Eω2, transform2, FT2 = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                                      constβ=true, precision=Float32)
+    output2 = Output.HDF5Output(fpath, 0, 1e-2, 11, Output.nostats)
+    Luna.run(Eω2, grid, linop, transform2, FT2, output2;
+             zmax=1e-2, boundary=:rate, init_dz=5e-4, rtol=1e-8)
+
+    # An uninterrupted run started fresh, for comparison
+    Eω3, transform3, FT3 = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                                      constβ=true, precision=Float32)
+    output3 = Output.MemoryOutput(0, 1e-2, 11, Output.nostats)
+    Luna.run(Eω3, grid, linop, transform3, FT3, output3;
+             zmax=1e-2, boundary=:rate, init_dz=5e-4, rtol=1e-8)
+
+    @test eltype(output2["Eω"]) === ComplexF32
+    @test output2["z"] ≈ output3["z"]
+    for idx in axes(output3["Eω"], 2)
+        h = output3["Eω"][:, idx]
+        d = output2["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
+    end
+    rm(fdir, recursive=true, force=true)
+end
