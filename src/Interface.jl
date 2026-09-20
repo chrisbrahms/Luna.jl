@@ -466,7 +466,18 @@ function prop_capillary_args(radius, flength, gas, pressure;
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
                                      noise_field, thg, device, precision)
-    stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
+    #= Stats.jl is host-only code (out of this branch's scope beyond the host-copy
+       warning and PeriodicStats): `Stats.default`/`collect_stats` use their `Eω`
+       argument only to size and type their internal buffers at construction, but for an
+       EnvGrid `Stats.plan_analytic` builds those buffers with `similar(Eω)` and plans an
+       FFTW transform directly on a copy of it, which only works when `Eω` is a host
+       array (found on Metal hardware: FFTW cannot plan on a device array's private
+       memory; a RealGrid's `plan_analytic` always allocates a host buffer regardless and
+       does not show this). The statistics function itself is called at every step with
+       the real, already-host `y` `Luna.ScaledOutput` provides, so a host-shaped
+       *template* is all construction needs. =#
+    stats = Stats.default(grid, Luna.isdevice(Eω) ? Luna.tohost(Eω) : Eω, mode_s, linop,
+                          transform; gas=gas, stats_kwargs...)
     stats_period > 1 && (stats = Output.PeriodicStats(stats, stats_period))
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
