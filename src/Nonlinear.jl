@@ -639,21 +639,20 @@ Adapt.adapt_structure(to, k::KerrEnvTHG) = KerrEnvTHG(k.γ3, Adapt.adapt(to, k.C
 
 resident_arrays(k::KerrEnvTHG) = (k.C,)
 
-struct Chi2Field{χT}
-    χ2::χT
-    toCrystal::RotMatrix3{Float64}
-    toLab::RotMatrix3{Float64}
-    χ2_toLab::χT # combined matrix to multiply by toLab * χ2
-    El::Vector{Float64} # field in the lab frame
-    Ec::Vector{Float64} # field in the crystal frame
-    Enl::Vector{Float64} # field products in the crystal frame
-    Pl::Vector{Float64} # polarisation in the lab frame
-end
+#=================================================#
+#===========  SECOND-ORDER RESPONSES  ============#
+#=================================================#
+
+#= The χ⁽²⁾ responses are [`VectorPointwise`](@ref): the contraction at one time sample
+   couples the two lab-frame polarisation components and nothing else. The matrices the
+   kernel contracts with are `StaticArrays`/`Rotations` matrices, which are `isbits` and
+   travel inside the closure a broadcast compiles, so no buffer and no host array is
+   involved -- that is what makes them run wherever the block does. =#
 
 """
     Chi2Field(θ, ϕ, χ2)
 
-Construct a second-order nonlinear polarisation response for real, two-component
+Second-order nonlinear polarisation response for real, two-component (field-resolved)
 electric fields in the lab frame.
 
 `θ` and `ϕ` (radians) define the crystal orientation relative to the lab frame.
@@ -663,30 +662,95 @@ in [`field_products!`](@ref)).
 
 The returned callable adds \$ε_0 P_{NL}\$ to `out` when invoked as
 `response(out, E, ρ)`. Note that the density `ρ` is ignored.
+
+[`VectorPointwise`](@ref): it needs a two-component field block and errors on a
+one-component one.
 """
-function Chi2Field(θ, ϕ, χ2)
+struct Chi2Field{T}
+    χ2::SMatrix{3, 6, T, 18}
+    toCrystal::RotMatrix3{T}
+    toLab::RotMatrix3{T}
+    χ2_toLab::SMatrix{3, 6, T, 18} # combined matrix toLab * χ2
+end
+
+Chi2Field(θ, ϕ, χ2) = Chi2Field(_chi2matrices(θ, ϕ, χ2)...)
+
+#= The crystal matrices, promoted to one real type so that the struct has a single
+   parameter and the kernel a single conversion. `toLab*χ2` is formed before the
+   conversion, as it always was, so that the default Float64 path is unchanged. =#
+function _chi2matrices(θ, ϕ, χ2)
     toCrystal = RotMatrix(RotZY(-ϕ, -θ)) # RotMatrix converts to static matrix
     toLab = RotMatrix(RotYZ(θ, ϕ))
-    sv3 = zeros(3)
-    sv6 = zeros(6)
     χ2 = SMatrix{3, 6}(χ2) # just χ2
     χ2_toLab = SMatrix{3, 6}(toLab * χ2) # χ2 and coordinate transform in one step
-    Chi2Field(χ2, toCrystal, toLab, χ2_toLab, sv3, copy(sv3), sv6, copy(sv3))
+    T = promote_type(eltype(χ2), eltype(toCrystal), eltype(toLab), eltype(χ2_toLab))
+    (SMatrix{3, 6, T}(χ2), RotMatrix3{T}(toCrystal), RotMatrix3{T}(toLab),
+     SMatrix{3, 6, T}(χ2_toLab))
 end
 
+kind(::Chi2Field) = VectorPointwise()
+
+coefficients(::Chi2Field, ρ, scaling) = ε_0*Luna.polscale(scaling, 2)
+
+#= The rotation and the contracted tensor in the real element type of the block. A
+   response is built from crystal data in Float64 and `rescale` converts it for a
+   reduced-precision run, but the conversion is repeated here -- it is 27 host scalars
+   once per right-hand side -- so that a kernel built from a response which was never
+   rescaled still carries no Float64 (GPU_PLAN.md section 4.2 rule 3). It is the identity
+   when the response is already in the block's precision. =#
+_chi2mats(::Type{T}, c) where {T} =
+    (SMatrix{3, 3, T}(c.toCrystal), SMatrix{3, 6, T}(c.χ2_toLab))
+
+#= The arithmetic, once. The fused component broadcasts and the columnwise call operator
+   below both go through this, so there is one kernel body per response. =#
+_chi2field(fac, toCrystal, χ2_toLab) = (ex, ey) -> begin
+    # the third lab-frame component (Ez) is always zero
+    Ec = toCrystal*SVector(ex, ey, zero(ex)) # transform to crystal frame
+    Enl = _field_products(Ec) # calculate nonlinear products
+    Pl = χ2_toLab*Enl # multiply by χ2 tensor and transform to lab frame
+    SVector(fac*Pl[1], fac*Pl[2])
+end
+
+vector_kernel(c::Chi2Field, E, ρ, scaling) =
+    _chi2field(Luna.scalar(E, coefficients(c, ρ, scaling)),
+               _chi2mats(real(eltype(E)), c)...)
+
+#= The columnwise contract, in physical units: what a direct caller still reaches. Like
+   the dispatcher's vector path it evaluates the kernel once per output component; see
+   `docs/src/developer/device_model.md`. =#
 function (c::Chi2Field)(out, E, ρ)
-    for i in axes(E, 1)
-        @inbounds c.El[1] = E[i, 1]
-        @inbounds c.El[2] = E[i, 2]
-        # note c.El[3] (Ez in the lab frame) is always zero here
-        mul!(c.Ec, c.toCrystal, c.El) # transform to crystal frame
-        @inbounds field_products!(c.Enl, c.Ec) # calculate nonlinear products
-        mul!(c.Pl, c.χ2_toLab, c.Enl) # multiply by χ2 tensor and transform to lab frame
-        @inbounds out[i, 1] += ε_0*c.Pl[1]
-        @inbounds out[i, 2] += ε_0*c.Pl[2]
-    end
+    size(E, 2) == 2 || error("Chi2Field requires a two-component (Nt×2) field")
+    f = _chi2field(Luna.scalar(E, coefficients(c, ρ, Luna.UNIT_SCALING)),
+                   _chi2mats(real(eltype(E)), c)...)
+    Ex = selectdim(E, 2, 1)
+    Ey = selectdim(E, 2, 2)
+    ox = selectdim(out, 2, 1)
+    oy = selectdim(out, 2, 2)
+    @. ox += first(f(Ex, Ey))
+    @. oy += last(f(Ex, Ey))
+    out
 end
 
+function rescale(c::Chi2Field, spec, scaling)
+    _isdefaultrun(spec, scaling) && return c
+    _chi2rescale(Luna.realtype(spec), c)
+end
+
+_chi2rescale(::Type{T}, c::Chi2Field) where {T} =
+    Chi2Field(SMatrix{3, 6, T}(c.χ2), RotMatrix3{T}(c.toCrystal),
+              RotMatrix3{T}(c.toLab), SMatrix{3, 6, T}(c.χ2_toLab))
+
+#= Every field is an `isbits` static matrix, so `Adapt` has nothing to move; the rule
+   exists so that adapting a container which holds a response is not a no-op by accident.
+   Precision is `rescale`'s job: `Adapt` does not know the target element type. =#
+Adapt.adapt_structure(to, c::Chi2Field) =
+    Chi2Field(Adapt.adapt(to, c.χ2), Adapt.adapt(to, c.toCrystal),
+              Adapt.adapt(to, c.toLab), Adapt.adapt(to, c.χ2_toLab))
+
+#= The contracted second-order field products, as an `SVector{6}`: the one body, which
+   both the kernel and `field_products!` use. =#
+_field_products(Ec) = SVector(Ec[1]^2, Ec[2]^2, Ec[3]^2,
+                              2*Ec[2]*Ec[3], 2*Ec[1]*Ec[3], 2*Ec[1]*Ec[2])
 
 """
     field_products!(Enl, Ec)
@@ -699,35 +763,16 @@ The output ordering is
 column order `[xx, yy, zz, yz, xz, xy]` used by [`Chi2Field`](@ref).
 
 Both `Enl` and `Ec` are mutated/read in place and are expected to have length 6
-and 3, respectively.
+and 3, respectively. This is the out-of-place expression the kernel uses, written into a
+vector; it is not what the response itself calls.
 """
-function field_products!(Enl, Ec)
-    Enl[1] = Ec[1]^2
-    Enl[2] = Ec[2]^2
-    Enl[3] = Ec[3]^2
-    Enl[4] = 2*Ec[2]*Ec[3]
-    Enl[5] = 2*Ec[1]*Ec[3]
-    Enl[6] = 2*Ec[1]*Ec[2]
-end
-
-struct Chi2Env{χT}
-    χ2::χT
-    toCrystal::RotMatrix3{Float64}
-    toLab::RotMatrix3{Float64}
-    χ2_toLab::χT # combined matrix to multiply by toLab * χ2
-    C::Vector{ComplexF64} # carrier phase exp(iω0t) on the (oversampled) time grid
-    Al::Vector{ComplexF64} # envelope in the lab frame
-    Ac::Vector{ComplexF64} # envelope in the crystal frame
-    Anl::Vector{ComplexF64} # combined SFG+DFG envelope products in the crystal frame
-    Pl::Vector{ComplexF64} # polarisation envelope in the lab frame
-end
+field_products!(Enl, Ec) = (Enl .= _field_products(SVector{3}(Ec)); Enl)
 
 """
     Chi2Env(θ, ϕ, χ2, ω0, t)
 
-Construct a second-order nonlinear polarisation response for complex envelope,
-two-component electric fields in the lab frame. Envelope counterpart of
-[`Chi2Field`](@ref).
+Second-order nonlinear polarisation response for complex envelope, two-component
+electric fields in the lab frame. Envelope counterpart of [`Chi2Field`](@ref).
 
 `θ` and `ϕ` (radians) define the crystal orientation relative to the lab frame.
 `χ2` must be a 3×6 second-order susceptibility tensor in contracted notation,
@@ -752,36 +797,84 @@ apodisation. Note that the grid must contain the second harmonic—use
 
 The returned callable adds \$ε_0 P_{NL}\$ to `out` when invoked as
 `response(out, E, ρ)`. Note that the density `ρ` is ignored.
+
+[`VectorPointwise`](@ref): it needs a two-component field block and errors on a
+one-component one. The carrier phase is a second broadcast argument rather than something
+the kernel captures, so it is aligned with the time axis whatever the block's shape.
 """
-function Chi2Env(θ, ϕ, χ2, ω0, t)
-    toCrystal = RotMatrix(RotZY(-ϕ, -θ)) # RotMatrix converts to static matrix
-    toLab = RotMatrix(RotYZ(θ, ϕ))
-    χ2 = SMatrix{3, 6}(χ2) # just χ2
-    χ2_toLab = SMatrix{3, 6}(toLab * χ2) # χ2 and coordinate transform in one step
-    C = exp.(1im*ω0.*t)
-    sv3 = zeros(ComplexF64, 3)
-    sv6 = zeros(ComplexF64, 6)
-    Chi2Env(χ2, toCrystal, toLab, χ2_toLab, C, sv3, copy(sv3), sv6, copy(sv3))
+struct Chi2Env{T, cT}
+    χ2::SMatrix{3, 6, T, 18}
+    toCrystal::RotMatrix3{T}
+    toLab::RotMatrix3{T}
+    χ2_toLab::SMatrix{3, 6, T, 18} # combined matrix to multiply by toLab * χ2
+    C::cT # carrier phase exp(iω0t) on the (oversampled) time grid
+end
+
+Chi2Env(θ, ϕ, χ2, ω0, t) = Chi2Env(_chi2matrices(θ, ϕ, χ2)..., exp.(1im*ω0.*t))
+
+kind(::Chi2Env) = VectorPointwise()
+
+coefficients(::Chi2Env, ρ, scaling) = ε_0*Luna.polscale(scaling, 2)
+
+_chi2env(fac, toCrystal, χ2_toLab) = (ax, ay, C) -> begin
+    cp = C/2 # ½exp(iω0t): sum-frequency (ω + ω → 2ω)
+    cm = conj(C) # exp(-iω0t): difference-frequency (2ω - ω → ω)
+    # the third lab-frame component (Az) is always zero
+    Ac = toCrystal*SVector(ax, ay, zero(ax)) # transform to crystal frame
+    Anl = _env_products(Ac, cp, cm) # calculate nonlinear products
+    Pl = χ2_toLab*Anl # multiply by χ2 tensor and transform to lab frame
+    SVector(fac*Pl[1], fac*Pl[2])
+end
+
+vector_expr(c::Chi2Env, Ex, Ey, ρ, scaling) =
+    Base.broadcasted(_chi2envkernel(c, Ex, ρ, scaling), Ex, Ey, c.C)
+
+function _chi2envkernel(c::Chi2Env, E, ρ, scaling)
+    size(E, 1) == length(c.C) || error(
+        "Chi2Env carrier phase array does not match the field length. "
+        * "The response must be constructed with the oversampled time axis `grid.to`.")
+    _chi2env(Luna.scalar(E, coefficients(c, ρ, scaling)),
+             _chi2mats(real(eltype(E)), c)...)
 end
 
 function (c::Chi2Env)(out, E, ρ)
     size(E, 2) == 2 || error("Chi2Env requires a two-component (Nt×2) envelope field")
-    length(c.C) == size(E, 1) || error(
-        "Chi2Env carrier phase array does not match the field length. "
-        * "The response must be constructed with the oversampled time axis `grid.to`.")
-    for i in axes(E, 1)
-        cp = 0.5*c.C[i] # ½exp(iω0t): sum-frequency (ω + ω → 2ω)
-        cm = conj(c.C[i]) # exp(-iω0t): difference-frequency (2ω - ω → ω)
-        @inbounds c.Al[1] = E[i, 1]
-        @inbounds c.Al[2] = E[i, 2]
-        # note c.Al[3] (Az in the lab frame) is always zero here
-        mul!(c.Ac, c.toCrystal, c.Al) # transform to crystal frame
-        @inbounds env_products!(c.Anl, c.Ac, cp, cm) # calculate nonlinear products
-        mul!(c.Pl, c.χ2_toLab, c.Anl) # multiply by χ2 tensor and transform to lab frame
-        @inbounds out[i, 1] += ε_0*c.Pl[1]
-        @inbounds out[i, 2] += ε_0*c.Pl[2]
-    end
+    Ex = selectdim(E, 2, 1)
+    Ey = selectdim(E, 2, 2)
+    f = _chi2envkernel(c, Ex, ρ, Luna.UNIT_SCALING)
+    C = c.C
+    ox = selectdim(out, 2, 1)
+    oy = selectdim(out, 2, 2)
+    @. ox += first(f(Ex, Ey, C))
+    @. oy += last(f(Ex, Ey, C))
+    out
 end
+
+function rescale(c::Chi2Env, spec, scaling)
+    _isdefaultrun(spec, scaling) && return c
+    _chi2rescale(Luna.realtype(spec), c, Luna.todevice(spec, c.C))
+end
+
+_chi2rescale(::Type{T}, c::Chi2Env, C) where {T} =
+    Chi2Env(SMatrix{3, 6, T}(c.χ2), RotMatrix3{T}(c.toCrystal),
+            RotMatrix3{T}(c.toLab), SMatrix{3, 6, T}(c.χ2_toLab), C)
+
+Adapt.adapt_structure(to, c::Chi2Env) =
+    Chi2Env(Adapt.adapt(to, c.χ2), Adapt.adapt(to, c.toCrystal),
+            Adapt.adapt(to, c.toLab), Adapt.adapt(to, c.χ2_toLab),
+            Adapt.adapt(to, c.C))
+
+resident_arrays(c::Chi2Env) = (c.C,)
+
+#= The contracted second-order envelope products, as an `SVector{6}`: the one body, which
+   both the kernel and `env_products!` use. =#
+_env_products(Ac, cp, cm) = SVector(
+    cp*Ac[1]^2 + cm*abs2(Ac[1]),
+    cp*Ac[2]^2 + cm*abs2(Ac[2]),
+    cp*Ac[3]^2 + cm*abs2(Ac[3]),
+    2*(cp*Ac[2]*Ac[3] + cm*real(Ac[2]*conj(Ac[3]))),
+    2*(cp*Ac[1]*Ac[3] + cm*real(Ac[1]*conj(Ac[3]))),
+    2*(cp*Ac[1]*Ac[2] + cm*real(Ac[1]*conj(Ac[2]))))
 
 """
     env_products!(Anl, Ac, cp, cm)
@@ -801,16 +894,10 @@ The output ordering is `[xx, yy, zz, yz, xz, xy]` with mixed terms multiplied by
 matching the 3x6 `χ2` tensor column order used by [`Chi2Env`](@ref).
 
 Both `Anl` and `Ac` are mutated/read in place and are expected to have length 6
-and 3, respectively.
+and 3, respectively. This is the out-of-place expression the kernel uses, written into a
+vector; it is not what the response itself calls.
 """
-function env_products!(Anl, Ac, cp, cm)
-    Anl[1] = cp*Ac[1]^2 + cm*abs2(Ac[1])
-    Anl[2] = cp*Ac[2]^2 + cm*abs2(Ac[2])
-    Anl[3] = cp*Ac[3]^2 + cm*abs2(Ac[3])
-    Anl[4] = 2*(cp*Ac[2]*Ac[3] + cm*real(Ac[2]*conj(Ac[3])))
-    Anl[5] = 2*(cp*Ac[1]*Ac[3] + cm*real(Ac[1]*conj(Ac[3])))
-    Anl[6] = 2*(cp*Ac[1]*Ac[2] + cm*real(Ac[1]*conj(Ac[2])))
-end
+env_products!(Anl, Ac, cp, cm) = (Anl .= _env_products(SVector{3}(Ac), cp, cm); Anl)
 
 "Response type for cumtrapz-based plasma polarisation, adapted from:
 M. Geissler, G. Tempea, A. Scrinzi, M. Schnürer, F. Krausz, and T. Brabec, Physical Review Letters 83, 2930 (1999)."
