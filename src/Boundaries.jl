@@ -104,7 +104,7 @@ import ..Maths
 import ..Grid
 import ..NonlinearRHS
 import ..Utils
-import Luna: upload_like, scalar, assert_resident, DeviceSpec
+import Luna: upload_like, todevice, scalar, assert_resident, DeviceSpec
 import LinearAlgebra: mul!
 import Logging
 import Printf: @sprintf
@@ -418,21 +418,21 @@ it first. It is applied to `Eω` directly (the collar is diagonal in ω) with on
 one forward Hankel transform along the last axis, into the buffer `buf` sized like `Eω`.
 
 `Tfwd` and `Tbwd` are copies of `rgrid`'s transform matrices in the element type of `Eω`,
-so that both operands of the matrix multiplication have the same element type; `weight` is
-a copy of its real-space integration weights, in the real precision of `Eω`. Nothing else
-of the grid is needed per step, so the grid itself is not kept.
+so that both operands of the matrix multiplication have the same element type (which a
+device's accelerated matrix multiply requires); `weight` is a copy of its real-space
+integration weights, in the real precision of `Eω`. Nothing else of the grid is needed per
+step, so the grid itself is not kept.
 
-`TransRadial` does not take a `device` keyword yet (Group E of GPU_PLAN.md), so `Eω` here
-is always a host array; `Tfwd`/`Tbwd`/`αr`/`weight` are adapted to its *precision* (for a
-`Float32` radial run) with `convert` rather than `Luna.todevice`, since a real-to-complex
-conversion (`Tfwd`/`Tbwd`) is not one `todevice` performs.
+Every array is `convert`ed to `Eω`'s precision on the host and then moved with
+[`Luna.todevice`](@ref), because a real-to-complex conversion (`Tfwd`/`Tbwd`) is not one
+`todevice` performs.
 """
-struct RadialCollar{mT, rT, bT}
-    Tfwd::Matrix{mT}
-    Tbwd::Matrix{mT}
-    αr::Vector{rT}
-    weight::Vector{rT} # radial integration weights, to measure what is removed
-    fac::Vector{rT} # scratch: exp(-αr*Δz/2), recomputed every step
+struct RadialCollar{mT, vT, bT}
+    Tfwd::mT
+    Tbwd::mT
+    αr::vT
+    weight::vT # radial integration weights, to measure what is removed
+    fac::vT # scratch: exp(-αr*Δz/2), recomputed every step
     buf::bT
     removed::Base.RefValue{Float64}
     reference::Base.RefValue{Float64}
@@ -440,15 +440,17 @@ struct RadialCollar{mT, rT, bT}
 end
 
 function RadialCollar(rgrid::Grid.RadialGrid, αr, Eω)
+    spec = _specof(Eω)
     TT = eltype(Eω)
     RT = real(TT)
-    Tfwd = convert(Matrix{TT}, rgrid.Tfwd)
-    Tbwd = convert(Matrix{TT}, rgrid.Tbwd)
-    αrc = convert(Vector{RT}, αr)
-    weight = convert(Vector{RT}, rgrid.wr)
+    Tfwd = todevice(spec, convert(Matrix{TT}, rgrid.Tfwd))
+    Tbwd = todevice(spec, convert(Matrix{TT}, rgrid.Tbwd))
+    αrc = todevice(spec, convert(Vector{RT}, αr))
+    weight = todevice(spec, convert(Vector{RT}, rgrid.wr))
+    fac = similar(αrc)
     buf = similar(Eω)
-    assert_resident(_specof(Eω), Eω, Tfwd, Tbwd, buf)
-    RadialCollar(Tfwd, Tbwd, αrc, weight, similar(αrc), buf, Ref(0.0), Ref(0.0), Ref(false))
+    assert_resident(spec, Eω, Tfwd, Tbwd, αrc, weight, fac, buf)
+    RadialCollar(Tfwd, Tbwd, αrc, weight, fac, buf, Ref(0.0), Ref(0.0), Ref(false))
 end
 
 _wabs2map(e, w) = w*abs2(e)
@@ -484,9 +486,9 @@ the spatial axes `(Nx,)` or `(Nx, Ny)`, applied as `exp(-αxy Δz/2)` per accept
 Fourier transform of those grids is joint in `(t, x[, y])`, so the collar is applied in
 the same real-space pass as the temporal collar, at no extra transform cost.
 
-Tested on the host only in this branch: `TransFree`/`TransFree2D` have no device path yet
-(`gpu/21`), so `αxy` is always a host `Array{Float64}`, matched to `Et`'s real precision
-by `Luna.upload_like` at construction (the identity on the default CPU path).
+Tested on the host only: `TransFree`/`TransFree2D` have no device path yet (`gpu/21`), so
+`αxy` is always a host `Array{Float64}`, matched to `Et`'s real precision by
+`Luna.upload_like` at construction (the identity on the default CPU path).
 """
 struct CartesianCollar{N, AT<:AbstractArray}
     αxy::AT # real precision of the state, host array type until gpu/21
@@ -524,14 +526,14 @@ apply_realspace!(c, Et, Δz) = nothing
     spatialcollar(spacegrid, αr, grid, Et)
 
 The transverse absorber functor for `spacegrid`, given the power rate `αr` over its real
-space. `grid` and `Et` size the buffer the radial collar needs, and `Et`'s real precision
-is what that buffer (and hence `RadialCollar`'s `Tfwd`/`Tbwd`/`αr`/`weight`) is built in
--- `Complex{real(eltype(Et))}` rather than a hardcoded `ComplexF64`, so a reduced-precision
-radial run (should `TransRadial` ever gain one, `gpu/21`) would not be handed a
-`Float64` collar buffer and matrices to multiply its `Float32` state against.
+space. `grid` and `Et` size the buffer the radial collar needs, and `Et`'s array type and
+real precision are what that buffer (and hence `RadialCollar`'s
+`Tfwd`/`Tbwd`/`αr`/`weight`) is built in -- `similar(Et, Complex{real(eltype(Et))}, ...)`
+rather than a host `ComplexF64` array, so a radial run on a device or in `Float32` is not
+handed host `Float64` matrices to multiply its state against.
 """
 spatialcollar(rg::Grid.RadialGrid, αr, grid, Et) = RadialCollar(
-    rg, αr, zeros(Complex{real(eltype(Et))}, (length(grid.ω), size(Et)[2:end]...)))
+    rg, αr, similar(Et, Complex{real(eltype(Et))}, (length(grid.ω), size(Et)[2:end]...)))
 spatialcollar(sg::Union{Grid.Free2DGrid, Grid.FreeGrid}, αr, grid, Et) = CartesianCollar(αr, Et)
 
 # --------------------------------------------------------------------------- application
