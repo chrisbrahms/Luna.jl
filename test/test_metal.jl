@@ -19,7 +19,7 @@
    a Float64 struct field or scalar which JLArrays and a Float32 `Array` silently promote
    fails here. Every branch which adds or changes a kernel runs this file. =#
 
-import Test: @test, @testset, @test_throws
+import Test: @test, @testset, @test_throws, @test_logs
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
              NonlinearRHS, PhysData, RK45, Stats, Boundaries, DeviceSpec, HostSpec,

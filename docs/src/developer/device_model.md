@@ -116,6 +116,105 @@ eighteen orders of magnitude above the subnormal threshold.
 
 The unscaling happens in one place only, the output boundary.
 
+## The response protocol
+
+A nonlinear response is still a callable `resp!(out, E, ρ)` which accumulates into `out`.
+What is new is a trait, [`Nonlinear.kind`](@ref Luna.Nonlinear.kind), which says *how*
+[`NonlinearRHS.Et_to_Pt!`](@ref Luna.NonlinearRHS.Et_to_Pt!) evaluates it. `Et_to_Pt!`
+walks the response list in order, takes the longest run of pointwise responses at a time
+and evaluates it as one broadcast, and applies everything else one response at a time.
+The first group written assigns into `Pt`; the rest accumulate, so the sequence of
+additions each element sees is the one the per-response loop produced.
+
+| kind | what the dispatcher does | what the response supplies | examples |
+| --- | --- | --- | --- |
+| [`Nonlinear.Pointwise`](@ref) | fuses it into one broadcast over the whole block with the other pointwise responses, no buffer | [`pointwise_kernel`](@ref Luna.Nonlinear.pointwise_kernel) (a `T -> T`), or [`pointwise_expr`](@ref Luna.Nonlinear.pointwise_expr) if it carries per-sample arrays | `KerrField`, `KerrEnv` (scalar field), `KerrEnvTHG` |
+| [`Nonlinear.VectorPointwise`](@ref) | two broadcasts, one per polarisation component, each fused across the group | [`vector_kernel`](@ref Luna.Nonlinear.vector_kernel) (an `(ex, ey) -> SVector{2}`), or [`vector_expr`](@ref Luna.Nonlinear.vector_expr) | `KerrField`, `KerrEnv` (two-component field) |
+| [`Nonlinear.Batched`](@ref) | calls it once with the whole `(nt, npol, ncols)` block | the call operator, plus its own full-size buffers in the run's array type | `HostResponse`; `PlasmaCumtrapz`, `RamanPolar*` after Group D |
+| [`Nonlinear.Columnwise`](@ref) | calls it once per column, on the host; refused on a device array | nothing — the default, so any callable works | anything user-written |
+
+Three functions carry the units and the precision:
+
+- [`Nonlinear.coefficients`](@ref Luna.Nonlinear.coefficients)`(r, ρ, scaling)` is the one
+  place a response's physical constants, the density and the powers of `E_ref`/`P_ref`
+  meet. It runs on the host, in `Float64`. [`Luna.polscale`](@ref)`(scaling, n)` gives the
+  factor for a response of polynomial degree `n` in the field (`Eref^(n-1)/Pref`): cubic
+  for Kerr, quadratic for χ⁽²⁾. A response with no single degree scales its intermediates
+  itself.
+- the kernel converts that scalar exactly once, with [`Luna.scalar`](@ref)`(E, c)`, so
+  nothing reachable from a device kernel is a `Float64`.
+- [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale)`(r, spec, scaling)` converts the
+  *arrays* a response carries (a carrier phase, a tabulated coefficient) to the run's
+  array type and precision, and is also where a columnwise response is wrapped for a
+  device run. A response whose coefficients are all scalars needs no method: the fallback
+  passes it through when [`resident_arrays`](@ref Luna.Nonlinear.resident_arrays) is
+  empty, and errors only when there is an array and no rule for moving it.
+
+**The response struct itself never enters a kernel.** Only the scalars the kernel captured
+and the arrays `rescale` converted do. That is why `KerrField` keeps its physical
+`Float64` `γ3` on a Metal run and the Metal tests check the *kernel's* element type rather
+than the struct's.
+
+A new scalar pointwise response is therefore three short methods (this is
+`SquareResponse` in `test/test_device.jl`):
+
+```julia
+struct SquareResponse{T}
+    c::T
+end
+Nonlinear.kind(::SquareResponse) = Nonlinear.Pointwise()
+Nonlinear.coefficients(r::SquareResponse, ρ, scaling) = ρ*r.c*Luna.polscale(scaling, 2)
+Nonlinear.pointwise_kernel(r::SquareResponse, E, ρ, scaling) =
+    (fac = Luna.scalar(E, Nonlinear.coefficients(r, ρ, scaling)); e -> fac*e^2)
+```
+
+The kernel must capture nothing but `isbits` scalars: it is the body of a broadcast which
+may be compiled for a GPU. A response which needs a per-sample array passes it as a second
+broadcast argument by overriding `pointwise_expr` instead, as `KerrEnvTHG` does with its
+carrier phase, and lists it in `resident_arrays` so the transform's residency assertion
+covers it.
+
+**Deviation from GPU_PLAN.md §4.3.** The plan describes the vector form as one broadcast
+returning an `SVector{2}` written through a `reinterpret`ed `(2, nt, ncols)` view of the
+output. Luna's buffers are `(nt, npol, ncols)` — the polarisation index is the *slow* axis
+— so there is no contiguous leading axis of length 2 to reinterpret, and producing one
+would mean a transpose and a buffer. The kernel contract is kept (the response returns an
+`SVector{2}` of the two lab-frame components); the dispatcher materialises it into the two
+output component views with one broadcast each, both fused across the whole pointwise
+group. For the two-component Kerr forms this is the same arithmetic, and the same number
+of passes, as the pair of broadcasts they were written as before.
+
+## The host fallback
+
+[`Nonlinear.HostResponse`](@ref Luna.Nonlinear.HostResponse) is what makes rule 6 of the
+kernel discipline concrete for responses, and what GPU_PLAN.md §3 means by keeping Luna
+hackable: a response written as a plain closure, in physical SI units, must not stop a
+user from running on a GPU.
+
+`rescale` wraps any [`Columnwise`](@ref Luna.Nonlinear.Columnwise) response in one as soon
+as the run is not host `Float64` in physical units, and logs one `@info` line per wrapped
+response at setup. The wrapper is `Batched`, so it receives the whole block, and at every
+right-hand side it
+
+1. copies the block to a host buffer in the run's element type, and multiplies by `E_ref`
+   into a `Float64`/`ComplexF64` buffer — physical units, double precision, which is what
+   the response was written for;
+2. zeroes its own polarisation buffer and calls the response on it column by column,
+   exactly as `Et_to_Pt!`'s `idcs` loop does;
+3. multiplies by `1/(P_ref E_ref)` into the staging buffer and copies it back up, then
+   adds it to the output.
+
+Five host-sized buffers and two copies per right-hand side, allocated on the first call
+(the block shape is not known at `rescale` time) and read back through a function barrier
+so the per-element code is still compiled for concrete types. The staging buffer exists
+because `copyto!` between a host array and a device array does not convert the precision.
+
+The simple interface deliberately does not use it: `prop_capillary` refuses an explicit
+`device`/`precision` request whose responses are not all
+[`device_capable`](@ref Luna.Nonlinear.device_capable), naming `device=:cpu`, rather than
+silently producing a run slower than the CPU. `device_capable` means "has a kernel of its
+own", i.e. `kind` is not `Columnwise`; it is about speed, not possibility.
+
 ## The output and statistics boundary
 
 `Output.jl` stays device-unaware: `MemoryOutput`/`HDF5Output` know how to save an array

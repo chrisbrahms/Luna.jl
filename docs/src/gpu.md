@@ -131,9 +131,11 @@ round 1".)
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-plasma, Raman and χ⁽²⁾ responses, and the radial, free-space and multimode transforms:
-`Luna.setup` refuses a device or a reduced precision for them, through the residency
-checks every transform and response makes, rather than running them wrongly.
+plasma, Raman and χ⁽²⁾ responses, and the radial, free-space and multimode transforms.
+`Luna.setup` refuses a device or a reduced precision for the *transforms*, through the
+residency checks each of them makes, rather than running them wrongly. A *response* is
+not refused: it falls back to the host copy described under "An ad hoc response on a
+device" below, which is correct and slow.
 
 The absorbing boundaries (`boundary=:rate`, `:legacy` and `:none`) and the default
 statistics *do* run with a device state, for the mode-averaged transform:
@@ -150,11 +152,29 @@ statistics *do* run with a device state, for the mode-averaged transform:
   therefore in physical units already, and is `ComplexF32` -- `eltype(y)` is what the
   output allocates with, not always `ComplexF64`.
 
-A nonlinear response which is a plain closure (the way an ad hoc response is usually
-written) still works on the default CPU path in double precision. On a device or in single
-precision it is refused, because its coefficients cannot be rescaled and its body is
-usually scalar code. The fallback which copies a column block to the host and runs it there
-is `gpu/12`.
+### An ad hoc response on a device
+
+A nonlinear response which is a plain closure `resp!(out, E, ρ)` (the way an ad hoc
+response is usually written) works everywhere, including on a GPU and in single
+precision. It is not run there: `Luna.setup` wraps it in a
+[`Nonlinear.HostResponse`](@ref Luna.Nonlinear.HostResponse), which at every right-hand
+side copies the whole field block to the host, converts it to physical SI units and
+`Float64`, calls the response column by column exactly as the CPU path does, converts the
+result back and adds it to the polarisation. One `@info` line at setup says which
+response this applies to.
+
+It is correct and slow. Two host copies and a host evaluation per right-hand side also
+serialise the step on a GPU, so a propagation whose dominant nonlinearity goes through
+this fallback will be slower than the same run on the CPU. It exists so that a response
+you wrote yourself does not stop you using a device at all, not as a way to run one
+quickly.
+
+Because of that, the *simple* interface refuses instead of falling back: an explicit
+`device` or `precision` request to `prop_capillary` with a response that has no device
+kernel of its own (plasma, Raman, χ⁽²⁾ at the moment) is an error naming `device=:cpu`. A
+call which does not mention `device` or `precision` is never affected — it stays on the
+CPU as it always did. Use the low-level interface (`Luna.setup`/`Luna.run`) if you really
+want the host fallback.
 
 ### `stats_period`
 

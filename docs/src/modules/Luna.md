@@ -50,6 +50,7 @@ Luna.assert_resident
 Luna.all_resident
 Luna.UnitScaling
 Luna.unitscaling
+Luna.polscale
 Luna.GridVectors
 Luna.gridvectors
 Luna.HostMirror
