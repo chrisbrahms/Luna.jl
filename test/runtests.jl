@@ -38,6 +38,15 @@ end
     include(joinpath(testdir, "test_rk45.jl"))
 end
 
+#= The device model. Needs JLArrays, which is in [extras]/[targets], so this runs under
+   `Pkg.test()` and skips its JLArray section otherwise. The Metal hardware tests are
+   test_metal.jl, which is not part of the suite: Metal is never installed with Luna, so
+   it is run from a separate environment (and from its own CI job). =#
+@testset "Device model" begin
+    @info("================= test_device.jl")
+    include(joinpath(testdir, "test_device.jl"))
+end
+
 @testset "Ionisation" begin
     @info("================= test_ionisation.jl")
     include(joinpath(testdir, "test_ionisation.jl"))

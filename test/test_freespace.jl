@@ -401,7 +401,7 @@ end
                                    normfun, responses, inputs; noise_field=nf)
     Eωo = zeros(ComplexF64, (length(rgrid.ωo), 1, q.N))
     Etk = zeros(Float64, (length(rgrid.to), 1, q.N))
-    NonlinearRHS.to_time!(Etk, nf, Eωo, transform.FT)
+    NonlinearRHS.to_time!(Etk, nf, Eωo, transform.IFT)
     @test size(transform.Et_noise) == size(Etk)
     @test transform.Et_noise ≈ Grid.to_rspace(q, Etk)
 end

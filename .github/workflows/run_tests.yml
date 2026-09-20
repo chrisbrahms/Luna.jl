@@ -23,3 +23,32 @@ jobs:
         uses: julia-actions/julia-buildpkg@v1
       - name: Run tests
         uses: julia-actions/julia-runtest@v1
+
+  # Metal hardware tests. Metal.jl is never a dependency of Luna, so it is installed into
+  # a throwaway environment stacked on the package rather than added to Project.toml, and
+  # only this job installs it. GitHub's Apple Silicon runners (macos-14 and later) expose
+  # a Metal device; test_metal.jl skips itself if Metal.functional() is false.
+  metal:
+    runs-on: macos-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@latest
+        with:
+          version: '1'
+          arch: 'default'
+      - name: Install Metal into a separate environment
+        run: |
+          julia --project=metalenv -e '
+            using Pkg
+            Pkg.develop(path=pwd())
+            Pkg.add(["Metal", "Test", "GPUArraysCore", "Adapt"])
+            Pkg.instantiate()'
+      - name: Run the Metal tests
+        run: |
+          julia --project=metalenv -t 1 -e '
+            using Luna, Metal
+            Luna.set_fftw_mode(:estimate)
+            Luna.set_fftw_threads(1)
+            Luna.set_fftw_wisdom(false)
+            include("test/test_metal.jl")'

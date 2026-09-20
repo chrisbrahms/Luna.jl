@@ -254,8 +254,13 @@ todevice(spec::DeviceSpec, x::AbstractArray{Bool}) =
 
 todevice(::DeviceSpec, ::Nothing) = nothing
 
-_adapt(::Type{Array}, x) = x
-_adapt(::Type{A}, x) where {A} = Adapt.adapt(A, x)
+#= The array type's own constructor rather than `Adapt.adapt`: not every GPU array
+   package defines an `Adapt.adapt_storage` rule for its bare array type (JLArrays does
+   not), and `Adapt.adapt` silently returns the host array when none exists, which would
+   put a host array into a device kernel. The constructor is the documented way to move
+   an array and every backend has it. =#
+_adapt(::Type{Array}, x::AbstractArray) = x
+_adapt(::Type{A}, x::AbstractArray) where {A} = A(x)
 
 _convertprec(::Type{T}, x::AbstractArray{T}) where {T<:AbstractFloat} = x
 _convertprec(::Type{T}, x::AbstractArray{<:AbstractFloat}) where {T} = convert(Array{T}, x)
