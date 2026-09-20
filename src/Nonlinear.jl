@@ -562,15 +562,146 @@ function KerrVector!(out, E, fac)
     out
 end
 
+#=================================================#
+#============  THE ANALYTIC SIGNAL  ==============#
+#=================================================#
+
+"""
+    AnalyticSignal(Et)
+
+The analytic signal of a real field block, as a batched operation on the array type of
+the prototype block `Et`: one complex FFT along the time axis, one broadcast against a
+filter vector, one inverse FFT. `Et` gives the shape, the precision and the array type;
+its contents are not read.
+
+Apply it with [`analytic!`](@ref). The two complex buffers and the filter are allocated
+here, so the per-call code allocates nothing and a transform's
+[`Luna.assert_resident`](@ref) check can see them through
+[`resident_arrays`](@ref).
+
+`Maths.plan_hilbert` is the same transform for a single host column. This is the form the
+batched responses use: whole-block, no scalar indexing, and no slice assignment (the
+factors 1, 2 and 0 are a vector the kernel broadcasts against), so it compiles for a
+device (GPU_PLAN.md §4.2). The `1/N` of the inverse transform is folded into that vector
+rather than applied as a separate pass, which is exact because Luna's time grids are
+powers of two; the result is bit-identical to `Maths.plan_hilbert`'s.
+"""
+struct AnalyticSignal{FTt, IFTt, Mt, Bt}
+    FT::FTt # complex forward plan along the time axis
+    IFT::IFTt # unnormalised backward plan (its 1/N is folded into `mask`)
+    mask::Mt # the analytic-signal filter, with 1/N folded in
+    c1::Bt # complex buffer: the field on the way in, the analytic signal on the way out
+    c2::Bt # complex buffer for the spectrum
+end
+
+function AnalyticSignal(Et)
+    CT = Complex{real(eltype(Et))}
+    c1 = fill!(similar(Et, CT), zero(CT))
+    c2 = similar(c1)
+    Utils.loadFFTwisdom()
+    FT = Utils.plan_ft(c1, 1)
+    IFT = Utils.plan_ift(FT)
+    Utils.saveFFTwisdom()
+    mask = Luna.upload_like(c1, _analytic_mask(size(Et, 1)) .* Utils.iscale(IFT))
+    AnalyticSignal(FT, Utils.iplan(IFT), mask, c1, c2)
+end
+
+resident_arrays(a::AnalyticSignal) = (a.mask, a.c1, a.c2)
+
+#= The factors which turn a spectrum into that of the analytic signal: the mean is kept,
+   the positive frequencies are doubled and the negative ones (and the Nyquist bin of an
+   even-length grid) are dropped. Exactly what `Maths.plan_hilbert!` does with three
+   slice assignments, as a vector instead. =#
+function _analytic_mask(n)
+    m = zeros(Float64, n)
+    m[1] = 1
+    m[2:(n÷2)] .= 2
+    m
+end
+
+"""
+    analytic!(a::AnalyticSignal, E) -> A
+
+The analytic signal of the real field block `E`, in `a`'s own buffer (which the next call
+overwrites). `E` must have the shape `a` was built for.
+"""
+function analytic!(a::AnalyticSignal, E)
+    a.c1 .= E
+    mul!(a.c2, a.FT, a.c1)
+    mask = a.mask
+    @. a.c2 *= mask
+    mul!(a.c1, a.IFT, a.c2)
+    a.c1
+end
+
+"""
+    KerrFieldNoTHG(γ3, n)
+
+Kerr response for a real (field-resolved) field with the third-harmonic term removed;
+built by `Kerr_field_nothg(γ3, n)`, where `n` is the length of the (oversampled) time
+grid. See [`KerrField`](@ref) for `γ3`.
+
+[`Batched`](@ref): removing THG needs the analytic signal of the whole column, so this is
+not a pointwise response. It owns an [`AnalyticSignal`](@ref) sized for the field block,
+which a transform replaces with one for the block it will actually pass by calling
+[`rescale`](@ref).
+"""
+struct KerrFieldNoTHG{T, At}
+    γ3::T
+    an::At # the analytic-signal transform, with the buffers
+    scaling::Luna.UnitScaling # units a direct call is in; the dispatcher passes its own
+end
+
 "Kerr response for real field but without THG"
-function Kerr_field_nothg(γ3, n)
-    E = Array{Float64}(undef, n)
-    hilbert = Maths.plan_hilbert(E)
-    Kerr = let γ3 = γ3, hilbert = hilbert
-        function Kerr(out, E, ρ)
-            out .+= ρ*3/4*ε_0*γ3.*abs2.(hilbert(E)).*E
-        end
-    end
+Kerr_field_nothg(γ3, n::Integer) =
+    KerrFieldNoTHG(γ3, AnalyticSignal(Array{Float64}(undef, n)), Luna.UNIT_SCALING)
+
+kind(::KerrFieldNoTHG) = Batched()
+kind(::KerrFieldNoTHG, ::Val) = Batched()
+
+resident_arrays(k::KerrFieldNoTHG) = resident_arrays(k.an)
+
+#= The same combined coefficient, in the same association, as the expression this
+   response used to be: `ρ*3/4*ε_0*γ3`, with the unit scaling (exactly 1 on every Float64
+   run) multiplied in last. =#
+coefficients(k::KerrFieldNoTHG, ρ, scaling) =
+    ρ*3/4*ε_0*k.γ3*Luna.polscale(scaling, 3)
+
+"""
+    rescale(k::KerrFieldNoTHG, spec, scaling, Et)
+
+A copy of the response whose analytic-signal transform is sized for the block `Et`, in its
+array type and precision.
+"""
+function rescale(k::KerrFieldNoTHG, spec, scaling, Et)
+    out = KerrFieldNoTHG(k.γ3, AnalyticSignal(Et), scaling)
+    Luna.assert_resident(spec, resident_arrays(out)...)
+    out
+end
+
+function batched!(k::KerrFieldNoTHG, out, E, ρ, scaling)
+    _checkbatchedblock(k, out, E, k.an.c1)
+    A = analytic!(k.an, E)
+    fac = Luna.scalar(E, coefficients(k, ρ, scaling))
+    @. out += fac*abs2(A)*E
+    out
+end
+
+(k::KerrFieldNoTHG)(out, E, ρ) = batched!(k, out, E, ρ, k.scaling)
+
+#= Shared by the batched responses in this file: a block of the shape their buffers were
+   built for, and an output of the same shape. A batched response cannot fall back to
+   anything else, so the message says how the buffers are sized. =#
+function _checkbatchedblock(r, out, E, proto)
+    size(out) == size(E) || throw(DimensionMismatch(
+        "$(nameof(typeof(r))): output block is $(size(out)), field block is $(size(E))"))
+    size(E) == size(proto) || error(
+        "$(nameof(typeof(r))) was given a $(join(size(E), "x")) field block but its "*
+        "buffers are $(join(size(proto), "x")). A batched response is called once with "*
+        "the whole block, so its buffers have to match it: call "*
+        "`Nonlinear.rescale(response, spec, scaling, Et)` with a prototype of the block "*
+        "(every transform does this at construction).")
+    nothing
 end
 
 """
@@ -1122,160 +1253,343 @@ function _plasma_loss!(J, E, Em, rate, fraction, closs)
     @. J += ifelse(Em^2 > 0, closs*rate*(1-fraction)/Em^2*E, zero(E))
 end
 
+#=================================================#
+#==========  THE RAMAN POLARISATION  =============#
+#=================================================#
+
 "Raman polarisation response type"
 abstract type RamanPolar end
 
-"Raman polarisation response type for a carrier resolved field"
-struct RamanPolarField{TR, Tt, Thv, Tω, Tv, FTt, HTt} <: RamanPolar
-    r::TR # Raman response
-    h::Tt # doubled buffer to hold response + padding
-    ht::Thv # buffer to hold time domain response
-    hω::Tω # the frequency domain Raman response function
-    Eω2::Tω # buffer to hold the Fourier transform of E^2
-    Pω::Tω # buffer to hold the frequency domain polarisation
-    E2::Tt # buffer to hold E^2
-    E2v::Tv # view into first half of E2
-    P::Tt # buffer to hold the time domain polarisation
-    Pout::Tt # buffer to hold the output portion of the time domain polarisation
-    FT::FTt # Fourier transform plan
-    HT::HTt # Hilbert transform
-    thg::Bool # do we include third harmonic generation
-    dt::Float64 # time step for scaling
-end
+#= Both Raman responses hold the same machinery, in the same order, and differ only in
+   how the field is squared (`_sqr!`) and in whether they carry an analytic-signal
+   transform. The fields are declared twice rather than shared through an inner struct so
+   that `R.hω`, `R.E2` and the rest stay where they have always been.
 
-"Raman polarisation response type for an envelope"
-struct RamanPolarEnv{TR, Tt, Thv, Tω, Tv, FTt} <: RamanPolar
-    r::TR # Raman response
-    h::Tt # doubled buffer to hold response + padding
-    ht::Thv # buffer to hold time domain response
-    hω::Tω # the frequency domain Raman response function
-    Eω2::Tω # buffer to hold the Fourier transform of E^2
-    Pω::Tω # buffer to hold the frequency domain polarisation
-    E2::Tω # buffer to hold E^2
-    E2v::Tv # view into first half of E2
-    P::Tω # buffer to hold the time domain polarisation
-    Pout::Tω # buffer to hold the output portion of the time domain polarisation
-    FT::FTt # Fourier transform plan
-    dt::Float64 # time step for scaling
+   The buffers are a doubled time grid: the response function occupies the first half and
+   the second half is zero padding, which makes the multiplication in the frequency
+   domain a full linear convolution rather than a circular one. See `batched!`. =#
+
+"""
+    RamanPolarField(t, r; thg=true)
+
+Raman polarisation response for a real (field-resolved) field on the (oversampled) time
+grid `t`, with the Raman response function `r` (see [`Raman.raman_response`](@ref
+Luna.Raman.raman_response)). With `thg=false` the third-harmonic part of the driving term
+is removed, which needs the analytic signal of the field.
+
+[`Batched`](@ref): the convolution is a transform of the whole block, so this is not a
+pointwise response. Per right-hand side it is one broadcast for the driving term, one
+forward and one inverse FFT along the time axis — batched over the block's columns —
+and one broadcast for the output.
+
+The response function itself is evaluated on the host, in `Float64`, by the callable `r`,
+and transformed there; only the result is converted to the run's precision and array
+type. That happens **only when the density changes**, so a run at constant pressure
+evaluates it once (it used to be evaluated at every right-hand side).
+
+# Fields
+- `r`: the Raman response function, as given. Host, `Float64`.
+- `nt`: the length of the time grid, i.e. of one column of the field block.
+- `E2`, `P`: doubled-length buffers for the driving term and for the convolution.
+- `Eω2`: the frequency-domain buffer, which also holds the frequency-domain product.
+- `hω`: the frequency-domain response function, normalised (see `_splitscale`) and in the
+  run's precision and array type. This is the only array of the kernel machinery a
+  device kernel touches.
+- `hhost`, `hωhost`, `hstage`, `FTh`: the host side of that kernel — the time-domain
+  buffer `r` fills, its transform in `Float64`, a staging copy in the run's precision
+  (`nothing` unless the run is on a device) and the host plan.
+- `an`: the [`AnalyticSignal`](@ref) of the driving term when `thg=false`, else `nothing`.
+"""
+struct RamanPolarField{TR, Tb, Tω, Tk, Thh, Tst, FTt, IFTt, FTht, At} <: RamanPolar
+    r::TR # the Raman response function (host, Float64)
+    nt::Int # length of the time grid
+    E2::Tb # doubled buffer holding the driving term in its first half
+    P::Tb # doubled buffer holding the convolution
+    Eω2::Tω # frequency-domain buffer for the driving term and the product
+    hω::Tk # frequency-domain response function, normalised, in the run's units
+    FT::FTt # forward plan over the doubled buffer
+    IFT::IFTt # unnormalised backward plan (its 1/N is folded into the coefficient)
+    hhost::Thh # host buffer the response function is evaluated into
+    hωhost::Vector{ComplexF64} # its transform, on the host in Float64
+    hstage::Tst # host staging copy in the run's precision, or nothing
+    FTh::FTht # host plan for `hhost`
+    iscale::Float64 # the 1/N of `IFT`
+    hsplit::Base.RefValue{Float64} # power of two `hω` is divided by
+    ρcache::Base.RefValue{Float64} # the density `hω` was built for
+    bcache::Base.RefValue{Float64} # the unit factor `hsplit` was chosen for
+    an::At # analytic-signal transform when thg=false, else nothing
+    thg::Bool # whether the third-harmonic part of the driving term is kept
+    dt::Float64 # the time step
+    scaling::Luna.UnitScaling # units a direct call is in; the dispatcher passes its own
 end
 
 """
-    RamanPolarField(t, ht; thg=true)
+    RamanPolarEnv(t, r)
 
-Construct Raman polarisation response for a field on time grid `t`
-using response function `r`. If `thg=false` then exclude the third
-harmonic generation component of the response.
+Raman polarisation response for an envelope field. Envelope counterpart of
+[`RamanPolarField`](@ref), which documents the fields and the batched contract; an
+envelope has no third-harmonic term to remove, so there is no `thg` keyword and no
+analytic signal.
 """
-function RamanPolarField(t, r; thg=true)
-    h = zeros(length(t)*2) # note double grid size, see explanation below
-    ht = view(h, 1:length(t))
+struct RamanPolarEnv{TR, Tb, Tω, Tk, Thh, Tst, FTt, IFTt, FTht} <: RamanPolar
+    r::TR
+    nt::Int
+    E2::Tb
+    P::Tb
+    Eω2::Tω
+    hω::Tk
+    FT::FTt
+    IFT::IFTt
+    hhost::Thh
+    hωhost::Vector{ComplexF64}
+    hstage::Tst
+    FTh::FTht
+    iscale::Float64
+    hsplit::Base.RefValue{Float64}
+    ρcache::Base.RefValue{Float64}
+    bcache::Base.RefValue{Float64}
+    dt::Float64
+    scaling::Luna.UnitScaling
+end
+
+RamanPolarField(t, r; thg=true) =
+    _ramanfield(r, Array{Float64}(undef, length(t)), t[2] - t[1], thg, Luna.UNIT_SCALING)
+
+RamanPolarEnv(t, r) =
+    _ramanenv(r, Array{ComplexF64}(undef, length(t)), t[2] - t[1], Luna.UNIT_SCALING)
+
+_ramanfield(r, Et, dt, thg, scaling) =
+    RamanPolarField(r, size(Et, 1), _ramanbufs(Et)...,
+                    thg ? nothing : AnalyticSignal(Et), thg, dt, scaling)
+
+_ramanenv(r, Et, dt, scaling) =
+    RamanPolarEnv(r, size(Et, 1), _ramanbufs(Et)..., dt, scaling)
+
+#= Buffers, plans and the host-side kernel machinery, in the order both structs declare
+   them (`E2` through `bcache`). =#
+function _ramanbufs(Et)
+    _checkramanpol(Et)
+    nt = size(Et, 1)
+    TT = eltype(Et)
+    CT = Complex{real(TT)}
+    cols = size(Et)[2:end]
+    #= A real field transforms as an rfft, an envelope as a full complex fft: the same
+       split `Utils.plan_ft` makes, and the same two cases as the buffers' element type. =#
+    nfreq = TT <: Real ? nt + 1 : 2nt
+    E2 = fill!(similar(Et, TT, (2nt, cols...)), zero(TT))
+    P = fill!(similar(Et, TT, (2nt, cols...)), zero(TT))
+    Eω2 = fill!(similar(Et, CT, (nfreq, cols...)), zero(CT))
+    hhost = zeros(_hosteltype(TT), 2nt)
     Utils.loadFFTwisdom()
-    FT = FFTW.plan_rfft(h, 1, flags=Luna.settings["fftw_flag"])
-    inv(FT)
+    #= The kernel plan is made first and, when the field buffer is the same kind of array
+       — the mode-averaged host run — used for that too. This response has always planned
+       once, on the kernel buffer, and applied that plan to both, so the mode-averaged
+       CPU arithmetic is exactly what it was. =#
+    FTh = Utils.plan_ft(hhost, 1)
+    FT = typeof(hhost) === typeof(E2) ? FTh : Utils.plan_ft(E2, 1)
+    IFT = Utils.plan_ift(FT)
     Utils.saveFFTwisdom()
-    hω = FT * h
-    Eω2 = similar(hω)
-    Pω = similar(hω)
-    E2 = similar(h)
-    E2v = view(E2, 1:length(t))
-    P = similar(h)
-    Pout = similar(t)
-    HT = Maths.plan_hilbert(Pout)
-    fill!(E2, 0.0)
-    RamanPolarField(r, h, ht, hω, Eω2, Pω, E2, E2v, P, Pout, FT, HT, thg, t[2] - t[1])
+    hω = fill!(similar(Et, CT, (nfreq,)), zero(CT))
+    #= `copyto!` between a host array and a device array does not convert the precision,
+       so a device run needs a host copy in the run's element type in between. A host run,
+       in either precision, converts inside the broadcast which writes `hω`. =#
+    hstage = Utils.isdevice(hω) ? zeros(CT, nfreq) : nothing
+    (E2, P, Eω2, hω, FT, Utils.iplan(IFT), hhost, zeros(ComplexF64, nfreq), hstage, FTh,
+     Utils.iscale(IFT), Ref(1.0), Ref(NaN), Ref(NaN))
+end
+
+function _checkramanpol(Et)
+    _npol(Et) == 1 || error("vector Raman not yet implemented")
+    nothing
+end
+
+kind(::RamanPolar) = Batched()
+kind(::RamanPolar, ::Val) = Batched()
+
+resident_arrays(R::RamanPolar) =
+    (R.E2, R.P, R.Eω2, R.hω, _analytic_arrays(R)...)
+
+_analytic_arrays(R::RamanPolarEnv) = ()
+_analytic_arrays(R::RamanPolarField) =
+    isnothing(R.an) ? () : resident_arrays(R.an)
+
+"""
+    rescale(R::RamanPolar, spec, scaling, Et)
+
+A copy of the Raman response with buffers, plans and frequency-domain response function
+sized for the block `Et`, in its array type and precision.
+
+Every transform calls this on its responses at construction, so the buffers always match
+the block the response is handed. The time axis has to be the one the response function
+was built on, which is what `Et` is checked against.
+
+The response function itself, and the host buffers it is evaluated into, stay on the host
+in `Float64` whatever the run: it is scalar code over a few dozen damped oscillators,
+evaluated once per density rather than once per right-hand side.
+"""
+function rescale(R::RamanPolarField, spec, scaling, Et)
+    _checkramangrid(R, Et)
+    out = _ramanfield(R.r, Et, R.dt, R.thg, scaling)
+    Luna.assert_resident(spec, resident_arrays(out)...)
+    out
+end
+
+function rescale(R::RamanPolarEnv, spec, scaling, Et)
+    _checkramangrid(R, Et)
+    out = _ramanenv(R.r, Et, R.dt, scaling)
+    Luna.assert_resident(spec, resident_arrays(out)...)
+    out
+end
+
+function _checkramangrid(R::RamanPolar, Et)
+    size(Et, 1) == R.nt || error(
+        "$(nameof(typeof(R))) was built for a time grid of $(R.nt) samples but the field "*
+        "block has $(size(Et, 1)). The Raman response function is tabulated on the time "*
+        "grid, so the two have to be the same: construct the response with `grid.to`.")
+    nothing
 end
 
 """
-    RamanPolarEnv(t, ht)
+    coefficients(R::RamanPolar, ρ, scaling) -> (hfac, ρ)
 
-Construct Raman polarisation response for an envelope on time grid `t`
-using response function `r`.
+The two scalars the Raman kernels need at number density `ρ`, in the units of `scaling`.
+
+`hfac` multiplies the product of the frequency-domain response function and the
+transformed driving term. It combines
+
+- the time step `dt`, which is the `dt dt df` the pair of transforms does not supply
+  (the `1/n` of the inverse transform is `dt df`, so one `dt` is left);
+- the `1/N` of the inverse transform, which is held unnormalised (GPU_PLAN.md §4.2
+  rule 6);
+- [`Luna.polscale`](@ref)`(scaling, 3)`, the response being cubic in the field;
+- the power of two the frequency-domain response function was divided by (`_splitscale`).
+
+`ρ` multiplies the convolution and the field, as it always has.
+
+Only valid once the response function is up to date for this `ρ` and `scaling`, which
+`batched!` does first: the power of two in `hfac` is chosen there.
 """
-function RamanPolarEnv(t, r)
-    h = zeros(length(t)*2) # note double grid size, see explanation below
-    ht = view(h, 1:length(t))
-    Utils.loadFFTwisdom()
-    FT = FFTW.plan_fft(h, 1, flags=Luna.settings["fftw_flag"])
-    inv(FT)
-    Utils.saveFFTwisdom()
-    hω = FT * h
-    Eω2 = similar(hω)
-    Pω = similar(hω)
-    E2 = similar(hω)
-    P = similar(hω)
-    Pout = Array{ComplexF64,}(undef,size(t))
-    E2v = view(E2, 1:length(t))
-    fill!(E2, 0.0)
-    RamanPolarEnv(r, h, ht, hω, Eω2, Pω, E2, E2v, P, Pout, FT, t[2] - t[1])
+coefficients(R::RamanPolar, ρ, scaling) = (_hfac(R, scaling), ρ)
+
+_hfac(R::RamanPolar, scaling) =
+    R.dt*Luna.polscale(scaling, 3)*R.iscale*R.hsplit[]
+
+#= Everything in `hfac` except the power of two, which is chosen against it. =#
+_unitfac(R::RamanPolar, scaling) = R.dt*Luna.polscale(scaling, 3)*R.iscale
+
+"""
+    _splitscale(hω, b) -> s
+
+The power of two the frequency-domain response function is divided by, given `b`, the
+rest of the scalar it will be multiplied by (`_unitfac`).
+
+The Raman constants are tiny in SI units — `K` in `Raman.RamanRespVibrational` is
+`(4πε₀)²(dα/dQ)²/(4μΩ)`, of order 1e-49 — and so is `b`, which carries `dt` and `1/N`.
+Their product is what the arithmetic needs, and it is fixed; but in `Float32` each factor
+has to be a normal number on its own, and neither is. `s` splits the smallness evenly
+between them, so that both land near the square root of the product and each has the
+widest margin against underflow it can have.
+
+Dividing and multiplying by a power of two is exact, and an FFT of an input scaled by one
+is the scaled FFT of the input, so this changes no `Float64` value anywhere: the default
+CPU path is bit-for-bit what it was.
+"""
+function _splitscale(hω, b)
+    m = maximum(abs, hω)
+    (isfinite(m) && m > 0 && isfinite(b) && b > 0) || return 1.0
+    exp2(clamp(round(Int, (log2(m) - log2(b))/2), -500, 500))
 end
 
-"Square the field or envelope"
-function sqr!(R::RamanPolarField, E)
-    if !R.thg
-        # see documentation for factor of 1/2 here
-        R.E2v .= 1/2 .* abs2.(R.HT(E))
+#= Evaluate the Raman response function on the host, transform it, and put it where the
+   kernel can reach it. Only when something it depends on has changed: the density (which
+   sets the dephasing time, and with it the whole response function) and the unit factor
+   the normalisation is chosen against. At constant pressure that is once per run. =#
+function _update_kernel!(R::RamanPolar, ρ, scaling)
+    b = _unitfac(R, scaling)
+    (R.ρcache[] == ρ && R.bcache[] == b) && return nothing
+    #= The response function goes into the first half of the doubled buffer, with time
+       zero in its first element: that is what keeps the convolution causal and puts no
+       delay between the field and the start of the response. The second half is the zero
+       padding, and is never written. =#
+    R.r(view(R.hhost, 1:R.nt), ρ)
+    mul!(R.hωhost, R.FTh, R.hhost)
+    R.hsplit[] = s = _splitscale(R.hωhost, b)
+    _sethω!(R.hω, R.hstage, R.hωhost, 1/s)
+    R.ρcache[] = ρ
+    R.bcache[] = b
+    nothing
+end
+
+_sethω!(hω, ::Nothing, hωhost, invs) = (@. hω = hωhost*invs; hω)
+
+function _sethω!(hω, stage, hωhost, invs)
+    @. stage = hωhost*invs
+    copyto!(hω, stage)
+    hω
+end
+
+"The driving term of the Raman response: the first half of `E2` is filled, the rest is
+the zero padding."
+function _sqr!(R::RamanPolarField, Et)
+    E2v = _firsthalf(R.E2, R.nt)
+    if isnothing(R.an)
+        @. E2v = Et^2
     else
-        R.E2v .= E.^2
+        # see the documentation for the factor of 1/2 here
+        A = analytic!(R.an, Et)
+        half = Luna.scalar(R.E2, 0.5)
+        @. E2v = half*abs2(A)
     end
+    nothing
 end
 
-function sqr!(R::RamanPolarEnv, E)
-    # see documentation for factor of 1/2 here
-    R.E2v .= 1/2 .* abs2.(E)
+@doc (@doc _sqr!)
+function _sqr!(R::RamanPolarEnv, Et)
+    # see the documentation for the factor of 1/2 here
+    E2v = _firsthalf(R.E2, R.nt)
+    half = Luna.scalar(R.E2, 0.5)
+    @. E2v = half*abs2(Et)
+    nothing
 end
 
-"Calculate Raman polarisation for field/envelope Et"
-function (R::RamanPolar)(out, Et, ρ)
-    # get the field as a 1D Array
-    n = size(Et, 1)
-    if ndims(Et) > 1
-        if size(Et, 2) == 1 # handle scalar case but within modal simulation
-            E = reshape(Et, n)
-        else
-            # handle vector case
-            error("vector Raman not yet implemented")
-        end
-    else
-        E = Et # handle straight scalar case
-    end
+"A view of the first `nt` samples along the time axis, for a block of any shape."
+_firsthalf(x::AbstractArray, nt) = view(x, 1:nt, ntuple(_ -> Colon(), ndims(x)-1)...)
 
-    # square the field or envelope in first half
-    # corresponding to the field/envelope grid size
-    sqr!(R, E)
+"""
+    batched!(R::RamanPolar, out, Et, ρ, scaling)
 
-    # update frequency domain response function `hω`.
-    # we fill only up to the first half of h (using the view ht)
-    # i.e. only the part corresponding to the original time grid
-    # note that the response function time 0 is put into the first element of the response array
-    # this ensures that causality is maintained, and no artificial delay between the field and
-    # the start of the response function occurs, at each convolution point.
-    R.r(R.ht, ρ)
-    R.hω .= R.FT * R.h
+Add the Raman polarisation driven by the field block `Et` at number density `ρ` to `out`.
 
-    # convolution by multiplication in frequency domain
-    # The double grid gives us accurate full convolution between the full field grid
-    # and full response function. It is unnecessary for highly damped responses, like
-    # in glass. But for gases with very long decay times it prevents artefacts due to
-    # truncation of the response function. There is likely a more efficient way. But
-    # this is safe, until we come up with one.
-    # we scale to correct for missing dt*dt*df from IFFT(FFT*FFT)
-    # the ifft already scales by 1/n = dt*df, so we need an additional dt
-    R.Eω2 .= R.FT * R.E2
-    @. R.Pω = R.hω * R.Eω2 * R.dt
-    R.P .= R.FT \ R.Pω
+The convolution is done by multiplication in the frequency domain on a doubled time grid.
+The doubling gives the full linear convolution of the field grid with the whole response
+function; it is unnecessary for a strongly damped response, as in glass, but for gases
+with long dephasing times it is what prevents the artefacts truncating the response would
+cause.
 
-    # calculate full polarisation, extracting only the valid
-    # grid region, which is the first length(E) part.
-    for i = 1:length(E)
-        R.Pout[i] = ρ*E[i]*R.P[i]
-    end
-
-    # copy to output in dimensions requested
-    if ndims(Et) > 1
-        out .+= reshape(R.Pout, size(Et))
-    else
-        out .+= R.Pout
-    end
+Both transforms are batched over the block's columns, so a multimode or free-space
+transform does one pair of FFTs per right-hand side rather than one pair per column.
+"""
+function batched!(R::RamanPolar, out, Et, ρ, scaling)
+    _checkbatchedblock(R, out, Et, _firsthalf(R.E2, R.nt))
+    _update_kernel!(R, ρ, scaling)
+    _sqr!(R, Et)
+    mul!(R.Eω2, R.FT, R.E2)
+    #= The product, in place: `Eω2` is the transform of the driving term on the way in and
+       the transform of the convolution on the way out. The backward transform overwrites
+       it, which is why nothing downstream reads it. =#
+    hfac = Luna.scalar(R.E2, _hfac(R, scaling))
+    hω = R.hω
+    Eω2 = R.Eω2
+    @. Eω2 = hω*Eω2*hfac
+    mul!(R.P, R.IFT, Eω2)
+    #= Only the first half of the convolution is on the field's own time grid; the rest is
+       the tail which the padding made room for. =#
+    ρc = Luna.scalar(Et, ρ)
+    Pv = _firsthalf(R.P, R.nt)
+    @. out += ρc*Et*Pv
+    out
 end
+
+(R::RamanPolar)(out, Et, ρ) = batched!(R, out, Et, ρ, R.scaling)
 
 end
