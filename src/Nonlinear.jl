@@ -1394,8 +1394,11 @@ function _ramanbufs(Et)
        so a device run needs a host copy in the run's element type in between. A host run,
        in either precision, converts inside the broadcast which writes `hω`. =#
     hstage = Utils.isdevice(hω) ? zeros(CT, nfreq) : nothing
+    #= `iscale` is exactly `1/2nt` and is kept in Float64 whatever the plan's precision:
+       everything in the coefficient is combined on the host in double precision and
+       converted once (GPU_PLAN.md 4.1). =#
     (E2, P, Eω2, hω, FT, Utils.iplan(IFT), hhost, zeros(ComplexF64, nfreq), hstage, FTh,
-     Utils.iscale(IFT), Ref(1.0), Ref(NaN), Ref(NaN))
+     Float64(Utils.iscale(IFT)), Ref(1.0), Ref(NaN), Ref(NaN))
 end
 
 function _checkramanpol(Et)

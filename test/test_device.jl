@@ -29,7 +29,7 @@
 import Test: @test, @testset, @test_throws, @test_logs, @inferred
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
-             NonlinearRHS, PhysData, RK45, Stats, Maths, Ionisation
+             NonlinearRHS, PhysData, RK45, Stats, Maths, Ionisation, Raman
 import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING
 import GPUArraysCore
 import AbstractFFTs
@@ -505,6 +505,22 @@ plasmafield(E0=6e10) = @. E0*exp(-PLASMA_T^2/(2*(10e-15/1.66)^2))*
 
 adkrate() = Ionisation.IonRateADK(:Ar)
 
+#= The pieces the Raman and no-THG tests share. A power-of-two grid, because that is what
+   `Grid.RealGrid`/`Grid.EnvGrid` produce and what makes the folded `1/N` exact; nitrogen
+   at 1 bar, which is the gas the regression matrix's Raman cases use. Building the
+   response function is the slow part (it sums a few dozen rotational levels), so the
+   tests build one per response rather than sharing a mutable one. =#
+const RAMAN_NT = 512
+const RAMAN_T = collect(range(-100e-15, 100e-15, length=RAMAN_NT))
+const RAMAN_ρ = PhysData.density(:N2, 1.0)
+
+ramanfield(E0=1e10) = @. E0*exp(-RAMAN_T^2/(2*(10e-15/1.66)^2))*
+                         cos(2π*PhysData.c/800e-9*RAMAN_T)
+
+ramanenvelope(E0=1e10) = complex.(@. E0*exp(-RAMAN_T^2/(2*(10e-15/1.66)^2)))
+
+ramanresp() = Raman.raman_response(RAMAN_T, :N2)
+
 #= A tabulated rate with the interface of a cached PPT rate, built here rather than from
    the shared cache: `IonRatePPTAccel(E, rate)` is the constructor the cache calls, the
    axis is uniform, and this takes milliseconds where pre-calculating a real PPT table
@@ -857,6 +873,109 @@ end
     @test trv.Pto_r == trt.Pto_r
 end
 
+#= The Raman and no-THG Kerr responses on the host: the batched contract, the kernel
+   cache, the unit scaling and the errors. The device side is below. =#
+@testset "the Raman and no-THG responses" begin
+    E = ramanfield()
+    for thg in (true, false)
+        R = Nonlinear.RamanPolarField(RAMAN_T, ramanresp(); thg)
+        @test Nonlinear.kind(R) isa Nonlinear.Batched
+        @test Nonlinear.kind(R, Val(1)) isa Nonlinear.Batched
+        @test Nonlinear.device_capable(R)
+        P = zeros(RAMAN_NT); R(P, E, RAMAN_ρ)
+        @test maximum(abs, P) > 0
+
+        #= The response function is evaluated only when the density changes. A second
+           call at the same density is the same answer; a call at another density is a
+           different one, and coming back gives the first answer again. =#
+        P2 = zeros(RAMAN_NT); R(P2, E, RAMAN_ρ)
+        @test P2 == P
+        @test R.ρcache[] == RAMAN_ρ
+        hω1 = copy(R.hω)
+        P3 = zeros(RAMAN_NT); R(P3, E, 2*RAMAN_ρ)
+        @test R.ρcache[] == 2*RAMAN_ρ
+        @test R.hω != hω1
+        P4 = zeros(RAMAN_NT); R(P4, E, RAMAN_ρ)
+        @test R.hω == hω1
+        @test P4 == P
+
+        #= The unit scaling: the same response on a state measured in `Eref`, with the
+           polarisation in `Pref*Eref`, is the same physical answer. `Eref` is a power of
+           two, so in `Float64` this is exact rather than approximate. =#
+        sc = UnitScaling(1024.0, PhysData.ε_0)
+        Rs = Nonlinear.rescale(R, HostSpec(), sc, E ./ sc.Eref)
+        Ps = zeros(RAMAN_NT)
+        Nonlinear.batched!(Rs, Ps, E ./ sc.Eref, RAMAN_ρ, sc)
+        @test maximum(abs, Ps.*(sc.Pref*sc.Eref) .- P)/maximum(abs, P) < 1e-14
+        # ... and the scaling moved the frequency-domain kernel, not the answer
+        @test Rs.hsplit[] != R.hsplit[]
+    end
+
+    # The same for the envelope response
+    Re = Nonlinear.RamanPolarEnv(RAMAN_T, ramanresp())
+    Ee = ramanenvelope()
+    Pe = zeros(ComplexF64, RAMAN_NT); Re(Pe, Ee, RAMAN_ρ)
+    @test maximum(abs, Pe) > 0
+    sc = UnitScaling(1024.0, PhysData.ε_0)
+    Res = Nonlinear.rescale(Re, HostSpec(), sc, Ee ./ sc.Eref)
+    Pes = zeros(ComplexF64, RAMAN_NT)
+    Nonlinear.batched!(Res, Pes, Ee ./ sc.Eref, RAMAN_ρ, sc)
+    @test maximum(abs, Pes.*(sc.Pref*sc.Eref) .- Pe)/maximum(abs, Pe) < 1e-14
+
+    # The no-THG Kerr response
+    k = Nonlinear.Kerr_field_nothg(PhysData.γ3_gas(:He), RAMAN_NT)
+    @test Nonlinear.kind(k) isa Nonlinear.Batched
+    @test Nonlinear.device_capable(k)
+    Pk = zeros(RAMAN_NT); k(Pk, E, RAMAN_ρ)
+    @test maximum(abs, Pk) > 0
+    ks = Nonlinear.rescale(k, HostSpec(), sc, E ./ sc.Eref)
+    Pks = zeros(RAMAN_NT)
+    Nonlinear.batched!(ks, Pks, E ./ sc.Eref, RAMAN_ρ, sc)
+    @test maximum(abs, Pks.*(sc.Pref*sc.Eref) .- Pk)/maximum(abs, Pk) < 1e-14
+
+    #= `AnalyticSignal` is the whole-block form of `Maths.plan_hilbert`, with the 1/N of
+       the inverse transform folded into the filter vector. Both are exact rescalings of
+       the same transform, so the two agree bit for bit. =#
+    an = Nonlinear.AnalyticSignal(E)
+    @test Nonlinear.analytic!(an, E) == Maths.plan_hilbert(E)(E)
+
+    #= A batched response is called with the whole block, so its buffers have to be the
+       block's shape: the block it was not built for is an error naming the fix, not a
+       silent wrong answer. =#
+    ncols = 3
+    E3 = zeros(RAMAN_NT, 1, ncols)
+    for i in 1:ncols; E3[:, 1, i] .= (0.5 + i/8) .* E; end
+    R = Nonlinear.RamanPolarField(RAMAN_T, ramanresp())
+    err = try; R(zeros(size(E3)), E3, RAMAN_ρ); nothing; catch e; e end
+    @test err isa ErrorException
+    @test occursin("RamanPolarField", err.msg)
+    @test occursin("rescale", err.msg)
+    # ... and rescaled for that block it runs, one column at a time being the same answer
+    R3 = Nonlinear.rescale(R, HostSpec(), UNIT_SCALING, E3)
+    P3 = zeros(size(E3)); R3(P3, E3, RAMAN_ρ)
+    for i in 1:ncols
+        Rc = Nonlinear.RamanPolarField(RAMAN_T, ramanresp())
+        Pc = zeros(RAMAN_NT); Rc(Pc, E3[:, 1, i], RAMAN_ρ)
+        @test maximum(abs, P3[:, 1, i] .- Pc)/maximum(abs, Pc) < 1e-12
+    end
+
+    # A time grid other than the one the response function is tabulated on
+    err = try
+        Nonlinear.rescale(R, HostSpec(), UNIT_SCALING, zeros(RAMAN_NT÷2))
+        nothing
+    catch e; e end
+    @test err isa ErrorException
+    @test occursin("time grid", err.msg)
+
+    # Vector Raman is still not implemented, and says so before it is run
+    err = try
+        Nonlinear.rescale(R, HostSpec(), UNIT_SCALING, zeros(RAMAN_NT, 2))
+        nothing
+    catch e; e end
+    @test err isa ErrorException
+    @test occursin("vector Raman", err.msg)
+end
+
 @testset "FFT planner dispatch" begin
     #= The host planner takes Luna's FFTW flags, the device planner must not (device FFT
        libraries reject them), and `plan_ift` splits the inverse into an unnormalised
@@ -957,6 +1076,32 @@ function plasmacase(spec; gas=:Ar, pres=1.0, energy=150e-6, flength=2e-3, λ0=80
     out, transform
 end
 
+
+#= A mode-averaged propagation in a Raman-active gas, the physics `prop_capillary` runs by
+   default for a molecular gas: Kerr plus the Raman polarisation. Fixed steps, so that the
+   only difference between two runs is the arithmetic. =#
+function ramancase(spec; gas=:N2, pres=1.0, energy=50e-6, flength=2e-3, λ0=800e-9,
+                   raman=true, precision=nothing)
+    grid = Grid.RealGrid(λ0, (200e-9, 3000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, gas, pres, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    if raman
+        resp = (resp...,
+                Nonlinear.RamanPolarField(grid.to, Raman.raman_response(grid.to, gas)))
+    end
+    linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                                   constβ=true, device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/10
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary=:none, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
 
 #= A pressure gradient. `LinearOps.make_linop` gives a z-dependent operator closure and
    `constβ` is left at its default of false, so this is the only case which exercises
@@ -1277,6 +1422,79 @@ end
           maximum(abs, plain["Eω"][:, end]) > 1e-3
 end
 
+@testset "Raman and the no-THG Kerr on JLArray" begin
+    E = ramanfield()
+    Ee = ramanenvelope()
+    ncols = 3
+    E3 = zeros(RAMAN_NT, 1, ncols)
+    for i in 1:ncols; E3[:, 1, i] .= (0.5 + i/8) .* E; end
+
+    cases = (("field, THG", () -> Nonlinear.RamanPolarField(RAMAN_T, ramanresp()), E),
+             ("field, no THG",
+              () -> Nonlinear.RamanPolarField(RAMAN_T, ramanresp(); thg=false), E),
+             ("envelope", () -> Nonlinear.RamanPolarEnv(RAMAN_T, ramanresp()), Ee),
+             ("several columns",
+              () -> Nonlinear.RamanPolarField(RAMAN_T, ramanresp()), E3))
+    for (nm, make, Eh) in cases
+        Rh = Nonlinear.rescale(make(), HostSpec(), UNIT_SCALING, Eh)
+        Ph = zeros(eltype(Eh), size(Eh)); Rh(Ph, Eh, RAMAN_ρ)
+
+        Ed = Luna.todevice(JLSpec, Eh)
+        Rd = Nonlinear.rescale(make(), JLSpec, UNIT_SCALING, Ed)
+        Pd = Luna.alloc(JLSpec, eltype(Eh), size(Eh))
+        Nonlinear.batched!(Rd, Pd, Ed, RAMAN_ρ, UNIT_SCALING)
+
+        @test Pd isa JLArray
+        @test Rd.E2 isa JLArray
+        @test Rd.hω isa JLArray
+        #= The response function is host scalar code: its buffers stay on the host
+           whatever the run, and the staging copy exists only because `copyto!` between
+           a host and a device array does not convert the precision. =#
+        @test Rd.hhost isa Vector
+        @test !(Rd.hhost isa JLArray)
+        @test Rd.hstage isa Vector{ComplexF64}
+        @test isnothing(Rh.hstage)
+        @test Luna.all_resident(JLSpec, Nonlinear.resident_arrays(Rd)...)
+        @test maximum(abs, Ph) > 0
+        @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-10
+    end
+
+    # The no-THG Kerr response, whose analytic signal is the same transform
+    kh = Nonlinear.Kerr_field_nothg(PhysData.γ3_gas(:He), RAMAN_NT)
+    Ph = zeros(RAMAN_NT); kh(Ph, E, RAMAN_ρ)
+    Ed = Luna.todevice(JLSpec, E)
+    kd = Nonlinear.rescale(kh, JLSpec, UNIT_SCALING, Ed)
+    Pd = Luna.alloc(JLSpec, Float64, size(E))
+    Nonlinear.batched!(kd, Pd, Ed, RAMAN_ρ, UNIT_SCALING)
+    @test kd.an.c1 isa JLArray
+    @test kd.an.mask isa JLArray{Float64, 1}
+    @test length(Nonlinear.resident_arrays(kd)) == 3 # the mask and the two buffers
+    @test Luna.all_resident(JLSpec, Nonlinear.resident_arrays(kd)...)
+    @test maximum(abs, Ph) > 0
+    @test maximum(abs, Array(Pd) .- Ph)/maximum(abs, Ph) < 1e-10
+end
+
+#= The exit condition of this branch on JLArray: a Raman gas propagated end to end
+   through `Luna.setup` and `Luna.run`, not by calling the response directly. =#
+@testset "Raman propagation on JLArray" begin
+    href, htr = ramancase(HostSpec())
+    dref, dtr = ramancase(JLSpec)
+    @test dtr.resp[2] isa Nonlinear.RamanPolarField
+    @test dtr.resp[2].E2 isa JLArray
+    @test dtr.resp[2].hω isa JLArray
+    @test size(dref["Eω"]) == size(href["Eω"])
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = dref["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+    end
+    #= The Raman response really contributes: without it the answer differs by far more
+       than the tolerance above, so this is not a comparison of two Kerr-only runs. =#
+    plain, _ = ramancase(HostSpec(); raman=false)
+    @test maximum(abs, href["Eω"][:, end] .- plain["Eω"][:, end])/
+          maximum(abs, plain["Eω"][:, end]) > 1e-3
+end
+
 #= The hackability fallback: a user-written columnwise closure, which knows nothing about
    devices, run through `HostResponse` on a JLArray propagation. =#
 @testset "a user closure response through HostResponse on JLArray" begin
@@ -1476,6 +1694,36 @@ end # have_jlarrays
         h = href["Eω"][:, idx]
         d = ComplexF64.(f32["Eω"][:, idx])
         @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
+    end
+end
+
+@testset "Raman in Float32 on the CPU" begin
+    href, _ = ramancase(HostSpec())
+    f32, tr32 = ramancase(DeviceSpec(Array, Float32))
+    R = tr32.resp[2]
+    @test R isa Nonlinear.RamanPolarField
+    @test R.E2 isa Vector{Float32}
+    @test R.hω isa Vector{ComplexF32}
+    @test R.hωhost isa Vector{ComplexF64} # the host side stays double precision
+
+    #= The dynamic-range case for this branch. The frequency-domain response function is
+       around 1e-45 in SI units: as computed it is not a Float32 number at all, it is
+       below the smallest subnormal, and a device flushes it to zero. `_splitscale` moves
+       a power of two out of it and into the scalar it is multiplied by, leaving both
+       normal with many orders to spare and the product unchanged. =#
+    ρ = PhysData.density(:N2, 1.0)
+    @test maximum(abs, R.hωhost) < floatmin(Float32) # unsplit: not a Float32 number
+    @test R.hsplit[] != 1 # ... so the split is doing something
+    hfac = Luna.scalar(R.E2, Nonlinear.coefficients(R, ρ, tr32.scaling)[1])
+    @test hfac isa Float32
+    @test floatmin(Float32) < abs(hfac) < floatmax(Float32)
+    @test floatmin(Float32) < maximum(abs, R.hω) < floatmax(Float32)
+
+    @test eltype(f32["Eω"]) === ComplexF32
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = ComplexF64.(f32["Eω"][:, idx])
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-4
     end
 end
 
