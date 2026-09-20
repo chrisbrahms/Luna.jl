@@ -328,6 +328,11 @@ branch does and none from this branch.
 - **`Chi2Field`/`Chi2Env` still keep `χ2` and `toLab`, which the response does not use.**
   They are read by `test_chi2.jl` and by `examples/.../chi2_benchmarking.jl`, so they
   stay. They cost nothing — the struct is `isbits` and never enters a kernel whole.
+- **`import LinearAlgebra: mul!` in `Nonlinear.jl` is now unused.** The χ⁽²⁾ responses
+  were its last users (`ldiv!` and `MArray` on the same two import lines were already
+  unused before this branch). It is left alone: removing it is a drive-by cleanup on a
+  line `gpu/14-raman` is likely to need when its batched response gains an FFT, and it
+  would conflict for nothing.
 - **Gas χ⁽²⁾ mixtures, and a χ⁽²⁾ response with a z-dependent tensor**, are not addressed;
   neither exists in Luna.
 - **`examples/low_level_interface/freespace/chi2_benchmarking.jl` is not updated.** It
