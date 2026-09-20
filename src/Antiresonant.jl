@@ -5,7 +5,8 @@ import Printf: @sprintf
 import Luna: Capillary
 import Luna.PhysData: c, wlfreq, ref_index_fun
 @reexport using Luna.Modes
-import Luna.Modes: AbstractMode, dimlimits, neff, field, Aeff, N, α, chkzkwarg
+import Luna.Modes: AbstractMode, dimlimits, neff, field, Aeff, N, α, chkzkwarg,
+                   zconstant, azimuthal_order
 
 struct ZeisbergerMode{mT<:Capillary.MarcatiliMode, LT} <: AbstractMode
     m::mT
@@ -45,7 +46,7 @@ wraptype(loss) = throw(
 neff(m::ZeisbergerMode, ω; z=0) = _neff(m.m, ω, m.wallthickness, m.loss; z=z)
 
 # All other mode properties are identical to a MarcatiliMode
-for fun in (:Aeff, :field, :N, :dimlimits)
+for fun in (:Aeff, :field, :N, :dimlimits, :zconstant, :azimuthal_order)
     @eval ($fun)(m::ZeisbergerMode, args...; kwargs...) = ($fun)(m.m, args...; kwargs...)
 end
 
@@ -160,7 +161,7 @@ neff(m::VincettiMode, ω; z=0) = neff_real(m, ω; z) + 1im*c/ω*α(m, ω; z)
 α(m::VincettiMode{mT, cT, <:Number}, ω; z=0) where {mT, cT} = m.loss * log(10)/10 * CL(m, ω; z)
 
 # All other mode properties are identical to a MarcatiliMode
-for fun in (:field, :N, :dimlimits)
+for fun in (:field, :N, :dimlimits, :zconstant, :azimuthal_order)
     @eval ($fun)(m::VincettiMode, args...; kwargs...) = ($fun)(m.m, args...; kwargs...)
 end
 

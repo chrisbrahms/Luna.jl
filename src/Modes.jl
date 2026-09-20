@@ -8,6 +8,7 @@ import Luna.PhysData: c, ε_0, μ_0
 import Memoize: @memoize
 import LinearAlgebra: mul!
 import DSP: unwrap
+import QuadGK
 
 export dimlimits, neff, β, α, losslength, transmission, dB_per_m, dispersion, zdw, field, Exy, Aeff, @delegated, @arbitrary, chkzkwarg
 
@@ -530,6 +531,306 @@ function to_space(Emω, xs, ms; components=:xy, z=0.0)
     to_space!(Erω, Emω, xs, ts, z=z)
     Erω
 end
+
+#=================================================#
+#===  MODE MATRICES AND TRANSVERSE QUADRATURE  ===#
+#=================================================#
+
+"""
+    zconstant(m::AbstractMode)
+
+Trait: `true` if the transverse field profile ([`field`](@ref)/[`Exy`](@ref)) and the
+[`dimlimits`](@ref) of `m` do not depend on `z`, so that a transform may evaluate them
+once and reuse the result for the whole propagation.
+
+The conservative default is `false`, which makes
+[`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed) rebuild its mode
+matrices whenever `z` changes. That is correct but expensive: it costs `nmodes × npol ×
+npts` evaluations of [`field`](@ref) plus one [`N`](@ref) per mode per `z`, and `N` is a
+2-D cubature for a mode type which does not define it in closed form. Mode types with
+`z`-independent geometry override it; [`Capillary.MarcatiliMode`](@ref
+Luna.Capillary.MarcatiliMode) does so when its core radius is a number rather than a
+function of `z`.
+
+Only the *transverse* profile is meant: a mode whose `neff` depends on `z` (a pressure
+gradient) but whose field shape does not is `zconstant`.
+"""
+zconstant(m::AbstractMode) = false
+
+"""
+    azimuthal_order(m::AbstractMode)
+
+The highest azimuthal harmonic present in the Cartesian field components of `m`, or
+`nothing` if it is not known. Used by
+[`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed) to check that the
+periodic-trapezoid rule in θ has enough nodes to integrate the cubic products of the modes
+exactly; see [`transverse_quadrature`](@ref).
+
+`nothing` (the default) means the check is skipped.
+"""
+azimuthal_order(m::AbstractMode) = nothing
+
+"""
+    mode_matrix(ms, indices, xs; z=0.0)
+    mode_matrix(ms, indices, q::TransverseQuadrature; z=0.0)
+
+The normalised transverse mode fields ([`Exy`](@ref)) of the modes `ms` at the transverse
+coordinates `xs` (a vector of `(x1, x2)` tuples) or at the nodes of the quadrature rule
+`q`, as an `Array{Float64, 3}` of size `(nmodes, npol, npts)`. `indices` selects the
+polarisation components, as in [`ToSpace`](@ref): `1:2`, `1` or `2`.
+
+This is the batched form of what [`to_space!`](@ref) does one point at a time, and it is
+laid out so that `reshape(out, nmodes, npol*npts)` is the synthesis matrix `S` of a field
+block with Luna's `(nt, npol, npts)` column order (polarisation fastest):
+`E[t, p, i] = Σₘ Eₘ(t) S[m, p + (i-1)npol]`.
+
+Points outside the [`dimlimits`](@ref) of `ms[1]` at `z` are filled with zeros, as
+[`to_space!`](@ref) does — including a negative polar radius, which [`to_space!`](@ref)
+raises on instead.
+
+The normalisation constant [`N`](@ref) is evaluated once per mode rather than once per
+point, which is what [`Exy`](@ref) would do.
+"""
+mode_matrix(ms, indices, xs::AbstractVector; z=0.0) =
+    mode_matrix!(Array{Float64, 3}(undef, length(ms), length(indices), length(xs)),
+                 ms, indices, xs; z)
+
+"""
+    mode_matrix!(out, ms, indices, xs; z=0.0)
+
+Fill `out`, an `(nmodes, npol, npts)` array, with the mode matrix; see
+[`mode_matrix`](@ref). `npts` is taken from `out`, so `xs` may be longer (a buffer of
+coordinates of which only the first `npts` are used).
+"""
+function mode_matrix!(out, ms, indices, xs; z=0.0)
+    #= `ToSpace` stores a single component as a bare `Int`, which is not iterable. =#
+    comps = indices isa Integer ? (indices:indices) : indices
+    size(out) == (length(ms), length(comps), size(out, 3)) || throw(DimensionMismatch(
+        "mode matrix is $(size(out)) for $(length(ms)) modes and "*
+        "$(length(comps)) polarisation components"))
+    npts = size(out, 3)
+    length(xs) >= npts || throw(DimensionMismatch(
+        "$(length(xs)) coordinates for a mode matrix with $npts points"))
+    dimlims = dimlimits(ms[1], z=z)
+    for (im, m) in enumerate(ms)
+        # one normalisation constant per mode and z, rather than one per point
+        Nm = sqrt(N(m, z=z))
+        for ip in 1:npts
+            xi = xs[ip]
+            if _outside(dimlims, xi)
+                for ic in eachindex(comps)
+                    out[im, ic, ip] = 0
+                end
+                continue
+            end
+            E = field(m, xi, z=z)
+            for (ic, comp) in enumerate(comps)
+                out[im, ic, ip] = E[comp]/Nm
+            end
+        end
+    end
+    out
+end
+
+#= The same test `to_space!` makes, except that a negative polar radius is treated as
+   outside rather than raised on: the one caller which can produce one is the adaptive
+   cubature driver, which discards those points anyway (they are on or outside the
+   boundary), and it has never raised. =#
+function _outside(dimlims, xs)
+    if dimlims[1] == :polar
+        return (xs[1] < 0) || (xs[1] >= dimlims[3][1])
+    end
+    (xs[1] <= dimlims[2][1]) || (xs[1] >= dimlims[3][1]) ||
+        (xs[2] <= dimlims[2][2]) || (xs[2] >= dimlims[3][2])
+end
+
+"""
+    TransverseQuadrature
+
+A fixed quadrature rule on the transverse plane of a mode collection, stored on a
+reference domain so that it can be mapped to any [`dimlimits`](@ref) — in particular to a
+`z`-dependent core radius. Node `p = i + (j-1)*nr` is node `i` of the first coordinate and
+node `j` of the second.
+
+- polar (`kind == :polar`): the first coordinate is `r/a ∈ (0, 1)` (Gauss–Legendre, or
+  Gauss–Kronrod when an embedded error estimate is wanted); the second is `θ` (a periodic
+  trapezoid rule with `nθ` nodes) for `full=true`, or the single node `θ = 0` with weight
+  `2π` for `full=false`, where the integrand is assumed azimuthally symmetric.
+- cartesian (`kind == :cartesian`): both coordinates are Gauss–Legendre on `[-1, 1]`,
+  mapped affinely onto the rectangle.
+
+`w1`/`w2` are the weights of the fine rule and `wc1`/`wc2` those of the embedded coarse
+rule — the Gauss subset of a Kronrod rule in the first coordinate, every other node in θ.
+Where there is no embedded rule the coarse weights are equal to the fine ones, and the
+error estimate built from them is identically zero
+([`NonlinearRHS.has_error_estimate`](@ref Luna.NonlinearRHS.has_error_estimate)).
+
+See [`transverse_quadrature`](@ref), [`quadrature_nodes`](@ref),
+[`quadrature_weights`](@ref) and [`mode_matrix`](@ref).
+"""
+struct TransverseQuadrature
+    kind::Symbol
+    full::Bool
+    nr::Int
+    nθ::Int
+    kronrod::Bool
+    ξ1::Vector{Float64}
+    w1::Vector{Float64}
+    wc1::Vector{Float64}
+    ξ2::Vector{Float64}
+    w2::Vector{Float64}
+    wc2::Vector{Float64}
+end
+
+Base.length(q::TransverseQuadrature) = length(q.ξ1)*length(q.ξ2)
+
+function Base.show(io::IO, q::TransverseQuadrature)
+    print(io, "TransverseQuadrature($(q.kind), full=$(q.full), nr=$(q.nr), "*
+              "nθ=$(q.nθ), kronrod=$(q.kronrod))")
+end
+
+"""
+    transverse_quadrature(kind, full; nr, nθ=16, kronrod=false)
+    transverse_quadrature(dimlimits, full; kwargs...)
+
+Construct a [`TransverseQuadrature`](@ref) for `kind ∈ (:polar, :cartesian)`, or for the
+kind of a [`dimlimits`](@ref) tuple.
+
+`nr` is the number of nodes along the first coordinate. With `kronrod=true` it is rounded
+up to an odd number `2n+1` and the rule is the `(2n+1)`-point Kronrod extension of the
+`n`-point Gauss rule, whose Gauss subset provides the embedded coarse weights; the fine
+rule is then a Kronrod rule rather than a Gauss rule, which for a smooth integrand is less
+accurate than the Gauss rule with the same number of nodes.
+
+`nθ` is the number of nodes along the second coordinate, ignored for polar `full=false`.
+The θ rule is the periodic trapezoid, which is exact for every azimuthal harmonic below
+`nθ`; a cubic response of modes of azimuthal order up to `h`, projected back onto a mode
+of order `h`, has harmonics up to `4h`, so `nθ ≥ 4h + 1` is needed for the rule to be
+exact (see [`azimuthal_order`](@ref)). An even `nθ ≥ 4` also gives the embedded coarse
+rule in θ.
+"""
+function transverse_quadrature(kind::Symbol, full::Bool; nr, nθ=16, kronrod=false)
+    kind in (:polar, :cartesian) || error(
+        "unknown transverse quadrature kind $kind; expected :polar or :cartesian")
+    (kind == :cartesian && !full) && error(
+        "cartesian modes need the full 2-D quadrature rule (full=true)")
+    nr >= 2 || throw(DomainError(nr, "nr must be at least 2"))
+    nθ >= 1 || throw(DomainError(nθ, "nθ must be at least 1"))
+    if kronrod
+        n = max(cld(nr - 1, 2), 1) # smallest n with 2n+1 >= nr
+        #= QuadGK.kronrod(n) returns the n+1 Kronrod nodes with x <= 0 in ascending order
+           (so xk[end] == 0), their weights, and the embedded n-point Gauss weights for
+           the nodes xk[2:2:end]. The rule is symmetric, so the other n nodes are the
+           mirror images. =#
+        xk, wk, gw = QuadGK.kronrod(n)
+        x = vcat(xk, -reverse(xk[1:end-1]))
+        w = vcat(wk, reverse(wk[1:end-1]))
+        wc = zeros(length(x))
+        for (k, i) in enumerate(2:2:length(xk))
+            wc[i] = gw[k]
+            #= For odd n the last Gauss node is x = 0, whose mirror index is itself: the
+               weight is written twice with the same value rather than doubled, which is
+               what the embedded rule needs. =#
+            wc[length(x) + 1 - i] = gw[k]
+        end
+        nr = length(x)
+    else
+        x, w = QuadGK.gauss(nr)
+        wc = copy(w)
+    end
+    if kind == :polar
+        # map [-1, 1] -> [0, 1], which is r/a
+        ξ1 = @. (x + 1)/2
+        w1 = @. w/2
+        wc1 = @. wc/2
+        if full
+            Δθ = 2π/nθ
+            ξ2 = [(j - 0.5)*Δθ for j in 1:nθ]
+            w2 = fill(Δθ, nθ)
+            #= The coarse θ rule is the same trapezoid on every other node. It exists only
+               for an even number of nodes (and is pointless for two). =#
+            wc2 = (iseven(nθ) && nθ >= 4) ? [isodd(j) ? 2Δθ : 0.0 for j in 1:nθ] : copy(w2)
+        else
+            nθ = 1
+            ξ2 = [0.0]
+            w2 = [2π]
+            wc2 = [2π]
+        end
+    else
+        ξ1 = collect(x); w1 = collect(w); wc1 = collect(wc)
+        xy, wy = QuadGK.gauss(nθ)
+        ξ2 = collect(xy); w2 = collect(wy); wc2 = copy(w2)
+    end
+    TransverseQuadrature(kind, full, nr, nθ, kronrod, ξ1, w1, wc1, ξ2, w2, wc2)
+end
+
+transverse_quadrature(dimlimits::Tuple, full::Bool; kwargs...) =
+    transverse_quadrature(dimlimits[1], full; kwargs...)
+
+"""
+    quadrature_nodes(q::TransverseQuadrature, dimlimits)
+
+The physical coordinates `(x1, x2)` of the nodes of `q` on the domain `dimlimits` (as
+returned by [`dimlimits`](@ref)), in node order.
+"""
+function quadrature_nodes(q::TransverseQuadrature, dimlimits)
+    kind, ll, ul = dimlimits
+    kind == q.kind || error(
+        "quadrature kind $(q.kind) does not match the dimlimits kind $kind")
+    out = Vector{NTuple{2, Float64}}(undef, length(q))
+    p = 0
+    if kind == :polar
+        a = ul[1]
+        for θ in q.ξ2, ξ in q.ξ1
+            p += 1
+            out[p] = (a*ξ, θ)
+        end
+    else
+        xc = (ul[1] + ll[1])/2; xh = (ul[1] - ll[1])/2
+        yc = (ul[2] + ll[2])/2; yh = (ul[2] - ll[2])/2
+        for η in q.ξ2, ξ in q.ξ1
+            p += 1
+            out[p] = (xc + xh*ξ, yc + yh*η)
+        end
+    end
+    out
+end
+
+"""
+    quadrature_weights(q::TransverseQuadrature, dimlimits; coarse=false)
+
+The area weights of the nodes of `q` on the domain `dimlimits`, in node order, including
+the Jacobian and the `2π` azimuthal factor of a radial rule. `coarse=true` gives the
+weights of the embedded coarse rule; see [`TransverseQuadrature`](@ref).
+"""
+function quadrature_weights(q::TransverseQuadrature, dimlimits; coarse=false)
+    kind, ll, ul = dimlimits
+    kind == q.kind || error(
+        "quadrature kind $(q.kind) does not match the dimlimits kind $kind")
+    w1 = coarse ? q.wc1 : q.w1
+    w2 = coarse ? q.wc2 : q.w2
+    out = Vector{Float64}(undef, length(q))
+    p = 0
+    if kind == :polar
+        a = ul[1]
+        for wθ in w2, (ξ, wξ) in zip(q.ξ1, w1)
+            p += 1
+            out[p] = a^2*ξ*wξ*wθ # r dr dθ with r = aξ
+        end
+    else
+        xh = (ul[1] - ll[1])/2
+        yh = (ul[2] - ll[2])/2
+        for wη in w2, wξ in w1
+            p += 1
+            out[p] = xh*yh*wξ*wη
+        end
+    end
+    out
+end
+
+@doc (@doc mode_matrix)
+mode_matrix(ms, indices, q::TransverseQuadrature; z=0.0) =
+    mode_matrix(ms, indices, quadrature_nodes(q, dimlimits(ms[1], z=z)); z)
 
 struct DelegatedMode{mT, idT} <: AbstractMode
     mode::mT # wrapped mode
