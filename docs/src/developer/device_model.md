@@ -268,9 +268,9 @@ host array, and Metal refuses to compile the kernel. That failure is loud and im
 not a silently wrong answer, but `Chi2Env` does need `rescale` — which is what
 `resident_arrays` and the transform's residency assertion are for.
 
-The χ⁽²⁾ transforms themselves — the free-space ones — are host-only until Group E, so the
-responses are exercised on a device block directly (`test_device.jl`, `test_metal.jl`)
-rather than through a propagation.
+The χ⁽²⁾ transforms themselves — the Cartesian free-space ones — are host-only until
+`gpu/21`, so the responses are exercised on a device block directly (`test_device.jl`,
+`test_metal.jl`) rather than through a propagation.
 
 ## The host fallback
 
@@ -647,6 +647,116 @@ so is the `Float64` propagation.
 
 `RamanPolarField(t, r; thg=false)` uses the same transform for its driving term.
 
+## The radial transform
+
+[`NonlinearRHS.TransRadial`](@ref Luna.NonlinearRHS.TransRadial) is the first transform
+with more than one transverse column, and the first one whose per-step work includes a
+matrix multiply. Per right-hand side it is
+
+1. one inverse FFT over the time axis, batched over the `(npol, nr)` columns;
+2. one matrix multiply, k-space to real space;
+3. the response protocol on the whole `(nto, npol, nr)` block;
+4. one broadcast for the temporal apodisation;
+5. one matrix multiply, real space back to k-space;
+6. one forward FFT;
+7. one broadcast for the frequency-domain normalisation.
+
+**The Hankel step is one GEMM per direction**, on the block reshaped to `(nto·npol, nr)`
+([`Grid.radial_matmul!`](@ref Luna.Grid.radial_matmul!)), where it used to be one `mul!`
+per polarisation component on a `view`. On a device that is the difference between the
+accelerated matrix multiply and a fallback: MPSGraph's matmul needs plain zero-offset
+operands of equal element type, and a `view` is neither (it becomes an `MtlMatrixOperand`
+and reaches only the native kernels, which for complex operands are scalar). The transform
+therefore holds its own copies of [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid)'s `Tfwd`
+and `Tbwd` **in the time-domain element type** -- `Float32`/`Float64` on a `RealGrid`,
+complex on an `EnvGrid` -- rather than the grid's `Float64` ones.
+
+For one polarisation component the reshaped operand is the same matrix, with the same
+leading dimension, as the view was, so the CPU result is bit-identical; for two the
+summation order may differ, and it is measured at 1e-14 relative in `test_device.jl`. The
+regression gate's two radial cases are unchanged to the last bit
+(`gpu/20-radial-device`).
+
+`Grid.radial_matmul!` allows `out === A` and makes one copy when it is, which is how the
+noise setup and the transverse collar use it; nothing per step does.
+
+**The frequency-domain normalisation** is one fused broadcast over a precombined vector
+`prefac = ωwin·(-iω)·Pref` and the normalisation array, written in the same association as
+the expression it replaces (`pre ./ (2 .* norm)`), with the `2` converted by
+[`Luna.scalar`](@ref). `Pref` is folded into `prefac` rather than into the normalisation,
+which stays physical.
+
+### The free-space normalisation
+
+[`NonlinearRHS.FreeSpaceNorm`](@ref) is shared by the radial and both Cartesian free-space
+transforms, and is device-capable for all three even though only the radial one has a
+device path so far.
+
+The isotropic fill is one broadcast over
+
+- `n(ω)`, evaluated on the host by scalar code (a Sellmeier equation, or a user's
+  function) into a `(Nω, Npol)` [`Luna.HostMirror`](@ref) and uploaded once per call. It is
+  host code and does not need a kernel: it runs once per `z`, not once per element.
+- mirrors of `ω` and `grid.sidx`, `(Nω,)`, and of `kperp2` and the k-space window,
+  reshaped to `(1, 1, Nk...)` so that they broadcast against the `(Nω, Npol, Nk...)`
+  output.
+
+The kernel is `normfactor` with every constant converted to the element type: `c`, `μ₀`,
+`κmax` and `ℓ` are captured scalars, and `βz` is written as
+`βsq < 0 ? complex(0, -√-βsq) : complex(√βsq, 0)` rather than with an `im` literal, which
+is a `Complex{Int}`. Out of band and at `ω = 0` it returns exactly 1, which is what the
+loop it replaces assigned.
+
+**The k-window mirror is rebuilt lazily.** `Boundaries.setup` calls
+[`NonlinearRHS.reflength!`](@ref) *after* the transform exists, to set `ℓ`, `κmax` and the
+k-space absorber profile; that invalidates the mirror, and the next `fillnorm!` refills it.
+Nothing else the kernel broadcasts against changes after construction.
+
+The **crystal-optics** variant, whose per-`(ω, kx)` root-finding for the internal angle is
+host scalar code with no kernel, stays on the host and copies its result up through a
+staging buffer. It is reached only from the Cartesian transforms, which are host-only until
+`gpu/21`.
+
+Because the normalisation is a positional argument of `Luna.setup` -- every low-level
+radial script builds one before it knows what device the run will use --
+[`NonlinearRHS.retarget`](@ref) rebuilds it for the run's spec, carrying over anything
+`reflength!` has already set. `norm_radial`/`norm_free`/`norm_free2D` and the `const_`
+variants also take a `spec` keyword directly. Anything which is not a `FreeSpaceNorm` (a
+user's own `normfun(z)`) is accepted only for the default host `Float64` path.
+
+### The transverse collar
+
+[`Boundaries.RadialCollar`](@ref) holds adapted copies of the same two matrices in the
+**complex spectral** type (it is applied to `Eω` directly, the collar being diagonal in ω),
+the absorption rate and the radial integration weights in the state's real precision, and a
+buffer the size of `Eω`. Per accepted step it is one `radial_matmul!` k→r, one `mapreduce`
+over a lazy `Broadcasted` for the energy bookkeeping, one broadcast for the absorbing
+multiply and one `radial_matmul!` r→k. The running totals are accumulated in `Float64` on
+the host from each step's reduction.
+
+### Measurements
+
+Radial Kerr propagation, M1 Pro, Julia 1.13.0, `-t 1`, one FFTW thread, one BLAS thread,
+`:estimate`, no wisdom; 20 fixed steps over 1 cm of argon at 1 bar on a 100 fs /
+400--2000 nm grid, `boundary=:none` (`benchmark/radial.jl`).
+
+| radial points | | CPU `Float64` | CPU `Float32` | Metal `Float32` |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | Hankel GEMM | 95.7 µs | 48.2 µs | 170.7 µs |
+| | right-hand side | 365.9 µs | 208.8 µs | 494.0 µs |
+| | propagation | 72.1 ms | 51.6 ms | 93.6 ms |
+| 256 | Hankel GEMM | 1.395 ms | 703.6 µs | 287.1 µs |
+| | right-hand side | 3.480 ms | 1.858 ms | 773.3 µs |
+| | propagation | 556.0 ms | 341.8 ms | 114.6 ms |
+| 1024 | Hankel GEMM | 22.23 ms | 11.12 ms | 592.6 µs |
+| | right-hand side | 47.68 ms | 24.09 ms | 1.215 ms |
+| | propagation | 6.51 s | 3.47 s | 210.6 ms |
+
+The crossover is at 64--96 radial points against the `Float64` host and 96--128 against
+the `Float32` one. At 1024 points Metal is 31 times the `Float64` host and 16 times the
+`Float32` one, and the Hankel GEMM alone is 38 times faster -- which is the whole reason
+this geometry is the one worth putting on a GPU.
+
 ## The output and statistics boundary
 
 `Output.jl` stays device-unaware: `MemoryOutput`/`HDF5Output` know how to save an array
@@ -730,4 +840,6 @@ loaded, so it always precompiles the CPU path.
 - **`test/test_metal.jl`** is the hardware test, and the only thing which catches those.
   It is not part of the suite (Metal is never installed with Luna); it has its own CI job,
   which installs Metal into a separate environment.
-- **`benchmark/device.jl`** times the same propagation on each device and precision.
+- **`benchmark/device.jl`** times the same mode-averaged propagation on each device and
+  precision, sweeping the time-grid size; **`benchmark/radial.jl`** does the same for the
+  radial transform, sweeping the number of radial points.

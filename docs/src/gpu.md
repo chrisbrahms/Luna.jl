@@ -4,20 +4,22 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! warning "Work in progress: mode-averaged propagation"
-    This page describes what the device model does as of `gpu/14-raman`.
+!!! warning "Work in progress: mode-averaged and radial propagation"
+    This page describes what the device model does as of `gpu/20-radial-device`.
     `prop_capillary` and `prop_gnlse` take `device` and `precision` keywords (below), and
     for mode-averaged propagation (`modes` a single mode) with the Kerr, plasma and
     Raman responses -- which is everything `prop_capillary` builds by default, in any gas
     -- it runs end to end on a device, including the absorbing boundaries
-    (`boundary=:rate`, the default) and the default per-step statistics.
-    Anything else -- multimode and radial propagation, `prop_gnlse`, and the χ⁽²⁾
-    responses -- is still host code; `Luna.setup`/`Luna.run` refuse a device or a
-    reduced precision for a *transform* rather than running it wrongly, and fall back to
-    the host for a *response* (or, for the simple interface, error with a message naming
-    the actual limitation). Free space and multimode propagation, and the remaining
-    nonlinear responses, follow in later branches; the page is completed in
-    `gpu/32-docs`.
+    (`boundary=:rate`, the default) and the default per-step statistics. Radially
+    symmetric free-space propagation does too, through the low-level interface, which is
+    the only way to build one.
+    Anything else -- multimode propagation, the Cartesian free-space geometries,
+    `prop_gnlse`, and with them the χ⁽²⁾ responses -- is still host code;
+    `Luna.setup`/`Luna.run` refuse a device or a reduced precision for a *transform*
+    rather than running it wrongly, and fall back to the host for a *response* (or, for
+    the simple interface, error with a message naming the actual limitation). Cartesian
+    free space and multimode propagation follow in later branches; the page is completed
+    in `gpu/32-docs`.
 
 ## Enabling it
 
@@ -133,17 +135,59 @@ round 1".)
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-the radial, free-space and multimode transforms. Every nonlinear response Luna ships
-has a device kernel: the Kerr responses, the χ⁽²⁾ responses, the plasma response and the
-Raman responses. The χ⁽²⁾ responses are only used by the free-space transforms, which are
-not device-capable yet, so a χ⁽²⁾ propagation still runs on the host as a whole.
+the Cartesian free-space transforms (`TransFree`, `TransFree2D`) and the multimode one
+(`TransModal`). The mode-averaged transform and the radially symmetric free-space one
+(`TransRadial`) are device-capable. Every nonlinear response Luna ships has a device
+kernel: the Kerr responses, the χ⁽²⁾ responses, the plasma response and the Raman
+responses. The χ⁽²⁾ responses are only used by the Cartesian free-space transforms, which
+are not device-capable yet, so a χ⁽²⁾ propagation still runs on the host as a whole.
 `Luna.setup` refuses a device or a reduced precision for the *transforms*, through the
 residency checks each of them makes, rather than running them wrongly. A *response* is
 not refused: it falls back to the host copy described under "An ad hoc response on a
 device" below, which is correct and slow.
 
+`prop_capillary` and `prop_gnlse` never build a radial run, so a radial propagation on a
+device is set up through the low-level interface:
+
+```julia
+using Luna, Metal
+grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 100e-15)
+rg = Grid.RadialGrid(1e-3, 256)
+nfunλ = PhysData.ref_index_fun(:Ar, 1.0)
+nfun = (λ; z=0.0) -> nfunλ(λ)
+linop = LinearOps.make_const_linop(grid, rg, nfun)
+normfun = NonlinearRHS.const_norm_radial(grid, rg, nfun)
+responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),)
+inputs = Fields.GaussGaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6, w0=200e-6)
+Eω, transform, FT = Luna.setup(grid, rg, z -> PhysData.density(:Ar, 1.0),
+                               normfun, responses, inputs)  # device=:auto by default
+output = Output.MemoryOutput(0, 1e-2, 11)
+Luna.run(Eω, grid, linop, transform, FT, output; zmax=1e-2)
+```
+
+The `normfun` is built before the device is known, so `Luna.setup` moves it for you; you
+can also build it on the device directly with the `spec` keyword of `norm_radial` /
+`const_norm_radial`.
+
+This is the geometry where a GPU is worth using. A mode-averaged run has one transverse
+column and is launch-bound; a radial run has one per radial point. Measured on an M1 Pro
+(`benchmark/radial.jl`, 20 fixed steps over 1 cm of argon at 1 bar, a 100 fs / 400-2000 nm
+grid, `boundary=:none`), wall time for the whole propagation:
+
+| radial points | CPU `Float64` | CPU `Float32` | Metal `Float32` |
+| ---: | ---: | ---: | ---: |
+| 64 | 72.1 ms | 51.6 ms | 93.6 ms |
+| 96 | 125.9 ms | 86.4 ms | 83.5 ms |
+| 128 | 192.0 ms | 126.8 ms | 102.8 ms |
+| 256 | 556.0 ms | 341.8 ms | 114.6 ms |
+| 1024 | 6.51 s | 3.47 s | 210.6 ms |
+
+Metal passes the `Float64` host between 64 and 96 radial points and the `Float32` host
+between 96 and 128; at 1024 it is 31 times the `Float64` host and 16 times the `Float32`
+one. Below the crossover the CPU is faster and `device=:cpu` is the right answer.
+
 The absorbing boundaries (`boundary=:rate`, `:legacy` and `:none`) and the default
-statistics *do* run with a device state, for the mode-averaged transform:
+statistics *do* run with a device state:
 
 - `Boundaries.RateAbsorber`/`LegacyAbsorber` and the transverse collars are broadcasts
   and reductions over mirrored arrays (`Boundaries.jl`), like everything else per-step.
@@ -253,9 +297,11 @@ propagation actually saves the field.
 ## Performance
 
 A GPU wins on many columns and large time grids; a mode-averaged single-column run is
-launch-bound and will not speed up. `benchmark/device.jl` times the same propagation on
-each device and precision, sweeping the grid size. Run it from an environment which has
-Luna, BenchmarkTools and the GPU package.
+launch-bound and will not speed up. `benchmark/device.jl` times the mode-averaged
+propagation on each device and precision, sweeping the grid size, and
+`benchmark/radial.jl` does the same for the radial one, sweeping the number of radial
+points (the table under "What runs where" is its output). Run either from an environment
+which has Luna, BenchmarkTools and the GPU package.
 
 ## Running the hardware tests
 
