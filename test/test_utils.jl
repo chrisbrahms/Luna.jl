@@ -1,4 +1,5 @@
 import Test: @test, @testset, @test_throws
+import Luna
 import Luna: Utils
 import HDF5
 import Dates
@@ -85,6 +86,36 @@ end
     start = Dates.DateTime(2022, 01, 01, 1, 15, 32)
     @test Utils.format_elapsed(finish-start) == "-1 hour, -15 minutes, -32.000 seconds"
 
+end
+
+
+#= The FFTW wisdom switch. The regression gate (test/test_regression.jl) depends on it, so
+   it is worth a test even though nothing else in the test suite turns it off. =#
+@testset "FFTW wisdom switch" begin
+    was = Luna.settings["fftw_wisdom"]
+    @test was == true # the default, and nothing before this point may have changed it
+    fpath = joinpath(Utils.cachedir(), "FFTWcache_$(Utils.FFTWthreads())threads")
+    lockpath = joinpath(Utils.cachedir(), "FFTWlock")
+    try
+        @test Luna.set_fftw_wisdom(false) == false
+        @test Luna.settings["fftw_wisdom"] == false
+        #= Both must become no-ops. `mtime` of a missing file is 0.0, which is a fine
+           before/after comparison either way: what matters is that neither call touches
+           the cache the other worktrees share. =#
+        before = mtime(fpath)
+        @test Utils.loadFFTwisdom() === nothing
+        @test Utils.saveFFTwisdom() === nothing
+        @test mtime(fpath) == before
+        @test !isfile(lockpath) # no pidlock taken either
+        # The thread count is still re-asserted (see the loadFFTwisdom docstring).
+        @test Utils.FFTWthreads() > 0
+
+        @test Luna.set_fftw_wisdom(true) == true
+        @test Luna.settings["fftw_wisdom"] == true
+    finally
+        Luna.set_fftw_wisdom(was)
+    end
+    @test Luna.settings["fftw_wisdom"] == was
 end
 
 end

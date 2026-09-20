@@ -11,7 +11,8 @@ Logging.disable_logging(Logging.BelowMinLevel)
 Dictionary of global settings for `Luna`.
 """
 settings = Dict{String, Any}("fftw_flag" => FFTW.PATIENT,
-                             "fftw_threads" => 0)
+                             "fftw_threads" => 0,
+                             "fftw_wisdom" => true)
 
 """
     set_fftw_mode(mode)
@@ -37,11 +38,44 @@ end
     set_fftw_threads(nthr)
 
 Set number of threads to be used by FFTW. If set to `0`, the number of threads used by
-FFTW is determined automatically (see [`Utils.FFTWthreads()`](@ref))
+FFTW is determined automatically (see `Utils.FFTWthreads`).
 """
 function set_fftw_threads(nthr=0)
     settings["fftw_threads"] = nthr
     FFTW.set_num_threads(Utils.FFTWthreads())
+end
+
+"""
+    set_fftw_wisdom(enabled::Bool)
+
+Enable (`true`, the default) or disable (`false`) the on-disk FFTW wisdom cache.
+
+When enabled, `Utils.loadFFTwisdom()` imports accumulated FFTW wisdom from a file in
+`Utils.cachedir()` before planning and `Utils.saveFFTwisdom()` writes it back
+afterwards, so that expensive planning modes (`:measure`, `:patient`, `:exhaustive`, see
+[`set_fftw_mode`](@ref)) only have to be paid for once per transform shape. When disabled,
+both functions do nothing, so the plan FFTW produces depends only on the planning mode and
+the transform shape. The FFTW thread count is re-asserted either way.
+
+Disabling wisdom is needed to make runs reproducible: the wisdom file is shared by every
+process using the same Julia depot, so wisdom written by an unrelated `:patient` run (for
+example Luna's own precompilation) silently changes the plan an `:estimate` run gets, and
+with it the order of the floating-point operations. Turning wisdom off also calls
+`FFTW.forget_wisdom()` once, so that wisdom already imported into the running process does
+not leak into plans made later.
+
+Turning wisdom back on does not re-import the file; the next call to
+`Utils.loadFFTwisdom()` (which `Luna.setup` makes) does that.
+
+Like [`set_fftw_mode`](@ref) and [`set_fftw_threads`](@ref), this changes `settings` in the
+calling process only: `Scans` workers load `Luna` fresh and start from the defaults, so a
+scan that has to be reproducible needs `@everywhere Luna.set_fftw_wisdom(false)` — and the
+same for the other two — after the workers exist.
+"""
+function set_fftw_wisdom(enabled::Bool)
+    settings["fftw_wisdom"] = enabled
+    enabled || FFTW.forget_wisdom()
+    enabled
 end
 
 function __init__()

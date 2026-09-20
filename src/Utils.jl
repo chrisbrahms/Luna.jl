@@ -81,8 +81,21 @@ function FFTWthreads()
     end
 end
 
+"""
+    loadFFTwisdom()
+
+Import accumulated FFTW wisdom from the cache file in `cachedir()`, unless the wisdom
+cache is disabled (see [`Luna.set_fftw_wisdom`](@ref)), in which case only the FFTW thread
+count is re-asserted and nothing is read.
+
+`Luna.setup` calls this immediately before planning, so the `FFTW.set_num_threads` here is
+what makes the thread count Luna plans with independent of anything else in the process
+that may have called `FFTW.set_num_threads`. It therefore happens whether or not the
+wisdom cache is enabled.
+"""
 function loadFFTwisdom()
     FFTW.set_num_threads(FFTWthreads())
+    settings["fftw_wisdom"] || return
     fpath = joinpath(cachedir(), "FFTWcache_$(FFTWthreads())threads")
     lockpath = joinpath(cachedir(), "FFTWlock")
     isdir(cachedir()) || mkpath(cachedir())
@@ -101,7 +114,15 @@ function loadFFTwisdom()
     end
 end
 
+"""
+    saveFFTwisdom()
+
+Write the FFTW wisdom accumulated in this process to the cache file in `cachedir()`,
+unless the wisdom cache is disabled (see [`Luna.set_fftw_wisdom`](@ref)), in which case
+this does nothing.
+"""
 function saveFFTwisdom()
+    settings["fftw_wisdom"] || return
     fpath = joinpath(cachedir(), "FFTWcache_$(FFTWthreads())threads")
     lockpath = joinpath(cachedir(), "FFTWlock")
     mkpidlock(lockpath; stale_age=600) do
