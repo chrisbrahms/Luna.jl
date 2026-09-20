@@ -14,7 +14,9 @@ host-only is the *transforms*: radial, free-space and multimode.
 | `3054b686` | Merge `gpu/15-chi2` into `gpu/int-D` (the merge alone, with the conflict resolutions below) |
 | `43d9d63c` | Semantic sweep: dead imports, a stale docstring, the restored `nameof` assertion |
 | `6cc8a1db` | Regression gate: argon plasma cases that actually ionise, and the tolerances for them |
-| this file | `PR_int-D.md` |
+| `df087d87` | `PR_int-D.md` |
+| `fa556e6f` | `modeavg_field_plasma` at 175 µJ, so that its adaptive step count is reproducible |
+| this commit | `PR_int-D.md` updated for the re-measured case |
 
 ## The merge and its conflicts
 
@@ -84,7 +86,7 @@ rows meant nothing. They are now argon at 0.1 bar, at the energies the review me
 
 | case | was | is | peak ionised fraction |
 | --- | --- | --- | ---: |
-| `modeavg_field_plasma` | `:He`, 1 bar, 800 nJ | `:Ar`, 0.1 bar, 300 µJ | 0.78 % |
+| `modeavg_field_plasma` | `:He`, 1 bar, 800 nJ | `:Ar`, 0.1 bar, 175 µJ | 0.032 % |
 | `modeavg_field_adk` | `:He`, 1 bar, 800 nJ | `:Ar`, 0.1 bar, 300 µJ | 0.26 % |
 | `modeavg_field_vector` | `:He`, 1 bar, 800 nJ | `:Ar`, 0.1 bar, 150 µJ | 0.13 % |
 | `multimode_field_plasma` | `:He`, 1 bar, 800 nJ | `:Ar`, 0.1 bar, 150 µJ | 0.37 % |
@@ -93,13 +95,38 @@ Nothing else about the cases changes (core radius, length, λ0, λlims, trange, 
 `PPT_options=NOCACHE` on the three PPT cases). They cost 1.4-16 s per mode where the
 helium versions cost 0.03-0.2 s, which is most of the gate's 2 m 25 s.
 
+Three of the four energies are the ones the `gpu/13-plasma` review measured.
+`modeavg_field_plasma` is 175 µJ rather than the review's 300 µJ (`fa556e6f`): at 300 µJ
+the adaptive run has no reproducible step sequence, and the step-count check is a hard
+failure by design, so such a case cannot be in the matrix without either a failing row or
+a tolerance large enough to disable the check. Sweep, on this branch, of the adaptive
+accepted steps unperturbed and with the input multiplied by `1 + eps()`:
+
+| energy | steps | +1 ulp | peak ionised fraction |
+| --- | ---: | ---: | ---: |
+| 300 µJ | 92 | 98 | 0.78 % |
+| 250 µJ | 77 | 86 | 0.27 % |
+| 200 µJ | 48 | 46 | 0.070 % |
+| **175 µJ** | **38** | **38** | **0.032 %** |
+| 150 µJ | 31 | 30 | 0.012 % |
+| 125 µJ | 28 | 28 | 0.003 % |
+| 100 µJ | 25 | 25 | 0.001 % |
+
+175 µJ is the most strongly ionising energy whose step count is reproducible; it gives 38
+accepted steps at ±1, ±2 and ±8 ulp and at 1e-14. Its ionised fraction is below the 0.1 %
+that was asked for — no energy satisfies both conditions — but the gate's metric is
+relative, so the case still measures the plasma response: `stats/peak_ionisation_rate` and
+`stats/electrondensity` move at 4.8e-15 between `evanescent` and this branch (below), which
+is what the old helium case, with an electron density of exactly zero, could not do at
+all.
+
 New tolerances, from `test/regression/sensitivity.jl` for those four cases (100× the
 one-ulp sensitivity, floor 1e-12):
 
 | case | mode | `:Eω` | `:stats` |
 | --- | --- | ---: | ---: |
-| `modeavg_field_plasma` | fixed | 1.0e-12 | 2.2e-12 |
-| `modeavg_field_plasma` | adaptive | 4.8e-03 | 7.3e-02 (borrowed, see below) |
+| `modeavg_field_plasma` | fixed | 1.0e-12 | 1.0e-12 |
+| `modeavg_field_plasma` | adaptive | 9.2e-07 | 1.2e-03 |
 | `modeavg_field_adk` | fixed | 1.0e-12 | 1.0e-12 |
 | `modeavg_field_adk` | adaptive | 4.8e-10 | 1.8e-04 |
 | `modeavg_field_vector` | fixed | 1.0e-12 | 8.0e-11 |
@@ -107,35 +134,34 @@ one-ulp sensitivity, floor 1e-12):
 | `multimode_field_plasma` | fixed | 6.7e-12 | 5.8e-11 |
 | `multimode_field_plasma` | adaptive | 7.3e-05 | 7.3e-02 |
 
-Ionisation feeds back into the step-size controller, so the adaptive tolerances of these
-cases are loose and constrain nothing; the `:fixed` mode is what measures them (that is
-what the mode is for). **`modeavg_field_plasma` in the adaptive mode has no reproducible
-step sequence at all**: one ulp at the input takes it from 92 accepted steps to 98, so
-`sensitivity.jl` reports a `step count` failure and `Inf` instead of a number. `Inf` is not
-usable as a tolerance — `Inf <= Inf` passes, which would turn the step-count check, which
-the harness means as a hard failure, into a no-op — so that one entry borrows
-`multimode_field_plasma`'s 7.3e-02. The consequence is documented in `tolerances.jl` and
-`test/regression/README.md`, and this branch hits it (below).
+Every one of these is measured; none is borrowed. Ionisation feeds back into the step-size
+controller, so the adaptive tolerances of these cases are looser than the rest of the
+matrix and the `:fixed` mode is what measures them (that is what the mode is for). The
+sweep behind the 175 µJ and the reason a borrowed tolerance was rejected are recorded in
+`cases.jl`, `tolerances.jl` and `test/regression/README.md`.
 
 ## The Group D regression record
 
-Baselines regenerated from all three commits with the new case definitions
-(`test/regression/generate.jl <commit>`), gate run on `gpu/int-D` HEAD against each.
-M1 Pro, Julia 1.13.0, `-t 1`, `:estimate`, one FFTW thread, one BLAS thread, wisdom off,
-`shotnoise=false`.
+Baselines regenerated from `fdf8dbe3`, `782f55d1` and `fa556e6f` with the final case
+definitions (`test/regression/generate.jl <commit>`), gate run on `gpu/int-D` HEAD against
+each. The earlier baseline at the merge commit `3054b686` is stale — it was generated with
+the 300 µJ plasma case — and was replaced by the one at `fa556e6f`; a baseline generated
+before `fa556e6f` has to be regenerated. M1 Pro, Julia 1.13.0, `-t 1`, `:estimate`, one
+FFTW thread, one BLAS thread, wisdom off, `shotnoise=false`.
 
 | baseline | result | largest difference |
 | --- | --- | --- |
-| `3054b686` (the `gpu/int-D` merge commit) | **460 pass, 0 fail** | `0.000e+00` on every row |
-| `782f55d1` (`gpu/int-A`) | **449 pass, 1 fail** | see below |
-| `fdf8dbe3` (`evanescent`) | **449 pass, 1 fail** | see below |
+| `fa556e6f` (this branch's HEAD before this commit) | **460 pass, 0 fail** | `0.000e+00` on every row |
+| `782f55d1` (`gpu/int-A`) | **460 pass, 0 fail** | 7.240e-05 (`multimode_field_plasma` adaptive statistics) |
+| `fdf8dbe3` (`evanescent`) | **460 pass, 0 fail** | 7.240e-05, same row |
 
-Every row which is not `0.000e+00` against `gpu/int-A` (`Eω` / `stats`, both modes):
+No case fails, and no case changed its number of accepted steps. Every row which is not
+`0.000e+00` against `gpu/int-A` (`Eω` / `stats`, both modes):
 
 | case | mode | `Eω` | `stats` | worst quantity |
 | --- | --- | ---: | ---: | --- |
-| `modeavg_field_plasma` | fixed | 2.511e-15 | 2.144e-14 | `stats/electrondensity` |
-| `modeavg_field_plasma` | adaptive | 6.837e-05 | `Inf` | **step count: 92, baseline 93** |
+| `modeavg_field_plasma` | fixed | 1.131e-15 | 4.769e-15 | `stats/peak_ionisation_rate` |
+| `modeavg_field_plasma` | adaptive | 5.616e-09 | 7.103e-06 | `stats/peak_ionisation_rate` |
 | `modeavg_field_adk` | fixed | 1.245e-15 | 5.202e-15 | `stats/peak_ionisation_rate` |
 | `modeavg_field_adk` | adaptive | 2.283e-13 | 8.550e-08 | `stats/peak_ionisation_rate` |
 | `modeavg_field_vector` | fixed | 1.053e-15 | 6.300e-13 | `stats/transverse_integral_error_rel` |
@@ -168,20 +194,16 @@ Reading the record:
   digit (4.841e-14 and 3.151e-14 in the adaptive mode, 7.683e-16 and 8.348e-16 fixed),
   three orders inside the tolerance.
 - The plasma rows are the first measurement of Group D's plasma rewrite against anything,
-  because until this commit the cases carried no plasma. In the attributable `:fixed` mode
-  they are 1.0e-15 to 3.8e-14 in `Eω` — the `accumulate!`-plus-correction scan against the
-  old serial `Maths.cumtrapz!` loop, exactly the rounding-level difference `gpu/13`
-  predicted, and two orders inside the tolerance even for the weakest of the four modes in
+  because until these cases were changed the gate's plasma cases carried no plasma. In the
+  attributable `:fixed` mode they are 1.1e-15 to 3.8e-14 in `Eω` and 4.8e-15 to 7.3e-13 in
+  the statistics — the `accumulate!`-plus-correction scan against the old serial
+  `Maths.cumtrapz!` loop, exactly the rounding-level difference `gpu/13` predicted, and two
+  orders inside the tolerance even for the weakest of the four modes in
   `multimode_field_plasma`.
-- **The one failure** is `modeavg_field_plasma` in the adaptive mode: 92 accepted steps
-  against the baseline's 93. The step count is a hard failure by design. It is that
-  rounding-level difference flipping one accept/reject decision in the case whose step
-  sequence the sensitivity study shows is not reproducible at the one-ulp level (one ulp at
-  the input moves it by six steps). The same case in the `:fixed` mode, where the step
-  sequence is imposed, is 2.5e-15. Nothing else in the matrix changed its step count.
-
-A Group E branch does not inherit this failure: it compares against `gpu/int-D`, where
-every row is zero.
+- The adaptive plasma rows (5.6e-09 to 7.6e-08 in `Eω`, up to 7.2e-05 in the statistics)
+  are that same difference amplified by the step-size controller, well inside tolerances
+  which were measured the same way.
+- No step count moved anywhere in the matrix, in either mode, against either baseline.
 
 ## Tests
 
@@ -190,7 +212,7 @@ thread, wisdom off, through the timing wrapper.
 
 | what | result |
 | --- | --- |
-| `test/test_regression.jl` ×3 baselines | 460/0, 449/1, 449/1 — the record above |
+| `test/test_regression.jl` ×3 baselines | 460/0, 460/0, 460/0 — the record above |
 | `test/test_device.jl` (JLArrays), `-t 1` | **611 pass, 0 fail**, 31 testsets |
 | `test/test_device.jl` (JLArrays), `-t 4` | **611 pass, 0 fail**, 31 testsets |
 | `test/test_metal.jl` (Metal 1.11.1, hardware) | **386 pass, 0 fail**, 16 testsets |
@@ -242,9 +264,13 @@ project, not fixed here.
   run with such a rate is refused at setup by `Ionisation.device_rate` with a message
   naming the alternatives. It is a `prop_capillary`-level inaccuracy only if someone passes
   a hand-built plasma response into it, which the interface does not support.
-- **The `modeavg_field_plasma` adaptive row** is expected to fail for any branch which
-  moves the plasma arithmetic at rounding level and is compared against a pre-Group-D
-  baseline. See above; a Group E branch compares against `gpu/int-D` and does not see it.
+- **`modeavg_field_plasma` runs at 175 µJ, ionising 0.032 %** rather than at the 300 µJ
+  and 0.78 % the `gpu/13-plasma` review recommended, because the adaptive step count is
+  only reproducible below about 200 µJ (sweep above). The case still measures the plasma
+  response through its statistics, which are compared relative to their own maximum, but
+  the plasma's effect on `Eω` is correspondingly smaller than it would be at 300 µJ. A
+  harder plasma case for the field itself would have to be a fixed-step-only case, which
+  the harness does not currently support.
 - **`_refuse_batched_legacy` checks the one-argument `Nonlinear.kind(r)` only**, so a
   response which is `Batched` only for `Val(2)` would slip past it. No such response
   exists, and the batched response's own shape check catches it.
@@ -281,8 +307,8 @@ LUNA_REGRESSION_BASE=fdf8dbe3 julia --project=$PWD -t 1 test/test_regression.jl
 ```
 
 accumulates the whole project's movement and is what a per-group record uses; on
-`gpu/int-D` it is the table above, including the one step-count failure.
+`gpu/int-D` it is the table above.
 
-Both baselines were regenerated with the new (argon) case definitions, so a baseline
-generated before this branch is stale for the four plasma cases and has to be regenerated;
+Both baselines were regenerated with the final (argon) case definitions, so a baseline
+generated before `fa556e6f` is stale for the four plasma cases and has to be regenerated;
 `generate.jl` overwrites all 21 case files, so there is nothing to clean up.
