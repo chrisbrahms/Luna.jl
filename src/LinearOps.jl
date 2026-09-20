@@ -1,6 +1,8 @@
 module LinearOps
 import FFTW
-import Luna: Modes, Grid, PhysData, Maths
+import Luna: Modes, Grid, PhysData, Maths, RK45
+import Luna: upload_like, scalar
+import Printf: @sprintf
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
 
 #=
@@ -532,5 +534,420 @@ function make_linop(grid::Grid.EnvGrid, modes::Modes.ModeCollection, λ0; ref_mo
     end
 end
 
+
+
+#=================================================#
+#============  TABULATED OPERATORS  ==============#
+#=================================================#
+
+#= Adaptive tabulation of the z-dependent quantities a propagation needs at every stage:
+   the integrated linear operator (`TabulatedLinop`), the propagation constant β
+   (`TabulatedVector`) and the effective area (`TabulatedScalar`).
+
+   All three are built by the same bisection: an interval is accepted when the
+   interpolant that will actually be used to read the table back is within a tolerance of
+   the directly computed value at the interval midpoint, which is where that interpolant's
+   error peaks, and is bisected otherwise. Luna's z-dependent quantities are usually not
+   smooth -- a pressure gradient built by `Capillary.gradient` goes as
+   √(p₀² + z/L(p₁² − p₀²)), which has a 1/√z cusp in its derivative at the entrance when
+   p₀ = 0, a multi-section fill has a derivative discontinuity at every junction, and a
+   taper is whatever function the user wrote -- so uniform nodes converge at second order
+   or worse across such a feature and give no way to tell how far off they are. Bisection
+   puts nodes only where they are needed: a kink costs a number of intervals proportional
+   to the depth it is resolved to, not to the resolution everywhere.
+
+   The design is PR 440's `TabulatedUnitaryPhase` generalised from ∫imag(linop) dz to the
+   full complex integrated operator, and to quantities which are tabulated rather than
+   integrated. =#
+
+"The default tolerance of the adaptive tabulation; see [`TabulatedLinop`](@ref)."
+const DEFAULT_LINOP_TOL = 1e-6
+
+"Largest number of nodes the adaptive tabulation will place before giving up and warning."
+const DEFAULT_MAXNODES = 1024
+
+"Deepest bisection the adaptive tabulation will go to before giving up and warning."
+const DEFAULT_MAXDEPTH = 40
+
+_tabmax(x::Number) = abs(x)
+_tabmax(x::AbstractArray) = isempty(x) ? 0.0 : maximum(abs, x)
+
+# Stack the per-node values along a new trailing axis, which is the layout the readback
+# broadcasts over (`selectdim` of the last dimension is a contiguous view on every backend).
+_stack(vs::Vector{T}) where {T<:Number} = copy(vs)
+function _stack(vs::Vector{<:AbstractArray})
+    out = Array{eltype(vs[1])}(undef, (size(vs[1])..., length(vs)))
+    for k in eachindex(vs)
+        selectdim(out, ndims(out), k) .= vs[k]
+    end
+    out
+end
+
+#= Locate z in the node vector: the interval index, the normalised position in it and its
+   width. Outside the table the end interval is used, which extrapolates rather than
+   erroring -- the table covers `[z0, zmax + max_dz]`, so this only happens if a caller
+   steps past the end it was built for. =#
+function _locate(zs::Vector{Float64}, z::Real)
+    if z <= zs[1]
+        return 1, 0.0, zs[2] - zs[1]
+    elseif z >= zs[end]
+        n = length(zs)
+        return n-1, 1.0, zs[n] - zs[n-1]
+    end
+    k = searchsortedlast(zs, z)
+    h = zs[k+1] - zs[k]
+    k, (z - zs[k])/h, h
+end
+
+#=------------------------- the integrated linear operator -------------------------=#
+
+"""
+    TabulatedLinop(linop!, proto, z0, z1; tol, maxdepth, maxnodes)
+
+The integrated linear operator `Φ(z) = ∫_{z0}^{z} linop(z') dz'` of the z-dependent
+operator `linop!(out, z)`, tabulated on adaptively placed nodes covering `[z0, z1]` and
+read back with a cubic Hermite interpolant. `proto` is the propagating field, whose array
+type and element type the tables are built in (so they are device-resident for a device
+run).
+
+[`RK45.make_prop!`](@ref Luna.RK45.make_prop!) builds the interaction-picture propagator
+`exp(Φ(t2) − Φ(t1))` from it. That is the exact propagator of the linear part over the
+step, where the untabulated path uses `exp(linop(t2)·(t2 − t1))`, a one-point rule; it is
+a different discretisation of the same equation, and it is opt-in
+(`tabulate_linop=true` on [`Luna.run`](@ref)) for that reason.
+
+# What is stored
+`Φ` holds not the integral itself but its deviation from the straight line through the two
+ends of the table,
+
+```
+Φ̃(z) = Φ(z) − L̄·(z − z0),   L̄ = Φ(z1)/(z1 − z0),
+```
+
+and `dΦ` holds `linop(z) − L̄`. The propagator adds `L̄·(t2 − t1)` back in the same
+broadcast, so the result is unchanged in exact arithmetic while the tabulated numbers are
+as small as the operator's *variation* along z rather than as large as its accumulated
+phase. That matters in `Float32`: the accumulated phase of a metre of fibre is thousands
+of radians, whose `Float32` spacing is larger than the phase difference over one step. A
+cubic Hermite reproduces a linear function exactly, so subtracting the secant changes
+neither the node placement nor the interpolation error.
+
+# Fields
+- `z`: the nodes, ascending, `z[1] == z0` and `z[end] == z1`
+- `Φ`, `dΦ`: `(size(linop)..., length(z))`, as described above
+- `secant`: `L̄`, the mean operator over `[z0, z1]`
+- `z0`: the lower end of the table, the origin `Φ` is measured from
+- `tol`: the tolerance the nodes were placed to satisfy
+- `err`: the largest interpolation error measured while placing them
+- `nevals`: how many times `linop!` was called to build the table
+- `scale`: `maximum(abs, Φ̃)`, the size of the stored numbers
+"""
+struct TabulatedLinop{aT, sT}
+    z::Vector{Float64}
+    Φ::aT
+    dΦ::aT
+    secant::sT
+    z0::Float64
+    tol::Float64
+    err::Float64
+    nevals::Int
+    scale::Float64
+end
+
+function TabulatedLinop(linop!, proto::AbstractArray, z0::Real, z1::Real;
+                        tol=DEFAULT_LINOP_TOL, maxdepth=DEFAULT_MAXDEPTH,
+                        maxnodes=DEFAULT_MAXNODES, quiet=false)
+    z0, z1 = float(z0), float(z1)
+    z1 > z0 || error("TabulatedLinop needs z1 > z0, got $z0 and $z1")
+    sz = size(proto)
+    buf = Array{ComplexF64}(undef, sz)
+    nevals = Ref(0)
+    dat = function (z)
+        nevals[] += 1
+        linop!(buf, z)
+        copy(buf)
+    end
+    znodes = Float64[z0]
+    dnodes = Array{ComplexF64, length(sz)}[dat(z0)]
+    deltas = Array{ComplexF64, length(sz)}[] # ∫linop dz across each accepted interval
+    worst = Ref(0.0)
+    _refine_int!(znodes, dnodes, deltas, worst, dat, z0, z1, dnodes[1], dat(z1), nothing,
+                 float(tol), 0, maxdepth, maxnodes)
+
+    n = length(znodes)
+    Φ = zeros(ComplexF64, (sz..., n))
+    d = length(sz) + 1
+    for k = 2:n
+        selectdim(Φ, d, k) .= selectdim(Φ, d, k-1) .+ deltas[k-1]
+    end
+    dΦ = _stack(dnodes)
+    # Subtract the secant (see the docstring): Φ̃(z0) = Φ̃(z1) = 0 by construction.
+    secant = selectdim(Φ, d, n)./(z1 - z0)
+    for k = 1:n
+        selectdim(Φ, d, k) .-= secant.*(znodes[k] - z0)
+        selectdim(dΦ, d, k) .-= secant
+    end
+    scale = _tabmax(Φ)
+    if worst[] > tol
+        @warn("The tabulated linear operator did not reach its tolerance: $n nodes, "*
+              "largest interpolation error $(worst[]) against a tolerance of $tol. The "*
+              "operator may be discontinuous in z; raise `linop_tol` or check it.")
+    elseif !quiet
+        @info(@sprintf("Tabulated linear operator: %d nodes over [%.4g, %.4g] m, %d evaluations, largest interpolation error %.2e, largest stored value %.2e.",
+                       n, z0, z1, nevals[], worst[], scale))
+    end
+    TabulatedLinop(znodes, upload_like(proto, Φ), upload_like(proto, dΦ),
+                   upload_like(proto, secant), z0, float(tol), worst[], nevals[], scale)
+end
+
+#= Bisect [a, b] until the cubic Hermite interpolant built from the endpoint values and
+   derivatives is within `tol` of the true integral at the midpoint, which is where its
+   error peaks. `dmid` is the already-evaluated derivative at the midpoint when the caller
+   has it -- a bisection's two children each inherit one of the parent's quarter points --
+   so each call costs two new evaluations of `linop!` rather than three. =#
+function _refine_int!(znodes, dnodes, deltas, worst, dat, a, b, da, db, dmid,
+                      tol, depth, maxdepth, maxnodes)
+    h = b - a
+    m = a + h/2
+    dm = isnothing(dmid) ? dat(m) : dmid
+    dq1 = dat(a + h/4)
+    dq2 = dat(a + 3h/4)
+    ΔΦ = @. h/12*(da + 4dq1 + 2dm + 4dq2 + db) # Φ(b) - Φ(a), Simpson on each half
+    err = 0.0
+    for i in eachindex(ΔΦ)
+        hermite = ΔΦ[i]/2 + h*(da[i] - db[i])/8 # Hermite at the midpoint, minus Φ(a)
+        exact = h/12*(da[i] + 4dq1[i] + dm[i]) # Simpson over [a, m]
+        err = max(err, abs(hermite - exact))
+    end
+    if err <= tol || depth >= maxdepth || length(znodes) >= maxnodes
+        push!(znodes, b)
+        push!(dnodes, db)
+        push!(deltas, ΔΦ)
+        worst[] = max(worst[], err)
+        return
+    end
+    _refine_int!(znodes, dnodes, deltas, worst, dat, a, m, da, dm, dq1,
+                 tol, depth+1, maxdepth, maxnodes)
+    _refine_int!(znodes, dnodes, deltas, worst, dat, m, b, dm, db, dq2,
+                 tol, depth+1, maxdepth, maxnodes)
+end
+
+"""
+    phase!(out, tab::TabulatedLinop, z)
+
+Fill `out` with the stored deviation `Φ̃(z) = Φ(z) − L̄·(z − z0)` (see
+[`TabulatedLinop`](@ref)), as one broadcast over four node slices with four scalar
+weights. Returns `out`.
+"""
+function phase!(out, tab::TabulatedLinop, z)
+    k, s, h = _locate(tab.z, z)
+    s2 = s*s
+    s3 = s2*s
+    w00 = scalar(out, 2s3 - 3s2 + 1)
+    w10 = scalar(out, h*(s3 - 2s2 + s))
+    w01 = scalar(out, -2s3 + 3s2)
+    w11 = scalar(out, h*(s3 - s2))
+    d = ndims(tab.Φ)
+    Φk = selectdim(tab.Φ, d, k)
+    Φk1 = selectdim(tab.Φ, d, k+1)
+    dk = selectdim(tab.dΦ, d, k)
+    dk1 = selectdim(tab.dΦ, d, k+1)
+    @. out = w00*Φk + w10*dk + w01*Φk1 + w11*dk1
+    out
+end
+
+"""
+    integrated!(out, tab::TabulatedLinop, z)
+
+Fill `out` with the integrated operator `Φ(z) = ∫_{z0}^{z} linop dz'` itself. Only
+differences of `Φ` enter the propagator, which forms them from [`phase!`](@ref) without
+ever building this; this is for checking the table against a direct integration.
+"""
+function integrated!(out, tab::TabulatedLinop, z)
+    phase!(out, tab, z)
+    dz = scalar(out, z - tab.z0)
+    sec = tab.secant
+    @. out += sec*dz
+    out
+end
+
+"""
+    RK45.make_prop!(tab::TabulatedLinop, y0)
+
+The interaction-picture propagator of a tabulated z-dependent operator,
+`y *= exp(Φ(t2) − Φ(t1))`.
+
+`Φ(t1)` and `Φ(t2)` are each read out of the table only when their argument changes: the
+six stages of a step share one `t1`, and `t2` repeats between the forward and the backward
+propagation of each stage, which is the same argument the untabulated propagator's
+last-`t2` cache rests on. Both readbacks and the exponential are broadcasts over the
+state's own array type, so nothing here touches the host on a device run.
+"""
+function RK45.make_prop!(tab::TabulatedLinop, y0)
+    Φ1 = similar(y0)
+    Φ2 = similar(y0)
+    lastt1 = Ref(NaN)
+    lastt2 = Ref(NaN)
+    prop! = let tab=tab, Φ1=Φ1, Φ2=Φ2, lastt1=lastt1, lastt2=lastt2
+        function prop!(y, t1, t2, bwd=false)
+            if lastt1[] != t1
+                phase!(Φ1, tab, t1)
+                lastt1[] = t1
+            end
+            if lastt2[] != t2
+                phase!(Φ2, tab, t2)
+                lastt2[] = t2
+            end
+            #= The secant term is put back here rather than in the readback: it is the
+               whole of a constant operator's contribution and is formed exactly as the
+               constant propagator forms it, from the step length. =#
+            dt = scalar(y, bwd ? (t1 - t2) : (t2 - t1))
+            sec = tab.secant
+            if bwd
+                @. y *= exp(Φ1 - Φ2 + sec*dt)
+            else
+                @. y *= exp(Φ2 - Φ1 + sec*dt)
+            end
+        end
+    end
+    return prop!
+end
+
+#=--------------------------- tabulated values (not integrals) ---------------------------=#
+
+#= β and Aeff are needed as values, not as integrals, and no derivative of either is
+   available: the mode interface gives the quantity and nothing else. The interpolant is
+   therefore linear rather than cubic Hermite, and the acceptance check compares the linear
+   interpolant's midpoint value against the true one -- the same bisection, measuring the
+   error of the interpolant that is actually used. Second order in the interval width
+   instead of fourth, which for quantities that only scale the nonlinear polarisation costs
+   a handful of extra nodes and nothing else.
+
+   The tolerance is relative to the largest value in the table, because β is ~1e7 in SI
+   units and Aeff ~1e-8, and one absolute tolerance cannot serve both. =#
+function _refine_val!(znodes, vnodes, worst, dat, a, b, va, vb, tol, depth,
+                      maxdepth, maxnodes)
+    h = b - a
+    m = a + h/2
+    vm = dat(m)
+    err = _tabmax(@. vm - (va + vb)/2)
+    if err <= tol || depth >= maxdepth || length(znodes) >= maxnodes
+        push!(znodes, b)
+        push!(vnodes, vb)
+        worst[] = max(worst[], err)
+        return
+    end
+    _refine_val!(znodes, vnodes, worst, dat, a, m, va, vm, tol, depth+1, maxdepth, maxnodes)
+    _refine_val!(znodes, vnodes, worst, dat, m, b, vm, vb, tol, depth+1, maxdepth, maxnodes)
+end
+
+#= Place the nodes for a value table. `f(z)` returns the quantity (a scalar or an array);
+   `rtol` is relative to the largest value seen at the two ends. =#
+function _tabulate_value(f, z0, z1, rtol, maxdepth, maxnodes)
+    z0, z1 = float(z0), float(z1)
+    z1 > z0 || error("a z table needs z1 > z0, got $z0 and $z1")
+    nevals = Ref(0)
+    dat = function (z)
+        nevals[] += 1
+        f(z)
+    end
+    v0, v1 = dat(z0), dat(z1)
+    scale = max(_tabmax(v0), _tabmax(v1))
+    scale == 0 && (scale = 1.0)
+    znodes = Float64[z0]
+    vnodes = typeof(v0)[v0]
+    worst = Ref(0.0)
+    _refine_val!(znodes, vnodes, worst, dat, z0, z1, v0, v1, rtol*scale, 0,
+                 maxdepth, maxnodes)
+    if worst[] > rtol*scale
+        @warn("A z table did not reach its tolerance: $(length(znodes)) nodes, largest "*
+              "interpolation error $(worst[]/scale) relative against a tolerance of $rtol.")
+    end
+    znodes, vnodes, worst[]/scale, nevals[]
+end
+
+"""
+    TabulatedScalar(f, z0, z1; tol, maxdepth, maxnodes)
+
+A scalar function of `z` -- the effective area of a tapered or pressure-graded waveguide --
+tabulated on adaptively placed nodes covering `[z0, z1]` and read back by linear
+interpolation. Callable as `t(z)`.
+
+`Modes.Aeff` is memoised on `(mode, z)`, so a z-dependent mode grows one `Dict` entry per
+distinct `z` it is asked about, i.e. per stage of every step, for the whole propagation.
+Tabulating it bounds that at the number of nodes and takes the quadrature out of the step.
+"""
+struct TabulatedScalar
+    z::Vector{Float64}
+    f::Vector{Float64}
+    tol::Float64
+    err::Float64
+    nevals::Int
+end
+
+function TabulatedScalar(f, z0, z1; tol=DEFAULT_LINOP_TOL, maxdepth=DEFAULT_MAXDEPTH,
+                         maxnodes=DEFAULT_MAXNODES)
+    zs, vs, err, nevals = _tabulate_value(z -> float(f(z)), z0, z1, float(tol),
+                                          maxdepth, maxnodes)
+    TabulatedScalar(zs, _stack(vs), float(tol), err, nevals)
+end
+
+function (t::TabulatedScalar)(z)
+    k, s, _ = _locate(t.z, z)
+    (1 - s)*t.f[k] + s*t.f[k+1]
+end
+
+"""
+    TabulatedVector(f!, proto, n, z0, z1; tol, maxdepth, maxnodes)
+
+A vector-valued function of `z` -- the propagation constant `β(z)` the mode-averaged
+normalisation divides by -- tabulated on adaptively placed nodes covering `[z0, z1]` and
+read back by linear interpolation into a buffer on `proto`'s array type and precision.
+`f!(out, z)` fills a length-`n` host buffer; `proto` is the propagating field.
+
+Callable as `t(z)`, returning the buffer. The buffer is reused, and the readback is skipped
+when `z` has not changed since the last call.
+
+This replaces the per-evaluation host call and upload of
+[`Luna.HostMirror`](@ref): with a table there is no host work left inside the right-hand
+side of a tapered or pressure-graded run.
+"""
+struct TabulatedVector{aT, bT}
+    z::Vector{Float64}
+    f::aT
+    buf::bT
+    lastz::Base.RefValue{Float64}
+    tol::Float64
+    err::Float64
+    nevals::Int
+end
+
+function TabulatedVector(f!, proto::AbstractArray, n::Integer, z0, z1;
+                         tol=DEFAULT_LINOP_TOL, maxdepth=DEFAULT_MAXDEPTH,
+                         maxnodes=DEFAULT_MAXNODES)
+    host = zeros(Float64, n)
+    f = function (z)
+        f!(host, z)
+        copy(host)
+    end
+    zs, vs, err, nevals = _tabulate_value(f, z0, z1, float(tol), maxdepth, maxnodes)
+    tab = upload_like(proto, _stack(vs))
+    buf = similar(proto, real(eltype(tab)), (n,))
+    TabulatedVector(zs, tab, buf, Ref(NaN), float(tol), err, nevals)
+end
+
+function (t::TabulatedVector)(z)
+    if t.lastz[] != z
+        k, s, _ = _locate(t.z, z)
+        w0 = scalar(t.buf, 1 - s)
+        w1 = scalar(t.buf, s)
+        fk = selectdim(t.f, 2, k)
+        fk1 = selectdim(t.f, 2, k+1)
+        out = t.buf
+        @. out = w0*fk + w1*fk1
+        t.lastz[] = z
+    end
+    t.buf
+end
 
 end
