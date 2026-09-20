@@ -58,8 +58,12 @@ Luna.setup
 
 ```@docs
 Utils.Backend
+Utils.CPUBackend
+Utils.DeviceBackend
 Utils.backend
+Utils.isdevice
 Utils.plan_ft
 Utils.plan_ift
 Utils.iplan
+Utils.iscale
 ```

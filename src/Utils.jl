@@ -300,16 +300,20 @@ plan_ift(FT) = inv(FT)
 
 """
     iplan(IFT)
-    iscale(IFT)
 
-The unnormalised backward plan held by an inverse plan, and its normalisation factor.
-Split apart so that the factor can be folded into the scale of the oversampling copy
-(see [`plan_ift`](@ref)).
+The unnormalised backward plan held by an inverse plan. Split from its normalisation
+factor ([`iscale`](@ref)) so that the factor can be folded into the scale of the
+oversampling copy; see [`plan_ift`](@ref).
 """
 iplan(p::AbstractFFTs.ScaledPlan) = p.p
 iplan(p) = p
 
-@doc (@doc iplan)
+"""
+    iscale(IFT)
+
+The normalisation factor of an inverse plan, `1/N`, separated from the plan itself
+([`iplan`](@ref)). `1` for a plan which is already normalised.
+"""
 iscale(p::AbstractFFTs.ScaledPlan) = p.scale
 iscale(p) = 1
 
