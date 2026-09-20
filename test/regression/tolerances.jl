@@ -56,6 +56,11 @@
    - Outside the ionising cases the loosest `:Eω` tolerances are `taper_field_kerr`
      8.7e-07 and `gradient_field_kerr` 2.6e-07, the two z-dependent cases: the operator is
      rebuilt at every stage, so where the stepper lands feeds back into the field itself.
+   - `radial_field_raman` (added in `gpu/20-radial-device` as the matrix's only
+     multi-column Raman case) is at the floor in the `:fixed` mode (2.4e-15) and 1.1e-09
+     in the `:adaptive` one, in line with the two radial Kerr cases. Its baseline does not
+     exist in any pre-`gpu/20` baseline directory, so the older baselines are run with
+     `LUNA_REGRESSION_SKIP=radial_field_raman`.
 =#
 module RegressionTolerances
 
@@ -116,6 +121,9 @@ const TOLERANCES = Dict{String, Dict{Symbol, Dict{Symbol, Float64}}}(
     "radial_env_kerr" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
         :adaptive  => Dict(:Eω => 8.2e-09, :stats => 1.0e-12)),
+    "radial_field_raman" => Dict(
+        :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
+        :adaptive  => Dict(:Eω => 1.1e-09, :stats => 1.0e-12)),
     "free3d_env_kerr" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
         :adaptive  => Dict(:Eω => 1.0e-12, :stats => 1.0e-12)),

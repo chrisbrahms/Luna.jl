@@ -274,23 +274,37 @@ const ΛLIMS_FREE = (400e-9, 2000e-9)
 const TRANGE_FREE = 0.1e-12
 
 """
-    setup_free(grid, zmax, sg, normfun, responses)
+Pulse energy of `setup_radial_field_raman`. The Kerr-only free-space cases run at 1 pJ,
+where a Raman term would be numerical dust; at 50 µJ, with `W0_FREE` and `ΤFWHM`, the Raman
+polarisation changes the field at the end of the propagation by 9.3e-03 relative, so the
+case measures the Raman response rather than a Kerr-only propagation. Measured against the
+same case with the Raman response removed, at 5, 20, 50 and 100 µJ: 8.6e-04, 3.5e-03,
+9.3e-03, 2.1e-02, with the adaptive step count (23) reproducible under a one-ulp
+perturbation at all four. 50 µJ is 1.6 GW, comfortably below the critical power for
+self-focusing in nitrogen.
+"""
+const RAMAN_FREE_ENERGY = 5e-5
 
-Kerr-only free-space propagation of a Gaussian beam focusing from `propz = -L_FREE`, on the
+"""
+    setup_free(grid, zmax, sg, normfun, responses; gas, pres, energy)
+
+Free-space propagation of a Gaussian beam focusing from `propz = -L_FREE`, on the
 transverse grid `sg` (a radial grid or a `Grid.FreeGrid`) with the matching `normfun` and
 nonlinear `responses`. `zmax` is the propagation length, which the grid no longer carries.
+`gas`, `pres` and `energy` default to the argon/1 bar/1 pJ the Kerr-only cases use.
 """
-function setup_free(grid, zmax, sg, normfun, responses)
-    nfunλ = PhysData.ref_index_fun(GAS_FREE, P_FREE)
+function setup_free(grid, zmax, sg, normfun, responses;
+                    gas=GAS_FREE, pres=P_FREE, energy=1e-12)
+    nfunλ = PhysData.ref_index_fun(gas, pres)
     nfun = (λ; z=0.0) -> nfunλ(λ)
     #= `thg` defaults to `true` for a `RealGrid` (required) and `false` for an `EnvGrid`,
        which matches the Kerr responses used below. =#
     linop = LinearOps.make_const_linop(grid, sg, nfun)
-    dens0 = PhysData.density(GAS_FREE, P_FREE)
+    dens0 = PhysData.density(gas, pres)
     densityfun = let dens0=dens0
         z -> dens0
     end
-    inputs = Fields.GaussGaussField(;λ0=Λ0, τfwhm=ΤFWHM, energy=1e-12,
+    inputs = Fields.GaussGaussField(;λ0=Λ0, τfwhm=ΤFWHM, energy,
                                      w0=W0_FREE, propz=-L_FREE)
     Eω, transform, FT = Luna.setup(grid, sg, densityfun, normfun, responses, inputs)
     output = Output.MemoryOutput(0, zmax, SAVEN, freestats(grid, Eω))
@@ -313,6 +327,29 @@ function setup_radial_env()
     nfun = (λ; z=0.0) -> nfunλ(λ)
     setup_free(grid, L_FREE, q, NonlinearRHS.const_norm_radial(grid, q, nfun),
                (Nonlinear.Kerr_env(PhysData.γ3_gas(GAS_FREE)),))
+end
+
+"""
+    setup_radial_field_raman()
+
+Radial Kerr + Raman in nitrogen: the only multi-column Raman case in the matrix. The
+batched Raman response owns `(2nt, npol, ncols)` buffers and does one pair of FFTs over the
+whole transverse block, which a single-column (mode-averaged or GNLSE) case cannot
+exercise. Nitrogen at 1 bar and [`RAMAN_FREE_ENERGY`](@ref), so that the Raman term is a
+per-cent-level contribution rather than numerical dust; everything else matches the two
+radial Kerr cases.
+"""
+function setup_radial_field_raman()
+    gas, pres = :N2, 1.0
+    grid = makegrid(Grid.RealGrid, L_FREE, Λ0, ΛLIMS_FREE, TRANGE_FREE)
+    q = radialgrid(R_FREE, 32)
+    nfunλ = PhysData.ref_index_fun(gas, pres)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    rr = Raman.raman_response(grid.to, gas)
+    setup_free(grid, L_FREE, q, NonlinearRHS.const_norm_radial(grid, q, nfun),
+               (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),
+                Nonlinear.RamanPolarField(grid.to, rr));
+               gas, pres, energy=RAMAN_FREE_ENERGY)
 end
 
 function setup_free3d_env()
@@ -482,6 +519,7 @@ const CASES = Case[
 
     lowlevel_case("radial_field_kerr", L_FREE, setup_radial_field),
     lowlevel_case("radial_env_kerr", L_FREE, setup_radial_env),
+    lowlevel_case("radial_field_raman", L_FREE, setup_radial_field_raman),
     lowlevel_case("free3d_env_kerr", L_FREE, setup_free3d_env),
     lowlevel_case("free2d_field_chi2", BBO_THICKNESS, setup_bbo_field),
     lowlevel_case("free2d_env_chi2", BBO_THICKNESS, setup_bbo_env),

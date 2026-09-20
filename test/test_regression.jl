@@ -56,7 +56,32 @@ function basecommit()
     readchomp(`git -C $repo merge-base HEAD $branch`)
 end
 
+"""
+    selected()
+
+The cases to run, as a `Vector{RegressionCases.Case}`: `ENV["LUNA_REGRESSION_ONLY"]` (a
+comma-separated list of case names) if set, minus `ENV["LUNA_REGRESSION_SKIP"]`.
+
+Both default to empty, i.e. the whole matrix. They exist because a baseline generated
+before a case was added has no file for it, so the gate would report it as a failure to
+load rather than as the missing baseline it is: a branch which adds a case runs the older
+baselines with that case skipped, and the new case against a baseline of its own. Neither
+variable is a way to make a failing case pass -- a skipped case is named in the header.
+"""
+function selected()
+    names(k) = haskey(ENV, k) ? split(ENV[k], ',') : String[]
+    only, skip = names("LUNA_REGRESSION_ONLY"), names("LUNA_REGRESSION_SKIP")
+    for n in vcat(only, skip)
+        any(c -> c.name == n, RegressionCases.CASES) ||
+            error("No regression case called $n (LUNA_REGRESSION_ONLY/SKIP)")
+    end
+    cases = isempty(only) ? RegressionCases.CASES :
+            filter(c -> c.name in only, RegressionCases.CASES)
+    filter(c -> !(c.name in skip), cases)
+end
+
 const BASE = basecommit()
+const CASES = selected()
 const BASEDIR = get(ENV, "LUNA_REGRESSION_DIR",
                     joinpath(Luna.Utils.cachedir(), "regression", BASE))
 
@@ -68,6 +93,9 @@ isdir(BASEDIR) || error(
 @printf("Regression gate\n")
 @printf("  baseline commit: %s\n", BASE)
 @printf("  baseline dir:    %s\n", BASEDIR)
+@printf("  cases:           %d of %d%s\n", length(CASES), length(RegressionCases.CASES),
+        length(CASES) == length(RegressionCases.CASES) ? "" :
+        " (" * join([c.name for c in CASES], ", ") * ")")
 @printf("\n%-24s %-9s %11s %10s %11s %10s  %s\n",
         "case", "mode", "Eω diff", "Eω tol", "stats diff", "stats tol", "worst quantity")
 @printf("%s\n", "-"^112)
@@ -75,7 +103,7 @@ isdir(BASEDIR) || error(
 worstoverall = 0.0
 
 @testset "regression" begin
-@testset "$(case.name)" for case in RegressionCases.CASES
+@testset "$(case.name)" for case in CASES
     baseline = try
         loadcase(BASEDIR, case.name)
     catch err

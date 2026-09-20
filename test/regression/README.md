@@ -80,6 +80,31 @@ the per-group record becomes the chain of merge-base comparisons.
 Baselines from different commits live in different directories, so both forms can be run
 without regenerating anything.
 
+### Running part of the matrix
+
+`LUNA_REGRESSION_ONLY` and `LUNA_REGRESSION_SKIP` take comma-separated case names and
+restrict the matrix (`ONLY` first, then `SKIP`). They exist for one situation: a branch
+which *adds* a case has no baseline for it in any older baseline directory, and without a
+filter the gate reports that as a failure to load rather than as the missing baseline it
+is. Such a branch runs
+
+```
+LUNA_REGRESSION_SKIP=<new case> LUNA_REGRESSION_BASE=<old commit> julia ... test/test_regression.jl
+```
+
+for the older baselines, and generates a baseline of its own for the new case:
+
+```
+julia --project=$PWD -t 1 test/regression/generate.jl <base commit> <dir> <new case>
+LUNA_REGRESSION_DIR=<dir> LUNA_REGRESSION_ONLY=<new case> LUNA_REGRESSION_BASE=<base commit> \
+    julia --project=$PWD -t 1 test/test_regression.jl
+```
+
+writing it to a directory of its own so that the shared baseline directories, which the
+integration branches regenerate wholesale, are left alone. The header prints which cases
+were selected whenever it is not all of them; neither variable can make a failing case
+pass.
+
 ### The compatibility shim in `cases.jl`
 
 `generate.jl` copies `cases.jl` into a worktree of the baseline commit, so the same file has
@@ -93,7 +118,10 @@ itself (`hasfield(Grid.RealGrid, :zmax)`, `isdefined(Grid, :RadialGrid)`), not f
 or a version — and the cases call `makegrid`, `runkw`, `radialgrid` and `absorber_setup`
 instead of the API directly. On `evanescent` each of those reduces to exactly the call the
 pre-Group-A `cases.jl` made: regenerating the `fdf8dbe3` baseline with the shimmed file
-reproduces the original one bit for bit, over all 21 cases, both modes and 502 datasets.
+reproduces the original one bit for bit, over the 21 cases which existed then, both modes
+and 502 datasets. `radial_field_raman`, added in `gpu/20-radial-device`, is the 22nd; it
+runs on `evanescent` through the same shim, but no baseline generated before that branch
+contains it.
 
 The block is marked in the file and should be deleted, with its call sites, once no baseline
 in use predates `gpu/int-A`.
