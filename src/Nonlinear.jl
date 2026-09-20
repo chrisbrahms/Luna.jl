@@ -325,7 +325,7 @@ function _check_listed_arrays(r, k)
 end
 
 """
-    rescale_responses(responses, spec, scaling, Et) -> Tuple
+    rescale_responses(responses, spec, scaling, Et)
 
 [`rescale`](@ref) applied to a transform's whole response collection, including the
 tuple-of-tuples a gas mixture is (each inner tuple is rescaled element by element and
@@ -336,12 +336,16 @@ stays a tuple, so that it still lines up with the density it is paired with).
 owns block-sized buffers ([`Batched`](@ref)) has them in the right shape, array type and
 precision before the transform asserts residency.
 
+The collection type is preserved, because whether the responses are a tuple is what
+[`NonlinearRHS.Et_to_Pt!`](@ref Luna.NonlinearRHS.Et_to_Pt!) uses to decide between the
+grouped dispatch and the historical per-response loop.
+
 On the default CPU path — host arrays, `Float64`, physical units — every fallback
 returns the response unchanged, so this is a no-op except for a response which
 implements the four-argument form because it has something to size to the block.
 """
 rescale_responses(responses, spec, scaling, Et) =
-    map(r -> _rescale_each(r, spec, scaling, Et), Tuple(responses))
+    map(r -> _rescale_each(r, spec, scaling, Et), responses)
 
 _rescale_each(r::Tuple, spec, scaling, Et) =
     map(x -> _rescale_each(x, spec, scaling, Et), r)

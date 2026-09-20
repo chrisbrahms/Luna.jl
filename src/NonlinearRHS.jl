@@ -682,7 +682,7 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
     #= The four-argument form: `Eto` is the prototype of the block the responses are
        called with, so one which owns buffers can allocate them here, in the run's array
        type, in time for the residency assertion below. =#
-    resp = Nonlinear.rescale_responses(resp, spec, scaling, Eto)
+    resp = Nonlinear.rescale_responses(Tuple(resp), spec, scaling, Eto)
     #= Every mirror the transform holds and every array its responses carry, not only the
        ones this transform's own kernels touch: the assertion is what catches a future
        mistake, so it has to cover everything. =#
