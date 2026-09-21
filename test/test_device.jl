@@ -37,6 +37,7 @@ import FFTW
 import Adapt
 import LinearAlgebra
 import LinearAlgebra: mul!
+import Logging
 
 # A minimal device-array type: enough to test the `backend` trait, which never touches
 # the data.
@@ -1072,7 +1073,8 @@ end
    it built -- already on the host, already unscaled. `boundary=:none` by default: the
    `:rate` case, which exercises `Boundaries.RateAbsorber`, has its own testset below. =#
 function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
-                  precision=nothing, boundary=:none, stats=false, extraresp=())
+                  precision=nothing, boundary=:none, stats=false, extraresp=(),
+                  stats_device=:auto)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15)
@@ -1090,11 +1092,11 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                    constβ=true, device=spec, precision)
-    #= Stats.jl is host-only: its EnvGrid plan_analytic builds an FFTW plan directly on
-       a copy of the given Eω, so construction needs a host-shaped template, not the
-       (possibly device) state itself. See Interface.jl's prop_capillary_args. =#
-    shost = Utils.isdevice(Eω) ? Luna.tohost(Eω) : Eω
-    statsfun = stats ? Stats.default(grid, shost, m, linop, transform; gas) : Output.nostats
+    #= The state itself: `Stats.default` builds its buffers and plans its transform for
+       the array type and precision `Eω` has, so the default statistics run where the
+       state does (gpu/24). =#
+    statsfun = stats ?
+        Stats.default(grid, Eω, m, linop, transform; gas, stats_device) : Output.nostats
     out = Output.MemoryOutput(0, flength, 3, statsfun)
     Luna.run(Eω, grid, linop, transform, FT, out;
              zmax=flength, boundary, init_dz=flength/20, rtol=1e-8)
@@ -2036,10 +2038,26 @@ end
           maximum(abs, plain["Eω"][:, end]) > 1e-6
 end
 
+#= The difference between two values of one statistic, which may be a scalar or a
+   vector, relative to the reference value's own magnitude (several of them -- `z`, `dz`,
+   `density` -- are exact, hence the absolute fallback). Paired with the key in the
+   assertions below, so that a failure names the quantity. =#
+_sdiff(a, b) = (isnan(a) && isnan(b)) ? zero(a) : abs(a - b) # `zdw` is NaN off resonance
+function statserr(d, h)
+    scale = maximum(x -> isnan(x) ? zero(x) : abs(x), h)
+    e = maximum(_sdiff.(d, h))
+    scale > 0 ? e/scale : e
+end
+
+#= `stats_device=:device` on the JLArray runs: these states are a single column, so
+   `:auto` would choose the host path (`Stats.STATS_DEVICE_MINLEN`), which is the right
+   default but would leave the device branches untested end to end. The `:auto` decision
+   itself has its own testset below. =#
 @testset "boundaries and default statistics on JLArray" begin
     for GT in (Grid.RealGrid, Grid.EnvGrid)
         href, htr = kerrcase(GT, HostSpec(); boundary=:rate, stats=true)
-        dref, dtr = kerrcase(GT, JLSpec; boundary=:rate, stats=true)
+        dref, dtr = kerrcase(GT, JLSpec; boundary=:rate, stats=true,
+                             stats_device=:device)
 
         @test dref["z"] ≈ href["z"]
         for idx in axes(href["Eω"], 2)
@@ -2047,10 +2065,329 @@ end
             d = dref["Eω"][:, idx]
             @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
         end
-        # The statistics agree too: they were computed from a host copy on both paths
-        @test dref["stats"]["energy"] ≈ href["stats"]["energy"] rtol=1e-8
+        #= Every recorded statistic agrees, and on the device path none of them saw a
+           host copy of the field: they were computed on the JLArray state itself. =#
         @test length(dref["stats"]["z"]) == length(href["stats"]["z"])
+        for key in sort(collect(keys(href["stats"])))
+            err = statserr(dref["stats"][key], href["stats"][key])
+            @test (key, err <= 1e-10) == (key, true)
+        end
     end
+end
+
+#= The default statistics evaluated directly on the state, JLArray against host, rather
+   than through a propagation: every statistic on one state, so a failure names the
+   quantity. The two states are made identical by copying the host one onto the device,
+   so what is compared is the statistics and nothing else.
+
+   `plasma=true` puts `Stats.electrondensity` into the set, which needs a field strong
+   enough to ionise (argon at 1 bar, 150 uJ -- the `plasmacase` parameters); `onaxis=true`
+   swaps the effective-area peak intensity for the single-mode on-axis one; `windows`
+   adds `Stats.energy_λ`. =#
+function statsstate(spec; GT=Grid.RealGrid, gas=:He, pres=1.0, energy=1e-6, λ0=800e-9,
+                    plasma=false, onaxis=false, windows=nothing, userfuns=Any[],
+                    stats_device=:auto)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (200e-9, 3000e-9), 400e-15) :
+        Grid.EnvGrid(λ0, (200e-9, 3000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, gas, pres, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = GT === Grid.RealGrid ?
+        (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),) :
+        (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
+    if plasma
+        resp = (resp...,
+                Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)), tablerate(),
+                                         PhysData.ionisation_potential(gas)))
+    end
+    linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                                   constβ=true, device=spec)
+    sf = Stats.default(grid, Eω, m, linop, transform;
+                       gas, onaxis, windows, userfuns, stats_device)
+    (grid, Eω, sf)
+end
+
+#= The default statistics of a mode-averaged run, built by hand so that `E_ref` and the
+   path can be set independently of any transform. Shared by the scaling testset and the
+   HDF5-cache one. =#
+function statsfunset(grid, m, aeff, dens, rate)
+    _, energyfunω = Fields.energyfuncs(grid)
+    (Stats.ω0(grid), Stats.energy(grid, energyfunω), Stats.peakpower(grid),
+     Stats.fwhm_t(grid), Stats.peakintensity(grid, aeff), Stats.density(dens),
+     Stats.energy_λ(grid, energyfunω, (150e-9, 300e-9)),
+     Stats.electrondensity(grid, rate, dens, aeff))
+end
+
+@testset "every default statistic on JLArray" begin
+    for (nm, kw) in (("Kerr, field-resolved", (;)),
+                     ("Kerr, envelope", (; GT=Grid.EnvGrid)),
+                     ("on-axis intensity", (; onaxis=true)),
+                     ("energy windows", (; windows=((150e-9, 300e-9),))),
+                     ("plasma", (; gas=:Ar, energy=150e-6, plasma=true)))
+        _, Eh, sfh = statsstate(HostSpec(); kw...)
+        _, Ed, sfd = statsstate(JLSpec; kw..., stats_device=:device)
+        copyto!(Ed, Eh) # the same state on both paths
+        @test Stats.device_capable(sfd)
+        @test isempty(Stats.host_statistics(sfd))
+        dh = sfh(Eh, 0.1, 1e-4)
+        dd = sfd(Ed, 0.1, 1e-4)
+        @test sort(collect(keys(dd))) == sort(collect(keys(dh)))
+        for key in sort(collect(keys(dh)))
+            err = statserr(dd[key], dh[key])
+            @test (nm, key, err <= 1e-10) == (nm, key, true)
+        end
+        if get(kw, :plasma, false)
+            # the case really ionises, so `electrondensity` is a meaningful comparison
+            @test dh["electrondensity"]/PhysData.density(:Ar, 1.0) > 1e-4
+        end
+    end
+end
+
+#= The unit scaling the device branches have to undo. On JLArray in Float64 `E_ref` is
+   1, so it is set by hand here: the same statistics built for `E_ref = r` and given the
+   state divided by `r` must give the physical answers back. That is exact arithmetic on
+   the scaling, independent of precision, which is what Metal cannot separate out. =#
+@testset "the device statistics undo the unit scaling" begin
+    r = 1024.0
+    grid = Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, :Ar, 1.0, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    ρ = PhysData.density(:Ar, 1.0)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),
+            Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)), tablerate(),
+                                     PhysData.ionisation_potential(:Ar)))
+    _, βfun!, _, _ = LinearOps.make_const_linop(grid, m, 800e-9)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=150e-6)
+    Eω, _, _ = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
+                          constβ=true, device=JLSpec)
+    funs = statsfunset(grid, m, aeff, dens, tablerate())
+    unscaled = Stats.collect_stats(grid, Eω, funs...; stats_device=:device)
+    scaled = Stats.collect_stats(grid, Eω, funs...; Eref=r, stats_device=:device)
+    d1 = unscaled(Eω, 0.1, 1e-4)
+    d2 = scaled(Eω ./ r, 0.1, 1e-4)
+    @test sort(collect(keys(d2))) == sort(collect(keys(d1)))
+    for key in sort(collect(keys(d1)))
+        err = statserr(d2[key], d1[key])
+        @test (key, err <= 1e-10) == (key, true)
+    end
+    @test d1["electrondensity"] > 0
+end
+
+#= Which statistics have a device form and which do not, and what the wiring does with
+   the answer. A multimode set is the case where the answer is "not all of them". =#
+@testset "device_capable and the host statistics list" begin
+    _, Ed, sfd = statsstate(JLSpec; stats_device=:device)
+    @test Stats.device_capable(sfd)
+    @test Luna.stats_device_capable(Output.MemoryOutput(0, 1.0, 2, sfd))
+    @test Luna.stats_device_capable(
+        Output.MemoryOutput(0, 1.0, 2, Output.maybe_periodic(sfd, 5)))
+    @test Luna.stats_device_capable(Output.MemoryOutput(0, 1.0, 2, Output.nostats))
+
+    # a user closure has no device form and is named in the list
+    uf = (d, Eω, Et, z, dz) -> d["mine"] = sum(abs2, Eω)
+    _, Eu, sfu = statsstate(JLSpec; userfuns=Any[uf], stats_device=:device)
+    @test !Stats.device_capable(sfu)
+    @test Stats.host_statistics(sfu) == ["userfuns[1]"] # named, not a gensym
+    @test !Luna.stats_device_capable(Output.MemoryOutput(0, 1.0, 2, sfu))
+    #= A set which is not device-capable is built for the host copy `ScaledOutput` will
+       hand it, not for the device state it was constructed from: its buffers and its
+       plan are host ones, and it is called with a host array. JLArrays interprets its
+       kernels on the host, so a mixed host/device broadcast would pass here silently and
+       fail on real hardware -- hence the structural check as well as the call. =#
+    @test sfu.Et isa Array
+    @test !Utils.isdevice(sfu.Et)
+    @test haskey(sfu(Array(Eu), 0.1, 1e-4), "mine")
+
+    #= The multimode default set: `fwhm_r`, `mode_reconstruction_error` and, for more
+       than one mode, the on-axis peak intensity keep their algorithms on the host, and
+       the list says so by name. The modal transform is host-only, so this is built on
+       the host. =#
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    modes = (Capillary.MarcatiliMode(75e-6, :He, 1.0, n=1, loss=false),
+             Capillary.MarcatiliMode(75e-6, :He, 1.0, n=2, loss=false))
+    ρ = PhysData.density(:He, 1.0)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, modes, :y; full=false)
+    linop = LinearOps.make_const_linop(grid, modes, 800e-9)
+    sfm = Stats.default(grid, Eω, modes, linop, transform)
+    @test !Stats.device_capable(sfm)
+    @test sort(Stats.host_statistics(sfm)) ==
+          ["FWHMr", "ModeReconstructionError", "PeakIntensityModes"]
+end
+
+#= The exit criterion of this branch on JLArray: the state is never copied to the host
+   for the default statistics. `ScaledOutput.ybuf` is the only place such a copy lands,
+   and `_tohost_unscale!` is the only thing which writes it, so filling it with a
+   sentinel and finding it unchanged after several calls is the copy count -- the same
+   instrument gpu/11's `stats_period` test uses. =#
+@testset "the default statistics skip the device-to-host copy" begin
+    _, Ed, sfd = statsstate(JLSpec; stats_device=:device)
+    out = Output.MemoryOutput(0, 1.0, 2, sfd)
+    so = Luna.ScaledOutput(out, Ed, 1.0)
+    @test so.devstats
+    fill!(so.ybuf, 7)
+    snap = copy(so.ybuf)
+    # no host-statistics warning, because there is no host copy
+    @test_logs min_level=Logging.Warn begin
+        for t in (0.0, 0.1, 0.2)
+            so(Ed, t, 0.05, _ -> Ed)
+        end
+    end
+    @test so.ybuf == snap             # nothing was copied down
+    @test length(out["stats"]["z"]) == 3
+    @test !so.warned[]
+
+    # add a user statistic and the copy comes back, with the warning naming it
+    uf = (d, Eω, Et, z, dz) -> d["mine"] = 1.0
+    _, Eu, sfu = statsstate(JLSpec; userfuns=Any[uf], stats_device=:device)
+    out2 = Output.MemoryOutput(0, 1.0, 2, sfu)
+    so2 = Luna.ScaledOutput(out2, Eu, 1.0)
+    @test !so2.devstats
+    @test sfu.Et isa Array # built for the host copy it is about to be handed
+    fill!(so2.ybuf, 7)
+    @test_logs (:warn, r"have no device form") match_mode=:any begin
+        so2(Eu, 0.0, 0.05, _ -> Eu)
+    end
+    @test so2.ybuf != fill(ComplexF64(7), size(so2.ybuf))
+    @test so2.warned[]
+end
+
+#= Review round 1, finding 1: an `HDF5Output` with a resume cache (the default, and what
+   `prop_capillary(…; filepath=…)` builds) writes the per-step `y` into the file *and*
+   passes it to its statistics function. Those need two different arrays when the
+   statistics are on the device: the state itself for the statistics, a host copy in
+   physical units for the cache. Before the fix `ScaledOutput` passed the host copy to
+   both, which threw on Metal and, here, silently applied `E_ref²` twice.
+
+   `E_ref = 2` throughout, so a double application is a factor of 4 and cannot hide. =#
+@testset "HDF5 resume cache with device statistics" begin
+    r = 2.0
+    grid = Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, :Ar, 1.0, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    ρ = PhysData.density(:Ar, 1.0)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),
+            Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)), tablerate(),
+                                     PhysData.ionisation_potential(:Ar)))
+    _, βfun!, _, _ = LinearOps.make_const_linop(grid, m, 800e-9)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=150e-6)
+    Eh, _, _ = Luna.setup(grid, dens, resp, inputs, βfun!, aeff; constβ=true)
+    Ed = Luna.todevice(JLSpec, Eh ./ r)   # the scaled device state
+    funs = statsfunset(grid, m, aeff, dens, tablerate())
+
+    # the reference: the host path, physical units, no wrapper
+    ref = Output.MemoryOutput(0, 1.0, 2, Stats.collect_stats(grid, Eh, funs...))
+    ref(Eh, 0.0, 0.05, _ -> Eh)
+
+    # the same statistics on the device, through a MemoryOutput (no cache)
+    mo = Output.MemoryOutput(
+        0, 1.0, 2, Stats.collect_stats(grid, Ed, funs...; Eref=r, stats_device=:device))
+    smo = Luna.ScaledOutput(mo, Ed, r)
+    @test smo.devstats
+    @test !smo.needcache
+    smo(Ed, 0.0, 0.05, _ -> Ed)
+
+    # ... and through an HDF5Output with a resume cache, which is the case that broke
+    mktempdir() do dir
+        fp = joinpath(dir, "cache.h5")
+        ho = Output.HDF5Output(
+            fp, 0, 1.0, 2,
+            Stats.collect_stats(grid, Ed, funs...; Eref=r, stats_device=:device))
+        sho = Luna.ScaledOutput(ho, Ed, r)
+        @test sho.devstats
+        @test sho.needcache
+        @test Output.willsave(ho, Ed, 0.0, 0.05) # so the cache write really happens
+        sho(Ed, 0.0, 0.05, _ -> Ed)
+        @test ho.saved == 1
+        #= The cache was written from the unscaled host copy, which is a different array
+           from the one the statistics saw. =#
+        @test maximum(abs, Array(sho.ybuf) .- Eh)/maximum(abs, Eh) < 1e-14
+        for key in sort(collect(keys(ref["stats"])))
+            @test (key, statserr(ho["stats"][key], ref["stats"][key]) <= 1e-10) ==
+                  (key, true)
+            @test (key, statserr(mo["stats"][key], ref["stats"][key]) <= 1e-10) ==
+                  (key, true)
+        end
+        # the recorded values are physical, not E_ref^2 too large
+        @test ho["stats"]["peakpower"][1] ≈ ref["stats"]["peakpower"][1] rtol=1e-10
+    end
+end
+
+#= Review round 1, finding 3: `:auto` picks the host path for a state below
+   `Stats.STATS_DEVICE_MINLEN`, where the copy costs less than six device-to-host round
+   trips. The rule is the size of the state and nothing else -- extra columns alone do not
+   make the device path pay, because `fwhm_t` copies the time-domain intensity down on
+   either path. `Luna.stats_device_capable` reports the decision, which is what
+   `ScaledOutput` acts on. =#
+@testset "the stats_device heuristic" begin
+    grid = Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15)
+    m = Capillary.MarcatiliMode(75e-6, :Ar, 1.0, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    ρ = PhysData.density(:Ar, 1.0); dens = z -> ρ
+    funs = statsfunset(grid, m, aeff, dens, tablerate())
+    n = length(grid.ω)
+    @test n < Stats.STATS_DEVICE_MINLEN # the case this test is about
+    #= The rule is `length >= STATS_DEVICE_MINLEN`; `Base.OneTo` stands in for a state of
+       that size, which would be 64 MB to allocate. =#
+    @test Stats._devicepays(Base.OneTo(Stats.STATS_DEVICE_MINLEN))
+    @test !Stats._devicepays(Base.OneTo(Stats.STATS_DEVICE_MINLEN - 1))
+
+    E1 = Luna.alloc(JLSpec, ComplexF64, (n,))
+    @test !Stats.device_capable(Stats.collect_stats(grid, E1, funs...))
+    @test Stats.device_capable(
+        Stats.collect_stats(grid, E1, funs...; stats_device=:device))
+    @test !Stats.device_capable(
+        Stats.collect_stats(grid, E1, funs...; stats_device=:host))
+    @test_throws ArgumentError Stats.collect_stats(grid, E1, funs...; stats_device=:gpu)
+
+    #= More than one column is not on its own a reason to use the device: the rule is
+       purely the size, and this state is still small. =#
+    E3 = Luna.alloc(JLSpec, ComplexF64, (n, 3))
+    funs3 = (Stats.ω0(grid), Stats.energy(grid, Fields.energyfuncs(grid)[2]),
+             Stats.peakpower(grid), Stats.fwhm_t(grid), Stats.density(dens))
+    @test !Stats.device_capable(Stats.collect_stats(grid, E3, funs3...))
+    #= and the multi-column device reductions, forced, give the host answers: three copies
+       of the same column, so every per-column value must be the single-column one. =#
+    Eh1 = randn(ComplexF64, n)
+    Eh3 = repeat(Eh1, 1, 3)
+    d1 = Stats.collect_stats(grid, Eh1, funs3...)(Eh1, 0.1, 1e-4)
+    dd = Stats.collect_stats(grid, E3, funs3...; stats_device=:device)(
+        Luna.todevice(JLSpec, Eh3), 0.1, 1e-4)
+    for key in ("ω0", "energy", "peakpower", "fwhm_t_min")
+        v = dd[key]
+        @test length(v) == 3
+        @test (key, maximum(abs, v .- d1[key])/abs(d1[key]) <= 1e-10) == (key, true)
+    end
+
+    # a host state is never on the device, whatever is asked for
+    @test !Stats.device_capable(
+        Stats.collect_stats(grid, zeros(ComplexF64, n), funs...; stats_device=:device))
+end
+
+#= A statistic prepared for one array and called with the other is a mistake, not a
+   fallback: it errors rather than computing something wrong. =#
+@testset "a statistic refuses the array it was not built for" begin
+    grid = Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15)
+    n = length(grid.ω)
+    Ed = Luna.alloc(JLSpec, ComplexF64, (n,))
+    Eh = zeros(ComplexF64, n)
+    ctxd = Stats.StatsContext(grid, Ed, 1.0, true)
+    pp = Stats.prepare(Stats.peakpower(grid), ctxd)
+    @test pp.ondevice
+    Etd = Luna.alloc(JLSpec, ComplexF64, (2(n-1),))
+    Eth = zeros(ComplexF64, 2(n-1))
+    dd = Dict{String, Any}()
+    pp(dd, Ed, Etd, 0.0, 1e-4)
+    @test haskey(dd, "peakpower")                       # the array it was built for
+    @test_throws ErrorException pp(dd, Eh, Eth, 0.0, 1e-4)  # and not the other one
 end
 
 #= Review round 1, finding 3: `stats_period` has to actually skip the device-to-host copy

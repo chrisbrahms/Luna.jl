@@ -244,10 +244,33 @@ statistics *do* run with a device state:
 
 - `Boundaries.RateAbsorber`/`LegacyAbsorber` and the transverse collars are broadcasts
   and reductions over mirrored arrays (`Boundaries.jl`), like everything else per-step.
-- Per-step statistics (`Stats.jl`) are still host code: the field is copied to the host
-  every accepted step to compute them, and `Luna.run` warns once when this happens. Use
-  `stats_period` to reduce how often they run (below), or `Output.nostats` to disable
-  them; device statistics (computing them without the copy) are `gpu/24`'s.
+- The default per-step statistics (`Stats.jl`) have a device form -- the energies, the
+  peak power and intensity, the temporal FWHM, the electron density and the z-dependent
+  quantities are reductions and broadcasts over the state where it is -- but **which path
+  a run takes depends on the size of the state**, and Luna logs which one it chose:
+
+  - a state with at least `Stats.STATS_DEVICE_MINLEN` elements computes its statistics on
+    the device, with no copy;
+  - a smaller one is copied to the host and the statistics are computed there, because the
+    copy is cheaper. Each statistic that ends in a device-to-host transfer costs the same
+    round trip whatever the size of the state -- about 400 µs on an M1 Pro through Metal --
+    and the default set makes six of them, where the host path makes one transfer. On the
+    mode-averaged Kerr case that is the difference between a 2.3 ms and a 4.6 ms accepted
+    step.
+
+  Every device state Luna produces today is one mode-averaged column, far below the
+  threshold, so in practice the host path is taken; the threshold is set from where the
+  transfer of the state costs as much as the round trips, and will be re-measured when the
+  radial and free-space transforms become device-capable. To override the choice,
+  `stats_kwargs=Dict(:stats_device => :device)` (or `:host`) reaches
+  `Stats.collect_stats` through `prop_capillary`.
+
+  `fwhm_r` and the modal reconstruction error have no device form at all and keep their
+  algorithms on the host; both belong to the multimode set, whose transform is host-only
+  anyway. A statistics function *you* write is host code too: the whole set is then
+  computed on a host copy of the field on every step the statistics fire, and `Luna.run`
+  warns once, naming it (`userfuns[1]`), when that happens. Use `stats_period` to reduce
+  how often they run (below), or `Output.nostats` to switch them off.
 - The output itself never sees a device array or a scaled one: `Luna.run` wraps it in
   `Luna.ScaledOutput`, which copies to the host and, for a `Float32` run, unscales, before
   handing it to `Output.MemoryOutput`/`HDF5Output`. A `Float32` run's saved field is
@@ -403,9 +426,15 @@ out = prop_capillary(...; stats_period=10)
 
 Collects the default statistics every 10th accepted step instead of every step
 (`Output.PeriodicStats`). The recorded statistics arrays are correspondingly shorter; the
-saved field (`saveN`, `out["Eω"]`) is unaffected. Worth raising on a device, where
-per-step statistics force a host copy every accepted step regardless of how often the
-propagation actually saves the field.
+saved field (`saveN`, `out["Eω"]`) is unaffected.
+
+This is still the lever it always was on a GPU. On the mode-averaged geometry the
+statistics are computed from a host copy of the field (above), which costs a transfer and
+the host reductions on every step they fire on -- about 0.3 ms against a 2.0 ms step for a
+1025-point grid, i.e. 13% of the step, and more with plasma. Raising `stats_period`
+removes that in proportion. It is worth raising further when you have added a statistics
+function of your own, and further still on a multi-column state, where the statistics run
+on the device but the field is large.
 
 ## Performance
 

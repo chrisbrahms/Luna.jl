@@ -577,12 +577,15 @@ requests through `yfun`), and therefore needs it on the host, in physical units.
 
 True whenever `o`'s statistics function is not `Output.nostats` and, if it is an
 [`Output.PeriodicStats`](@ref), will actually fire this step ([`Output.willfire`](@ref)):
-[`Stats.collect_stats`](@ref Luna.Stats.collect_stats) does a full inverse FFT and host
-reductions, so a device run has to copy the state down on every step whose statistics are
-really computed -- but not on a step `PeriodicStats` is going to skip, which is the whole
-point of `stats_period` on a device. [`ScaledOutput`](@ref) warns once when this forces a
-device-to-host copy. Conservatively `true` for an output whose statistics function cannot
-be inspected this way.
+a statistic which cannot be evaluated where the state lives has to have it copied down on
+every step whose statistics are really computed -- but not on a step `PeriodicStats` is
+going to skip, which is the whole point of `stats_period` on a device. Conservatively
+`true` for an output whose statistics function cannot be inspected this way.
+
+Whether the copy is needed at all is the second question, answered by
+[`stats_device_capable`](@ref): a statistics set which runs on the state as the stepper
+holds it needs no copy on any step. [`ScaledOutput`](@ref) asks both, and warns once,
+naming the statistics responsible, when a copy is forced.
 """
 needs_host_y(o, t) = true
 needs_host_y(o::Output.MemoryOutput, t) = _stats_will_run(o.statsfun, t)
@@ -590,6 +593,41 @@ needs_host_y(o::Output.HDF5Output, t) = _stats_will_run(o.statsfun, t)
 
 _stats_will_run(f, t) = f !== Output.nostats
 _stats_will_run(p::Output.PeriodicStats, t) = Output.willfire(p, t)
+
+"""
+    stats_device_capable(x) -> Bool
+
+Whether the statistics `x` stands for **are** evaluated on the propagating state as the
+stepper holds it: a device array, in the scaled units of [`UnitScaling`](@ref). `x` is
+either an output handler or a statistics function.
+
+This is the path a set was built for, not only what it is capable of: a set built by
+[`Stats.collect_stats`](@ref Luna.Stats.collect_stats) reports `false` when every one of
+its statistics has a device form but the state is a single column, where the device path
+costs more than the copy (see that function). Anything else -- a user-written closure, a
+statistics function from somewhere else -- is `false` too, which is what makes
+[`ScaledOutput`](@ref) copy the state to the host every step. `Output.nostats` is
+trivially capable: it reads nothing.
+"""
+stats_device_capable(x) = false
+stats_device_capable(o::Output.MemoryOutput) = stats_device_capable(o.statsfun)
+stats_device_capable(o::Output.HDF5Output) = stats_device_capable(o.statsfun)
+stats_device_capable(p::Output.PeriodicStats) = stats_device_capable(p.f)
+stats_device_capable(::typeof(Output.nostats)) = true
+
+"""
+    stats_host_list(x) -> Vector{String}
+
+The names of the statistics in `x` which are not [`stats_device_capable`](@ref), for the
+one-time warning [`ScaledOutput`](@ref) emits. `x` is either an output handler or a
+statistics function. Extended by
+[`Stats.host_statistics`](@ref Luna.Stats.host_statistics) for the sets `Stats.default`
+builds; the fallback is a single entry naming the type of the statistics function.
+"""
+stats_host_list(x) = stats_device_capable(x) ? String[] : [string(nameof(typeof(x)))]
+stats_host_list(o::Output.MemoryOutput) = stats_host_list(o.statsfun)
+stats_host_list(o::Output.HDF5Output) = stats_host_list(o.statsfun)
+stats_host_list(p::Output.PeriodicStats) = stats_host_list(p.f)
 
 """
     needs_host_cache(o) -> Bool
@@ -617,7 +655,11 @@ Two reusable host buffers, in `y`'s element type (so a `Float32` run saves `Floa
   step, so `Output.PeriodicStats` skips the copy on a step it is not going to fire on) or
   ([`needs_host_cache`](@ref) and [`Output.willsave`](@ref)) says it is needed this step
   -- so a device run with `Output.nostats` and no HDF5 cache never pays for it, and an
-  `HDF5Output` with caching pays only on a save step.
+  `HDF5Output` with caching pays only on a save step. Statistics need it only when they
+  are not [`stats_device_capable`](@ref) (`devstats` below): a device run whose statistics
+  are evaluated on the device does no per-step copy for them, and on a save step of an
+  `HDF5Output` with a cache it still gets its host copy, passed to the output as
+  `cache_y` while the statistics are handed the state itself.
 - `ibuf` holds the unscaled, host copy of a **saved** field. It is filled lazily, inside
   the closure `o` calls as `yfun`, so it costs nothing on a step which does not save
   (`o`'s own save condition decides whether to call it at all) and it is a different
@@ -633,14 +675,21 @@ mutable struct ScaledOutput{O, A<:AbstractArray}
     o::O
     Eref::Float64
     needcache::Bool     # `o` is an HDF5Output with a resumable cache
+    devstats::Bool      # the statistics read the state where it is: no copy for them
     ybuf::A
     ibuf::A
     warned::Base.RefValue{Bool}
 end
 
+#= `devstats` is decided once, here: the statistics function is fixed for the propagation
+   and so is where the state lives. It is only ever true for a state on a device -- a
+   scaled host run (`Float32` on the CPU) still copies, because the statistics would
+   otherwise see the scaled field and the host branches of `Stats.jl` are the unscaled,
+   physical-unit code Luna has always run. =#
 function ScaledOutput(o, y::AbstractArray, Eref::Real)
     A = Array{eltype(y), ndims(y)}
     ScaledOutput{typeof(o), A}(o, Float64(Eref), needs_host_cache(o),
+                               isdevice(y) && stats_device_capable(o),
                                A(undef, size(y)), A(undef, size(y)), Ref(false))
 end
 
@@ -655,28 +704,50 @@ function _tohost_unscale!(buf::AbstractArray, y::AbstractArray, Eref::Float64)
     buf
 end
 
+#= Only for a set which contains a statistic with no device form. A set which *could*
+   have run on the device and was built for the host anyway (the shape heuristic in
+   `Stats.collect_stats`) has already said so with an `@info` line at construction, and
+   repeating it as a warning would be noise. =#
 function _warn_host_stats!(so::ScaledOutput, y)
     so.warned[] && return nothing
     isdevice(y) || return nothing
+    names = stats_host_list(so.o)
+    isempty(names) && return nothing
     so.warned[] = true
     Logging.@warn(
-        "Per-step statistics run on the host: the propagating field is copied to the "*
-        "device every accepted step to compute them. Pass `stats_period` (or "*
+        "Per-step statistics run on the host: the propagating field is copied from the "*
+        "device every accepted step to compute them, because these statistics have no "*
+        "device form ("*join(names, ", ")*"). Pass `stats_period` (or "*
         "`Output.PeriodicStats`) to run them less often, or `Output.nostats` to disable "*
-        "them. Device statistics are `gpu/24`'s. (Reported once.)")
+        "them. (Reported once.)")
     nothing
 end
 
+#= Which array the wrapped output is called with, and which array its resume cache is
+   written from, are two separate questions, and on a device run with device-capable
+   statistics they have two different answers: the statistics were built for the state
+   where it lives and the cache needs a host array in physical units. `HDF5Output` takes
+   the second as a keyword (`cache_y`); every other output has no cache, so
+   `needs_host_cache` is false for it and the keyword is never passed. =#
 function (so::ScaledOutput)(y, t, dt, yfun)
-    needy = needs_host_y(so.o, t)
+    needy = !so.devstats && needs_host_y(so.o, t)
     needcache = so.needcache && Output.willsave(so.o, y, t, dt)
-    if needy || needcache
-        yh = _tohost_unscale!(so.ybuf, y, so.Eref)
+    ifun = ts -> _tohost_unscale!(so.ibuf, yfun(ts), so.Eref)
+    if needcache
+        cy = _tohost_unscale!(so.ybuf, y, so.Eref)
         needy && _warn_host_stats!(so, y)
+        #= `devstats`: the statistics see the state itself, the cache sees `cy`. Anything
+           else (including `Output.nostats`) is handed the host copy for both, which is
+           what it always got. =#
+        return so.o(so.devstats ? y : cy, t, dt, ifun; cache_y=cy)
+    end
+    if needy
+        yh = _tohost_unscale!(so.ybuf, y, so.Eref)
+        _warn_host_stats!(so, y)
     else
         yh = y # nothing inspects it this step: pass the state through untouched, no copy
     end
-    so.o(yh, t, dt, ts -> _tohost_unscale!(so.ibuf, yfun(ts), so.Eref))
+    so.o(yh, t, dt, ifun)
 end
 
 # Metadata and any other call (e.g. `output(dict; group=...)`) pass straight through.

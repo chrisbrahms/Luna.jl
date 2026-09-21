@@ -239,12 +239,19 @@ function HDF5Output(fpath::AbstractString)
 end
 
 """
-    initialise(o::HDF5Output, y)
+    initialise(o::HDF5Output, y; cache_y=y)
 
 Create the solution dataset, with element type `eltype(y)` (see the `MemoryOutput` method
-of the same name). `y` is always a host array here.
+of the same name).
+
+`y` is used only for its shape and element type, so it may be whatever the caller's
+statistics function is being given. `cache_y` is the array actually written into the
+resume cache and must therefore be a host array in physical units; it defaults to `y`,
+which is what it is for every caller that does not wrap this output. `Luna.ScaledOutput`
+is the one that passes them separately: a device run with device-capable statistics hands
+the statistics the state where it lives and the cache its own host copy.
 """
-function initialise(o::HDF5Output, y)
+function initialise(o::HDF5Output, y; cache_y=y)
     ydims = size(y)
     idims = init_dims(ydims, o.save_cond)
     cdims = collect(idims)
@@ -272,7 +279,7 @@ function initialise(o::HDF5Output, y)
         if o.cache
             file["meta"]["cache"]["t"] = typemin(0.0)
             file["meta"]["cache"]["dt"] = typemin(0.0)
-            file["meta"]["cache"]["y"] = y
+            file["meta"]["cache"]["y"] = cache_y
             file["meta"]["cache"]["saved"] = 0
         end
     end
@@ -351,16 +358,24 @@ end
         t: current propagation point
         dt: current stepsize
         yfun: callable which returns interpolated function value at different t
+        cache_y: the array to write into the resume cache (keyword, defaults to `y`)
     Note that from RK45.jl, this will be called with yn and tn as arguments.
+
+`y` is passed to the statistics function and used for the shape and element type of the
+solution dataset; `cache_y` is what the resume cache is written from and must be a host
+array in physical units. They are the same array for every caller which does not wrap
+this output. `Luna.ScaledOutput` separates them so that a device run with device-capable
+statistics can hand the statistics the state where it lives while the cache still gets a
+host copy -- `Output.jl` itself knows nothing about either.
 """
-function (o::HDF5Output)(y, t, dt, yfun)
+function (o::HDF5Output)(y, t, dt, yfun; cache_y=y)
     o.readonly && error("Cannot add data to read-only output!")
     save, ts = o.save_cond(y, t, dt, o.saved)
     st = o.statsfun(y, t, dt)
     isnothing(st) || push!(o.stats_tmp, st) # `nothing`: no statistics this step (PeriodicStats)
     if save
         HDF5.h5open(o.fpath, "r+") do file
-            !HDF5.haskey(file, o.yname) && initialise(o, y)
+            !HDF5.haskey(file, o.yname) && initialise(o, y; cache_y)
             #= `stats_tmp` can be empty here if `stats_period` is coarser than the save
                interval: the cachehash check then has nothing to compare and is skipped,
                since the field it would check (which statistics exist) has not changed. =#
@@ -392,7 +407,7 @@ function (o::HDF5Output)(y, t, dt, yfun)
             if o.cache
                 write(file["meta"]["cache"]["t"], t)
                 write(file["meta"]["cache"]["dt"], dt)
-                write(file["meta"]["cache"]["y"], y)
+                write(file["meta"]["cache"]["y"], cache_y)
                 write(file["meta"]["cache"]["saved"], o.saved)
             end
         end
