@@ -516,6 +516,50 @@ to `mfcn` points) would allocate the whole sequence.
 const MODAL_MAXBATCH = 16
 
 """
+    PCUBATURE_ROUNDS, HCUBATURE_ROUNDS
+
+The numbers of transverse points `Cubature.pcubature_v` (the radial integral) and
+`Cubature.hcubature_v` (the full 2-D one) hand over in one round. `pcubature_v` doubles a
+Clenshaw–Curtis rule and `hcubature_v` works in multiples of its 17-point rule; both
+sequences are fixed by the rule and do not depend on the integrand's dimension, on the
+tolerance or on the integrand itself, which is what makes [`modal_round_widths`](@ref)
+possible. Measured by calling the two drivers directly.
+"""
+const PCUBATURE_ROUNDS = (3, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+
+@doc (@doc PCUBATURE_ROUNDS)
+const HCUBATURE_ROUNDS = (17, 34, 68, 102)
+
+"""
+    modal_round_widths(full, maxbatch, mfcn)
+
+The block widths a [`TransModal`](@ref) will need: each round of the driver
+([`PCUBATURE_ROUNDS`](@ref)/`HCUBATURE_ROUNDS`, those no larger than `mfcn`) split into
+chunks of at most `maxbatch`, plus the width-1 block
+[`Erω_to_Prω!`](@ref) uses. `TransModal`'s constructor builds all of them, so that their
+transforms are planned inside `Luna.setup` — where the FFTW wisdom is loaded and saved —
+rather than inside the propagation.
+
+At the default `maxbatch` of $(MODAL_MAXBATCH) this is `[1, 2, 3, 4, 8, 16]` for the
+radial integral and `[1, 2, 4, 6, 16]` for the full 2-D one. A run which converges in two
+rounds therefore allocates a few blocks it never uses; `maxbatch` is the dial (see
+[`MODAL_MAXBATCH`](@ref)).
+"""
+function modal_round_widths(full::Bool, maxbatch::Int, mfcn::Int)
+    widths = Set{Int}((1,))
+    for r in (full ? HCUBATURE_ROUNDS : PCUBATURE_ROUNDS)
+        r > mfcn && continue
+        left = r
+        while left > 0
+            w = min(maxbatch, left)
+            push!(widths, w)
+            left -= w
+        end
+    end
+    sort!(collect(widths))
+end
+
+"""
     TransModal
 
 Transform E(ω) -> Pₙₗ(ω) for multimode propagation, with the transverse integral evaluated
@@ -660,6 +704,12 @@ function TransModal(tT, grid, ts::Modes.ToSpace, resp, densityfun, norm!;
         Emt_noise = nothing
         Emt_nl = nothing
     end
+    #= The mode matrix is real, but it is held in the field's element type -- so
+       `ComplexF64` on an envelope grid, with a zero imaginary part. `mul!` needs both
+       operands in the same element type to reach a BLAS `gemm` (and, on a device,
+       to reach the accelerated path at all); a mixed real/complex product falls back to
+       the generic matmul, which is far slower than the four real multiplies per element
+       this costs. =#
     S = Array{tT, 2}(undef, nmodes, npol*maxbatch)
     #= `reshape` of an `Array` is an `Array` over the same memory, so `S3` is the mode
        matrix layout of `S` rather than a copy. =#
@@ -668,12 +718,19 @@ function TransModal(tT, grid, ts::Modes.ToSpace, resp, densityfun, norm!;
     pre = Array{Float64, 3}(undef, 1, 1, maxbatch)
     pts = Vector{NTuple{2, Float64}}(undef, maxbatch)
     inside = Vector{Bool}(undef, maxbatch)
-    #= One round of width 1 is built here rather than lazily: it is what `Erω_to_Prω!`
-       (and so `Stats.mode_reconstruction_error`) uses, it fixes the element type of the
-       dictionary, and building it inside `Luna.setup` means its FFT plan is made where
-       the FFTW wisdom is saved. =#
+    #= The round widths the driver will ask for are predictable, so they are all built
+       here rather than lazily: their transforms are then planned inside `Luna.setup`,
+       where the FFTW wisdom is loaded and saved, instead of inside an RK45 step. Width 1
+       is always among them -- it is what `Erω_to_Prω!`, and so
+       `Stats.mode_reconstruction_error`, uses -- and it also fixes the element type of
+       the dictionary. A width which was not predicted is still built on demand
+       (`modalround!`). =#
     r1 = ModalRound(tT, grid, npol, 1, resp, spec, scaling)
     rounds = Dict{Int, typeof(r1)}(1 => r1)
+    for n in modal_round_widths(full, Int(maxbatch), mfcn)
+        n == 1 && continue
+        rounds[n] = ModalRound(tT, grid, npol, n, resp, spec, scaling)
+    end
     TransModal(ts, full, Modes.dimlimits(ts.ms[1]), Emω, Emωo, Emt,
                Emt_noise, Emt_nl,
                Array{ComplexF64, 2}(undef, nω, npol), IFT, rounds, Int(maxbatch),
@@ -866,18 +923,21 @@ end
     modalround!(t::TransModal, n)
 
 The [`ModalRound`](@ref) buffers for a round of `n` transverse points, allocating them the
-first time that width is asked for. See [`MODAL_MAXBATCH`](@ref).
+first time that width is asked for.
+
+The widths the driver asks for are predictable ([`modal_round_widths`](@ref)) and are all
+built by the constructor, inside `Luna.setup`, where the FFTW wisdom is loaded and saved.
+This is the fallback for a width which was not predicted: the block is allocated and its
+transform planned inside the right-hand side, and **the wisdom file is not written**. A
+write would take the shared `FFTW` pid lock in the middle of an RK45 step, which is a
+filesystem lock several processes of a `Scans.runscan` share; the accumulated wisdom is
+exported by the next `Luna.setup` in the process anyway.
 """
 function modalround!(t::TransModal, n::Int)
     r = get(t.rounds, n, nothing)
     isnothing(r) || return r
-    r = ModalRound(eltype(t.Emt), t.grid, t.ts.npol, n, t.resp, HostSpec(), UNIT_SCALING)
-    #= A block for a width not seen before is planned here, inside the propagation. Save
-       the wisdom so that the next run in this process, or a later one, does not pay for
-       the planning again. =#
-    Utils.saveFFTwisdom()
-    t.rounds[n] = r
-    r
+    t.rounds[n] = ModalRound(eltype(t.Emt), t.grid, t.ts.npol, n, t.resp,
+                             HostSpec(), UNIT_SCALING)
 end
 
 """
@@ -960,6 +1020,14 @@ Unlike the adaptive rule, the number of nodes is fixed in advance: `nr` (and `n�
 [`Modes.transverse_quadrature`](@ref Luna.Modes.transverse_quadrature) for the exactness
 condition in θ, which is checked against
 [`Modes.azimuthal_order`](@ref Luna.Modes.azimuthal_order) at construction.
+
+!!! note "Statistics"
+    `Stats.default` has to be called with `mode_error=false` for this transform.
+    `Stats.mode_reconstruction_error` re-evaluates the transform at a single transverse
+    point and records the cubature's own error estimate, neither of which a fixed rule
+    has, and it is typed on [`TransModal`](@ref), so leaving it on gives a `MethodError`.
+    `prop_capillary` does this for you. The fixed rule's own embedded estimate is
+    [`integral_error!`](@ref); it becomes a statistic in a later branch of the GPU work.
 
 # Fields of note
 - `quad`: the quadrature rule
@@ -1118,7 +1186,12 @@ end
 
 #= Synthesis and projection matrices for the mode collection at position z, on the host.
    Column p + (i-1)*npol of S (row of Wp) is polarisation component p at quadrature node
-   i, which is the column order of a (nto, npol, npts) block. =#
+   i, which is the column order of a (nto, npol, npts) block.
+
+   They are built in Float64 and converted at the end, and they are held in the field's
+   element type -- `ComplexF32`/`ComplexF64` on an envelope grid, with a zero imaginary
+   part -- because `mul!` needs matching element types to reach a BLAS `gemm` on the host
+   and the accelerated path on a device. =#
 function _mode_matrices(tT, ts::Modes.ToSpace, quad, z)
     dl = Modes.dimlimits(ts.ms[1], z=z)
     Ems = Modes.mode_matrix(ts.ms, ts.indices, Modes.quadrature_nodes(quad, dl); z)
@@ -1197,10 +1270,17 @@ end
     has_error_estimate(t::TransModalFixed)
 
 Whether the quadrature rule of `t` has an embedded coarse rule, so that
-[`integral_error!`](@ref) means something.
+[`integral_error!`](@ref) means something: a Gauss–Kronrod rule in the first coordinate,
+or a periodic trapezoid in θ with an even number of at least four nodes.
+
+The θ clause is **polar only**. A Cartesian domain's second coordinate is Gauss–Legendre
+in y, which has no embedded rule, so a Cartesian rule without `kronrod=true` has
+`Wd == 0` and would report an error of exactly zero — "the rule is exact", which is the
+most misleading answer an error estimate can give.
 """
 has_error_estimate(t::TransModalFixed) =
-    t.quad.kronrod || (t.full && iseven(t.quad.nθ) && t.quad.nθ >= 4)
+    t.quad.kronrod || (t.quad.kind === :polar && t.full &&
+                       iseven(t.quad.nθ) && t.quad.nθ >= 4)
 
 #=================================================#
 #========  MODAL NORMALISATION  ==================#

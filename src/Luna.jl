@@ -297,6 +297,14 @@ collection of [`Modes.AbstractMode`](@ref Luna.Modes.AbstractMode)s and `compone
 - `noise_field=nothing`: `(nω, nmodes)` noise field for the modified shot-noise model.
 - `device`, `precision`: where to run and in what precision, as for the mode-averaged
     `setup` above. A device or a `Float32` run needs `modal_integral=:fixed`.
+
+!!! note "Statistics with `modal_integral=:fixed`"
+    `Stats.default` has to be called with `mode_error=false` for a
+    [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed):
+    `Stats.mode_reconstruction_error` is typed on
+    [`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal) and records the
+    adaptive rule's own behaviour, so leaving it at its default of `true` gives a
+    `MethodError`. `prop_capillary` does this for you.
 """
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components; kwargs...)
@@ -689,9 +697,12 @@ function run(Eω, grid,
     #= Absorbing boundaries used to be host scalar code, so a device run needed
        boundary=:none. `Boundaries.RateAbsorber`/`LegacyAbsorber` are now broadcasts and
        reductions over mirrored arrays (see `Boundaries.jl`), so every `boundary` mode
-       works on a device -- for the mode-averaged transform, the only one which can
-       produce a device `Eω` at all: `TransRadial`/`TransModal`/`TransFree*` do not take a
-       `device` keyword yet (Group E of GPU_PLAN.md) and always build a host array. =#
+       works on a device. The transforms which can produce a device `Eω` are
+       `TransModeAvg` and `TransModalFixed` (`modal_integral=:fixed`), whose `Luna.setup`
+       methods take `device`/`precision`. `TransRadial`/`TransFree*` do not take those
+       keywords yet (Group E of GPU_PLAN.md) and `TransModal` cannot take them at all
+       (its cubature driver is host scalar code returning `Vector{Float64}`), so those
+       three always build a host array. =#
 
     #= Et is the time-domain buffer the absorbers and the transverse collar work on --
        nothing about its *contents* matters here, only its shape and element type, since

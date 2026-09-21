@@ -1231,8 +1231,11 @@ columns out over threads, because the task overhead would not be worth it. Above
 is one task per column: a column costs an ionisation-rate evaluation and three prefix
 scans over the time axis, so the grain is large even for one column (GPU_PLAN.md §4.9).
 
-A block with a single column — every mode-averaged and modal transform — is never
-threaded whatever its length.
+A block with a single column — every mode-averaged transform, and the modal transforms
+before the batched column evaluator — is never threaded whatever its length. The modal
+transforms now hand over the transverse points of one round (up to
+`NonlinearRHS.MODAL_MAXBATCH` of them) or of a whole quadrature rule, so they do reach
+this path.
 """
 const PLASMA_THREAD_MINLEN = 1 << 14
 

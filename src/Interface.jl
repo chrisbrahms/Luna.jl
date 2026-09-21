@@ -323,11 +323,13 @@ In this case, all keyword arguments except for `λ0` are ignored.
     [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed).
 - `radial_integral_rtol::Number`: relative tolerance of the adaptive transverse integral
     (`modal_integral=:adaptive` only).
-- `nr::Int`, `nθ::Int`, `kronrod::Bool`: the quadrature rule of `modal_integral=:fixed`:
-    the number of nodes along r (or x) and θ (or y), and whether to use a Gauss-Kronrod
-    rule in r so that the rule carries an embedded error estimate. `nr` has to resolve the
-    transverse structure of the highest mode, and `nθ` has to be at least `4h+1` for modes
-    of azimuthal order up to `h` (so at least 5 for an HE₁ₘ set).
+- `modal_nr::Int`, `modal_nθ::Int`, `modal_kronrod::Bool`: the quadrature rule of
+    `modal_integral=:fixed`: the number of nodes along r (or x) and θ (or y), and whether
+    to use a Gauss-Kronrod rule in r so that the rule carries an embedded error estimate.
+    `modal_nr` has to resolve the transverse structure of the highest mode, and
+    `modal_nθ` has to be at least `4h+1` for modes of azimuthal order up to `h` (so at
+    least 5 for an HE₁ₘ set). They are `nr`, `nθ` and `kronrod` on [`Luna.setup`](@ref),
+    where the context leaves no room for confusion.
 - `model::Symbol`: Can be `:full`, which includes the full complex refractive index of the cladding
     in the effective index of the mode, or `:reduced`, which uses the simpler model more
     commonly seen in the literature. See `Luna.Capillary` for more details.
@@ -489,8 +491,8 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         rng=GLOBAL_RNG,
                         modes=:HE11, model=:full, loss=true,
                         radial_integral_rtol=1e-3, modal_integral=:adaptive,
-                        nr=NonlinearRHS.FIXED_NR, nθ=NonlinearRHS.FIXED_Nθ,
-                        kronrod=false,
+                        modal_nr=NonlinearRHS.FIXED_NR,
+                        modal_nθ=NonlinearRHS.FIXED_Nθ, modal_kronrod=false,
                         raman=nothing, kerr=true, plasma=nothing,
                         stats_kwargs=Dict{Symbol, Any}(),
                         PPT_options=Dict{Symbol, Any}(), preionfrac=0.0,
@@ -560,7 +562,8 @@ function prop_capillary_args(radius, flength, gas, pressure;
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
                                      noise_field, thg, device=devicereq, precision,
-                                     modal_integral, nr, nθ, kronrod)
+                                     modal_integral, nr=modal_nr, nθ=modal_nθ,
+                                     kronrod=modal_kronrod)
     #= Stats.jl is host-only code (out of this branch's scope beyond the host-copy
        warning and PeriodicStats): `Stats.default`/`collect_stats` use their `Eω`
        argument only to size and type their internal buffers at construction, but for an
@@ -579,7 +582,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
         shotnoise, modes, model, loss, raman, kerr, plasma, PPT_options,
-        modal_integral, nr, nθ, kronrod,
+        modal_integral, modal_nr, modal_nθ, modal_kronrod,
         temperature, saveN, filepath, filename,
         boundary, boundary_N, boundary_length, tcollar,
         device, precision, stats_period)
@@ -1115,8 +1118,15 @@ function _statskwargs(transform::NonlinearRHS.TransModalFixed, stats_kwargs)
             "by default with modal_integral=:fixed) or pass modal_integral=:adaptive.")
         return stats_kwargs
     end
-    merge(stats_kwargs, Dict{Symbol, Any}(:mode_error => false))
+    _mergekw(stats_kwargs)
 end
+
+#= `stats_kwargs` is splatted everywhere else, so a `NamedTuple` works as well as the
+   documented `Dict`; `merge` of a `NamedTuple` with a `Dict` is a `MethodError`. The
+   default goes first in both, so that anything in `stats_kwargs` wins -- there is
+   nothing there to win, by the `haskey` above, but that is the order a reader expects. =#
+_mergekw(kw::AbstractDict) = merge(Dict{Symbol, Any}(:mode_error => false), kw)
+_mergekw(kw) = merge((; mode_error=false), NamedTuple(pairs(kw)))
 
 function makeoutput(flength, saveN, stats, filepath::Nothing, scan::Nothing, scanidx, filename)
     Output.MemoryOutput(0, flength, saveN, stats)

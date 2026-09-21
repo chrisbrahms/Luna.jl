@@ -806,7 +806,8 @@ radius case; a taper re-evaluates the mode fields on the host and uploads them, 
 what the adaptive rule does at every point anyway.
 
 The rule carries an embedded coarse rule — the Gauss subset of a Kronrod rule in r
-(`kronrod=true`), every other node in θ — and
+(`kronrod=true`), or every other node of the *polar* θ trapezoid (a Cartesian domain's
+second coordinate is Gauss–Legendre, which has none) — and
 [`NonlinearRHS.integral_error!`](@ref Luna.NonlinearRHS.integral_error!) turns it into
 `P_coarse - P_fine` with one further matrix product against the precomputed difference of
 the two weight sets. Nothing evaluates it per step; it becomes a statistic once `Stats`

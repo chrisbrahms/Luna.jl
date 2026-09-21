@@ -1015,10 +1015,6 @@ end
     end
 end
 
-#= `Luna.set_device(:cpu)` opts out, whatever `settings["device"]` is otherwise: this is
-   exit criterion 3. `prop_gnlse` and multimode/radial `prop_capillary` are not
-   device-capable (`_cpu_only!`, `Interface.jl`) and keep giving the CPU, Float64 answer
-   under `:auto` too -- refusing only when the caller explicitly asks for something else. =#
 #= A multimode propagation on the fixed transverse quadrature rule
    (`NonlinearRHS.TransModalFixed`), which is the transverse integral with a device path:
    the adaptive cubature driver is host scalar code returning `Vector{Float64}`.
@@ -1137,7 +1133,7 @@ end
     args = (125e-6, 2e-3, :Ar, 0.1)
     kwargs = (λ0=800e-9, energy=50e-6, τfwhm=20e-15, trange=400e-15,
               λlims=(200e-9, 3000e-9), shotnoise=false, saveN=3, modes=4,
-              modal_integral=:fixed, nr=32)
+              modal_integral=:fixed, modal_nr=32)
     function runfixed(; kw...)
         Eω, grid, linop, transform, FT, output =
             Luna.Interface.prop_capillary_args(args...; kwargs..., kw...)
@@ -1176,6 +1172,12 @@ end
     @test occursin("modal_integral=:fixed", err.msg)
 end
 
+#= `Luna.set_device(:cpu)` opts out, whatever `settings["device"]` is otherwise: this is
+   exit criterion 3. `prop_gnlse`, radial `prop_capillary` and multimode `prop_capillary`
+   with the *adaptive* transverse integral (the default) are not device-capable, and keep
+   giving the CPU, Float64 answer under `:auto` too -- refusing only when the caller
+   explicitly asks for something else. Multimode with `modal_integral=:fixed` is
+   device-capable and does follow `:auto`, which is checked below. =#
 @testset "Luna.set_device(:cpu) opts out" begin
     old = get(Luna.settings, "device", nothing)
     capargs = (125e-6, 1e-3, :He, 1.0)
@@ -1205,14 +1207,29 @@ end
         dcap = Luna.prop_capillary(capargs...; capkw..., device=:cpu)
         @test dcap["Eω"] == ocap["Eω"]
 
-        #= Multimode propagation is not device-capable and must stay on the CPU by
-           default under :auto too -- it must not turn a working run into an error just
-           because a GPU package happens to be loaded (the bug an earlier version of
-           this branch had: `device`'s default resolved through `:auto` even for paths
-           that can never honour it). =#
+        #= Multimode propagation with the adaptive transverse integral (the default) is
+           not device-capable and must stay on the CPU by default under :auto too -- it
+           must not turn a working run into an error just because a GPU package happens
+           to be loaded (the bug an earlier version of this branch had: `device`'s
+           default resolved through `:auto` even for paths that can never honour it). =#
         om = Luna.prop_capillary(capargs...; capkw..., modes=4)
         @test size(om["Eω"], 2) == 4
-        # ... but an explicit device request for multimode still errors
+        @test eltype(om["Eω"]) === ComplexF64
+
+        #= ... while multimode with `modal_integral=:fixed` *is* device-capable, so the
+           sentinel resolves it to the GPU under :auto with no `device` keyword at all.
+           This is the only hardware test of that branch of `Interface.prop_capillary_args`;
+           everything else passes `device=MetalSpec` explicitly. =#
+        omf = Luna.prop_capillary(capargs...; capkw..., modes=4,
+                                  modal_integral=:fixed, modal_nr=16)
+        @test size(omf["Eω"], 2) == 4
+        @test eltype(omf["Eω"]) === ComplexF32
+        # ... and `device=:cpu` still opts that out
+        omfc = Luna.prop_capillary(capargs...; capkw..., modes=4, modal_integral=:fixed,
+                                   modal_nr=16, device=:cpu)
+        @test eltype(omfc["Eω"]) === ComplexF64
+
+        # ... but an explicit device request for the adaptive rule still errors
         @test_throws ErrorException Luna.prop_capillary(capargs...; capkw..., modes=4,
                                                          device=MetalSpec)
     finally
@@ -1238,7 +1255,9 @@ end
     @test_throws ErrorException NonlinearRHS.Et_to_Pt!(
         Pd, Ed, ((out, E, ρ) -> nothing,), 1.0)
 
-    # multimode propagation is not device-capable through the simple interface either
+    #= multimode propagation with the adaptive transverse integral is not device-capable
+       through the simple interface either (with `modal_integral=:fixed` it is, which the
+       "prop_capillary multimode on Metal" testset above covers) =#
     @test_throws ErrorException Luna.prop_capillary(
         125e-6, 1e-3, :He, 1.0; λ0=800e-9, energy=1e-9, τfwhm=10e-15,
         λlims=(300e-9, 2e-6), trange=400e-15, saveN=3, plasma=false, shotnoise=false,

@@ -29,7 +29,8 @@
 import Test: @test, @testset, @test_throws, @test_logs, @inferred
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
-             NonlinearRHS, PhysData, RK45, Stats, Maths, Ionisation, Raman
+             NonlinearRHS, PhysData, RK45, Stats, Maths, Ionisation, Raman, RectModes
+import Random: MersenneTwister
 import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING
 import GPUArraysCore
 import AbstractFFTs
@@ -1186,13 +1187,15 @@ end
 function modalcase(GT, spec; nmodes=4, components=:y, gas=:Ar, pres=0.1, energy=50e-6,
                    flength=2e-3, λ0=800e-9, plasma=false, modal_integral=:fixed,
                    nr=32, nθ=16, full=false, kronrod=false, precision=nothing, run=true,
-                   taper=false)
+                   taper=false, noise=false, modes=nothing)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (200e-9, 3000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (200e-9, 3000e-9), 400e-15)
     a = taper ? (z -> 75e-6*(1 - 0.2z/flength)) : 75e-6
-    modes = Tuple(Capillary.MarcatiliMode(a, gas, pres; n=1, m=mi, loss=false)
-                  for mi in 1:nmodes)
+    modes = isnothing(modes) ?
+        Tuple(Capillary.MarcatiliMode(a, gas, pres; n=1, m=mi, loss=false)
+              for mi in 1:nmodes) : modes
+    nmodes = length(modes)
     ρ = PhysData.density(gas, pres)
     dens = z -> ρ
     resp = GT === Grid.RealGrid ?
@@ -1206,8 +1209,13 @@ function modalcase(GT, spec; nmodes=4, components=:y, gas=:Ar, pres=0.1, energy=
     linop = taper ? LinearOps.make_linop(grid, modes, λ0) :
                     LinearOps.make_const_linop(grid, modes, λ0)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
+    #= The modified shot-noise model: the noise enters through the nonlinear operator, so
+       the transform carries it in the modal time domain. Seeded, so that a host and a
+       device run of the same case get the same noise field. =#
+    noise_field = noise ?
+        Fields.generate_noise_field(grid; nmodes, rng=MersenneTwister(1234)) : nothing
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, modes, components;
-                                   modal_integral, full, nr, nθ, kronrod,
+                                   modal_integral, full, nr, nθ, kronrod, noise_field,
                                    device=spec, precision)
     run || return Eω, transform, FT, linop, grid
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
@@ -1307,6 +1315,58 @@ end
     _, _, trn = modalrhs(Grid.RealGrid, HostSpec(); nr=32, kronrod=false)
     @test !NonlinearRHS.has_error_estimate(trn)
     @test all(isnan, NonlinearRHS.integral_error!(trn))
+
+    #= A Cartesian domain always needs `full=true`, but its second coordinate is
+       Gauss-Legendre in y, which has no embedded rule -- so unlike the polar θ
+       trapezoid, `full=true` alone does not give one. Review round 1, finding 1: the
+       `nθ` clause used to fire here, and `integral_error!` then reported a quadrature
+       error of exactly zero, which is the most misleading answer an error estimate can
+       give. =#
+    rect = (RectModes.RectMode(50e-6, 20e-6, :Ar, 0.1, :Ag; n=1, m=1, pol=:x),
+            RectModes.RectMode(50e-6, 20e-6, :Ar, 0.1, :Ag; n=2, m=1, pol=:x))
+    _, nlc, trc = modalrhs(Grid.RealGrid, HostSpec(); modes=rect, components=:x,
+                           full=true, nr=16, nθ=8)
+    @test trc.quad.kind === :cartesian
+    @test !NonlinearRHS.has_error_estimate(trc)
+    @test all(iszero, trc.Wd) # nothing to subtract, so no estimate
+    @test all(isnan, NonlinearRHS.integral_error!(trc))
+    # ... with a Kronrod rule in x there is one, and it is not zero
+    _, nlk, trk = modalrhs(Grid.RealGrid, HostSpec(); modes=rect, components=:x,
+                           full=true, nr=17, nθ=8, kronrod=true)
+    @test NonlinearRHS.has_error_estimate(trk)
+    errk = NonlinearRHS.integral_error!(trk)
+    @test all(isfinite, errk)
+    @test 0 < maximum(abs, errk)/maximum(abs, nlk) < 1e-3
+end
+
+#= The round widths the cubature driver asks for are fixed by the rule, so they are all
+   allocated and planned by the constructor, inside `Luna.setup`, where the FFTW wisdom is
+   loaded and saved. Review round 1, finding 3: they used to be built lazily inside the
+   right-hand side, which also wrote the wisdom file -- a shared pid lock taken in the
+   middle of an RK45 step. =#
+@testset "the round widths are planned at setup" begin
+    @test NonlinearRHS.modal_round_widths(false, 16, 512) == [1, 2, 3, 4, 8, 16]
+    @test NonlinearRHS.modal_round_widths(true, 16, 512) == [1, 2, 4, 6, 16]
+    @test NonlinearRHS.modal_round_widths(false, 1, 512) == [1]
+    @test NonlinearRHS.modal_round_widths(false, 16, 4) == [1, 2, 3, 4]
+
+    for full in (false, true)
+        _, tr, _, _, _ = modalcase(Grid.RealGrid, HostSpec(); run=false, full,
+                                   nmodes=(full ? 2 : 4), components=(full ? :xy : :y),
+                                   modal_integral=:adaptive)
+        @test sort(collect(keys(tr.rounds))) ==
+              NonlinearRHS.modal_round_widths(full, tr.maxbatch, tr.mfcn)
+        #= ... and a whole right-hand side adds none of them, i.e. the driver asks for
+           nothing the constructor did not predict. =#
+        before = sort(collect(keys(tr.rounds)))
+        nl = zeros(ComplexF64, length(tr.grid.ω), tr.ts.nmodes)
+        Eω, _, _, _, _ = modalcase(Grid.RealGrid, HostSpec(); run=false, full,
+                                   nmodes=(full ? 2 : 4), components=(full ? :xy : :y),
+                                   modal_integral=:adaptive)
+        tr(nl, Eω, 0.0)
+        @test sort(collect(keys(tr.rounds))) == before
+        @test tr.ncalls > 0
+    end
 end
 
 #= The adaptive transverse integral is host scalar code driven by `Cubature`, which
@@ -1862,6 +1922,23 @@ end
             @test maximum(abs, d .- h)/nrm < 1e-10
         end
     end
+end
+
+#= The modified shot-noise model on a device: the modal noise field is transformed once
+   at construction, divided by `Eref` there, and added to the modal field before the
+   synthesis. Review round 1, finding 8: that path had no test. =#
+@testset "the modified shot-noise model on JLArray" begin
+    hEω, hnl, htr = modalrhs(Grid.RealGrid, HostSpec(); noise=true)
+    dEω, dnl, dtr = modalrhs(Grid.RealGrid, JLSpec; noise=true)
+    @test dtr.Emt_noise isa JLArray
+    @test dtr.Emt_nl isa JLArray
+    @test maximum(abs, Array(dtr.Emt_noise) .- htr.Emt_noise) == 0
+    @test maximum(abs, Array(dnl) .- hnl)/maximum(abs, hnl) < 1e-10
+    #= The noise really contributes: the same case without it differs by far more than
+       the tolerance above. =#
+    _, nonl, notr = modalrhs(Grid.RealGrid, HostSpec())
+    @test isnothing(notr.Emt_noise)
+    @test maximum(abs, nonl .- hnl)/maximum(abs, hnl) > 1e-10
 end
 
 #= The embedded error estimate is two matrix products and a transform like everything

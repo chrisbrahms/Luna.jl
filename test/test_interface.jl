@@ -610,7 +610,7 @@ end
 
     #= The fixed quadrature rule is the multimode transform which does run in reduced
        precision (and on a device; that is test_device.jl's and test_metal.jl's). =#
-    omf = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed, nr=32)
+    omf = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed, modal_nr=32)
     @test size(omf["Eω"], 2) == 4
     #= A different discretisation of the same integral, so it agrees with the adaptive
        rule to the accuracy of the quadrature, not to rounding. The HE1m fields are
@@ -618,7 +618,7 @@ end
        its default 1e-3 tolerance; the residual is the *adaptive* rule's error. =#
     @test maximum(abs, omf["Eω"][:, 1, end] .- om["Eω"][:, 1, end]) /
           maximum(abs, om["Eω"][:, 1, end]) < 1e-6
-    omf32 = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed, nr=32,
+    omf32 = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed, modal_nr=32,
                            device=DeviceSpec(Array, Float32))
     @test eltype(omf32["Eω"]) === ComplexF32
     @test maximum(abs, ComplexF64.(omf32["Eω"][:, 1, end]) .- omf["Eω"][:, 1, end]) /
@@ -632,7 +632,7 @@ end
     @test haskey(omf["stats"], "energy")
     # asking for it explicitly is an error which says why
     @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
-                                            modal_integral=:fixed, nr=32,
+                                            modal_integral=:fixed, modal_nr=32,
                                             stats_kwargs=Dict{Symbol, Any}(
                                                 :mode_error => true))
     # an unknown modal_integral is refused

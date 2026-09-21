@@ -169,17 +169,17 @@ integrates it against each mode's transverse field. `modal_integral` chooses how
   (`Cubature.pcubature_v`/`hcubature_v`) is host scalar code and hands its results back
   as `Vector{Float64}`, so this cannot run on a device or in single precision; asking for
   one is an error naming `modal_integral=:fixed`.
-- `:fixed` uses a fixed Gauss quadrature rule of `nr` nodes along r (and, for the full
-  2-D integral, `nθ` along θ). Every right-hand side costs the same, everything it does
-  is a matrix product, a batched transform or a broadcast, and it runs wherever the
-  mode-averaged transform does.
+- `:fixed` uses a fixed Gauss quadrature rule of `modal_nr` nodes along r (and, for the
+  full 2-D integral, `modal_nθ` along θ; they are `nr` and `nθ` on `Luna.setup`). Every
+  right-hand side costs the same, everything it does is a matrix product, a batched
+  transform or a broadcast, and it runs wherever the mode-averaged transform does.
 
 ```julia
 using Luna, Metal
 prop_capillary(125e-6, 0.1, :Ar, 0.1;
                λ0=800e-9, energy=50e-6, τfwhm=20e-15,
                λlims=(200e-9, 3000e-9), trange=400e-15,
-               modes=4, modal_integral=:fixed, nr=64)
+               modes=4, modal_integral=:fixed, modal_nr=64)
 ```
 
 The two are different discretisations of the same integral, so they agree to the accuracy
@@ -190,22 +190,23 @@ on one right-hand side, which is the *adaptive* rule's error, not the fixed rule
 
 Two things to check before using it:
 
-- **`nr` has to resolve the transverse structure of the highest mode.** The rule is not
-  adaptive and will not tell you it is under-resolved. `nr=64` is the default; a mode set
+- **`modal_nr` has to resolve the transverse structure of the highest mode.** The rule is
+  not adaptive and will not tell you it is under-resolved. 64 is the default; a mode set
   reaching HE₁₈ or beyond wants more.
-- **`nθ` has to be at least `4h+1`** for modes of azimuthal order up to `h` (`h` is
+- **`modal_nθ` has to be at least `4h+1`** for modes of azimuthal order up to `h` (`h` is
   `|n-1|` for an HE\_{nm} mode), because the θ rule is a periodic trapezoid and the
   integrand of a cubic response projected back onto a mode reaches the harmonic `4h`.
-  Luna warns at setup when it can tell that `nθ` is too small. An HE₁ₘ set has `h = 0`,
-  so any `nθ` will do, and `full=false` (which `prop_capillary` picks for such a set)
-  uses a single θ node.
+  Luna warns at setup when it can tell that it is too small. An HE₁ₘ set has `h = 0`, so
+  any number of θ nodes will do, and `full=false` (which `prop_capillary` picks for such a
+  set) uses a single one.
 
 `modal_integral=:fixed` does not collect the `mode_reconstruction_error`,
 `transverse_points` and `transverse_integral_error_*` statistics: those describe the
 adaptive rule's own behaviour. The fixed rule carries an embedded Gauss--Kronrod error
-estimate instead (`kronrod=true`, which rounds `nr` up to an odd number), which
-`NonlinearRHS.integral_error!` evaluates on demand; it becomes a statistic in a later
-branch.
+estimate instead (`modal_kronrod=true`, which rounds `modal_nr` up to an odd number),
+which `NonlinearRHS.integral_error!` evaluates on demand; it becomes a statistic in a
+later branch. At the low level, `Stats.default` needs `mode_error=false` for this
+transform; `prop_capillary` does that for you.
 
 ### An ad hoc response on a device
 
