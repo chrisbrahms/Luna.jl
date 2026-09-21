@@ -1,7 +1,8 @@
 module LinearOps
 import FFTW
 import Luna: Modes, Grid, PhysData, Maths, RK45
-import Luna: upload_like, scalar
+import Luna: upload_like, scalar, isdevice
+import QuadGK
 import Printf: @sprintf
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
 
@@ -570,6 +571,13 @@ const DEFAULT_MAXNODES = 1024
 const DEFAULT_MAXDEPTH = 40
 
 """
+Largest number of operator evaluations [`QuadratureLinop`](@ref) will spend on one integral
+before giving up and warning. Over one step, 15 (one Gauss--Kronrod rule) is the usual
+cost.
+"""
+const DEFAULT_QUAD_MAXEVALS = 10^4
+
+"""
 Table size above which [`TabulatedLinop`](@ref) warns. A mode-averaged operator is a few
 megabytes at any sensible tolerance; a multimode, radial or free-space one is the size of
 the whole state, so the same node count costs `2·nnodes` times that.
@@ -609,6 +617,218 @@ function _locate(zs::Vector{Float64}, z::Real)
     k = searchsortedlast(zs, z)
     h = zs[k+1] - zs[k]
     k, (z - zs[k])/h, h
+end
+
+#=--------------------- the integrated linear operator: interface ---------------------=#
+
+"""
+    AbstractIntegratedLinop
+
+A z-dependent linear operator given to the stepper as its integral
+
+```
+Φ(z) = ∫_{z0}^{z} L(z′) dz′,
+```
+
+from which [`RK45.make_prop!`](@ref Luna.RK45.make_prop!) builds the interaction-picture
+propagator `exp(Φ(t2) − Φ(t1))`. That is the exact propagator of the linear part over the
+step. Luna used to propagate a z-dependent operator with `exp(L(t2)·(t2 − t1))`, a
+one-point rule whose error is first order in the step size and invisible to the step-size
+controller -- it is common to both of the embedded Runge–Kutta solutions the error
+estimate is formed from, so it cancels out of the estimate and the controller does not
+respond to it. That rule is gone: [`Luna.run`](@ref) converts a `linop!(out, z)` closure
+into one of these (`linop_integral=:tabulated` or `:quadrature`), and a caller who knows
+`Φ` in closed form can implement this interface instead.
+
+A constant operator is not one of these: it is passed as an array and propagated exactly
+by `RK45.make_prop!(::AbstractArray, y0)`.
+
+# Interface
+A subtype implements one of two styles, declared by [`PhaseStyle`](@ref):
+
+- [`AbsolutePhase`](@ref) (the default): `phase!(out, op, z)` fills `out` with `Φ(z)`
+  measured from the operator's own origin, optionally with a straight line subtracted
+  ([`secant`](@ref)), and the propagator forms the difference itself and adds the line
+  back. This is the style for an operator whose integral can be evaluated at a point --
+  a table ([`TabulatedLinop`](@ref)) or a closed form.
+- [`IncrementalPhase`](@ref): `phasediff!(out, op, z1, z2)` fills `out` with
+  `Φ(z2) − Φ(z1)` directly. This is the style for an operator whose integral is computed
+  by quadrature ([`QuadratureLinop`](@ref)), where integrating from a fixed origin at
+  every stage would be both wasteful and less accurate than integrating over the step.
+
+Every subtype also implements `derivative!(out, op, z)`, the operator `L(z)` itself.
+Diagnostics need the operator rather than its integral -- a zero-dispersion wavelength, or
+a linear propagation applied to an input field -- and the integral alone does not give it.
+"""
+abstract type AbstractIntegratedLinop end
+
+"""
+    PhaseStyle(op::AbstractIntegratedLinop)
+
+Which of the two [`AbstractIntegratedLinop`](@ref) phase interfaces `op` implements:
+[`AbsolutePhase`](@ref) (`phase!` and `secant`; the default) or [`IncrementalPhase`](@ref)
+(`phasediff!`). [`RK45.make_prop!`](@ref Luna.RK45.make_prop!) dispatches on it.
+"""
+abstract type PhaseStyle end
+
+"""
+`Φ(z)` can be evaluated at a point: the operator implements [`phase!`](@ref) and
+optionally [`secant`](@ref). See [`PhaseStyle`](@ref).
+"""
+struct AbsolutePhase <: PhaseStyle end
+
+"""
+Only differences of `Φ` are available: the operator implements [`phasediff!`](@ref).
+See [`PhaseStyle`](@ref).
+"""
+struct IncrementalPhase <: PhaseStyle end
+
+PhaseStyle(::AbstractIntegratedLinop) = AbsolutePhase()
+
+"""
+    phase!(out, op::AbstractIntegratedLinop, z)
+
+Fill `out` with `Φ(z) − L̄·(z − z0)`, the integrated operator less whatever straight line
+[`secant`](@ref) reports (nothing, for most operators, in which case this is `Φ(z)`
+itself). Returns `out`.
+
+Required for an [`AbsolutePhase`](@ref) operator. It must be a broadcast or another kernel
+over `out`'s array type: it runs at every stage of every step and, on a device run, `out`
+is on the device.
+"""
+function phase! end
+
+"""
+    secant(op::AbstractIntegratedLinop)
+
+The straight line subtracted from the `Φ` that [`phase!`](@ref) returns, as the mean
+operator `L̄` over the span the table covers, or `nothing` when nothing is subtracted.
+The propagator adds `L̄·(t2 − t1)` back, formed from the step length exactly as the
+constant propagator forms it.
+
+The default is `nothing`; [`TabulatedLinop`](@ref) is the one operator here which
+subtracts a secant, and `QuadratureLinop` has none because it never forms an absolute `Φ`.
+"""
+secant(::AbstractIntegratedLinop) = nothing
+
+"""
+    derivative!(out, op::AbstractIntegratedLinop, z)
+
+Fill `out` with the operator `L(z) = dΦ/dz` itself, in `out`'s array type. Returns `out`.
+
+Required of every [`AbstractIntegratedLinop`](@ref). The propagation only ever needs `Φ`,
+but diagnostics need `L`: [`Stats.zdw_linop`](@ref Luna.Stats) and a `propagator!` passed
+to [`Fields.PropagatedField`](@ref Luna.Fields.PropagatedField) are written against the
+operator, and a caller who replaced the closure with an integrated operator has to be able
+to get it back.
+"""
+function derivative! end
+
+"""
+    phasediff!(out, op::AbstractIntegratedLinop, z1, z2)
+
+Fill `out` with `Φ(z2) − Φ(z1)`, the exponent of the propagator over `[z1, z2]`, including
+the secant term. Returns `out`.
+
+This is the primitive an [`IncrementalPhase`](@ref) operator implements. The generic method
+here is for an [`AbsolutePhase`](@ref) operator: it allocates one temporary, and is for
+checking and for code outside the stepper. `RK45.make_prop!` does not call it for such an
+operator -- it keeps its own two buffers so that the `t1` and `t2` readbacks are each done
+only when their argument changes.
+"""
+function phasediff!(out, op::AbstractIntegratedLinop, z1, z2)
+    tmp = similar(out)
+    phase!(tmp, op, z1)
+    phase!(out, op, z2)
+    sec = _seclike(secant(op), out)
+    if isnothing(sec)
+        @. out -= tmp
+    else
+        dz = scalar(out, z2 - z1)
+        @. out += -tmp + sec*dz
+    end
+    out
+end
+
+#= The secant in the array type the propagator broadcasts over. An operator which builds
+   its own tables on the state (`TabulatedLinop`) already returns one there and this is a
+   no-op on the host; one which returns a plain host array -- which is what a
+   caller-written operator and `OffsetLinop` do -- is converted once, when the propagator
+   is built. =#
+_seclike(::Nothing, proto) = nothing
+_seclike(sec, proto) = upload_like(proto, sec)
+
+"""
+    RK45.make_prop!(op::AbstractIntegratedLinop, y0)
+
+The interaction-picture propagator of a z-dependent operator supplied as its integral,
+`y *= exp(Φ(t2) − Φ(t1))`, or its inverse when `bwd` is true.
+
+For an [`AbsolutePhase`](@ref) operator, `Φ(t1)` and `Φ(t2)` are each read only when their
+argument changes: the six stages of a step share one `t1`, and `t2` repeats between the
+forward and the backward propagation of each stage. For an [`IncrementalPhase`](@ref) one
+the difference itself is cached on the `(t1, t2)` pair, which catches the same repeat.
+Both are broadcasts over the state's own array type.
+"""
+RK45.make_prop!(op::AbstractIntegratedLinop, y0) = _make_prop!(PhaseStyle(op), op, y0)
+
+function _make_prop!(::AbsolutePhase, op, y0)
+    Φ1 = similar(y0)
+    Φ2 = similar(y0)
+    lastt1 = Ref(NaN)
+    lastt2 = Ref(NaN)
+    #= `sec` is read once here rather than per call so that the `isnothing` branch below
+       is decided at compile time, and converted once to the state's array type. =#
+    sec = _seclike(secant(op), y0)
+    prop! = let op=op, Φ1=Φ1, Φ2=Φ2, lastt1=lastt1, lastt2=lastt2, sec=sec
+        function prop!(y, t1, t2, bwd=false)
+            if lastt1[] != t1
+                phase!(Φ1, op, t1)
+                lastt1[] = t1
+            end
+            if lastt2[] != t2
+                phase!(Φ2, op, t2)
+                lastt2[] = t2
+            end
+            if isnothing(sec)
+                if bwd
+                    @. y *= exp(Φ1 - Φ2)
+                else
+                    @. y *= exp(Φ2 - Φ1)
+                end
+            else
+                #= The secant term is put back here rather than in the readback: it is the
+                   whole of a constant operator's contribution and is formed exactly as the
+                   constant propagator forms it, from the step length. =#
+                dt = scalar(y, bwd ? (t1 - t2) : (t2 - t1))
+                if bwd
+                    @. y *= exp(Φ1 - Φ2 + sec*dt)
+                else
+                    @. y *= exp(Φ2 - Φ1 + sec*dt)
+                end
+            end
+        end
+    end
+    return prop!
+end
+
+function _make_prop!(::IncrementalPhase, op, y0)
+    ΔΦ = similar(y0)
+    lastt = Ref((NaN, NaN))
+    prop! = let op=op, ΔΦ=ΔΦ, lastt=lastt
+        function prop!(y, t1, t2, bwd=false)
+            if lastt[] != (t1, t2)
+                phasediff!(ΔΦ, op, t1, t2)
+                lastt[] = (t1, t2)
+            end
+            if bwd
+                @. y *= exp(-ΔΦ)
+            else
+                @. y *= exp(ΔΦ)
+            end
+        end
+    end
+    return prop!
 end
 
 #=------------------------- the integrated linear operator -------------------------=#
@@ -661,7 +881,7 @@ z-independent operator, which then stores nothing at all.
 the refinement before `tol` is met, a warning reports the error achieved. `quiet=true`
 suppresses the summary the constructor otherwise logs, but not the warnings.
 """
-struct TabulatedLinop{aT, sT}
+struct TabulatedLinop{aT, sT} <: AbstractIntegratedLinop
     z::Vector{Float64}
     Φ::aT
     dΦ::aT
@@ -808,45 +1028,243 @@ function integrated!(out, tab::TabulatedLinop, z)
 end
 
 """
-    RK45.make_prop!(tab::TabulatedLinop, y0)
+    secant(tab::TabulatedLinop)
 
-The interaction-picture propagator of a tabulated z-dependent operator,
-`y *= exp(Φ(t2) − Φ(t1))`.
-
-`Φ(t1)` and `Φ(t2)` are each read out of the table only when their argument changes: the
-six stages of a step share one `t1`, and `t2` repeats between the forward and the backward
-propagation of each stage, which is the same argument the untabulated propagator's
-last-`t2` cache rests on. Both readbacks and the exponential are broadcasts over the
-state's own array type, so nothing here touches the host on a device run.
+The mean operator `L̄` over the span the table covers, which is the straight line
+[`phase!`](@ref) has subtracted from `Φ`.
 """
-function RK45.make_prop!(tab::TabulatedLinop, y0)
-    Φ1 = similar(y0)
-    Φ2 = similar(y0)
-    lastt1 = Ref(NaN)
-    lastt2 = Ref(NaN)
-    prop! = let tab=tab, Φ1=Φ1, Φ2=Φ2, lastt1=lastt1, lastt2=lastt2
-        function prop!(y, t1, t2, bwd=false)
-            if lastt1[] != t1
-                phase!(Φ1, tab, t1)
-                lastt1[] = t1
-            end
-            if lastt2[] != t2
-                phase!(Φ2, tab, t2)
-                lastt2[] = t2
-            end
-            #= The secant term is put back here rather than in the readback: it is the
-               whole of a constant operator's contribution and is formed exactly as the
-               constant propagator forms it, from the step length. =#
-            dt = scalar(y, bwd ? (t1 - t2) : (t2 - t1))
-            sec = tab.secant
-            if bwd
-                @. y *= exp(Φ1 - Φ2 + sec*dt)
-            else
-                @. y *= exp(Φ2 - Φ1 + sec*dt)
-            end
+secant(tab::TabulatedLinop) = tab.secant
+
+"""
+    derivative!(out, tab::TabulatedLinop, z)
+
+Fill `out` with the operator `L(z)` itself, as the derivative of the same cubic Hermite
+interpolant [`phase!`](@ref) reads the integral back with, plus the secant. One broadcast
+over four node slices. Returns `out`.
+
+At a node this is exactly the stored `linop(z)`; between nodes it is the derivative of the
+interpolant rather than an interpolation of the derivative, so it is consistent with the
+`Φ` the propagator uses. Outside the table the end value is held, as [`phase!`](@ref)
+does.
+"""
+function derivative!(out, tab::TabulatedLinop, z)
+    k, s, h = _locate(tab.z, z)
+    s2 = s*s
+    w00 = scalar(out, (6s2 - 6s)/h)
+    w10 = scalar(out, 3s2 - 4s + 1)
+    w01 = scalar(out, (6s - 6s2)/h)
+    w11 = scalar(out, 3s2 - 2s)
+    d = ndims(tab.Φ)
+    Φk = selectdim(tab.Φ, d, k)
+    Φk1 = selectdim(tab.Φ, d, k+1)
+    dk = selectdim(tab.dΦ, d, k)
+    dk1 = selectdim(tab.dΦ, d, k+1)
+    sec = tab.secant
+    @. out = w00*Φk + w10*dk + w01*Φk1 + w11*dk1 + sec
+    out
+end
+
+#=------------------------ the integral by adaptive quadrature ------------------------=#
+
+"""
+    QuadratureLinop(linop!, proto; tol, z0, order)
+
+The integrated linear operator of `linop!(out, z)` computed on demand rather than
+tabulated: every call to the propagator integrates the operator over the step by adaptive
+Gauss–Kronrod quadrature (`QuadGK`) on the host and uploads the result.
+
+This is the second of the three ways to supply `Φ` to the stepper
+([`AbstractIntegratedLinop`](@ref)), selected by `linop_integral=:quadrature` on
+[`Luna.run`](@ref) and [`prop_capillary`](@ref Luna.Interface.prop_capillary). Compared
+with [`TabulatedLinop`](@ref):
+
+- it holds no table, so it costs no memory whatever the geometry, and it needs no setup
+  pass over the fibre;
+- it makes no assumption about how `linop!` behaves in z, so a discontinuous or
+  pathologically structured operator that the table's bisection would have to be told
+  about is integrated to tolerance here as a matter of course;
+- it is much slower per stage: `order*2 + 1` (15 by default) host evaluations of `linop!`
+  per distinct `(t1, t2)` pair at the least, against one table readback, and the
+  quadrature allocates host buffers on each call. On a device run the operator is
+  evaluated on the host and uploaded, which is what tabulation exists to avoid.
+
+Use it to check a tabulated result, for an operator the table cannot resolve, or when the
+table would be too large (a multimode or free-space operator is the size of the whole
+state, and the table holds `2·nnodes` copies of it).
+
+`tol` is the absolute tolerance, in radians, on the largest element of `Φ(z2) − Φ(z1)`;
+`order` is the Gauss–Kronrod order; `maxevals` bounds the evaluations of one integral, and
+a quadrature which stops there reports how far off it was; `z0` is the origin
+[`phase!`](@ref) measures the integral from, which the propagator never uses.
+
+Over a step the integrand is smooth and the first 15-point rule almost always suffices.
+Over a long span it need not be: `Capillary.gradient` from `p₀ = 0` has a `√z` cusp at the
+entrance, and Gauss–Kronrod resolves such a point by bisecting towards it, which is what
+`maxevals` is there to stop.
+
+# Fields
+- `linop!`: the operator, called as `linop!(out, z)` on a host `ComplexF64` buffer
+- `nevals`: how many times `linop!` has been called
+- `ncalls`: how many quadratures have been run
+"""
+struct QuadratureLinop{F, hT, sT} <: AbstractIntegratedLinop
+    linop!::F
+    host::hT
+    stage::sT
+    z0::Float64
+    tol::Float64
+    order::Int
+    maxevals::Int
+    nevals::Base.RefValue{Int}
+    ncalls::Base.RefValue{Int}
+end
+
+function QuadratureLinop(linop!, proto::AbstractArray; tol=DEFAULT_LINOP_TOL, z0=0.0,
+                         order=7, maxevals=DEFAULT_QUAD_MAXEVALS)
+    #= The quadrature runs in Float64 on the host whatever the state's precision: the
+       operator itself is host code in Float64, and the sum is what the precision of Φ
+       depends on. `stage` is the host buffer in the state's element type, which is what
+       `copyto!` to a device array needs; on the default CPU path it is not needed. =#
+    host = Array{ComplexF64}(undef, size(proto))
+    ET = Complex{real(eltype(proto))}
+    stage = (isdevice(proto) && ET !== ComplexF64) ? Array{ET}(undef, size(proto)) : nothing
+    QuadratureLinop(linop!, host, stage, float(z0), float(tol), Int(order), Int(maxevals),
+                    Ref(0), Ref(0))
+end
+
+PhaseStyle(::QuadratureLinop) = IncrementalPhase()
+
+"""
+    phasediff!(out, q::QuadratureLinop, z1, z2)
+
+Fill `out` with `Φ(z2) − Φ(z1) = ∫_{z1}^{z2} linop dz`, by adaptive Gauss–Kronrod
+quadrature on the host, uploaded to `out`'s array type. Returns `out`.
+
+The integral is taken over the step and not from a fixed origin: the accumulated `Φ` of a
+metre of fibre is hundreds of radians while the difference over a step is a small fraction
+of one, so forming it as a difference of two absolute integrals would both cost more and
+round worse. This is the same argument as [`TabulatedLinop`](@ref)'s secant subtraction.
+"""
+function phasediff!(out, q::QuadratureLinop, z1, z2)
+    z1, z2 = float(z1), float(z2)
+    if z1 == z2
+        fill!(out, zero(eltype(out)))
+        return out
+    end
+    f! = let q=q
+        function (y, z)
+            q.nevals[] += 1
+            q.linop!(y, z)
+            y
         end
     end
-    return prop!
+    q.ncalls[] += 1
+    _, err = QuadGK.quadgk!(f!, q.host, z1, z2; atol=q.tol, rtol=0, order=q.order,
+                            maxevals=q.maxevals, norm=_tabmax)
+    if err > q.tol
+        #= `quadgk` returns its best estimate when it runs out of evaluations and says
+           nothing, so say it here: the propagation would otherwise carry on with an
+           operator integrated to an unknown accuracy. =#
+        @warn(@sprintf("The linear operator's integral over [%.6g, %.6g] m reached %.2e against a tolerance of %.2e in %d evaluations of the operator. Raise `linop_tol`, or use `linop_integral=:tabulated`, whose bisection resolves a cusp in the operator more cheaply than Gauss--Kronrod does.",
+                       z1, z2, err, q.tol, q.maxevals), maxlog=1)
+    end
+    _upload!(out, q)
+end
+
+"""
+    phase!(out, q::QuadratureLinop, z)
+
+Fill `out` with `Φ(z) = ∫_{z0}^{z} linop dz′` measured from the operator's origin `z0`.
+
+The propagator never calls this -- a `QuadratureLinop` is an [`IncrementalPhase`](@ref)
+operator and the propagator asks it for differences -- and over a long span it is both
+expensive and less accurate than the differences are. It is here so that the three sources
+of `Φ` can be compared against each other.
+"""
+phase!(out, q::QuadratureLinop, z) = phasediff!(out, q, q.z0, z)
+
+"""
+    derivative!(out, q::QuadratureLinop, z)
+
+Fill `out` with `linop(z)`: one host evaluation of the operator, uploaded. Returns `out`.
+"""
+function derivative!(out, q::QuadratureLinop, z)
+    q.nevals[] += 1
+    q.linop!(q.host, z)
+    _upload!(out, q)
+end
+
+#= The host `ComplexF64` result into `out`, converting through `stage` when `out` is on a
+   device and holds a different element type. On the default CPU path `out` is the host
+   buffer's own type and this is one copy. =#
+function _upload!(out, q::QuadratureLinop)
+    if isnothing(q.stage)
+        copyto!(out, q.host)
+    else
+        copyto!(q.stage, q.host)
+        copyto!(out, q.stage)
+    end
+    out
+end
+
+#=------------------------ a constant added to an integrated operator ------------------------=#
+
+"""
+    OffsetLinop(op, δ)
+
+The [`AbstractIntegratedLinop`](@ref) `op` with the z-independent operator `δ` added to
+it: `L(z) + δ`, whose integral is `Φ(z) + δ·z`.
+
+This is how an absorbing boundary reaches an operator the caller supplied as its integral.
+[`Boundaries.addloss`](@ref Luna.Boundaries.addloss) folds a spectral absorption rate into
+the operator as `-α/2`, which is a constant, so it goes into the integral exactly --
+nothing has to be re-integrated, and for an [`AbsolutePhase`](@ref) operator it costs
+nothing per step at all, because a term linear in z is exactly what the propagator's
+secant is.
+
+`δ` may be a host array whatever the state's array type: it is converted once, against the
+first array it is used with.
+"""
+struct OffsetLinop{oT, dT} <: AbstractIntegratedLinop
+    op::oT
+    δ::dT
+    cache::Base.RefValue{Any}
+end
+
+OffsetLinop(op::AbstractIntegratedLinop, δ) = OffsetLinop(op, δ, Ref{Any}(nothing))
+
+PhaseStyle(w::OffsetLinop) = PhaseStyle(w.op)
+
+phase!(out, w::OffsetLinop, z) = phase!(out, w.op, z)
+
+#= A constant added to the operator is a straight line added to its integral, which is
+   what `secant` is for: an `AbsolutePhase` operator therefore pays nothing extra per
+   step. =#
+secant(w::OffsetLinop) = _addsec(secant(w.op), w.δ)
+_addsec(::Nothing, δ) = δ
+_addsec(sec, δ) = sec .+ upload_like(sec, δ)
+
+function phasediff!(out, w::OffsetLinop, z1, z2)
+    phasediff!(out, w.op, z1, z2)
+    δ = _δlike(w, out)
+    dz = scalar(out, z2 - z1)
+    @. out += δ*dz
+    out
+end
+
+function derivative!(out, w::OffsetLinop, z)
+    derivative!(out, w.op, z)
+    δ = _δlike(w, out)
+    @. out += δ
+    out
+end
+
+#= `δ` in the array type of whatever it is being broadcast against, built on first use.
+   `Ref{Any}` because that type is not known until then; the branch is perfectly predicted
+   next to the field-sized broadcast which follows it. =#
+function _δlike(w::OffsetLinop, proto)
+    isnothing(w.cache[]) && (w.cache[] = upload_like(proto, w.δ))
+    w.cache[]
 end
 
 #=--------------------------- tabulated values (not integrals) ---------------------------=#

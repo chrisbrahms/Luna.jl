@@ -1172,16 +1172,50 @@ end
 CountCalls(f) = CountCalls(f, 0)
 (c::CountCalls)(args...; kwargs...) = (c.n += 1; c.f(args...; kwargs...))
 
+#= The propagator Luna used for a z-dependent operator before gpu/27 -- `exp(linop(t2)·
+   (t2 − t1))`, a one-point rule -- written as an integrated operator so that the
+   convergence comparison below can still be made against it. Defining
+   `Φ(t2) − Φ(t1) := linop(t2)·(t2 − t1)` reproduces the removed code exactly, including
+   its arithmetic: the backward direction was `exp(linop·(t1 − t2))`, which is
+   `exp(−(linop·(t2 − t1)))` bit for bit. The operator is evaluated into a host buffer of
+   the state's element type and copied up, as it was.
+
+   It is a reference, not a recommendation: its error is first order in the step and
+   cancels out of the embedded error estimate, so the step controller never sees it. =#
+struct OnePointLinop{F, hT} <: LinearOps.AbstractIntegratedLinop
+    linop!::F
+    host::hT
+end
+
+OnePointLinop(linop!, proto::AbstractArray) =
+    OnePointLinop(linop!, Array{eltype(proto)}(undef, size(proto)))
+
+LinearOps.PhaseStyle(::OnePointLinop) = LinearOps.IncrementalPhase()
+
+function LinearOps.phasediff!(out, op::OnePointLinop, z1, z2)
+    op.linop!(op.host, z2)
+    copyto!(out, op.host)
+    dz = Luna.scalar(out, z2 - z1)
+    @. out *= dz
+    out
+end
+
+function LinearOps.derivative!(out, op::OnePointLinop, z)
+    op.linop!(op.host, z)
+    copyto!(out, op.host)
+end
+
 #= A pressure gradient and a taper. `LinearOps.make_linop` gives a z-dependent operator
    closure and `constβ` is left at its default of false, so these are the only cases which
-   exercise `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s host-buffer branch
-   -- the two pieces of GPU_PLAN.md section 4.5 layer 1 which upload from the host on every
-   stage -- and, with `tabulate_linop=true`, the tables which replace them (layer 2).
+   exercise `NormModeAvg`'s `HostMirror` branch -- GPU_PLAN.md section 4.5 layer 1, which
+   uploads from the host on every stage -- and, with `linop_integral=:tabulated`, the
+   tables which replace it (layer 2). `onepoint=true` propagates with the removed
+   one-point rule instead, which also leaves `β` and `Aeff` untabulated.
    Fixed steps by default, so that the only difference between two runs is the arithmetic.
 
    The third element of the return value counts the host calls each run made. =#
 function zcase(spec; kind=:gradient, gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9,
-               precision=nothing, tabulate_linop=false,
+               precision=nothing, linop_integral=:tabulated, onepoint=false,
                linop_tol=LinearOps.DEFAULT_LINOP_TOL, nsteps=20, maxdz=nothing, rtol=1e-6)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
     if kind === :gradient
@@ -1209,9 +1243,10 @@ function zcase(spec; kind=:gradient, gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, �
        table. =#
     dz = flength/nsteps
     mdz = isnothing(maxdz) ? dz : maxdz
-    Luna.run(Eω, grid, linop, transform, FT, out;
+    lop = onepoint ? OnePointLinop(linop, Eω) : linop
+    Luna.run(Eω, grid, lop, transform, FT, out;
              zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=mdz, rtol,
-             tabulate_linop, linop_tol)
+             linop_integral, linop_tol)
     out, transform, (; linop=linop.n, β=βfun!.n, aeff=aeff.n, rhs=dens.n)
 end
 
@@ -1553,7 +1588,7 @@ end
 
 #= A caller-supplied normalisation (`Luna.setup`'s `norm!` keyword) is not one of Luna's
    own and need not have an `aeff` field at all, so `tabulate` has to pass it through
-   rather than inspect it. Before this was guarded, `tabulate_linop=true` aborted such a
+   rather than inspect it. Before this was guarded, tabulation aborted such a
    run with a `FieldError` before the first step. =#
 struct WrapperNorm{N}
     n::N
@@ -1578,8 +1613,7 @@ end
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
     dz = flength/20
     Luna.run(Eω, grid, linop, transform, FT, out;
-             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz,
-             tabulate_linop=true)
+             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz)
     @test all(isfinite, out["Eω"])
     @test maximum(abs, out["Eω"]) > 0
 end
@@ -1760,15 +1794,15 @@ end
 
 #= gpu/23: the tabulated operator (GPU_PLAN.md section 4.5 layer 2) on a device. Three
    things to establish: that the tables are device-resident and used, that the tabulated
-   run agrees between host and device to the same rounding level as the untabulated one,
+   run agrees between host and device to rounding level,
    and that no host code runs inside the propagation -- which is checked by counting the
    calls, not by reading the types. The difference from the untabulated *discretisation*
    is not a rounding-level quantity and is measured separately below. =#
 @testset "tabulated operator on JLArray: $kind" for (kind, mk) in (
         ("gradient", gradientcase), ("taper", tapercase))
     flength = 1e-2
-    href, htr, _ = mk(HostSpec(); flength, tabulate_linop=true)
-    dref, dtr, _ = mk(JLSpec; flength, tabulate_linop=true)
+    href, htr, _ = mk(HostSpec(); flength)
+    dref, dtr, _ = mk(JLSpec; flength)
 
     #= `Luna.run` tabulates into a transform of its own and does not modify the caller's,
        so the tables are inspected by building the same thing here. What the propagation
@@ -1802,16 +1836,16 @@ end
        evaluations; anything the stepper evaluated on the host would scale with the number
        of stages, which the right-hand side count shows really did change. =#
     maxdz = 1e-2/20
-    _, _, coarse = gradientcase(JLSpec; tabulate_linop=true, nsteps=20, maxdz)
-    _, _, fine = gradientcase(JLSpec; tabulate_linop=true, nsteps=80, maxdz, rtol=1e-13)
+    _, _, coarse = gradientcase(JLSpec; nsteps=20, maxdz)
+    _, _, fine = gradientcase(JLSpec; nsteps=80, maxdz, rtol=1e-13)
     @test fine.rhs > 1.5*coarse.rhs # the second run really did take more steps
     @test fine.linop == coarse.linop
     @test fine.β == coarse.β
     @test fine.aeff == coarse.aeff
 
-    # ... where the untabulated path evaluates all three on the host at every stage
-    _, _, ecoarse = gradientcase(JLSpec; nsteps=20, maxdz)
-    _, _, efine = gradientcase(JLSpec; nsteps=80, maxdz, rtol=1e-13)
+    # ... where an untabulated operator evaluates all three on the host at every stage
+    _, _, ecoarse = gradientcase(JLSpec; onepoint=true, nsteps=20, maxdz)
+    _, _, efine = gradientcase(JLSpec; onepoint=true, nsteps=80, maxdz, rtol=1e-13)
     @test efine.rhs > 1.5*ecoarse.rhs
     @test efine.linop > 1.5*ecoarse.linop
     @test efine.β > 1.5*ecoarse.β
@@ -1823,27 +1857,27 @@ end
     @test coarse.β < efine.β
 end
 
-#= What tabulating the operator does to the answer. This is a change of discretisation --
-   the exact interaction-picture propagator instead of a one-point rule -- so it is not a
-   rounding-level difference and is not gated as one. The untabulated path's error is first
-   order in the step and the tabulated one's is not: the two converge to the same solution,
-   and the tabulated run at 20 steps is already closer to the well resolved answer than the
-   untabulated run at 20 times as many. =#
-@testset "tabulated vs untabulated discretisation: $kind" for (kind, mk) in (
+#= What integrating the operator does to the answer, against the one-point rule Luna used
+   before. This is a change of discretisation, so it is not a rounding-level difference and
+   is not gated as one. The one-point rule's error is first order in the step and the
+   tabulated propagator's is not: the two converge to the same solution, and the tabulated
+   run at 20 steps is already closer to the well resolved answer than the one-point run at
+   20 times as many. =#
+@testset "tabulated vs one-point discretisation: $kind" for (kind, mk) in (
         ("gradient", gradientcase), ("taper", tapercase))
     flength = 0.1 # a fibre long enough for the step size to matter
-    ref, _, _ = mk(HostSpec(); flength, nsteps=1280)
+    ref, _, _ = mk(HostSpec(); flength, onepoint=true, nsteps=1280)
     d(a, b) = maximum(map(axes(a["Eω"], 2)) do i
         maximum(abs, a["Eω"][:, i] .- b["Eω"][:, i])/maximum(abs, b["Eω"][:, i])
     end)
-    exact = [mk(HostSpec(); flength, nsteps=n)[1] for n in (20, 80, 320)]
-    tab = [mk(HostSpec(); flength, tabulate_linop=true, nsteps=n)[1] for n in (20, 80, 320)]
+    exact = [mk(HostSpec(); flength, onepoint=true, nsteps=n)[1] for n in (20, 80, 320)]
+    tab = [mk(HostSpec(); flength, nsteps=n)[1] for n in (20, 80, 320)]
     eerr = d.(exact, Ref(ref))
     terr = d.(tab, Ref(ref))
-    # the untabulated path converges at first order in the step
+    # the one-point propagator converges at first order in the step
     @test eerr[1]/eerr[2] > 3 && eerr[2]/eerr[3] > 3
-    #= The tabulated run at 20 steps is closer to the reference than the untabulated one
-       at 320. The reference is itself a finite-step untabulated run, so what is left of
+    #= The tabulated run at 20 steps is closer to the reference than the one-point one
+       at 320. The reference is itself a finite-step one-point run, so what is left of
        `terr` is largely the reference's own error, which is why this is a comparison
        against `eerr` rather than an absolute number. =#
     @test terr[1] < 0.5*eerr[3]

@@ -180,14 +180,15 @@ CountCalls(f) = CountCalls(f, 0)
 (c::CountCalls)(args...; kwargs...) = (c.n += 1; c.f(args...; kwargs...))
 
 #= A pressure gradient: a z-dependent operator closure and `constβ=false`, which is the
-   only case exercising `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s
-   host-buffer branch -- the two pieces which upload from the host on every stage unless
-   `tabulate_linop=true` replaces them with tables (gpu/23). Fixed steps, so the runs
-   differ only in arithmetic. The third element of the return value counts the host calls
-   the run made. =#
+   only case exercising `NormModeAvg`'s `HostMirror` branch -- the piece which uploads
+   from the host on every stage unless `linop_integral=:tabulated` replaces it with a
+   table (gpu/23). `linop_integral=:quadrature` is the other way of integrating the
+   operator, which does its work on the host per stage as the old propagator did.
+   Fixed steps, so the runs differ only in arithmetic. The third element of the return
+   value counts the host calls the run made. =#
 function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, energy=1e-6, flength=1e-2,
                            λ0=800e-9, boundary=:none, stats=false, fixed=true,
-                           tabulate_linop=false, stats_device=:auto,
+                           linop_integral=:tabulated, stats_device=:auto,
                            linop_tol=LinearOps.DEFAULT_LINOP_TOL, nsteps=20, rtol=1e-8)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
     coren, densityfun0 = Capillary.gradient(gas, flength, pin, pout)
@@ -214,11 +215,11 @@ function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, energy=1e-6, flengt
     if fixed
         Luna.run(Eω, grid, linop, transform, FT, out;
                  zmax=flength, boundary, init_dz=dz, min_dz=dz, max_dz=maxdz, rtol,
-                 tabulate_linop, linop_tol)
+                 linop_integral, linop_tol)
     else
         Luna.run(Eω, grid, linop, transform, FT, out;
                  zmax=flength, boundary, init_dz=dz, rtol=1e-8,
-                 tabulate_linop, linop_tol)
+                 linop_integral, linop_tol)
     end
     out, transform, (; linop=linop.n, β=βfun!.n, aeff=aeff.n, rhs=densityfun.n)
 end
@@ -878,7 +879,7 @@ end
     @test maximum(abs, Pk .- P64)/maximum(abs, P64) > 0.1
 end
 
-#= gpu/23's exit criterion: a pressure gradient on Metal with `tabulate_linop=true` and
+#= gpu/23's exit criterion: a pressure gradient on Metal with a tabulated operator and
    no host work inside the propagation. Three things are checked -- that the tables reach
    the kernels as Float32/ComplexF32 MtlArrays (the only place a stray Float64 in them
    would show, since Metal refuses one), that the tabulated Metal run agrees with a
@@ -886,9 +887,8 @@ end
    is counted rather than inferred. =#
 @testset "tabulated operator on Metal" begin
     flength = 1e-2
-    h32, htr, _ = metalgradientcase(DeviceSpec(Array, Float32); flength,
-                                    tabulate_linop=true)
-    dm, dtr, dcount = metalgradientcase(MetalSpec; flength, tabulate_linop=true)
+    h32, htr, _ = metalgradientcase(DeviceSpec(Array, Float32); flength)
+    dm, dtr, dcount = metalgradientcase(MetalSpec; flength)
 
     #= `Luna.run` tabulates into a transform of its own and does not modify the caller's,
        so the tables are inspected by building the same thing here. =#
@@ -928,17 +928,27 @@ end
        so the tables span the same interval and cost the same number of evaluations.
        Anything the stepper evaluated on the host would scale with the stage count, which
        the right-hand side count shows really did change. =#
-    _, _, fine = metalgradientcase(MetalSpec; flength, tabulate_linop=true,
-                                   nsteps=80, rtol=1e-13)
+    _, _, fine = metalgradientcase(MetalSpec; flength, nsteps=80, rtol=1e-13)
     @test fine.rhs > 1.5*dcount.rhs
     @test fine.linop == dcount.linop
     @test fine.β == dcount.β
     @test fine.aeff == dcount.aeff
-    # ... where the untabulated path evaluates and uploads all three at every stage
-    _, _, ecoarse = metalgradientcase(MetalSpec; flength, nsteps=20)
-    _, _, efine = metalgradientcase(MetalSpec; flength, nsteps=80, rtol=1e-13)
+    #= ... where `:quadrature` evaluates and uploads all three at every stage. This is
+       also the check that the quadrature path runs on Metal at all: the operator is
+       integrated on the host in Float64 and the result is uploaded as ComplexF32. =#
+    q20, _, ecoarse = metalgradientcase(MetalSpec; flength, linop_integral=:quadrature,
+                                        nsteps=20)
+    _, _, efine = metalgradientcase(MetalSpec; flength, linop_integral=:quadrature,
+                                    nsteps=80, rtol=1e-13)
     @test efine.linop > 1.5*ecoarse.linop
     @test efine.β > 1.5*ecoarse.β
+    #= The quadrature and the table are two ways of computing the same integral, so at
+       the same fixed step count the two Metal runs agree to the Float32 rounding of the
+       state rather than to a discretisation difference. =#
+    for idx in axes(dm["Eω"], 2)
+        @test maximum(abs, q20["Eω"][:, idx] .- dm["Eω"][:, idx]) /
+              maximum(abs, dm["Eω"][:, idx]) < 1e-4
+    end
 end
 
 @testset "prop_capillary on Metal" begin
@@ -978,23 +988,23 @@ end
     end
     @test isapprox(dgrad["stats"]["energy"], hgrad32["stats"]["energy"]; rtol=1e-3)
 
-    #= gpu/23: the same gradient with `tabulate_linop=true`, which is the keyword a user
-       passes to run a pressure-graded capillary on the GPU with nothing left on the host
-       inside the step. Metal against CPU Float32 at the same tolerance as the untabulated
-       comparison above: the two runs use the same discretisation as each other, so this
-       is the device path and nothing else. The tabulated answer is *not* compared with
-       the untabulated one -- it is a different discretisation of the linear step, and
-       much better resolved; that difference is measured in `test_device.jl`. =#
-    tgrad32 = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
+    #= gpu/27: the same gradient with `linop_integral=:quadrature`, the other way of
+       integrating a z-dependent operator. Metal against CPU Float32 at the same
+       tolerance as the tabulated comparison above. The two are the same discretisation
+       computed two ways, so the difference between them is the tolerance each was
+       computed to, not a change of scheme -- but `prop_capillary` has no fixed-step
+       option and a pressure gradient's step sequence is sensitive to Float32 rounding,
+       so this is compared within precisions rather than across them. =#
+    qgrad32 = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
                                   capkw..., device=DeviceSpec(Array, Float32),
-                                  tabulate_linop=true)
-    tgrad = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
-                                capkw..., device=MetalSpec, tabulate_linop=true)
-    for idx in axes(tgrad32["Eω"], 2)
-        @test maximum(abs, tgrad["Eω"][:, idx] .- tgrad32["Eω"][:, idx]) /
-              maximum(abs, tgrad32["Eω"][:, idx]) < 1e-4
+                                  linop_integral=:quadrature)
+    qgrad = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
+                                capkw..., device=MetalSpec, linop_integral=:quadrature)
+    for idx in axes(qgrad32["Eω"], 2)
+        @test maximum(abs, qgrad["Eω"][:, idx] .- qgrad32["Eω"][:, idx]) /
+              maximum(abs, qgrad32["Eω"][:, idx]) < 1e-4
     end
-    @test isapprox(tgrad["stats"]["energy"], tgrad32["stats"]["energy"]; rtol=1e-3)
+    @test isapprox(qgrad["stats"]["energy"], qgrad32["stats"]["energy"]; rtol=1e-3)
 
     #= gpu/13's exit condition: Kerr *and* plasma, the default physics of a
        field-resolved `prop_capillary` call in a non-Raman gas, on Metal end to end.

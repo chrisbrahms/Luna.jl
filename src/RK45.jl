@@ -2,7 +2,7 @@ module RK45
 import Dates
 import Logging
 import Printf: @sprintf
-import Luna.Utils: format_elapsed, isdevice
+import Luna.Utils: format_elapsed
 
 #Get Butcher tableau etc from separate file (for convenience of changing if wanted)
 include("dopri.jl")
@@ -384,7 +384,23 @@ function interpolant!(s, ti::Float64)
     return s.yi
 end
 
-"Make propagator for the case of constant linear operator"
+"""
+    make_prop!(linop, y0)
+
+The interaction-picture propagator `prop!(y, t1, t2, bwd=false)` of the linear operator
+`linop`, which multiplies `y` in place by `exp(∫linop dz)` over `[t1, t2]`, or by its
+inverse when `bwd` is true.
+
+A constant operator is an array and this is exact. A z-dependent one has to be supplied as
+its *integral*, i.e. as a
+[`LinearOps.AbstractIntegratedLinop`](@ref Luna.LinearOps.AbstractIntegratedLinop), which
+has its own method of this function; a bare `linop!(out, z)` callable is refused. Luna
+propagated such a callable with `exp(linop(t2)·(t2 − t1))` until that was removed: a
+one-point rule, first order in the step size, whose error is common to both of the
+embedded Runge–Kutta solutions and therefore cancels out of the error estimate, so the
+step-size controller never responds to it. [`Luna.run`](@ref) converts a callable into an
+integrated operator; see its `linop_integral` keyword.
+"""
 function make_prop!(linop::AbstractArray, y0)
     prop! = let linop=linop
         function prop!(y, t1, t2, bwd=false)
@@ -394,40 +410,13 @@ function make_prop!(linop::AbstractArray, y0)
     end
 end
 
-"""
-Make propagator for the case of non-constant linear operator.
-
-`linop!(out, z)` is host code -- the operators in `LinearOps` are scalar loops over
-`Modes.neff` -- so when the state lives on a device the operator is evaluated into a host
-buffer of the state's element type and copied up, once per distinct `t2`.
-
-This is the fallback, and the path a user-supplied `linop!` takes.
-`Luna.run(...; tabulate_linop=true)` replaces the operator with a
-[`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop), which has its own method
-of this function and does no host work per stage.
-"""
+@doc (@doc make_prop!)
 function make_prop!(linop!, y0)
-    linop_int = similar(y0)
-    hostbuf = isdevice(y0) ? Array{eltype(y0)}(undef, size(y0)) : nothing
-    lastt2 = Ref(typemin(Float64))
-    prop! = let linop! = linop!, linop_int = linop_int, hostbuf = hostbuf, lastt2 = lastt2
-        function prop!(y, t1, t2, bwd=false)
-            #= linop is always evaluated at later time, even for backward propagation
-                therefore, linop is often evaluated at the same t2 twice in a row=#
-            if lastt2[] != t2
-                if isnothing(hostbuf)
-                    linop!(linop_int, t2)
-                else
-                    linop!(hostbuf, t2)
-                    copyto!(linop_int, hostbuf)
-                end
-            end
-            lastt2[] = t2
-            dt = convert(real(eltype(y)), bwd ? (t1-t2) : (t2-t1))
-            @. y *= exp(linop_int*dt)
-        end
-    end
-    return prop!
+    throw(ArgumentError(
+        "a z-dependent linear operator has to be supplied as its integral, not as the "*
+        "callable $(typeof(linop!)): wrap it in a LinearOps.TabulatedLinop or a "*
+        "LinearOps.QuadratureLinop, or give it to Luna.run, which does that for you "*
+        "(see the `linop_integral` keyword)."))
 end
 
 """

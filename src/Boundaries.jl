@@ -103,6 +103,7 @@ module Boundaries
 import ..Maths
 import ..Grid
 import ..NonlinearRHS
+import ..LinearOps
 import ..Utils
 import Luna: upload_like, todevice, scalar, assert_resident, DeviceSpec
 import LinearAlgebra: mul!
@@ -295,6 +296,11 @@ function addloss(linop!, α)
     end
 end
 
+#= An operator the caller supplied as its integral. `-α/2` is z-independent, so it adds a
+   straight line to the integral and goes in exactly; see
+   [`LinearOps.OffsetLinop`](@ref). =#
+addloss(op::LinearOps.AbstractIntegratedLinop, α) = LinearOps.OffsetLinop(op, -α./2)
+
 # ---------------------------------------------------------------------------- free space
 
 """
@@ -365,6 +371,10 @@ function addloss_k(linop!, α)
     end
 end
 
+@doc (@doc addloss_k)
+addloss_k(op::LinearOps.AbstractIntegratedLinop, α) =
+    LinearOps.OffsetLinop(op, reshape(-α./2, 1, 1, size(α)...))
+
 """
     clampdecay(linop, ratemax)
 
@@ -392,6 +402,17 @@ function clampdecay(linop!, ratemax)
         out
     end
 end
+
+#= The clamp is not linear in the operator, so it cannot be pushed through an integral: an
+   operator which arrives already integrated cannot be clamped. `Luna.run` integrates
+   after `Boundaries.setup`, so an operator it built itself is always clamped first; this
+   can only be reached by a caller who supplied their own integrated operator for a
+   free-space propagation. =#
+clampdecay(op::LinearOps.AbstractIntegratedLinop, ratemax) = error(
+    "the evanescent decay of a free-space linear operator cannot be clamped once the "*
+    "operator has been integrated, and $(typeof(op)) is an integrated operator. Pass "*
+    "the `linop!(out, z)` callable to Luna.run instead and let it integrate (see "*
+    "`linop_integral`), or clamp the operator yourself before integrating it.")
 
 """
     evanescent(linop, transform, ℓ; kwin=nothing)

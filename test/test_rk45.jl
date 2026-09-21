@@ -1,7 +1,8 @@
 import FFTW
 import Logging
-import Luna: RK45
-import Test: @test
+import Luna: RK45, LinearOps
+import Logging
+import Test: @test, @test_throws
 
 function testinit()
     trange = 32
@@ -123,7 +124,16 @@ dz = 1e-3
 zarr, Aarr = RK45.solve(f!, copy(Aω), z, dz, zmax, rtol=1e-8, output=true, outputN=501)
 zarrp, Aarrp = RK45.solve_precon(fnl!, Lin, copy(Aω), z, dz, zmax,
                                  rtol=1e-8, output=true, outputN=501)
-zarrpf, Aarrpf = RK45.solve_precon(fnl!, Linfunc, copy(Aω), z, dz, zmax, 
+#= A z-dependent operator is given to the stepper as its integral. `Linfunc` does not
+   actually depend on z, so its table has two nodes and stores nothing but the secant --
+   but the secant is the Simpson sum of five evaluations divided by the span, so it is the
+   operator to within rounding rather than bitwise, which is why the comparison below is
+   approximate. It was exact when a callable was propagated with the one-point rule
+   `exp(linop(t2)*(t2 - t1))`, which has been removed. =#
+Linint = Logging.with_logger(Logging.NullLogger()) do
+    LinearOps.TabulatedLinop(Linfunc, Aω, 0.0, zmax + dz)
+end
+zarrpf, Aarrpf = RK45.solve_precon(fnl!, Linint, copy(Aω), z, dz, zmax,
                                    rtol=1e-8, output=true, outputN=501)
 # Is the initial spectrum restored after 2 soliton periods? (without preconditioner)
 @test isapprox(abs2.(Aarr[:, 1]), abs2.(Aarr[:, end]), rtol=1e-4)
@@ -133,7 +143,10 @@ zarrpf, Aarrpf = RK45.solve_precon(fnl!, Linfunc, copy(Aω), z, dz, zmax,
 # (with preconditioner and z-dependent linear part)
 @test isapprox(abs2.(Aarrpf[:, 1]), abs2.(Aarrpf[:, end]), rtol=1e-3)
 # Is there a difference if the linear part is a function (but constant)?
-@test all(abs2.(Aarrp) .== abs2.(Aarrpf))
+@test isapprox(abs2.(Aarrp), abs2.(Aarrpf), rtol=1e-12)
+
+# A bare `linop!(out, z)` callable is not a propagator: it has to be integrated first.
+@test_throws ArgumentError RK45.make_prop!(Linfunc, Aω)
 
 # --- dense output (interpolant) accuracy ------------------------------------
 # DOPRI5 is FSAL: k7 of a step is k1 of the next. That move must not happen

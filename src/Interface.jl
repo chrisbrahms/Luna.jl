@@ -384,17 +384,19 @@ If `raman` is `true`, then the following options apply:
 - `boundary_length`: Absorber reference length in metres, overriding `boundary_N`.
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
-- `tabulate_linop::Bool=false`: tabulate the z-dependent linear operator, propagation
-    constant and effective area of a tapered or pressure-graded capillary at setup instead
-    of evaluating them on the host at every stage. This is what makes such a propagation
-    run entirely on a device. It changes the discretisation of the linear step (the
-    propagator becomes the exact `exp(∫linop dz)` rather than a one-point rule), so it is
-    opt-in; see [`Luna.run`](@ref). A uniform fibre keeps its constant operator, which is
-    already exact in the propagator, and gets a two-node table of `Aeff`; reading a
-    constant off a two-node table is not bit-identical to calling `Modes.Aeff` (it is
-    `(1-s)f + sf`), so even there the keyword is not a no-op.
-- `linop_tol::Real`: the tolerance the tabulation's adaptive nodes are placed to satisfy.
-    See [`Luna.run`](@ref).
+- `linop_integral::Symbol=:tabulated`: how the integral `Φ(z) = ∫linop dz'` of a tapered
+    or pressure-graded capillary's z-dependent linear operator is obtained. The stepper
+    propagates the linear part by `exp(Φ(t2) − Φ(t1))`, which is exact.
+    `:tabulated` builds a table of `Φ` at setup, along with the propagation constant and
+    effective area, so that the propagation does no host work per stage -- which is what
+    makes such a run go entirely on a device; `:quadrature` integrates the operator over
+    each step instead, with no table and no setup pass but around fifteen host
+    evaluations of the operator per stage. See [`Luna.run`](@ref).
+
+    A uniform fibre has a constant operator, which is already exact in the propagator, and
+    is not affected by this keyword at all.
+- `linop_tol::Real`: the tolerance `Φ` is computed to, in radians. See [`Luna.run`](@ref).
+- `tabulate_linop`: **deprecated** and ignored; see [`Luna.run`](@ref).
 - `device`: where to run: `:cpu`, `:auto`, `:metal`, `:cuda` or a [`Luna.DeviceSpec`](@ref).
     `nothing` (the default) means "not specified": it becomes `Luna.device_request()`,
     i.e. `Luna.settings["device"]` as the user set it (`:cpu` if nothing was set and
@@ -453,7 +455,7 @@ end
 boundary_kwargs(kwargs) = NamedTuple(
     k => v for (k, v) in pairs(kwargs)
     if k in (:boundary, :boundary_N, :boundary_length, :tcollar,
-             :tabulate_linop, :linop_tol))
+             :linop_integral, :linop_tol, :tabulate_linop))
 
 #= Error, naming the fix, when an *explicit* `device`/`precision` request cannot be
    honoured well because `resp` (mode-averaged only; multimode/radial go through
@@ -518,8 +520,9 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
                         boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR,
-                        tabulate_linop=false,
+                        linop_integral=:tabulated,
                         linop_tol=LinearOps.DEFAULT_LINOP_TOL,
+                        tabulate_linop=nothing,
                         device=nothing, precision=nothing, stats_period=1)
 
     # do we have energy in the orthogonal polarisation states, or just the fundamental?
@@ -579,18 +582,24 @@ function prop_capillary_args(radius, flength, gas, pressure;
     else
         Luna.HostSpec()
     end
-    #= `aefftol`/`aeffspan`: with `tabulate_linop=true` the effective area is tabulated
-       here, before `Stats.default` closes over it (below), rather than only inside
-       `Luna.run`. `Luna.run` rebinds its own `transform` and leaves this one alone, so a
-       statistics function built from `transform.aeff` would otherwise keep calling
-       `Modes.Aeff` -- memoised on `(mode, z)`, so once per accepted step forever -- for a
-       tapered fibre. The span is the fibre; the propagation needs `Aeff` up to one step
-       past the end, and `NonlinearRHS.tabulate` rebuilds a wider table for that from this
-       one's source callable. =#
+    #= `aefftol`/`aeffspan`: with `linop_integral=:tabulated` and a z-dependent operator,
+       the effective area is tabulated here, before `Stats.default` closes over it
+       (below), rather than only inside `Luna.run`. `Luna.run` rebinds its own `transform`
+       and leaves this one alone, so a statistics function built from `transform.aeff`
+       would otherwise keep calling `Modes.Aeff` -- memoised on `(mode, z)`, so once per
+       accepted step forever -- for a tapered fibre. The span is the fibre; the
+       propagation needs `Aeff` up to one step past the end, and `NonlinearRHS.tabulate`
+       rebuilds a wider table for that from this one's source callable.
+
+       A uniform fibre is left alone: its `Aeff` is a constant, `Luna.run` tabulates
+       nothing for it, and reading the constant off a two-node table would be
+       `(1-s)f + sf` rather than `f` -- a rounding difference for no gain. =#
+    tabvalues = (linop_integral === :tabulated) &&
+                (const_linop(radius, pressure) === Val(false))
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
                                      noise_field, thg, device=devicereq, precision,
-                                     aefftol=(tabulate_linop ? linop_tol : nothing),
+                                     aefftol=(tabvalues ? linop_tol : nothing),
                                      aeffspan=(0.0, float(flength)),
                                      modal_integral, nr=modal_nr, nθ=modal_nθ,
                                      kronrod=modal_kronrod)
@@ -610,7 +619,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
         shotnoise, modes, model, loss, raman, kerr, plasma, PPT_options,
         modal_integral, modal_nr, modal_nθ, modal_kronrod,
         temperature, saveN, filepath, filename,
-        boundary, boundary_N, boundary_length, tcollar, tabulate_linop, linop_tol,
+        boundary, boundary_N, boundary_length, tcollar, linop_integral, linop_tol,
         device, precision, stats_period)
 
     return Eω, grid, linop, transform, FT, output

@@ -1,5 +1,6 @@
-import Luna: PhysData, Grid, LinearOps, Modes, Capillary, RK45
-import Test: @testset, @test, @test_logs
+import Luna
+import Luna: PhysData, Grid, LinearOps, Modes, Capillary, RK45, Boundaries
+import Test: @testset, @test, @test_logs, @test_throws
 import Luna.PhysData: wlfreq
 
 R = 5e-3
@@ -476,5 +477,206 @@ end
         wider = LinearOps.TabulatedScalar(atab.src, 0.0, 1.5zend; tol=1e-6)
         @test wider.z[end] == 1.5zend
         @test isapprox(wider(L/3), aeff(L/3); rtol=1e-5)
+    end
+end
+
+#= A caller-supplied analytic Φ, the third source of an integrated operator and the reason
+   the interface is a type rather than a keyword: `-im*(k0 + k1*√z) - k2` is the shape a
+   pressure gradient's operator has (a capillary filled by `Capillary.gradient` from
+   p₀ = 0 has a density ∝ √z, and the propagation constant of a dilute gas is linear in
+   density), and its integral is elementary. `phase!` returns Φ itself -- no secant is
+   subtracted, so `secant` keeps its default of `nothing` -- and `derivative!` returns the
+   operator, which is what the diagnostics need. Every scalar goes through `Luna.scalar`
+   so that the broadcasts hold nothing but the state's own element type, which is what
+   makes the same type run on a device (`test_device.jl`). =#
+struct AnalyticLinop{T} <: LinearOps.AbstractIntegratedLinop
+    k0::T
+    k1::T
+    k2::T
+end
+
+function LinearOps.phase!(out, op::AnalyticLinop, z)
+    zs = Luna.scalar(out, z)
+    zh = Luna.scalar(out, z^1.5*2/3)
+    k0, k1, k2 = op.k0, op.k1, op.k2
+    @. out = -im*(k0*zs + k1*zh) - k2*zs
+    out
+end
+
+function LinearOps.derivative!(out, op::AnalyticLinop, z)
+    sq = Luna.scalar(out, sqrt(z))
+    k0, k1, k2 = op.k0, op.k1, op.k2
+    @. out = -im*(k0 + k1*sq) - k2
+    out
+end
+
+#= gpu/27: the interface the stepper actually propagates with. A z-dependent operator is
+   given to `RK45.make_prop!` as its integral `Φ(z) = ∫linop dz'`, and there are three
+   ways to get one: the table above, adaptive quadrature over each step
+   (`QuadratureLinop`), and a closed form written by the caller. They are checked against
+   each other and against the closed form here. =#
+@testset "integrated linear operators" begin
+    L = 0.1
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    nω = length(grid.ω)
+    proto = zeros(ComplexF64, nω)
+
+    #= The same operator the tabulation testset uses: a √z term on top of a constant, of
+       the size a capillary's operator is. It is not an arbitrary choice -- a capillary
+       filled by `Capillary.gradient` from p₀ = 0 has a density ∝ √z, and the propagation
+       constant of a dilute gas is linear in density, so `a + b√z` is the shape of a
+       pressure gradient's operator. Its integral is known in closed form, which is what
+       makes it the reference for all three sources. =#
+    k0 = @. 1e7*(1 + 0.1*sin(1:nω))
+    k1 = @. 1e4*(1 + 0.5*cos(1:nω))
+    k2 = @. 1.0*(1 + 0.5*sin(2*(1:nω)))
+    cusp!(out, z) = (@. out = -im*(k0 + k1*sqrt(z)) - k2; out)
+    cuspΦ(z) = @. -im*(k0*z + k1*2/3*z^1.5) - k2*z
+
+    @testset "the three sources agree with the closed form" begin
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, L; tol=1e-8, quiet=true)
+        quad = LinearOps.QuadratureLinop(cusp!, proto; tol=1e-8)
+        ana = AnalyticLinop(k0, k1, k2)
+        @test LinearOps.PhaseStyle(tab) === LinearOps.AbsolutePhase()
+        @test LinearOps.PhaseStyle(quad) === LinearOps.IncrementalPhase()
+        @test LinearOps.PhaseStyle(ana) === LinearOps.AbsolutePhase()
+        @test LinearOps.secant(ana) === nothing
+        out = similar(proto)
+        for (z1, z2) in ((0.0, 1e-4), (0.0, L/20), (0.3L, 0.35L), (0.5L, L))
+            ref = cuspΦ(z2) .- cuspΦ(z1)
+            for op in (tab, quad, ana)
+                LinearOps.phasediff!(out, op, z1, z2)
+                @test maximum(abs, out .- ref) < 2e-7
+            end
+        end
+        # the operator itself, which is what `derivative!` is for
+        for z in (1e-6, L/3, 0.9L)
+            cusp!(proto, z)
+            for (op, atol) in ((tab, 1e-4), (quad, 1e-12), (ana, 1e-12))
+                LinearOps.derivative!(out, op, z)
+                @test maximum(abs, out .- proto)/maximum(abs, proto) < atol
+            end
+        end
+    end
+
+    #= The propagator is one method for all three, and `exp(Φ(t2) − Φ(t1))` is exact for
+       the linear part: propagating forwards and back returns the state. =#
+    @testset "the propagator" begin
+        ops = (("tabulated", LinearOps.TabulatedLinop(cusp!, proto, 0.0, L;
+                                                      tol=1e-10, quiet=true)),
+               ("quadrature", LinearOps.QuadratureLinop(cusp!, proto; tol=1e-10)),
+               ("analytic", AnalyticLinop(k0, k1, k2)))
+        y0 = ones(ComplexF64, nω)
+        t1, t2 = 0.31L, 0.33L
+        ref = exp.(cuspΦ(t2) .- cuspΦ(t1))
+        for (name, op) in ops
+            y = copy(y0)
+            prop! = RK45.make_prop!(op, y0)
+            prop!(y, t1, t2)
+            @test maximum(abs, y .- ref)/maximum(abs, ref) < 1e-8
+            prop!(y, t1, t2, true)
+            @test maximum(abs, y .- y0) < 1e-12
+            # the caches do not change the answer when the arguments repeat
+            y2 = copy(y0)
+            prop!(y2, t1, t2)
+            y3 = copy(y0)
+            RK45.make_prop!(op, y0)(y3, t1, t2)
+            @test y2 == y3
+        end
+    end
+
+    #= Luna's own operators, where there is no closed form: the table and the quadrature
+       have to agree with each other to their tolerances. =#
+    function gradient_linop(p0, p1)
+        coren, _ = Capillary.gradient(:Ar, L, p0, p1)
+        LinearOps.make_linop(grid, Capillary.MarcatiliMode(75e-6, coren, loss=false),
+                             800e-9)[1]
+    end
+    taper_linop() = LinearOps.make_linop(
+        grid, Capillary.MarcatiliMode(z -> 75e-6 + (50e-6 - 75e-6)*z/L, :Ar, 1.0,
+                                      loss=false, model=:full), 800e-9)[1]
+
+    @testset "table and quadrature agree: $name" for (name, linop!) in (
+            ("gradient 0 -> 1 bar", gradient_linop(0.0, 1.0)),
+            ("taper", taper_linop()))
+        tol = 1e-8
+        tab = LinearOps.TabulatedLinop(linop!, proto, 0.0, L; tol, quiet=true)
+        quad = LinearOps.QuadratureLinop(linop!, proto; tol)
+        a = similar(proto)
+        b = similar(proto)
+        for (z1, z2) in ((0.0, L/20), (0.2L, 0.21L), (0.5L, L))
+            LinearOps.phasediff!(a, tab, z1, z2)
+            LinearOps.phasediff!(b, quad, z1, z2)
+            # a few interval tolerances, as the interpolation error accumulates over them
+            @test maximum(abs, a .- b) < 20tol
+        end
+        # and so do the operators they report
+        linop!(proto, 0.43L)
+        LinearOps.derivative!(a, tab, 0.43L)
+        LinearOps.derivative!(b, quad, 0.43L)
+        @test maximum(abs, b .- proto) == 0 # the quadrature just calls the closure
+        @test maximum(abs, a .- proto)/maximum(abs, proto) < 1e-6
+    end
+
+    #= The quadrature over a step is one 15-point rule for a smooth operator. Over the
+       whole of a gradient filled from zero it is not, because the √z cusp is at the
+       entrance -- which is what `maxevals` bounds and what the table's bisection handles
+       instead. =#
+    @testset "quadrature cost" begin
+        linop! = gradient_linop(1.0, 0.0) # smooth: no cusp at either end
+        quad = LinearOps.QuadratureLinop(linop!, proto; tol=1e-6)
+        out = similar(proto)
+        LinearOps.phasediff!(out, quad, 0.5L, 0.5L + L/20)
+        @test quad.nevals[] == 15
+        @test quad.ncalls[] == 1
+        # a zero-length step costs nothing at all
+        LinearOps.phasediff!(out, quad, 0.3L, 0.3L)
+        @test all(iszero, out)
+        @test quad.nevals[] == 15
+    end
+
+    #= A constant added to an integrated operator -- which is how an absorbing boundary
+       reaches one -- goes into the integral exactly, because it is linear in z. =#
+    @testset "OffsetLinop" begin
+        δ = @. -0.5*(1 + 0.2*cos(1:nω))
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, L; tol=1e-10, quiet=true)
+        quad = LinearOps.QuadratureLinop(cusp!, proto; tol=1e-10)
+        out = similar(proto)
+        ref = similar(proto)
+        for op in (tab, quad, AnalyticLinop(k0, k1, k2))
+            off = LinearOps.OffsetLinop(op, δ)
+            @test LinearOps.PhaseStyle(off) === LinearOps.PhaseStyle(op)
+            LinearOps.phasediff!(out, off, 0.2L, 0.25L)
+            LinearOps.phasediff!(ref, op, 0.2L, 0.25L)
+            @test maximum(abs, out .- ref .- δ.*(0.05L)) < 1e-9
+            LinearOps.derivative!(out, off, 0.2L)
+            LinearOps.derivative!(ref, op, 0.2L)
+            @test out ≈ ref .+ δ
+        end
+        # and the same through `Boundaries.addloss`, which is where it comes from
+        α = @. 1.0*(1 + 0.5*sin(1:nω))
+        off = Boundaries.addloss(AnalyticLinop(k0, k1, k2), α)
+        @test off isa LinearOps.OffsetLinop
+        LinearOps.derivative!(out, off, 0.4L)
+        cusp!(ref, 0.4L)
+        @test out ≈ ref .- α./2
+        # the free-space clamp cannot be applied to an operator which is already integrated
+        @test_throws ErrorException Boundaries.clampdecay(
+            AnalyticLinop(k0, k1, k2), 100.0)
+    end
+
+    #= A bare `linop!(out, z)` callable is not a propagator any more: the one-point rule
+       `exp(linop(t2)·(t2 − t1))` has been removed. =#
+    @testset "a callable is refused" begin
+        @test_throws ArgumentError RK45.make_prop!(cusp!, proto)
+    end
+
+    @testset "linop_integral" begin
+        @test Luna._linop_integral(:tabulated, nothing) === :tabulated
+        @test Luna._linop_integral(:quadrature, nothing) === :quadrature
+        @test_throws ErrorException Luna._linop_integral(:hermite, nothing)
+        # the deprecated keyword warns and does not override an explicit request
+        @test_logs (:warn, r"deprecated") Luna._linop_integral(:tabulated, true)
+        @test Luna._linop_integral(:quadrature, false) === :quadrature
     end
 end

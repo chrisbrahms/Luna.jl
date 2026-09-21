@@ -597,8 +597,28 @@ function setup_free(::Type{TH}, grid, spacegrid, densityfun, normfun, responses,
     Eωk, transform, FT
 end
 
+#= `tabulate_linop` was the keyword which chose between the one-point propagator and the
+   tabulated integral. The one-point propagator is gone, so the only thing left for it to
+   do is to say so; an explicit `linop_integral` wins over it. =#
+function _linop_integral(linop_integral, tabulate_linop)
+    linop_integral in (:tabulated, :quadrature) || error(
+        "linop_integral must be :tabulated or :quadrature, got $(repr(linop_integral))")
+    isnothing(tabulate_linop) && return linop_integral
+    Logging.@warn(
+        "`tabulate_linop` is deprecated and does nothing: use `linop_integral=:tabulated` "*
+        "(the default) or `linop_integral=:quadrature`. A z-dependent linear operator is "*
+        "now always given to the stepper as its integral -- the one-point propagator "*
+        "`tabulate_linop=false` selected has been removed -- so both values of the old "*
+        "keyword mean `:tabulated`.", maxlog=1)
+    linop_integral
+end
+
+#= What went into the output's `simulation_type` group. "variable" is what a caller who
+   supplies their own `AbstractIntegratedLinop` subtype gets; "constant" is the array. =#
 linoptype(l::AbstractArray) = "constant"
 linoptype(l::LinearOps.TabulatedLinop) = "tabulated"
+linoptype(l::LinearOps.QuadratureLinop) = "quadrature"
+linoptype(l::LinearOps.AbstractIntegratedLinop) = "integrated"
 linoptype(l) = "variable"
 
 gridtype(g::Grid.RealGrid) = "field-resolved"
@@ -687,33 +707,46 @@ space" in [`Luna.Boundaries`](@ref) and [`NonlinearRHS.FreeSpaceNorm`](@ref).
 
 See [`Luna.Boundaries`](@ref) for the rationale.
 
-# Tabulating a z-dependent linear operator
-- `tabulate_linop::Bool=false`: tabulate the z-dependent quantities of the propagation --
-    the integrated linear operator `Φ(z) = ∫ linop dz'`
-    ([`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop)), and the
-    propagation constant `β(z)` and effective area `Aeff(z)` of a mode-averaged transform
-    -- on adaptively placed z nodes at setup, instead of evaluating them on the host at
-    every stage of every step. A tapered or pressure-graded run then does no host work
-    inside the right-hand side, which is what a device run needs; on the CPU it replaces
-    the per-stage `Modes.neff` loop with an interpolation.
+# The integral of a z-dependent linear operator
+The stepper propagates the linear part over a step by `exp(Φ(t2) − Φ(t1))`, where
+`Φ(z) = ∫linop dz'`, which is exact. A z-dependent `linop!(out, z)` callable therefore has
+to be turned into its integral before the propagation starts, and these two keywords say
+how. A constant operator (an array) is left alone -- it is already exact in the propagator
+-- and so is an operator the caller has already supplied as a
+[`LinearOps.AbstractIntegratedLinop`](@ref Luna.LinearOps.AbstractIntegratedLinop),
+which is how to use an analytic `Φ`.
 
-    It **changes the discretisation**: the propagator becomes `exp(Φ(t2) − Φ(t1))`, the
-    exact interaction-picture propagator of the linear part over the step, where the
-    default is `exp(linop(t2)·(t2 − t1))`, a one-point rule. Both converge to the same
-    solution as the step shrinks and the difference is largest where the operator varies
-    fastest within a step -- the entrance of a `p₀ = 0` pressure gradient. It is off by
-    default for that reason, and a run which uses it is not comparable element by element
-    with one which does not.
+- `linop_integral::Symbol=:tabulated`: how `Φ` is obtained from the callable.
+    - `:tabulated` tabulates `Φ` on adaptively placed z nodes at setup
+      ([`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop)), and with it the
+      propagation constant `β(z)` and effective area `Aeff(z)` of a mode-averaged
+      transform. A tapered or pressure-graded run then does no host work inside the
+      right-hand side, which is what a device run needs; on the CPU it replaces the
+      per-stage `Modes.neff` loop with an interpolation.
+    - `:quadrature` integrates the operator over each step by adaptive Gauss–Kronrod
+      quadrature instead ([`LinearOps.QuadratureLinop`](@ref Luna.LinearOps.QuadratureLinop)).
+      No table, no setup pass and no assumption about the operator's behaviour in z, but
+      roughly fifteen host evaluations of `linop!` per stage against one table readback,
+      and `β` and `Aeff` are evaluated per stage as well. Use it to check a tabulated
+      result, or for an operator whose table would be too large (a multimode or
+      free-space operator is the size of the whole state).
 
-    A constant operator is unaffected: it is already exact in the propagator and is not
-    tabulated. The tables are built for the propagation: the `transform` object the caller
-    passed in is not modified, so a statistics function built from `transform.aeff` before
-    the run keeps calling the untabulated one (once per accepted step, on the host, where
-    the statistics already are).
-- `linop_tol::Real=$(LinearOps.DEFAULT_LINOP_TOL)`: the tolerance the nodes are placed to
-    satisfy, in radians for the integrated operator (absolute) and relative for `β` and
-    `Aeff`. The tables cost `2·length(Eω)·nnodes` numbers for the operator, so a tolerance
-    far below the solver's own `rtol` buys nothing and costs memory.
+    Until this branch, a callable was propagated with `exp(linop(t2)·(t2 − t1))`, a
+    one-point rule whose error is first order in the step size and cancels out of the
+    embedded error estimate, so the step-size controller never responded to it. Gradient
+    and taper results therefore change; see the user page.
+
+    The tables are built for the propagation: the `transform` object the caller passed in
+    is not modified, so a statistics function built from `transform.aeff` before the run
+    keeps calling the untabulated one (once per accepted step, on the host, where the
+    statistics already are).
+- `linop_tol::Real=$(LinearOps.DEFAULT_LINOP_TOL)`: the tolerance `Φ` is computed to, in
+    radians (absolute), and relative for the `β` and `Aeff` tables. With `:tabulated` the
+    tables cost `2·length(Eω)·nnodes` numbers for the operator, so a tolerance far below
+    the solver's own `rtol` buys nothing and costs memory.
+- `tabulate_linop`: **deprecated**, and ignored apart from a warning. Both of its values
+    now mean `linop_integral=:tabulated`, because the propagator `false` selected no
+    longer exists.
 """
 function run(Eω, grid,
              linop, transform, FT, output;
@@ -723,7 +756,8 @@ function run(Eω, grid,
              boundary=:rate, boundary_N=Boundaries.DEFAULT_N, boundary_length=nothing,
              tcollar=Boundaries.DEFAULT_TCOLLAR, kcollar=Boundaries.DEFAULT_KCOLLAR,
              rcollar=Boundaries.DEFAULT_RCOLLAR,
-             tabulate_linop=false, linop_tol=LinearOps.DEFAULT_LINOP_TOL)
+             linop_integral=:tabulated, linop_tol=LinearOps.DEFAULT_LINOP_TOL,
+             tabulate_linop=nothing)
 
     isnothing(zmax) && error(
         "Luna.run requires the propagation length as the keyword argument zmax, e.g. "*
@@ -732,6 +766,7 @@ function run(Eω, grid,
     #= `grid.zmax` was a Float64 field, so the length reached the absorbers, the stepper and
        the output as a Float64 whatever the caller wrote. Keep that. =#
     zmax = float(zmax)
+    linop_integral = _linop_integral(linop_integral, tabulate_linop)
     isnothing(max_dz) && (max_dz = zmax/2)
     #= The save grid and zmax are two separate statements of the propagation length; check
        here that they cannot drift apart. Only possible when `output` is the output object
@@ -824,24 +859,31 @@ function run(Eω, grid,
        returns the operator unchanged. =#
     linop = upload_like(Eω, linop)
 
-    #= Tabulation (GPU_PLAN.md section 4.5 layer 2), opt-in. The table has to cover every
+    #= A z-dependent operator is converted into its integral Φ(z) = ∫linop dz, which is
+       what the propagator needs (GPU_PLAN.md section 4.5 layer 2, section 4.6): the
+       stepper multiplies by exp(Φ(t2) − Φ(t1)), the exact propagator of the linear part
+       over the step. The table has to cover every
        z the stepper can ask about: `RK45.solve` runs `while tn <= tmax`, so the last step
        starts at or before `zmax` and ends up to `max_dz` past it, and that step's stages
        are what the last saved plane is interpolated from. `max_dz` is the absorber's,
        which is the one the stepper will be given. Both tabulations happen after
        `Boundaries.setup`, so the operator includes the absorber and the evanescent clamp.
 
-       A constant operator is already exact in the propagator and is left alone; the
-       transform's own z-dependent quantities are tabulated either way, which for a
-       constant operator is a two-node table and no change to the arithmetic that matters. =#
-    if tabulate_linop
-        #= `init_dz` as well as `max_dz`: the first step is taken at `init_dz` before
-           `steplims!` has had a chance to clamp it, and `Boundaries.setup` only reduces
-           it to `max_dz` for `boundary=:rate`. =#
-        ztab = zmax + max(max_dz, init_dz)
-        transform = NonlinearRHS.tabulate(transform, z0, ztab, linop_tol, Eω)
-        if !(linop isa AbstractArray)
+       A constant operator is already exact in the propagator and is left alone, and so
+       are the transform's own z-dependent quantities, which are constant with it; an
+       operator the caller has already integrated is used as it is. =#
+    if !(linop isa AbstractArray) && !(linop isa LinearOps.AbstractIntegratedLinop)
+        if linop_integral === :tabulated
+            #= `init_dz` as well as `max_dz`: the first step is taken at `init_dz` before
+               `steplims!` has had a chance to clamp it, and `Boundaries.setup` only
+               reduces it to `max_dz` for `boundary=:rate`. =#
+            ztab = zmax + max(max_dz, init_dz)
+            transform = NonlinearRHS.tabulate(transform, z0, ztab, linop_tol, Eω)
             linop = LinearOps.TabulatedLinop(linop, Eω, z0, ztab; tol=linop_tol)
+        else
+            #= No table, so the transform's own z-dependent quantities are left to be
+               evaluated on the host per stage, as they were before tabulation existed. =#
+            linop = LinearOps.QuadratureLinop(linop, Eω; tol=linop_tol, z0)
         end
     end
 
