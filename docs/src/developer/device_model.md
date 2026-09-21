@@ -731,3 +731,103 @@ loaded, so it always precompiles the CPU path.
   It is not part of the suite (Metal is never installed with Luna); it has its own CI job,
   which installs Metal into a separate environment.
 - **`benchmark/device.jl`** times the same propagation on each device and precision.
+
+## The modal transforms
+
+A multimode propagation evaluates the nonlinear polarisation at transverse points and
+integrates it against each mode's transverse field. That integral used to be evaluated
+one point at a time: for every point, a matrix product to synthesise the field there, an
+inverse transform of that one column, the responses on it, a forward transform and a
+matrix product back. Both modal transforms now share one **batched column evaluator**,
+[`NonlinearRHS.synthesise_responses!`](@ref Luna.NonlinearRHS.synthesise_responses!):
+
+1. the modal spectrum goes to the oversampled time domain **once per right-hand side**,
+   over the `nmodes` columns at once. Synthesis is linear and diagonal in time, so it
+   commutes with the transform: synthesising and then transforming gives the same field
+   as transforming and then synthesising, and the second order needs `nmodes` transform
+   columns instead of one per point;
+2. one matrix product (`Et = Emt S`) synthesises the field at every point of the current
+   set, with `S` the mode matrix
+   ([`Modes.mode_matrix`](@ref Luna.Modes.mode_matrix)) reshaped so that its column order
+   is the `(nto, npol, npts)` block's — polarisation fastest;
+3. the responses see the whole block through
+   [`NonlinearRHS.Et_to_Pt!`](@ref Luna.NonlinearRHS.Et_to_Pt!), exactly as a radial or
+   free-space transform's columns do.
+
+What happens next is the only thing the two transforms do differently, and it is what
+decides which one can run on a device.
+
+### `TransModal`: the adaptive rule
+
+[`NonlinearRHS.TransModal`](@ref) is the default (`modal_integral=:adaptive`). Its driver
+is `Cubature.pcubature_v`/`hcubature_v`, which chooses the transverse points itself and
+needs the integrand **at each point separately**, so the polarisation has to be
+transformed back per point and projected per point. The driver is host scalar code and
+returns the integral and its error estimate as `Vector{Float64}`, which is why this
+transform is host- and `Float64`-only and says so, naming the fixed rule, rather than
+being made parametric for a path it could not take.
+
+The driver hands over a *round* of points at a time — 3, 2, 4, 8, … for `pcubature_v`,
+17, 34, … for `hcubature_v`, independent of the integrand's dimension — and a round is
+evaluated as one block, or as a few blocks where the round is wider than `maxbatch`
+([`NonlinearRHS.MODAL_MAXBATCH`](@ref Luna.NonlinearRHS.MODAL_MAXBATCH)). Each distinct
+width has its own buffers, its own forward plan *and its own copy of any response which
+owns buffers*, because a [`Batched`](@ref Luna.Nonlinear.Batched) response sizes its
+buffers to the block it is given; that is what the cap is for. The set of widths is fixed
+by the rule, so the dictionary holding them stops growing after the first right-hand
+side.
+
+The projection is a broadcast rather than a matrix product: `out[ω, m, i] = pre[i] Σₚ
+Pω[ω, p, i] W[m, p, i]` writes straight into the driver's buffer, reinterpreted as the
+complex modal array. There are one or two polarisation components, so the sum over `p` is
+unrolled.
+
+### `TransModalFixed`: the fixed rule
+
+[`NonlinearRHS.TransModalFixed`](@ref) (`modal_integral=:fixed`) evaluates the same
+integral on a fixed quadrature rule
+([`Modes.TransverseQuadrature`](@ref Luna.Modes.TransverseQuadrature); Gauss–Legendre or
+Gauss–Kronrod in r or x, a periodic trapezoid in θ or Gauss–Legendre in y). Because the
+rule's weights are known in advance, the points are summed **before** the transform back:
+one matrix product `Pmt = Pt Wp` with the weights folded into `Wp`, then the time window,
+one batched transform over the `nmodes` columns, the spectral window and the
+normalisation. The time and spectral windows are diagonal in time and in frequency, and
+the projection is a sum over points at fixed time, so applying them after the projection
+is the same operation in a different order — and it means the number of transform columns
+does not grow with the number of nodes. Everything per step is a matrix product, a
+batched transform or a broadcast, which is the kernel discipline, so this is the
+multimode transform which runs on a device.
+
+The mode matrices are rebuilt when `z` moves, unless
+[`Modes.zconstant`](@ref Luna.Modes.zconstant) says the transverse profiles do not depend
+on it. That trait is `false` by default and `true` for a `Capillary.MarcatiliMode` with a
+numeric core radius (and for the `Antiresonant` modes wrapping one), which is the fixed-
+radius case; a taper re-evaluates the mode fields on the host and uploads them, which is
+what the adaptive rule does at every point anyway.
+
+The rule carries an embedded coarse rule — the Gauss subset of a Kronrod rule in r
+(`kronrod=true`), every other node in θ — and
+[`NonlinearRHS.integral_error!`](@ref Luna.NonlinearRHS.integral_error!) turns it into
+`P_coarse - P_fine` with one further matrix product against the precomputed difference of
+the two weight sets. Nothing evaluates it per step; it becomes a statistic once `Stats`
+has been refactored.
+
+`Stats.mode_reconstruction_error` is the adaptive transform's: it re-evaluates the
+transform at one transverse point (which is what
+[`NonlinearRHS.Erω_to_Prω!`](@ref Luna.NonlinearRHS.Erω_to_Prω!) is for) and records the
+cubature's own error estimate. `prop_capillary` turns it off for a `:fixed` run and
+errors if it is asked for explicitly.
+
+### What moved
+
+Replacing a per-point loop with a matrix product and a batched transform changes the
+order of the arithmetic, which is what the regression gate allows and measures. Against
+`gpu/int-D`, the two cases which go through a modal transform moved by 1.5e-15
+(`modeavg_field_vector`, two modes and two polarisation components) and 6.9e-14
+(`multimode_field_plasma`, four modes) in `Eω` in the fixed-step mode; every other case
+is exactly zero, and the adaptive step counts did not change.
+
+The fixed rule is a different *discretisation*, so it agrees with the adaptive rule to
+the accuracy of the quadrature and not to rounding: 3.0e-16 (Kerr), 2.1e-14 (Kerr and
+plasma) and 4.2e-16 (envelope Kerr) on one right-hand side of a four-HE₁ₘ-mode capillary
+with `nr=64`, which is the adaptive rule's error rather than the fixed rule's.
