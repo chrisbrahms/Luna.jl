@@ -311,6 +311,16 @@ to nothing, exactly as in gpu/23 — the `AbsolutePhase` propagator is that code
 table replaced by the interface, so there is no per-step cost to the generalisation.
 `PhaseStyle` and `isnothing(secant(op))` are resolved when the propagator is built.
 
+## Documentation
+
+`include("docs/make.jl")` still ends with `makedocs` refusing to render on unresolved
+cross-references, as it does on the base. **Four** unresolved references here against
+`gpu/int-E`'s six, and **none of the four is new**: `loadFFTwisdom`, `saveFFTwisdom`,
+`AbstractOutput` and `Luna.PhysData.crystal_internal_angle`. The two `LinearOps.βz` ones
+`PR_int-E.md` listed no longer appear. One reference *was* new on the first build of this
+branch and is fixed: `Stats.zdw_linop`, which does not resolve from inside
+`module LinearOps`.
+
 ## Known gaps and risks
 
 - **A free-space or multimode run with a z-dependent operator now builds a table by

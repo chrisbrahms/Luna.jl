@@ -717,8 +717,8 @@ secant(::AbstractIntegratedLinop) = nothing
 Fill `out` with the operator `L(z) = dΦ/dz` itself, in `out`'s array type. Returns `out`.
 
 Required of every [`AbstractIntegratedLinop`](@ref). The propagation only ever needs `Φ`,
-but diagnostics need `L`: [`Stats.zdw_linop`](@ref Luna.Stats) and a `propagator!` passed
-to [`Fields.PropagatedField`](@ref Luna.Fields.PropagatedField) are written against the
+but diagnostics need `L`: `Stats.zdw_linop` and a `propagator!` passed to
+[`Fields.PropagatedField`](@ref Luna.Fields.PropagatedField) are written against the
 operator, and a caller who replaced the closure with an integrated operator has to be able
 to get it back.
 """
