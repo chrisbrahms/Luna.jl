@@ -1017,9 +1017,9 @@ end
    all. These two methods accept and validate them instead of erroring with an unhelpful
    "no keyword argument device", so a `device`/`precision` request which does not resolve
    to the CPU in `Float64` -- the only thing that transform can produce -- gets a message
-   naming the actual limitation. `prop_capillary`/`prop_gnlse` never build a radial run,
-   so `TransRadial`'s device path (gpu/20) is reached through the low-level interface
-   only. =#
+   naming the actual limitation. `prop_capillary`/`prop_gnlse` never build a free-space
+   run, so the device paths of `TransRadial` (gpu/20), `TransFree` and `TransFree2D`
+   (gpu/21) are reached through the low-level interface only. =#
 function _cpu_only!(device, precision, what)
     spec = Luna.withprecision(Luna.resolve_device(device), precision)
     (Luna.arraytype(spec) === Array && Luna.realtype(spec) === Float64) || error(

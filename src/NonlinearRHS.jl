@@ -1484,33 +1484,99 @@ function _zfun(nfuns::Tuple)
     ((λ, δθ; z) -> nfunx(λ, δθ), (λ; z) -> nfuny(λ))
 end
 
+#=================================================#
+#======  CARTESIAN FREE-SPACE TRANSFORMS  ========#
+#=================================================#
+
+#= `TransFree` (3-D, `(t, x, y)`) and `TransFree2D` (2-D, `(t, x)`) are the same transform
+   in two dimensionalities: one multi-axis FFT takes the state from `(ω, k⊥)` to
+   `(t, r⊥)` and back, with the polarisation axis skipped. They are separate types because
+   `Boundaries.spacegrid` and `Luna.setup` dispatch on them and because the transform
+   region differs; everything else below is written once for both. =#
+
+"""
+    freebuffers(spec, TT, ωshape, tshape)
+
+The buffers a Cartesian free-space transform holds: `(Eωo, Eto, Pto)`, on `spec`'s array
+type and precision.
+
+**Three** field-sized arrays, not four: the oversampled frequency-domain buffer does
+double duty as the field's (`Eωo`) and the nonlinear polarisation's (`Pωo`). `to_time!`
+is the only reader of the field's copy and it has finished with it before `to_freq!`
+writes the polarisation's, so aliasing them removes one field-sized allocation per
+transform (GPU_PLAN.md §4.4). The two never appear as the input and the output of the
+same FFT call, which a device plan would reject.
+"""
+function freebuffers(spec, ::Type{TT}, ωshape, tshape) where {TT}
+    CT = Complex{realtype(spec)}
+    Eωo = alloc(spec, CT, ωshape)
+    Eto = alloc(spec, TT, tshape)
+    Pto = similar(Eto)
+    Eωo, Eto, Pto
+end
+
+#= The oversampled real-space noise field, shared by both Cartesian transforms: ω -> t on
+   the oversampled grid and k⊥ -> r⊥ in the same multi-axis inverse transform, exactly the
+   transform the field itself takes on every step. The noise is a state-unit quantity, so
+   it carries the same 1/Eref the state does. =#
+function freenoise(spec, ::Type{TT}, noise_field, grid, ωshape, tshape, IFT,
+                   scaling) where {TT}
+    isnothing(noise_field) && return nothing, nothing
+    size(noise_field) == ωshape || error(
+        "the noise field is $(size(noise_field)), but this transform's frequency-domain "*
+        "shape is $ωshape. Build it with the state's shape, polarisation axis included.")
+    CT = Complex{realtype(spec)}
+    Eωo_noise = alloc(spec, CT, ωshape_oversampled(grid, ωshape))
+    Et_noise = alloc(spec, TT, tshape)
+    nf = isunity(scaling) ? noise_field : noise_field ./ scaling.Eref
+    to_time!(Et_noise, todevice(spec, nf), Eωo_noise, IFT)
+    Et_noise, alloc(spec, TT, tshape)
+end
+
+ωshape_oversampled(grid, ωshape) = (length(grid.ωo), ωshape[2:end]...)
+
 """
     TransFree
 
-Transform E(ω) -> Pₙₗ(ω) for 3D free-space propagation.
+Transform E(ω) -> Pₙₗ(ω) for 3-D free-space propagation on a
+[`Grid.FreeGrid`](@ref Luna.Grid.FreeGrid).
+
+Parametric in its buffer array type, like [`TransRadial`](@ref): every buffer and grid
+mirror is allocated with [`Luna.alloc`](@ref)/[`Luna.todevice`](@ref) from the run's
+[`Luna.DeviceSpec`](@ref), so the same code runs on the host, in reduced precision and on
+a device. The `(t, x, y)` <-> `(ω, kx, ky)` transform is a single plan over the region
+`(1, 3, 4)` on every backend.
 
 # Fields
-- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, ny, nx)`
-  for the modified shot-noise model, or `nothing`.
+- `gv`: mirror of the grid vectors the kernels broadcast against.
+- `prefac`: the z-independent part of the frequency-domain normalisation,
+  `ωwin·(-iω)·Pref`, precombined on the host.
+- `Eωo`, `Pωo`: the oversampled frequency-domain buffer, held under both names because
+  they are the **same array** (see [`freebuffers`](@ref)).
+- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid
+  `(nto, npol, nx, ny)` for the modified shot-noise model, or `nothing`.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
+- `scaling`: the [`Luna.UnitScaling`](@ref) the state and the polarisation are in.
 """
-mutable struct TransFree{TT, FTT, IFTT, nT, rT, gT, xygT, dT, iT, eT, nlT}
-    FT::FTT # 3D Fourier transform (space to k-space and time to frequency)
+struct TransFree{TT, ωT, FTT, IFTT, nT, rT, gT, gvT, xygT, dT, iT, pT, eT, nlT}
+    FT::FTT # joint (t, x, y) -> (ω, kx, ky) transform, region (1, 3, 4)
     IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
-    normfun::nT # Function which returns normalisation factor
+    normfun::nT # callable returning the normalisation factor
     resp::rT # nonlinear responses (tuple of callables)
-    grid::gT # time grid
-    xygrid::xygT
+    grid::gT # host grid, for metadata and for anything not in a kernel
+    gv::gvT # mirror of the grid vectors the kernels broadcast against
+    xygrid::xygT # transverse grid
     densityfun::dT # callable which returns density
-    Pto::Array{TT, 4} # buffer for oversampled time-domain NL polarisation
-    Eto::Array{TT, 4} # buffer for oversampled time-domain field
-    Eωo::Array{ComplexF64, 4} # buffer for oversampled frequency-domain field
-    Pωo::Array{ComplexF64, 4} # buffer for oversampled frequency-domain NL polarisation
-    scale::Float64 # scale factor to be applied during oversampling
-    idcs::iT # iterating over these slices Eto/Pto into Vectors, one at each position
+    Pto::TT # buffer for oversampled time-domain NL polarisation
+    Eto::TT # buffer for oversampled time-domain field
+    Eωo::ωT # buffer for oversampled frequency-domain field
+    Pωo::ωT # === Eωo: the same buffer under the name the polarisation pass uses
+    idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
+    prefac::pT # ωwin*(-im*ω)*Pref: the z-independent normalisation factor
     Et_noise::eT # time-domain noise for modified shot-noise model, or nothing
     Et_nl::nlT # buffer for field+noise passed to Et_to_Pt!, or nothing
+    scaling::UnitScaling # units the state and the polarisation are expressed in
 end
 
 function show(io::IO, t::TransFree)
@@ -1524,100 +1590,88 @@ function show(io::IO, t::TransFree)
 end
 
 """
-    TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false; noise_field=nothing)
+    TransFree(TT, grid, xygrid, FT, responses, densityfun, normfun, pol=false; kwargs...)
+    TransFree(grid, xygrid, FT, responses, densityfun, normfun, pol=false; kwargs...)
 
-Construct a `TransFree` to calculate the reciprocal-domain nonlinear polarisation for 3D
-free-space propagation.
+Construct a `TransFree` to calculate the reciprocal-domain nonlinear polarisation for 3-D
+free-space propagation. `TT` is the time-domain element type (`Float64`/`Float32` on a
+`Grid.RealGrid`, complex on a `Grid.EnvGrid`); the form without it picks it from the grid.
+`FT` is the oversampled `(t, x, y) -> (ω, kx, ky)` plan.
 
 # Keyword arguments
-- `noise_field=nothing`: optional `(nω, ny, nx)` frequency/k-space noise field for the
-  modified shot-noise model. When provided, it is converted to the real-space oversampled
-  time domain `(nto, ny, nx)` via `copy_scale!` and 3D inverse FFT, and stored as `Et_noise`.
-  Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `noise_field=nothing`: optional `(nω, npol, nx, ny)` frequency/k-space noise field for
+  the modified shot-noise model. When provided, it is converted to the oversampled
+  real-space time domain and stored as `Et_noise`. Generate with
+  [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `spec=HostSpec()`: the [`Luna.DeviceSpec`](@ref) the buffers, mirrors and responses live
+  on.
+- `scaling=UNIT_SCALING`: the [`Luna.UnitScaling`](@ref) the state and the nonlinear
+  polarisation are expressed in. The responses are converted to it with
+  [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale), the noise field is divided by `Eref`
+  and `Pref` is folded into `prefac`.
 """
-function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false;
-                   noise_field=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
-    Ny = length(xygrid.y)
-    Nx = length(xygrid.x)
-    Eωo = zeros(ComplexF64, (length(grid.ωo), pol ? 2 : 1, Nx, Ny))
-    Eto = zeros(TT, (length(grid.to), pol ? 2 : 1, Nx, Ny))
-    Pto = similar(Eto)
-    Pωo = similar(Eωo)
-    idcs = CartesianIndices((Nx, Ny))
-    # Precompute time-domain noise in real space:
-    # copy_scale! into oversampled spectral grid, then 3D IFFT: (ω,kx,ky) → (t,x,y)
-    if !isnothing(noise_field)
-        Eωo_noise = zeros(ComplexF64, (length(grid.ωo), Nx, Ny))
-        N = length(grid.ω)
-        copy_scale!(Eωo_noise, noise_field, N, scale)
-        Et_noise = zeros(TT, (length(grid.to), Nx, Ny))
-        ldiv!(Et_noise, FT, Eωo_noise)
-        Et_nl = zeros(TT, (length(grid.to), Nx, Ny))
-    else
-        Et_noise = nothing
-        Et_nl = nothing
-    end
-    #= Responses are given the prototype of the block they will be called with, so that
-       a batched one has its buffers in the right shape, and as a `Tuple`, because a
-       batched response cannot be applied by the legacy per-response loop (see
-       `_refuse_batched_legacy`). Every fallback returns the response unchanged on the
-       host Float64 path, which is the only one this transform runs today; `spec` and
-       `scaling` are threaded through so that Group E, which gives it a device path,
-       changes the caller and not this line. =#
+function TransFree(TT, grid, xygrid::Grid.FreeGrid, FT, responses, densityfun, normfun,
+                   pol=false; noise_field=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
+    np = pol ? 2 : 1
+    Nx, Ny = length(xygrid.x), length(xygrid.y)
+    ωshape = (length(grid.ω), np, Nx, Ny)
+    tshape = (length(grid.to), np, Nx, Ny)
+    IFT = Utils.plan_ift(FT)
+    Eωo, Eto, Pto = freebuffers(spec, TT, ωshape_oversampled(grid, ωshape), tshape)
+    gv = gridvectors(grid, spec)
+    prefac = freeprefac(grid, spec, scaling)
+    Et_noise, Et_nl = freenoise(spec, TT, noise_field, grid, ωshape, tshape, IFT, scaling)
     responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto)
-    TransFree(FT, Utils.plan_ift(FT), normfun, responses, grid, xygrid, densityfun,
-              Pto, Eto, Eωo, Pωo, scale, idcs, Et_noise, Et_nl)
+    check_norm(normfun, spec, scaling)
+    resparrays = Nonlinear.resident_arrays_all(responses)
+    assert_resident(spec, Eωo, Eto, Pto, prefac, gv.ω, gv.ωwin, gv.twin, gv.towin,
+                    gv.sidx, Et_noise, Et_nl, resparrays...)
+    TransFree(FT, IFT, normfun, responses, grid, gv, xygrid, densityfun, Pto, Eto,
+              Eωo, Eωo, CartesianIndices((Nx, Ny)), prefac, Et_noise, Et_nl, scaling)
 end
 
-function TransFree(grid::Grid.RealGrid, args...; kwargs...)
-    N = length(grid.ω)
-    No = length(grid.ωo)
-    scale = (No-1)/(N-1)
-    TransFree(Float64, scale, grid, args...; kwargs...)
+function TransFree(grid::Grid.RealGrid, args...; spec=HostSpec(), kwargs...)
+    TransFree(realtype(spec), grid, args...; spec, kwargs...)
 end
 
-function TransFree(grid::Grid.EnvGrid, args...; kwargs...)
-    N = length(grid.ω)
-    No = length(grid.ωo)
-    scale = No/N
-    TransFree(ComplexF64, scale, grid, args...; kwargs...)
+function TransFree(grid::Grid.EnvGrid, args...; spec=HostSpec(), kwargs...)
+    TransFree(Complex{realtype(spec)}, grid, args...; spec, kwargs...)
 end
 
 """
-    (t::TransFree)(nl, Eω, z)
+    (t::TransFree)(nl, Eωk, z)
 
-Calculate the reciprocal-domain (ω-kx-ky-space) nonlinear response due to the field `Eω`
+Calculate the reciprocal-domain (ω-kx-ky-space) nonlinear response due to the field `Eωk`
 and place the result in `nl`.
 """
-function (t::TransFree)(nl, Eωk, z)
-    to_time!(t.Eto, Eωk, t.Eωo, t.IFT) # transform (ω, kx, ky) -> (t, x, y)
-    # Modified shot-noise: compute field+noise in separate buffer (Et_nl) so the
-    # propagating field (Eto) is never contaminated.
-    if !isnothing(t.Et_noise)
-        @. t.Et_nl = t.Eto + t.Et_noise
-        Et_to_Pt!(t.Pto, t.Et_nl, t.resp, t.densityfun(z), t.idcs)
-    else
-        Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z), t.idcs)
-    end
-    @. t.Pto *= t.grid.towin # apodisation
-    to_freq!(nl, t.Pωo, t.Pto, t.FT) # transform (t, x, y) -> (ω, kx, ky)
-    nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
-end
+(t::TransFree)(nl, Eωk, z) = freetransform!(t, nl, Eωk, z)
 
-mutable struct TransFree2D{TT, FTT, IFTT, nT, rT, gT, xgT, dT, iT}
-    FT::FTT # 2D Fourier transform (space to k-space and time to frequency)
+"""
+    TransFree2D
+
+Transform E(ω) -> Pₙₗ(ω) for 2-D (x-z) free-space propagation on a
+[`Grid.Free2DGrid`](@ref Luna.Grid.Free2DGrid). The 2-D counterpart of
+[`TransFree`](@ref), with the same fields and the same `Pωo === Eωo` aliasing; its
+transform region is `(1, 3)`.
+"""
+struct TransFree2D{TT, ωT, FTT, IFTT, nT, rT, gT, gvT, xgT, dT, iT, pT, eT, nlT}
+    FT::FTT # joint (t, x) -> (ω, kx) transform, region (1, 3)
     IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
-    normfun::nT # Function which returns normalisation factor
+    normfun::nT # callable returning the normalisation factor
     resp::rT # nonlinear responses (tuple of callables)
-    grid::gT # time grid
-    xgrid::xgT
+    grid::gT # host grid, for metadata and for anything not in a kernel
+    gv::gvT # mirror of the grid vectors the kernels broadcast against
+    xgrid::xgT # transverse grid
     densityfun::dT # callable which returns density
-    Pto::Array{TT, 3} # buffer for oversampled time-domain NL polarisation
-    Eto::Array{TT, 3} # buffer for oversampled time-domain field
-    Eωo::Array{ComplexF64, 3} # buffer for oversampled frequency-domain field
-    Pωo::Array{ComplexF64, 3} # buffer for oversampled frequency-domain NL polarisation
-    scale::Float64 # scale factor to be applied during oversampling
-    idcs::iT # iterating over these slices Eto/Pto into Vectors, one at each position
+    Pto::TT # buffer for oversampled time-domain NL polarisation
+    Eto::TT # buffer for oversampled time-domain field
+    Eωo::ωT # buffer for oversampled frequency-domain field
+    Pωo::ωT # === Eωo: the same buffer under the name the polarisation pass uses
+    idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
+    prefac::pT # ωwin*(-im*ω)*Pref: the z-independent normalisation factor
+    Et_noise::eT # time-domain noise for modified shot-noise model, or nothing
+    Et_nl::nlT # buffer for field+noise passed to Et_to_Pt!, or nothing
+    scaling::UnitScaling # units the state and the polarisation are expressed in
 end
 
 function show(io::IO, t::TransFree2D)
@@ -1629,66 +1683,81 @@ function show(io::IO, t::TransFree2D)
     print(io, out)
 end
 
-function TransFree2D(TT, scale, grid, xgrid, FT, responses, densityfun, normfun, pol=false;
-                     spec=HostSpec(), scaling=UNIT_SCALING)
+"""
+    TransFree2D(TT, grid, xgrid, FT, responses, densityfun, normfun, pol=false; kwargs...)
+    TransFree2D(grid, xgrid, FT, responses, densityfun, normfun, pol=false; kwargs...)
+
+Construct a `TransFree2D` to calculate the reciprocal-domain nonlinear polarisation for
+2-D free-space propagation. Arguments and keyword arguments are those of
+[`TransFree`](@ref), with `xgrid` a [`Grid.Free2DGrid`](@ref Luna.Grid.Free2DGrid), `FT`
+the oversampled `(t, x) -> (ω, kx)` plan and `noise_field` of shape `(nω, npol, nx)`.
+"""
+function TransFree2D(TT, grid, xgrid::Grid.Free2DGrid, FT, responses, densityfun, normfun,
+                     pol=false; noise_field=nothing, spec=HostSpec(),
+                     scaling=UNIT_SCALING)
+    np = pol ? 2 : 1
     Nx = length(xgrid.x)
-    Eωo = zeros(ComplexF64, (length(grid.ωo), pol ? 2 : 1, Nx))
-    Eto = zeros(TT, (length(grid.to), pol ? 2 : 1, Nx))
-    Pto = similar(Eto)
-    Pωo = similar(Eωo)
-    idcs = CartesianIndices(size(Pto)[3:end])
-    #= Responses are given the prototype of the block they will be called with, so that
-       a batched one has its buffers in the right shape, and as a `Tuple`, because a
-       batched response cannot be applied by the legacy per-response loop (see
-       `_refuse_batched_legacy`). Every fallback returns the response unchanged on the
-       host Float64 path, which is the only one this transform runs today; `spec` and
-       `scaling` are threaded through so that Group E, which gives it a device path,
-       changes the caller and not this line. =#
+    ωshape = (length(grid.ω), np, Nx)
+    tshape = (length(grid.to), np, Nx)
+    IFT = Utils.plan_ift(FT)
+    Eωo, Eto, Pto = freebuffers(spec, TT, ωshape_oversampled(grid, ωshape), tshape)
+    gv = gridvectors(grid, spec)
+    prefac = freeprefac(grid, spec, scaling)
+    Et_noise, Et_nl = freenoise(spec, TT, noise_field, grid, ωshape, tshape, IFT, scaling)
     responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto)
-    TransFree2D(FT, Utils.plan_ift(FT), normfun, responses, grid, xgrid, densityfun,
-              Pto, Eto, Eωo, Pωo, scale, idcs)
+    check_norm(normfun, spec, scaling)
+    resparrays = Nonlinear.resident_arrays_all(responses)
+    assert_resident(spec, Eωo, Eto, Pto, prefac, gv.ω, gv.ωwin, gv.twin, gv.towin,
+                    gv.sidx, Et_noise, Et_nl, resparrays...)
+    TransFree2D(FT, IFT, normfun, responses, grid, gv, xgrid, densityfun, Pto, Eto,
+                Eωo, Eωo, CartesianIndices((Nx,)), prefac, Et_noise, Et_nl, scaling)
+end
+
+function TransFree2D(grid::Grid.RealGrid, args...; spec=HostSpec(), kwargs...)
+    TransFree2D(realtype(spec), grid, args...; spec, kwargs...)
+end
+
+function TransFree2D(grid::Grid.EnvGrid, args...; spec=HostSpec(), kwargs...)
+    TransFree2D(Complex{realtype(spec)}, grid, args...; spec, kwargs...)
 end
 
 """
-    TransFree2D(grid, xygrid, FT, responses, densityfun, normfun)
+    (t::TransFree2D)(nl, Eωk, z)
 
-Construct a `TransFree2D` to calculate the reciprocal-domain nonlinear polarisation.
-
-# Arguments
-- `grid::AbstractGrid` : the grid used in the simulation
-- `xgrid` : the spatial grid (instances of [`Grid.FreeGrid`](@ref))
-- `FT::FFTW.Plan` : the 2D (t-x) Fourier transform for the oversampled time grid
-- `responses` : `Tuple` of response functions
-- `densityfun` : callable which returns the gas density as a function of `z`
-- `normfun` : normalisation factor as fctn of `z`, can be created via [`norm_free`](@ref)
-"""
-function TransFree2D(grid::Grid.RealGrid, args...)
-    N = length(grid.ω)
-    No = length(grid.ωo)
-    scale = (No-1)/(N-1)
-    TransFree2D(Float64, scale, grid, args...)
-end
-
-function TransFree2D(grid::Grid.EnvGrid, args...)
-    N = length(grid.ω)
-    No = length(grid.ωo)
-    scale = No/N
-    TransFree2D(ComplexF64, scale, grid, args...)
-end
-
-"""
-    (t::TransFree2D)(nl, Eω, z)
-
-Calculate the reciprocal-domain (ω-kx-space) nonlinear response due to the field `Eω`
+Calculate the reciprocal-domain (ω-kx-space) nonlinear response due to the field `Eωk`
 and place the result in `nl`.
 """
-function (t::TransFree2D)(nl, Eωk, z)
-    # TODO: this can probably be combined with the case for TransFree
-    to_time!(t.Eto, Eωk, t.Eωo, t.IFT) # transform (ω, kx) -> (t, x)
-    Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z), t.idcs) # add up responses
-    @. t.Pto *= t.grid.towin # apodisation
-    to_freq!(nl, t.Pωo, t.Pto, t.FT) # transform (t, x) -> (ω, kx)
-    nl .*= t.grid.ωwin .* (-im.*t.grid.ω)./(2 .* t.normfun(z))
+(t::TransFree2D)(nl, Eωk, z) = freetransform!(t, nl, Eωk, z)
+
+#= The z-independent part of the frequency-domain normalisation, precombined on the host
+   in Float64 as one vector (GPU_PLAN.md 4.1), as `TransRadial` does. `Pref` converts the
+   polarisation buffer's units back to physical ones and is 1 on every Float64 run, so
+   this is exactly the vector the per-step expression used to rebuild every call. =#
+freeprefac(grid, spec, scaling) =
+    todevice(spec, @. grid.ωwin * (-im*grid.ω) * scaling.Pref)
+
+"""
+    freetransform!(t, nl, Eωk, z)
+
+One right-hand side of a Cartesian free-space transform: the joint inverse transform to
+`(t, r⊥)`, the nonlinear responses, the temporal apodisation, the joint forward transform
+and the frequency-domain normalisation. Written once for [`TransFree`](@ref) and
+[`TransFree2D`](@ref), which differ only in how many transverse axes they have.
+"""
+function freetransform!(t, nl, Eωk, z)
+    to_time!(t.Eto, Eωk, t.Eωo, t.IFT) # (ω, k⊥) -> (t, r⊥)
+    #= Modified shot-noise: field+noise goes into a separate buffer, so the propagating
+       field (`Eto`) is never contaminated. With no noise field `Eto` is passed straight
+       through, with no copy. =#
+    if !isnothing(t.Et_noise)
+        @. t.Et_nl = t.Eto + t.Et_noise
+        Et_to_Pt!(t.Pto, t.Et_nl, t.resp, t.densityfun(z), t.idcs; scaling=t.scaling)
+    else
+        Et_to_Pt!(t.Pto, t.Eto, t.resp, t.densityfun(z), t.idcs; scaling=t.scaling)
+    end
+    @. t.Pto *= t.gv.towin # apodisation
+    to_freq!(nl, t.Pωo, t.Pto, t.FT) # (t, r⊥) -> (ω, k⊥)
+    fsnorm!(nl, t.prefac, t.normfun(z))
 end
 
 #= reflength! on a transform forwards to its normalisation; defined here, after every

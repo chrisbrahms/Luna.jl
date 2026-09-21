@@ -197,13 +197,16 @@ timetype(::Grid.EnvGrid, ::Type{T}) where {T} = Complex{T}
 
 The [`UnitScaling`](@ref) `transform` was built with, or `UNIT_SCALING` (the
 identity) for a transform which does not carry one. `NonlinearRHS.TransModeAvg` and
-`NonlinearRHS.TransRadial` do; the other transforms are not device- or
-reduced-precision-capable yet (Group E of GPU_PLAN.md) and always run at `E_ref = 1`. Used
+`NonlinearRHS.TransRadial`, `NonlinearRHS.TransFree` and `NonlinearRHS.TransFree2D`
+do; `NonlinearRHS.TransModal` is not device- or reduced-precision-capable yet (`gpu/22` of
+GPU_PLAN.md) and always runs at `E_ref = 1`. Used
 by [`run`](@ref) to decide whether the output needs [`ScaledOutput`](@ref).
 """
 runscaling(transform) = UNIT_SCALING
 runscaling(transform::NonlinearRHS.TransModeAvg) = transform.scaling
 runscaling(transform::NonlinearRHS.TransRadial) = transform.scaling
+runscaling(transform::NonlinearRHS.TransFree) = transform.scaling
+runscaling(transform::NonlinearRHS.TransFree2D) = transform.scaling
 
 function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
                             norm! = nothing, noise_field=nothing, constβ=false,
@@ -427,100 +430,101 @@ function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
     Eωk, transform, FT
 end
 
+"""
+    setup(grid, xygrid::Grid.FreeGrid, densityfun, normfun, responses, inputs; kwargs...)
+    setup(grid, xgrid::Grid.Free2DGrid, densityfun, normfun, responses, inputs; kwargs...)
+
+Set up a 3-D or 2-D Cartesian free-space propagation: plan the transforms, build the
+initial `(ω, polarisation, k⊥...)` field from `inputs`, and return `(Eωk, transform, FT)`.
+
+The joint time-and-space transform is one multi-axis plan — region `(1, 3, 4)` in 3-D and
+`(1, 3)` in 2-D, the polarisation axis skipped — on every backend.
+
+# Keyword arguments
+- `noise_field=nothing`: `(nω, npol, nk...)` frequency/k-space noise field for the
+  modified shot-noise model.
+- `device`, `precision`: where and in what precision to run; see the mode-averaged
+  [`setup`](@ref) for the meaning. `normfun` is built by the caller, before the device is
+  known, so it is retargeted here with
+  [`NonlinearRHS.retarget`](@ref Luna.NonlinearRHS.retarget).
+
+The input fields are built on the host in `Float64` (`Fields` is host scalar code), so the
+transform they need is planned on the host whatever the run uses; the returned `FT` is the
+plan on the *state's* array type, which is what the absorbing boundaries apply.
+"""
 function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs; noise_field=nothing)
-    Logging.@info("Setting up and planning FFTs...")
-    flush(stderr)
-    Utils.loadFFTwisdom()
-    np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
-    x = xygrid.x
-    y = xygrid.y
-    xr = Array{Float64}(undef, length(grid.t), np, length(x), length(y))
-    FT = FFTW.plan_rfft(xr, (1, 3, 4), flags=settings["fftw_flag"])
-    Eωk = zeros(ComplexF64, length(grid.ω), np, length(x), length(y))
-    xr_xy = Array{Float64}(undef, length(grid.t), 2, length(x), length(y))
-    FT_xy = FFTW.plan_rfft(xr_xy, (1, 3, 4), flags=settings["fftw_flag"])
-    doinputs_fs!(Eωk, grid, xygrid, FT_xy, inputs)
-    xo = Array{Float64}(undef, length(grid.to), np, length(x), length(y))
-    FTo = FFTW.plan_rfft(xo, (1, 3, 4), flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun, np > 1;
-                                       noise_field)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
-    Utils.saveFFTwisdom()
-    Logging.@info("Setup finished.")
-    flush(stderr)
-    Eωk, transform, FT
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup_free(Float64, grid, xygrid, densityfun, normfun, responses, inputs; kwargs...)
 end
 
+@doc (@doc setup)
 function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs; noise_field=nothing)
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup_free(ComplexF64, grid, xygrid, densityfun, normfun, responses, inputs; kwargs...)
+end
+
+@doc (@doc setup)
+function setup(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid,
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup_free(Float64, grid, xgrid, densityfun, normfun, responses, inputs; kwargs...)
+end
+
+@doc (@doc setup)
+function setup(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid,
+               densityfun, normfun, responses, inputs; kwargs...)
+    setup_free(ComplexF64, grid, xgrid, densityfun, normfun, responses, inputs; kwargs...)
+end
+
+#= The transverse shape and FFT region of a Cartesian free-space grid: `(Nx, Ny)` and
+   `(1, 3, 4)` in 3-D, `(Nx,)` and `(1, 3)` in 2-D. Everything else in `setup_free` is
+   written once for both. =#
+freeshape(xygrid::Grid.FreeGrid) = (length(xygrid.x), length(xygrid.y))
+freeshape(xgrid::Grid.Free2DGrid) = (length(xgrid.x),)
+freeregion(::Grid.FreeGrid) = (1, 3, 4)
+freeregion(::Grid.Free2DGrid) = (1, 3)
+
+freetransform(grid, spacegrid::Grid.FreeGrid, args...; kwargs...) =
+    NonlinearRHS.TransFree(grid, spacegrid, args...; kwargs...)
+freetransform(grid, spacegrid::Grid.Free2DGrid, args...; kwargs...) =
+    NonlinearRHS.TransFree2D(grid, spacegrid, args...; kwargs...)
+
+function setup_free(::Type{TH}, grid, spacegrid, densityfun, normfun, responses, inputs;
+                    noise_field=nothing, device=device_request(),
+                    precision=nothing) where {TH}
+    spec = withprecision(resolve_device(device), precision)
+    T = realtype(spec)
+    log_device(spec, device)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
+    #= The normalisation is built by the caller (it is a positional argument), so it does
+       not know the device; move it before anything asks it for its shape. =#
+    normfun = NonlinearRHS.retarget(normfun, spec)
     np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
-    x = xygrid.x
-    y = xygrid.y
-    xr = Array{ComplexF64}(undef, length(grid.t), np, length(x), length(y))
-    FT = FFTW.plan_fft(xr, (1, 3, 4), flags=settings["fftw_flag"])
-    Eωk = zeros(ComplexF64, length(grid.ω), np, length(x), length(y))
-    xr_xy = Array{ComplexF64}(undef, length(grid.t), 2, length(x), length(y))
-    FT_xy = FFTW.plan_fft(xr_xy, (1, 3, 4), flags=settings["fftw_flag"])
-    doinputs_fs!(Eωk, grid, xygrid, FT_xy, inputs)
-    xo = Array{ComplexF64}(undef, length(grid.to), np, length(x), length(y))
-    FTo = FFTW.plan_fft(xo, (1, 3, 4), flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun, np > 1;
-                                       noise_field)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
-    Utils.saveFFTwisdom()
-    Eωk, transform, FT
-end
-
-function setup(grid::Grid.RealGrid, xgrid::Grid.Free2DGrid,
-               densityfun, normfun, responses, inputs)
-    Utils.loadFFTwisdom()
-    x = xgrid.x
-    np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
-    tshape = (length(grid.t), np, length(x))
-    ωshape = (length(grid.ω), np, length(x))
-    xr = Array{Float64}(undef, tshape)
-    FT = FFTW.plan_rfft(xr, (1, 3), flags=settings["fftw_flag"])
+    xyshape = freeshape(spacegrid)
+    region = freeregion(spacegrid)
+    tshape = (length(grid.t), np, xyshape...)
+    ωshape = (length(grid.ω), np, xyshape...)
+    # host plans and buffers: the input fields are built in Float64 on the host
+    FTh = Utils.plan_ft(Array{TH}(undef, tshape), region)
     Eωk = zeros(ComplexF64, ωshape)
-    xr_xy = Array{Float64}(undef, length(grid.t), 2, length(x))
-    FT_xy = FFTW.plan_rfft(xr_xy, (1, 3), flags=settings["fftw_flag"])
-    doinputs_fs!(Eωk, grid, xgrid, FT_xy, inputs)
-    xo = Array{Float64}(undef, (length(grid.to), np, length(x)))
-    FTo = FFTW.plan_rfft(xo, (1, 3), flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransFree2D(grid, xgrid, FTo,
-                                         responses, densityfun, normfun, np > 1)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
-    Utils.saveFFTwisdom()
-    Eωk, transform, FT
-end
-
-function setup(grid::Grid.EnvGrid, xgrid::Grid.Free2DGrid,
-               densityfun, normfun, responses, inputs)
-    Utils.loadFFTwisdom()
-    x = xgrid.x
-    np = size(normfun(0), 2) # number of polarisation directions (1 or 2)
-    tshape = (length(grid.t), np, length(x))
-    ωshape = (length(grid.ω), np, length(x))
-    xr = Array{ComplexF64}(undef, tshape)
-    FT = FFTW.plan_fft(xr, (1, 3), flags=settings["fftw_flag"])
-    Eωk = zeros(ComplexF64, ωshape)
-    xr_xy = Array{ComplexF64}(undef, length(grid.t), 2, length(x))
-    FT_xy = FFTW.plan_fft(xr_xy, (1, 3), flags=settings["fftw_flag"])
-    doinputs_fs!(Eωk, grid, xgrid, FT_xy, inputs)
-    xo = Array{ComplexF64}(undef, (length(grid.to), np, length(x)))
-    FTo = FFTW.plan_fft(xo, (1, 3), flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransFree2D(grid, xgrid, FTo,
-                                         responses, densityfun, normfun, np > 1)
-    inv(FT) # create inverse FT plans now, so wisdom is saved
-    inv(FTo)
+    # plan the transform for xy polarisation for field creation
+    FT_xy = Utils.plan_ft(Array{TH}(undef, (length(grid.t), 2, xyshape...)), region)
+    doinputs_fs!(Eωk, grid, spacegrid, FT_xy, inputs)
+    #= The unit scaling needs the peak of the physical time-domain field, which the joint
+       inverse transform gives directly. `copy` because a real inverse FFTW plan
+       overwrites its input, and `Eωk` is the state. Only evaluated for Float32. =#
+    scaling = unitscaling(T, () -> FTh \ copy(Eωk), PhysData.ε_0)
+    xo = alloc(spec, timetype(grid, T), (length(grid.to), np, xyshape...))
+    FTo = Utils.plan_ft(xo, region)
+    FT = (arraytype(spec) === Array && T === Float64) ? FTh :
+         Utils.plan_ft(alloc(spec, timetype(grid, T), tshape), region)
+    Utils.plan_ift(FT) # create inverse FT plans now, so wisdom is saved
+    Utils.plan_ift(FTh)
+    Utils.plan_ift(FTo)
+    transform = freetransform(grid, spacegrid, FTo, responses, densityfun, normfun, np > 1;
+                              noise_field, spec, scaling)
+    Eωk = todevice(spec, isunity(scaling) ? Eωk : Eωk ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
     flush(stderr)
@@ -647,9 +651,9 @@ function run(Eω, grid,
     #= Absorbing boundaries used to be host scalar code, so a device run needed
        boundary=:none. `Boundaries.RateAbsorber`/`LegacyAbsorber` are now broadcasts and
        reductions over mirrored arrays (see `Boundaries.jl`), so every `boundary` mode
-       works on a device. `TransModeAvg` and `TransRadial` are the transforms which can
-       produce a device `Eω`; `TransModal`/`TransFree*` do not take a `device` keyword yet
-       (Group E of GPU_PLAN.md) and always build a host array. =#
+       works on a device. Every transform except `TransModal` can produce a device `Eω`;
+       `TransModal` does not take a `device` keyword yet (`gpu/22` of GPU_PLAN.md) and
+       always builds a host array. =#
 
     #= Et is the time-domain buffer the absorbers and the transverse collar work on --
        nothing about its *contents* matters here, only its shape and element type, since
