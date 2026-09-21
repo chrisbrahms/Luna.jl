@@ -143,6 +143,11 @@ function stats(output; kwargs...)
     haskey(stats, "fwhm_t_min") && push!(pstats, (1e15*stats["fwhm_t_min"], "min FWHM (fs)"))
     haskey(stats, "fwhm_t_max") && push!(pstats, (1e15*stats["fwhm_t_max"], "max FWHM (fs)"))
     haskey(stats, "fwhm_r") && push!(pstats, (1e6*stats["fwhm_r"], "Radial FWHM (μm)"))
+    # the Cartesian transverse grids have no radius, so they record one width per axis
+    haskey(stats, "fwhm_x") && push!(pstats, (1e6*stats["fwhm_x"], "X FWHM (μm)"))
+    haskey(stats, "fwhm_y") && push!(pstats, (1e6*stats["fwhm_y"], "Y FWHM (μm)"))
+    haskey(stats, "collar_energy_fraction") && push!(
+        pstats, (100*stats["collar_energy_fraction"], "Energy in the collar (%)"))
     haskey(stats, "ω0") && push!(pstats, (1e9*wlfreq.(stats["ω0"]), "Central wavelength (nm)"))
 
     fstats = [] # fibre/waveguide/propagation statistics

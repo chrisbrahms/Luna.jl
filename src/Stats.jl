@@ -1307,7 +1307,9 @@ Create stats function to record the transverse size of the beam and the fraction
 energy which has reached the absorbing collar at the edge of the transverse grid.
 
 It records, from the transverse fluence profile `Σ_ω,pol |E(ω, pol, r)|²` in **real**
-space:
+space -- which by Parseval's theorem is the time-integrated intensity at each transverse
+point, up to one constant factor, so an unweighted sum over the frequency axis is enough
+for both a width and a ratio:
 
 - `fwhm_r` on a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid), from the profile mirrored
   about the axis ([`Grid.rsymmetric`](@ref Luna.Grid.rsymmetric)), with the on-axis sample
@@ -1319,6 +1321,11 @@ space:
   Luna.Boundaries.rprofile)) is active. `collar` is the collar width as a fraction of the
   aperture and should match `Luna.run`'s `rcollar`; it is ignored on the Cartesian grids,
   whose absorber profile is the grid's own window. `collar=nothing` skips the dataset.
+
+  It is a ratio of a tail to a total, so it is only meaningful while the tail is above the
+  rounding level of the run: a beam far inside the aperture records ~1e-18 of its energy in
+  the collar in `Float64` and ~1e-14 in `Float32`, both of which mean "nothing has reached
+  the collar" and neither of which is a number to compare.
 
 Host-only, and the one expensive statistic in the free-space set: it applies the inverse
 transverse transform to the whole state, which is a `N×N` matrix product on a radial grid

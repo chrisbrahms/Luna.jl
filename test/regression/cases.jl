@@ -254,13 +254,14 @@ function setup_mixture()
     Eω, grid, linop, transform, FT, output
 end
 
-#= There is no `Stats.default` for free-space geometries: `Stats.default` dispatches on
-   `Modes.AbstractMode`/`Modes.ModeCollection`, and the individual functions do not work on a
-   3- or 4-dimensional `Eω` (`Stats.ω0`'s `squeeze` has 1- and 2-dimensional methods only;
-   `Stats.energy` and `Stats.peakpower` index `Eω[:, i]`). `Stats.collect_stats` with no
-   functions does work, and appends `Stats.zdz!`, so these cases at least record `z` and `dz`
-   -- enough for the fixed-step check that the step sequence really was imposed, and for the
-   step-count check in the adaptive mode. =#
+#= `z` and `dz` are all the free-space cases record. `gpu/25-modal-error-stat` added a
+   `Stats.default` for the radial and free-space transforms, so they *could* record the
+   whole set; they do not, because every per-case tolerance in `tolerances.jl` comes from a
+   one-ulp sensitivity study of the quantities actually compared, and adding a class of
+   statistics to a case means re-measuring its tolerance and regenerating every baseline.
+   `Stats.collect_stats` with no functions appends `Stats.zdz!`, which is enough for the
+   fixed-step check that the step sequence really was imposed, and for the step-count check
+   in the adaptive mode. =#
 "`z` and `dz` only: the statistics a free-space geometry can record."
 freestats(grid, Eω) = Stats.collect_stats(grid, Eω)
 

@@ -1011,9 +1011,10 @@ The device branches are:
 | `energy`, `energy_λ`, `energy_window` | the frequency integral as one weighted reduction; a window folds into the weights squared |
 | `peakpower`, `peakintensity` | one `maximum`; the on-axis form takes the single mode's transverse field out of the reduction as a scalar |
 | `fwhm_t` | `abs2` into a device buffer, one copy of *that* to the host, then the same root-finding on the same samples |
-| `electrondensity` (mode-averaged) | one broadcast of the ionisation-rate kernel off the state, then two reductions |
+| `electrondensity` | one broadcast of the ionisation-rate kernel off the state, then two reductions |
 | `density`, `pressure`, `core_radius`, `zdw`, `zdz!` | they read only `z` |
-| `fwhm_r`, `mode_reconstruction_error` | **not device-capable**: they keep their algorithms on the host |
+| `onaxis` (radial, free space) | one weighted reduction over the transverse axes, then the wrapped statistic on the `(nω, npol)` result |
+| `fwhm_r`, `beam_profile`, `mode_reconstruction_error`, `transverse_integral_error` | **not device-capable**: they keep their algorithms on the host |
 
 `Fields.energyfuncs(grid)[2]` integrates the spectral power density with
 `NumericalIntegration`'s `SimpsonEven` (a `RealGrid`) or a plain `sum` (an `EnvGrid`).
@@ -1047,9 +1048,49 @@ keyword and `Stats.default` reads it off the transform.
 
 `Stats.plan_analytic` builds its buffers with `similar`/`Luna.alloc` and plans through
 `Utils.plan_ft`/`Utils.plan_ift`, so the analytic signal is one inverse FFT on whatever the
-state lives on, shared by every statistic which needs it. When no statistic reads `Et` the
-transform is not *applied*, but it is still planned and its buffers still allocated, which
-is what Luna has always done.
+state lives on, shared by every statistic which needs it. When no statistic reads `Et` it
+is not planned at all and its buffers are not allocated: on a `RealGrid` that buffer is
+four times the state, which for a 3-D free-space run is the whole memory budget, and the
+free-space default set does not read it (see below).
+
+### Radial and free-space states
+
+A radial or free-space state is `(nω, npol, nk...)` and lives in transverse *reciprocal*
+space. Two consequences for the statistics.
+
+The total energy is a functional of the whole state, because Parseval's theorem is what
+makes the transverse integral available there. `Stats.energy(grid, spacegrid,
+energyfun_ω)` builds it; its device form is a `Stats.EnergyWeights`, a prefactor and one
+weight vector per *weighted* axis, reduced over all the axes but the polarisation one. A
+radial grid weights the frequency axis (`SimpsonEven` or a plain sum, as before) and the
+reciprocal radial axis (`Grid.integrate_k`'s weights); the Cartesian grids weight nothing,
+because their functional is a plain sum over every axis, including the frequency axis. The
+weights are still checked against the functional the caller passed, now on a probe state of
+the run's own shape.
+
+Everything which is a property of the pulse rather than of the beam — the peak intensity,
+the duration, the centre of mass of the spectrum — is taken **on the propagation axis**,
+because a transverse average of a duration is not a duration.
+[`Stats.onaxis`](@ref Luna.Stats.onaxis)`(f, spacegrid)` wraps any statistic so that it is
+evaluated there. The field on axis is a fixed linear combination of the transverse samples:
+`Grid.onaxis`'s weights on a radial grid, and on a Cartesian grid the inverse DFT evaluated
+at `x = 0`, whose weights are exactly `±1/N` on a centred axis (`cispi` of an integer is
+exactly `±1`). So the projection is one weighted reduction over the transverse axes, and
+the inverse time transform which follows is of the `(nω, npol)` result rather than of the
+state. `ω0`, `fwhm_t`, `peakintensity` and `electrondensity` then apply unchanged, with
+their own device branches, which is why they need no free-space versions.
+
+The projection is done once per wrapper, so a set with three on-axis statistics reduces the
+state three times. Sharing it would mean caching the result against `z`, which a repeated
+`z` would silently get wrong; the reductions are a small part of the step which produced
+the state.
+
+`Stats.beam_profile` is the exception and has no device form. It applies the inverse
+transverse transform to the whole state — an `N×N` matrix product on a radial grid, an FFT
+over the transverse axes on a Cartesian one — and reads the beam size and the collar energy
+fraction off the real-space fluence profile. It is therefore what decides the path for the
+whole free-space set; `beam_profile=false` on `Stats.default` leaves a set every member of
+which is device-capable.
 
 ## Which array a statistics set is built for
 

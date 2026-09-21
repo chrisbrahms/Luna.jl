@@ -40,9 +40,9 @@ inputs = Fields.GaussGaussField(λ0=λ0, τfwhm=τ, energy=energy, w0=w0)
 
 Eω, transform, FT = Luna.setup(grid, q, densityfun, normfun, responses, inputs)
 
-# statsfun = Stats.collect_stats(grid, Eω, Stats.ω0(grid))
 #output = Output.MemoryOutput(0, L, 201, (length(grid.ω), length(q.r)))
-output = Output.MemoryOutput(0, L, 201)
+statsfun = Stats.default(grid, Eω, transform, linop; gas=gas)
+output = Output.MemoryOutput(0, L, 201, statsfun)
 Luna.run(Eω, grid, linop, transform, FT, output; zmax=L)
 
 ω = grid.ω

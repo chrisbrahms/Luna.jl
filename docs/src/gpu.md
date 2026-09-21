@@ -292,9 +292,16 @@ mode-averaged one, the three free-space ones and the fixed-quadrature multimode 
   override the choice, `stats_kwargs=Dict(:stats_device => :device)` (or `:host`) reaches
   `Stats.collect_stats` through `prop_capillary`.
 
-  `fwhm_r` and the modal reconstruction error have no device form at all and keep their
-  algorithms on the host, so a multimode set is computed on a host copy whichever
-  transverse integral it came from. A statistics function *you* write is host code too:
+  `fwhm_r`, the modal reconstruction error and the transverse quadrature error have no
+  device form at all and keep their algorithms on the host, so a multimode set is computed
+  on a host copy whichever transverse integral it came from. The radial and free-space
+  default sets are in the same position: `Stats.beam_profile`, which records the beam size
+  and the collar energy fraction, applies the inverse transverse transform to the whole
+  state and has no device form, so it makes its set host-only. `beam_profile=false` on
+  `Stats.default` drops it and leaves a set every member of which is device-capable --
+  the energy, and the on-axis `ω0`, peak intensity, duration and electron density, all of
+  which reduce over the transverse axes on the device. A statistics function *you* write
+  is host code too:
   the whole set is then
   computed on a host copy of the field on every step the statistics fire, and `Luna.run`
   warns once, naming it (`userfuns[1]`), when that happens. Use `stats_period` to reduce
