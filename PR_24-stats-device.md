@@ -538,3 +538,15 @@ allocated, which is what Luna has always done.
 | `test/test_stats.jl` | 1 pass, 0 fail |
 | `test/test_output.jl` | 117 pass, 0 fail, 8 testsets |
 | `benchmark/stats.jl` (CPU + Metal) | the tables above |
+
+And the number the heuristic exists for, measured end to end through `ScaledOutput` with
+the set `Stats.default` builds under `:auto` (M1 Pro, Metal, argon 1 bar, mode-averaged
+Kerr, one column):
+
+| trange | state | path chosen | statistics per step | one step | together | vs step alone |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 400 fs | 1025 | host | 331.4 µs | 2.400 ms | 2.732 ms | **1.14x** |
+| 6400 fs | 16385 | host | 1.155 ms | 2.460 ms | 3.616 ms | 1.47x |
+
+1.14x at 400 fs, against the 1.99x review round 1 measured on `e151267f`: `gpu/int-D`'s
+number is back, which is what the shape rule is for.
