@@ -4,22 +4,20 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! warning "Work in progress: mode-averaged and radial propagation"
-    This page describes what the device model does as of `gpu/20-radial-device`.
+!!! warning "Work in progress: everything but multimode propagation"
+    This page describes what the device model does as of `gpu/21-free-device`.
     `prop_capillary` and `prop_gnlse` take `device` and `precision` keywords (below), and
     for mode-averaged propagation (`modes` a single mode) with the Kerr, plasma and
     Raman responses -- which is everything `prop_capillary` builds by default, in any gas
     -- it runs end to end on a device, including the absorbing boundaries
-    (`boundary=:rate`, the default) and the default per-step statistics. Radially
-    symmetric free-space propagation does too, through the low-level interface, which is
-    the only way to build one.
-    Anything else -- multimode propagation, the Cartesian free-space geometries,
-    `prop_gnlse`, and with them the χ⁽²⁾ responses -- is still host code;
-    `Luna.setup`/`Luna.run` refuse a device or a reduced precision for a *transform*
-    rather than running it wrongly, and fall back to the host for a *response* (or, for
-    the simple interface, error with a message naming the actual limitation). Cartesian
-    free space and multimode propagation follow in later branches; the page is completed
-    in `gpu/32-docs`.
+    (`boundary=:rate`, the default) and the default per-step statistics. All three
+    free-space geometries -- radially symmetric, 2-D Cartesian and full 3-D, with the
+    Kerr, plasma, Raman and χ⁽²⁾ responses -- do too, through the low-level interface,
+    which is the only way to build one.
+    Multimode propagation (`TransModal`) is still host code; `Luna.setup`/`Luna.run`
+    refuse a device or a reduced precision for it rather than running it wrongly (or, for
+    the simple interface, error with a message naming the actual limitation). It follows
+    in `gpu/22-modal`; the page is completed in `gpu/32-docs`.
 
 ## Enabling it
 
@@ -135,19 +133,17 @@ round 1".)
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-the Cartesian free-space transforms (`TransFree`, `TransFree2D`) and the multimode one
-(`TransModal`). The mode-averaged transform and the radially symmetric free-space one
-(`TransRadial`) are device-capable. Every nonlinear response Luna ships has a device
-kernel: the Kerr responses, the χ⁽²⁾ responses, the plasma response and the Raman
-responses. The χ⁽²⁾ responses are only used by the Cartesian free-space transforms, which
-are not device-capable yet, so a χ⁽²⁾ propagation still runs on the host as a whole.
-`Luna.setup` refuses a device or a reduced precision for the *transforms*, through the
-residency checks each of them makes, rather than running them wrongly. A *response* is
-not refused: it falls back to the host copy described under "An ad hoc response on a
-device" below, which is correct and slow.
+the multimode transform (`TransModal`) alone. The mode-averaged transform and all three
+free-space ones -- `TransRadial`, `TransFree2D` and `TransFree` -- are device-capable, and
+so is every nonlinear response Luna ships: the Kerr responses, the χ⁽²⁾ responses, the
+plasma response and the Raman responses. `Luna.setup` refuses a device or a reduced
+precision for a *transform* which cannot do it, through the residency checks each of them
+makes, rather than running it wrongly. A *response* is not refused: it falls back to the
+host copy described under "An ad hoc response on a device" below, which is correct and
+slow.
 
-`prop_capillary` and `prop_gnlse` never build a radial run, so a radial propagation on a
-device is set up through the low-level interface:
+`prop_capillary` and `prop_gnlse` never build a free-space run, so a free-space
+propagation on a device is set up through the low-level interface:
 
 ```julia
 using Luna, Metal
@@ -174,8 +170,15 @@ or reading its `out`, afterwards does nothing useful. Reach it through the trans
 of `norm_radial` / `const_norm_radial`, in which case `retarget` returns it unchanged. On
 the default host `Float64` path nothing is replaced.
 
+The same applies to the two Cartesian free-space geometries: build the transverse grid
+(`Grid.Free2DGrid` or `Grid.FreeGrid`), the normalisation (`const_norm_free2D` /
+`const_norm_free`, or the crystal-optics pair from `PhysData.ref_index_fun_xy` for a
+χ⁽²⁾ crystal) and the responses, and pass `device`/`precision` to `Luna.setup` in the same
+way. The time and transverse axes are transformed together by one multi-axis FFT plan --
+region `(1, 3)` in 2-D and `(1, 3, 4)` in 3-D -- on every backend.
+
 This is the geometry where a GPU is worth using. A mode-averaged run has one transverse
-column and is launch-bound; a radial run has one per radial point. Measured on an M1 Pro
+column and is launch-bound; a free-space run has one per transverse grid point. Measured on an M1 Pro
 (`benchmark/radial.jl`, 20 fixed steps over 1 cm of argon at 1 bar, a 100 fs / 400-2000 nm
 grid, `boundary=:none`), wall time for the whole propagation:
 
@@ -190,6 +193,41 @@ grid, `boundary=:none`), wall time for the whole propagation:
 Metal passes the `Float64` host between 64 and 96 radial points and the `Float32` host
 between 96 and 128; at 1024 it is 31 times the `Float64` host and 16 times the `Float32`
 one. Below the crossover the CPU is faster and `device=:cpu` is the right answer.
+
+A 3-D Cartesian run has `Nx*Ny` columns, so even the smallest useful grid is past the
+crossover. Measured on the same machine (`benchmark/free.jl`, 10 fixed steps over 1 cm of
+argon at 1 bar, a 100 fs / 400-2000 nm envelope grid, `boundary=:none`):
+
+| transverse grid | columns | CPU `Float64` | CPU `Float32` | Metal `Float32` |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 x 32 | 1024 | 478 ms | 412 ms | 61.1 ms |
+| 64 x 64 | 4096 | 2.05 s | 1.69 s | 138 ms |
+| 128 x 128 | 16384 | 10.96 s | 7.28 s | 521 ms |
+
+Metal is 7.8 times the `Float64` host at 32 x 32 and 21 times at 128 x 128.
+
+### Memory
+
+A free-space state is `(nω, npol, Nk...)` and the transforms hold their buffers on the
+oversampled time grid, so device memory, not speed, is what limits the grid. Each
+transform holds **three** field-sized buffers -- the oversampled time-domain field and
+polarisation, and one oversampled frequency-domain buffer used by both passes (`Pωo` and
+`Eωo` are the same array). The stepper holds eleven state-sized ones, which is the largest
+single item in any free-space run.
+
+For the 3-D example (`examples/low_level_interface/freespace/full3D.jl`: a field-resolved
+400-2000 nm, 0.2 ps grid on a 128 x 128 transverse grid, one polarisation) in `Float32`:
+
+| | Kerr | Kerr + plasma | Kerr + Raman |
+| --- | ---: | ---: | ---: |
+| transform buffers | 192 MB | 192 MB | 192 MB |
+| response buffers | 0 | 256 MB | 384 MB |
+| stepper, operator, normalisation, absorber | 450 MB | 450 MB | 450 MB |
+| **total** | **0.63 GB** | **0.88 GB** | **1.00 GB** |
+
+so that run fits a 16 GB device with room to spare; the total scales as `Nx*Ny`, and
+128 x 128 Kerr + plasma at 0.88 GB extrapolates to 3.5 GB at 256 x 256 and 14 GB at
+512 x 512. `Float64` on the host is twice these numbers.
 
 The absorbing boundaries (`boundary=:rate`, `:legacy` and `:none`) and the default
 statistics *do* run with a device state:
@@ -305,8 +343,9 @@ A GPU wins on many columns and large time grids; a mode-averaged single-column r
 launch-bound and will not speed up. `benchmark/device.jl` times the mode-averaged
 propagation on each device and precision, sweeping the grid size, and
 `benchmark/radial.jl` does the same for the radial one, sweeping the number of radial
-points (the table under "What runs where" is its output). Run either from an environment
-which has Luna, BenchmarkTools and the GPU package.
+points, and `benchmark/free.jl` for the 3-D Cartesian one, sweeping the transverse grid
+(the two tables under "What runs where" are their output). Run any of them from an
+environment which has Luna, BenchmarkTools and the GPU package.
 
 ## Running the hardware tests
 

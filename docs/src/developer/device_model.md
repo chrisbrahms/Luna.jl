@@ -689,8 +689,7 @@ which stays physical.
 ### The free-space normalisation
 
 [`NonlinearRHS.FreeSpaceNorm`](@ref) is shared by the radial and both Cartesian free-space
-transforms, and is device-capable for all three even though only the radial one has a
-device path so far.
+transforms, and is device-capable for all three.
 
 The isotropic fill is one broadcast over
 
@@ -756,6 +755,108 @@ The crossover is at 64--96 radial points against the `Float64` host and 96--128 
 the `Float32` one. At 1024 points Metal is 31 times the `Float64` host and 16 times the
 `Float32` one, and the Hankel GEMM alone is 38 times faster -- which is the whole reason
 this geometry is the one worth putting on a GPU.
+
+## The Cartesian free-space transforms
+
+[`NonlinearRHS.TransFree2D`](@ref Luna.NonlinearRHS.TransFree2D) (2-D, `(t, x)`) and
+[`NonlinearRHS.TransFree`](@ref Luna.NonlinearRHS.TransFree) (3-D, `(t, x, y)`) are the
+same transform in two dimensionalities, and their per-step body is written once
+([`NonlinearRHS.freetransform!`](@ref Luna.NonlinearRHS.freetransform!)). They are
+separate types because `Boundaries.spacegrid` and `Luna.setup` dispatch on them and
+because their transform region differs. Per right-hand side:
+
+1. one inverse FFT over the time axis **and** the transverse axes together, taking the
+   state from `(ω, k⊥)` to `(t, r⊥)`;
+2. the response protocol on the whole `(nto, npol, Nk...)` block;
+3. one broadcast for the temporal apodisation;
+4. one forward FFT the other way;
+5. one broadcast for the frequency-domain normalisation.
+
+There is no matrix multiply: the transverse transform *is* the FFT. The region is
+`(1, 3)` in 2-D and `(1, 3, 4)` in 3-D -- axis 2 is polarisation and is not transformed --
+and both are planned through [`Utils.plan_ft`](@ref Luna.Utils.plan_ft) on the run's array
+type. Metal.jl's own tests cover `(1, 3)` and `(1, 4)` but not `(1, 3, 4)`; the region is
+checked directly against FFTW in `test_metal.jl` ("multi-axis FFT plans on Metal"), real
+and complex, forward and inverse, and it is correct.
+
+**The frequency-domain normalisation** is the same fused `fsnorm!` broadcast over a
+precombined `prefac = ωwin·(-iω)·Pref` as the radial transform uses.
+
+**One buffer fewer: `Pωo === Eωo`.** The oversampled frequency-domain buffer does double
+duty. `to_time!` writes the field into it, applies the inverse plan and never reads it
+again; `to_freq!` then writes the nonlinear polarisation into the same array. The two
+never appear as the input and the output of the same FFT call, which a device plan would
+reject. Each Cartesian transform therefore holds **three** field-sized arrays -- `Eto`,
+`Pto` and the shared frequency-domain buffer -- where it used to hold four, and
+`test_device.jl` asserts the count ("the free-space transforms hold three field-sized
+buffers").
+
+### Memory
+
+Free-space geometry is where device memory starts to matter, because the state has
+`prod(Nk)` columns. Counted from the shapes for the 3-D example
+(`examples/low_level_interface/freespace/full3D.jl`: field-resolved, 400--2000 nm,
+0.2 ps, `nt = 512`/`nto = 1024`, `nω = 257`/`nωo = 513`, 128 x 128 transverse, one
+polarisation) in `Float32`:
+
+| item | Kerr | Kerr + plasma | Kerr + Raman |
+| --- | ---: | ---: | ---: |
+| transform `Eto`, `Pto` | 128 MB | 128 MB | 128 MB |
+| transform `Eωo === Pωo` | 64 MB | 64 MB | 64 MB |
+| normalisation `out` | 32 MB | 32 MB | 32 MB |
+| stepper (`y`, `yn`, `yi`, `yerr`, 7 stages) | 353 MB | 353 MB | 353 MB |
+| linear operator | 32 MB | 32 MB | 32 MB |
+| absorber `Et` | 32 MB | 32 MB | 32 MB |
+| response block buffers | -- | 256 MB | 384 MB |
+| **total** | **0.63 GB** | **0.88 GB** | **1.00 GB** |
+
+Three things follow.
+
+- **The examples' 3-D plasma run fits a 16 GB device eighteen times over**, so the
+  response block is not chunked. The total scales as `Nx·Ny`: 0.88 GB at 128 x 128 is
+  3.5 GB at 256 x 256 and 14.0 GB at 512 x 512, which is where a 16 GB device runs out.
+  Chunking the response block along the transverse axes would move that limit by less
+  than it looks: the batched buffers are 29 % of the total and the stepper's eleven
+  state-sized arrays, which cannot be chunked without changing `RK45`, are 39 %.
+- **The aliasing is worth about 7 %** of a 3-D run (64 MB of 0.88 GB at 128 x 128), and
+  more of a transform-dominated one.
+- A `Float64` host run is exactly twice these numbers.
+
+### The transverse collar
+
+[`Boundaries.CartesianCollar`](@ref Luna.Boundaries.CartesianCollar) needed no change to
+run on a device. The Cartesian grids transform time and space together, so when
+`RateAbsorber` applies the temporal collar the state is already in `(t, x[, y])` and the
+transverse collar is applied in the same pass: one broadcast for
+`exp(-α Δz/2)` over the rate mirrored with [`Luna.upload_like`](@ref), one `sum(abs2, ·)`
+and one `mapreduce` over a lazy `Broadcasted` for the energy bookkeeping, and one
+broadcast for the multiply. No transform, no index vectors, no host scalar code.
+
+### Measurements
+
+3-D free-space envelope Kerr, M1 Pro, Julia 1.13.0, `-t 1`, one FFTW thread, one BLAS
+thread, `:estimate`, no wisdom; 10 fixed steps over 1 cm of argon at 1 bar on a 100 fs /
+400--2000 nm envelope grid (`nω = 128`), `boundary=:none` (`benchmark/free.jl`).
+
+| transverse grid | | CPU `Float64` | CPU `Float32` | Metal `Float32` |
+| ---: | --- | ---: | ---: | ---: |
+| 32 x 32 | joint inverse FFT | 1.149 ms | 916.5 µs | 297.3 µs |
+| | right-hand side | 3.689 ms | 2.750 ms | 463.3 µs |
+| | one step | 46.16 ms | 39.69 ms | 3.344 ms |
+| | propagation | 477.7 ms | 411.7 ms | 61.1 ms |
+| 64 x 64 | joint inverse FFT | 5.271 ms | 3.889 ms | 422.7 µs |
+| | right-hand side | 16.23 ms | 11.54 ms | 870.9 µs |
+| | one step | 195.1 ms | 163.8 ms | 7.406 ms |
+| | propagation | 2.052 s | 1.689 s | 137.6 ms |
+| 128 x 128 | joint inverse FFT | 39.72 ms | 18.15 ms | 1.063 ms |
+| | right-hand side | 100.8 ms | 51.26 ms | 2.684 ms |
+| | one step | 1.060 s | 704.5 ms | 26.04 ms |
+| | propagation | 10.96 s | 7.278 s | 521.0 ms |
+
+There is no crossover to report: the smallest grid in the sweep already has 1024
+transverse columns, and Metal is 7.8 times the `Float64` host there and 21 times at
+128 x 128. The gap is the FFT -- at 128 x 128 the joint inverse transform alone is 37
+times faster on the GPU.
 
 ## The output and statistics boundary
 
@@ -842,4 +943,5 @@ loaded, so it always precompiles the CPU path.
   which installs Metal into a separate environment.
 - **`benchmark/device.jl`** times the same mode-averaged propagation on each device and
   precision, sweeping the time-grid size; **`benchmark/radial.jl`** does the same for the
-  radial transform, sweeping the number of radial points.
+  radial transform, sweeping the number of radial points; **`benchmark/free.jl`** does the
+  same for the 3-D Cartesian transform, sweeping the transverse grid.
