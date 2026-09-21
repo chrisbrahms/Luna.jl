@@ -150,22 +150,23 @@ statistics *do* run with a device state, for the mode-averaged transform:
 - The default per-step statistics (`Stats.jl`) have a device form -- the energies, the
   peak power and intensity, the temporal FWHM, the electron density and the z-dependent
   quantities are reductions and broadcasts over the state where it is -- but **which path
-  a run takes depends on the shape of the state**, and Luna logs which one it chose:
+  a run takes depends on the size of the state**, and Luna logs which one it chose:
 
-  - a state with **more than one column** (a radial, free-space or multimode grid, once
-    those transforms are device-capable) computes its statistics on the device, with no
-    copy;
-  - a **single-column** state (mode-averaged, which is the only device-capable geometry
-    today) is copied to the host and the statistics are computed there, because the copy
-    is cheaper. Each statistic that ends in a device-to-host transfer costs the same round
-    trip whatever the grid size -- about 400 µs on an M1 Pro through Metal -- and the
-    default set makes six of them, where the host path makes one transfer of a few tens of
-    kilobytes. On the mode-averaged Kerr case that is the difference between a 2.3 ms and
-    a 4.6 ms accepted step.
+  - a state with at least `Stats.STATS_DEVICE_MINLEN` elements computes its statistics on
+    the device, with no copy;
+  - a smaller one is copied to the host and the statistics are computed there, because the
+    copy is cheaper. Each statistic that ends in a device-to-host transfer costs the same
+    round trip whatever the size of the state -- about 400 µs on an M1 Pro through Metal --
+    and the default set makes six of them, where the host path makes one transfer. On the
+    mode-averaged Kerr case that is the difference between a 2.3 ms and a 4.6 ms accepted
+    step.
 
-  The threshold is `Stats.STATS_DEVICE_MINLEN`, and Luna logs which path a device run
-  chose. To override it, `stats_kwargs=Dict(:stats_device => :device)` (or `:host`)
-  reaches `Stats.collect_stats` through `prop_capillary`.
+  Every device state Luna produces today is one mode-averaged column, far below the
+  threshold, so in practice the host path is taken; the threshold is set from where the
+  transfer of the state costs as much as the round trips, and will be re-measured when the
+  radial and free-space transforms become device-capable. To override the choice,
+  `stats_kwargs=Dict(:stats_device => :device)` (or `:host`) reaches
+  `Stats.collect_stats` through `prop_capillary`.
 
   `fwhm_r` and the modal reconstruction error have no device form at all and keep their
   algorithms on the host; both belong to the multimode set, whose transform is host-only

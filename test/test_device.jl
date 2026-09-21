@@ -1928,10 +1928,12 @@ end
     end
 end
 
-#= Review round 1, finding 3: `:auto` picks the host path for a single small column, where
-   the copy costs less than six device-to-host round trips, and the device path when the
-   state has more than one column. `Luna.stats_device_capable` reports the decision, which
-   is what `ScaledOutput` acts on. =#
+#= Review round 1, finding 3: `:auto` picks the host path for a state below
+   `Stats.STATS_DEVICE_MINLEN`, where the copy costs less than six device-to-host round
+   trips. The rule is the size of the state and nothing else -- extra columns alone do not
+   make the device path pay, because `fwhm_t` copies the time-domain intensity down on
+   either path. `Luna.stats_device_capable` reports the decision, which is what
+   `ScaledOutput` acts on. =#
 @testset "the stats_device heuristic" begin
     grid = Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15)
     m = Capillary.MarcatiliMode(75e-6, :Ar, 1.0, loss=false)
@@ -1940,6 +1942,10 @@ end
     funs = statsfunset(grid, m, aeff, dens, tablerate())
     n = length(grid.ω)
     @test n < Stats.STATS_DEVICE_MINLEN # the case this test is about
+    #= The rule is `length >= STATS_DEVICE_MINLEN`; `Base.OneTo` stands in for a state of
+       that size, which would be 64 MB to allocate. =#
+    @test Stats._devicepays(Base.OneTo(Stats.STATS_DEVICE_MINLEN))
+    @test !Stats._devicepays(Base.OneTo(Stats.STATS_DEVICE_MINLEN - 1))
 
     E1 = Luna.alloc(JLSpec, ComplexF64, (n,))
     @test !Stats.device_capable(Stats.collect_stats(grid, E1, funs...))
@@ -1949,17 +1955,19 @@ end
         Stats.collect_stats(grid, E1, funs...; stats_device=:host))
     @test_throws ArgumentError Stats.collect_stats(grid, E1, funs...; stats_device=:gpu)
 
-    # more than one column: the copy is what grows, so `:auto` takes the device path
+    #= More than one column is not on its own a reason to use the device: the rule is
+       purely the size, and this state is still small. =#
     E3 = Luna.alloc(JLSpec, ComplexF64, (n, 3))
     funs3 = (Stats.ω0(grid), Stats.energy(grid, Fields.energyfuncs(grid)[2]),
              Stats.peakpower(grid), Stats.fwhm_t(grid), Stats.density(dens))
-    @test Stats.device_capable(Stats.collect_stats(grid, E3, funs3...))
-    #= and the multi-column device reductions give the host answers: three copies of the
-       same column, so every per-column value must be the single-column one. =#
+    @test !Stats.device_capable(Stats.collect_stats(grid, E3, funs3...))
+    #= and the multi-column device reductions, forced, give the host answers: three copies
+       of the same column, so every per-column value must be the single-column one. =#
     Eh1 = randn(ComplexF64, n)
     Eh3 = repeat(Eh1, 1, 3)
     d1 = Stats.collect_stats(grid, Eh1, funs3...)(Eh1, 0.1, 1e-4)
-    dd = Stats.collect_stats(grid, E3, funs3...)(Luna.todevice(JLSpec, Eh3), 0.1, 1e-4)
+    dd = Stats.collect_stats(grid, E3, funs3...; stats_device=:device)(
+        Luna.todevice(JLSpec, Eh3), 0.1, 1e-4)
     for key in ("ω0", "energy", "peakpower", "fwhm_t_min")
         v = dd[key]
         @test length(v) == 3

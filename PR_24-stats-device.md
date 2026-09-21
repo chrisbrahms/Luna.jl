@@ -447,12 +447,12 @@ zero.
 device state is used only when
 
 - every statistic in the set has a device form, **and**
-- `stats_device` allows it: `:auto` (default) requires more than one column or at least
+- `stats_device` allows it: `:auto` (default) requires at least
   `Stats.STATS_DEVICE_MINLEN` elements, `:device` requires only the capability, `:host`
   never.
 
-A single-column mode-averaged state is below the threshold, so **`prop_capillary` on Metal
-is back to `gpu/int-D`'s behaviour**: the field is copied down and the host branches run,
+A mode-averaged state is far below the threshold, so **`prop_capillary` on Metal is back to
+`gpu/int-D`'s behaviour**: the field is copied down and the host branches run,
 at 0.34 ms against a 2.36 ms step instead of 2.73 ms against it. The keyword is on
 `Stats.collect_stats` and `Stats.default`; it is reachable from `prop_capillary` through
 `stats_kwargs=Dict(:stats_device => :device)` and is deliberately not a `prop_capillary`
@@ -469,9 +469,10 @@ measured step cost, and says `stats_period` is still the lever. `device_model.md
 the two-phase batched-transfer protocol as the fix that would make the device path win on
 a single column.
 
-**The multi-column arm of the rule is not supported by a measurement**, and the PR says
-so. `benchmark/stats.jl` gained a column sweep (no transform on this branch produces a
-multi-column device state, so the state is synthetic):
+**The rule is the size of the state and nothing else.** An earlier version of it also took
+the device path for any state with more than one column; the column sweep
+`benchmark/stats.jl` gained does not support that, so the arm was dropped (no transform on
+this branch produces a multi-column device state, so the state is synthetic):
 
 | device | columns | state | host+copy | device |
 | --- | ---: | ---: | ---: | ---: |
@@ -486,12 +487,17 @@ The device path is still the slower of the two at 128 columns on Metal. The abso
 is constant (~2.7 ms, the six round trips) while both sides grow, so the *relative*
 penalty falls from 7.5× to 1.17×, but it does not cross: `fwhm_t` copies the time-domain
 intensity to the host on either path and its per-column root-finding is host work either
-way, and the state transfer the device path saves is only ~1 MB at 128 columns. The
-`ncols > 1` rule is therefore a forward-looking bet on `gpu/20`–`gpu/22`, whose states are
-far larger, and it should be re-measured when one of them exists; `stats_device=:host` is
-the escape hatch until then. `STATS_DEVICE_MINLEN` is `2^22`, the size at which the
-transfer alone reaches the round-trip constant — for a single column that is effectively
-"always the host", which is what the measurement says.
+way, and the state transfer the device path saves is only ~1 MB at 128 columns. Extra
+columns alone therefore do not make the device path pay, and `Stats._devicepays` is
+`length(x) >= STATS_DEVICE_MINLEN` with nothing else in it.
+
+`STATS_DEVICE_MINLEN` is `2^22`, the size at which the transfer of the state alone reaches
+the ~2.7 ms the round trips cost. Every device state Luna produces today is one
+mode-averaged column, far below that, so in practice the host path is taken and
+`stats_device=:device` is how the device branches are reached (which is what the tests
+do). `gpu/int-E` should re-measure this on real radial and free-space device states, where
+the transfer is much larger relative to the per-statistic round trips, and may well lower
+the threshold.
 
 ### 4 (minor) — a `Float32` host run's analytic transform changed precision
 

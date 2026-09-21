@@ -785,20 +785,25 @@ which JLArrays tolerates silently and Metal refuses.
 
 The device state is used when it is a device array, when every statistic in the set has a
 device form, and when `stats_device` allows it. `stats_device` is `:auto` (default),
-`:device` or `:host`; under `:auto` the device state is used only when it has more than one
-column or at least `Stats.STATS_DEVICE_MINLEN` elements. **For a single column the copy is
-cheaper**, and measurably so: on an M1 Pro through Metal every statistic which ends in a
-device-to-host transfer costs ~400 µs regardless of grid size, and the default set makes
-six of them plus one MPSGraph inverse FFT — 2.7–3.6 ms for 1025 to 16385 elements, against
-0.34–1.31 ms for one transfer plus the host branches. On the mode-averaged Kerr case that
-is a 1.99× slower accepted step, so the shape test restores the host path there, which is
-what `gpu/int-D` did. Luna logs which path a device run took, once, at construction.
+`:device` or `:host`; under `:auto` the device state is used only when it has at least
+`Stats.STATS_DEVICE_MINLEN` elements. **Below that the copy is cheaper**, and measurably
+so: on an M1 Pro through Metal every statistic which ends in a device-to-host transfer
+costs ~400 µs regardless of the size of the state, and the default set makes six of them
+plus one MPSGraph inverse FFT — 2.7–3.6 ms for 1025 to 16385 elements, against 0.34–1.31 ms
+for one transfer plus the host branches. On the mode-averaged Kerr case that is a 1.99×
+slower accepted step, so the size test restores the host path there, which is what
+`gpu/int-D` did. Luna logs which path a device run took, once, at construction.
 
-The "more than one column" arm of the rule is a bet, not a measurement: no transform on
-this branch produces a multi-column device state, and on a synthetic one the device path is
-still slower at 16 and 128 columns, because `fwhm_t` copies the time-domain intensity to
-the host on either path and its per-column root-finding is host work either way. It is
-worth re-measuring when `gpu/20`–`gpu/22` land.
+The rule is the size of the state and nothing else. An earlier version also took the device
+path for any state with more than one column; the column sweep in `benchmark/stats.jl` does
+not support that — on Metal the device path is still slower at 16 and 128 columns, because
+`fwhm_t` copies the time-domain intensity to the host on either path and its per-column
+root-finding is host work either way, so extra columns alone do not make it pay. The
+threshold is where the transfer of the state reaches the fixed cost of the round trips,
+which is a few million elements. Every device state Luna produces today is one
+mode-averaged column, far below it. `gpu/int-E` should re-measure on real radial and
+free-space device states, where the transfer is much larger relative to the round trips,
+and may well lower the threshold.
 
 The fix that would make the device path win on a single column is to stop making six round
 trips: a two-phase protocol in which each statistic writes its scalar reductions into one

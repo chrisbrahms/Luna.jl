@@ -1024,36 +1024,33 @@ end
 """
     STATS_DEVICE_MINLEN
 
-The number of elements a *single-column* state has to have before [`collect_stats`](@ref)
-evaluates the statistics on the device rather than on a host copy of it. Below it the copy
-is cheaper.
+The number of elements a state has to have before [`collect_stats`](@ref) evaluates the
+statistics on the device rather than on a host copy of it. Below it the copy is cheaper.
 
 The cost the device path adds is a fixed number of device-to-host round trips -- one per
 statistic that ends in a scalar read, six for the default set -- and a round trip does not
-depend on the grid size. The cost it removes is one transfer of the state, which does.
-Measured on an M1 Pro through Metal (`benchmark/stats.jl`), a round trip is ~400 µs and
-the default set costs 2.7-3.6 ms on the device for 1025 to 16385 elements, against
-0.34-1.31 ms for the copy plus the host branches. The transfer only reaches the ~2.7 ms
-the round trips cost at a few million elements, which is what this threshold is; a
-single-column state that large is not something Luna produces, so in practice a
-mode-averaged run always takes the host path. `stats_device=:device` overrides it.
+depend on the size of the state. The cost it removes is one transfer of the state, which
+does. Measured on an M1 Pro through Metal (`benchmark/stats.jl`), a round trip is ~400 µs
+and the default set costs 2.7-3.6 ms on the device for 1025 to 16385 elements against
+0.34-1.31 ms for the copy plus the host branches, and it is still the slower of the two on
+a 128-column, 131200-element state (18.8 ms against 16.1 ms). The transfer reaches the
+~2.7 ms the round trips cost at a few million elements, which is what this threshold is.
 
-A state with **more than one column** takes the device path whatever its length. That is a
-forward-looking rule, not one this branch can measure: no transform here produces a
-multi-column device state (the radial, free-space and multimode transforms are host-only
-until `gpu/20`-`gpu/22`). On a synthetic multi-column state the device path is still the
-slower of the two at 16 and 128 columns, because `fwhm_t` copies the time-domain intensity
-to the host on either path and its per-column root-finding is host work either way. See
-`PR_24-stats-device.md`; it is worth re-measuring when a device-capable multi-column
-transform exists.
+The rule is **the size of the state and nothing else**: an earlier version also took the
+device path for any state with more than one column, which the column sweep in
+`benchmark/stats.jl` does not support -- `fwhm_t` copies the time-domain intensity to the
+host on either path and its per-column root-finding is host work either way, so extra
+columns alone do not make the device path pay. `stats_device=:device` forces it regardless.
+
+Every device state Luna produces today is a single mode-averaged column, far below this, so
+in practice the host path is taken. `gpu/int-E` should re-measure this on real radial and
+free-space device states, where the transfer is much larger relative to the per-statistic
+round trips, and may well lower the threshold.
 """
 const STATS_DEVICE_MINLEN = 1 << 22
 
-"The number of columns (transverse points, modes) of a state."
-_ncols(x::AbstractArray) = ndims(x) < 2 ? 1 : prod(size(x)[2:end])
-
-"Whether the device path is worth taking for a state of this shape; see `STATS_DEVICE_MINLEN`."
-_devicepays(x) = _ncols(x) > 1 || length(x) >= STATS_DEVICE_MINLEN
+"Whether the device path is worth taking for a state this size; see `STATS_DEVICE_MINLEN`."
+_devicepays(x) = length(x) >= STATS_DEVICE_MINLEN
 
 """
     collect_stats(grid, Eω, funcs...; Eref=1.0, stats_device=:auto)
@@ -1090,14 +1087,13 @@ whether to copy the state to the host. The device state is used when
 - `stats_device` allows it.
 
 `stats_device` is `:auto` (the default), `:device` or `:host`. Under `:auto` the device
-state is used only when it has more than one column or at least
-[`STATS_DEVICE_MINLEN`](@ref) elements; that docstring has the measurement behind the
-rule. A single-column mode-averaged state is below both, and there the device path costs
-more than the copy it avoids: every statistic which ends in a device-to-host transfer
-costs the same round trip whatever the grid size (~400 µs on an M1 Pro through Metal), and
-the default set makes six of them, against one transfer of a few tens of kilobytes for the
-host path. `:device` overrides the shape test (the capability test still applies); `:host`
-builds for the host whatever the state is.
+state is used only when it has at least [`STATS_DEVICE_MINLEN`](@ref) elements; that
+docstring has the measurement behind the threshold. A mode-averaged state is far below it,
+and there the device path costs more than the copy it avoids: every statistic which ends
+in a device-to-host transfer costs the same round trip whatever the size of the state
+(~400 µs on an M1 Pro through Metal), and the default set makes six of them, against one
+transfer of a few tens of kilobytes for the host path. `:device` overrides the size test
+(the capability test still applies); `:host` builds for the host whatever the state is.
 
 Otherwise everything is built for a host copy in physical units, with `Eref = 1`, because
 that is what `Luna.ScaledOutput` will hand it.
@@ -1146,10 +1142,9 @@ function _logstatspath(Eω, ondev, hostlist, stats_device)
         Logging.@info("Per-step statistics run on the host (stats_device=:host).")
     else
         Logging.@info(
-            "Per-step statistics run on the host: this state is a single column of "*
-            "$(length(Eω)) elements, below Stats.STATS_DEVICE_MINLEN, where copying it "*
-            "down costs less than the device reductions. Pass stats_device=:device to "*
-            "override.")
+            "Per-step statistics run on the host: this state has $(length(Eω)) elements, "*
+            "below Stats.STATS_DEVICE_MINLEN, where copying it down costs less than the "*
+            "device reductions. Pass stats_device=:device to override.")
     end
     nothing
 end
