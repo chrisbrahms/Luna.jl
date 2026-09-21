@@ -29,7 +29,7 @@
 import Test: @test, @testset, @test_throws, @test_logs, @inferred
 import Luna
 import Luna: Utils, Output, Grid, Modes, Capillary, Fields, LinearOps, Nonlinear,
-             NonlinearRHS, PhysData, RK45, Stats, Maths, Ionisation, Raman
+             NonlinearRHS, PhysData, RK45, Stats, Maths, Ionisation, Raman, Boundaries
 import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING
 import GPUArraysCore
 import AbstractFFTs
@@ -1174,11 +1174,12 @@ function gradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9
     out, transform
 end
 
-#= The difference between two radial runs, normalised per save by the largest `|Eω|` in
-   that save -- the metric the regression gate uses. An elementwise relative difference is
-   meaningless in the k-channels the evanescent taper has emptied and outside the
+#= The difference between two free-space runs, normalised per save by the largest `|Eω|`
+   in that save -- the metric the regression gate uses. An elementwise relative difference
+   is meaningless in the k-channels the evanescent taper has emptied and outside the
    simulation band, where the field is fifteen orders below its peak and what is left is
-   numerical dust. =#
+   numerical dust. Shape-generic: the saved field's last axis is z whatever the transverse
+   geometry, so the radial, 2-D and 3-D Cartesian testsets all use this. =#
 function radialdiff(a, b)
     A, B = a["Eω"], b["Eω"]
     size(A) == size(B) || return Inf
@@ -2074,3 +2075,219 @@ end
     end
 end
 
+
+#= --------------------------------------------- the Cartesian free-space transforms =#
+
+#= Type I SHG in BBO on a `Grid.Free2DGrid`: the χ⁽²⁾ response with two polarisation
+   components, on the 2-D Cartesian transform. The refractive index is the crystal-optics
+   pair `(nfunx, nfuny)`, so the normalisation takes the host root-finding fill and uploads
+   its result, which is the only path in `FreeSpaceNorm` that is not a broadcast.
+   `boundary=:rate` adds the k-space absorber, the evanescent clamp with its matching
+   source taper and `Boundaries.CartesianCollar`; fixed steps, so two runs differ only in
+   their arithmetic. The same case as the "BBO SHG" testset in `test_freespace.jl` and the
+   `free2d_*_chi2` regression cases, on a smaller grid. =#
+const BBO_θ = deg2rad(29.2) # type I phase-matching angle
+const BBO_ϕ = deg2rad(30)
+
+function free2dcase(GT, spec; λ0=800e-9, τfwhm=30e-15, w0=20e-6, energy=10e-9,
+                    thickness=30e-6, Nx=2^5, noise_field=nothing, precision=nothing,
+                    boundary=:rate)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (250e-9, 2e-6), 120e-15) :
+        Grid.EnvGrid(λ0, (250e-9, 2e-6), 120e-15; thg=true)
+    xgrid = Grid.Free2DGrid(4w0, Nx)
+    nfuns = PhysData.ref_index_fun_xy(:BBO, BBO_θ)
+    linop = LinearOps.make_const_linop(grid, xgrid, nfuns)
+    normfun = NonlinearRHS.const_norm_free2D(grid, xgrid, nfuns)
+    densityfun = z -> 1 # unity density: this is a solid
+    resp = (freechi2(grid),)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm, energy=energy/(sqrt(π/2)*w0), w0)
+    Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, resp, inputs;
+                                   noise_field, device=spec, precision)
+    out = Output.MemoryOutput(0, thickness, 3, Output.nostats)
+    h = thickness/8
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=thickness, boundary, boundary_N=4, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= The χ⁽²⁾ response matching the grid, built from the grid's own carrier frequency and
+   oversampled time axis (which `Chi2Env` needs for the carrier phase). =#
+freechi2(::Grid.RealGrid) = Nonlinear.Chi2Field(BBO_θ, BBO_ϕ, PhysData.χ2(:BBO))
+freechi2(grid::Grid.EnvGrid) = Nonlinear.Chi2Env(BBO_θ, BBO_ϕ, PhysData.χ2(:BBO),
+                                                 grid.ω0, grid.to)
+
+#= A 3-D free-space envelope Kerr propagation on a `Grid.FreeGrid`: the same geometry as
+   the `free3d_env_kerr` regression case, on a coarser grid, with `boundary=:rate` and
+   fixed steps. The block is `(nto, npol, Nx, Ny)` and the transform is one region-(1,3,4)
+   FFT each way. =#
+function free3dcase(spec; gas=:Ar, pres=1.0, λ0=800e-9, energy=1e-9, flength=2e-3,
+                    R=1e-3, Nx=8, Ny=6, w0=200e-6, precision=nothing, boundary=:rate)
+    grid = Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
+    xygrid = Grid.FreeGrid(R, Nx, R, Ny)
+    nfunλ = PhysData.ref_index_fun(gas, pres)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    linop = LinearOps.make_const_linop(grid, xygrid, nfun)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
+    normfun = NonlinearRHS.const_norm_free(grid, xygrid, nfun)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
+    Eω, transform, FT = Luna.setup(grid, xygrid, dens, normfun, resp, inputs;
+                                   device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/8
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, boundary_N=4, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= Every field-sized array a transform holds, by identity. `Eωo` and `Pωo` are the same
+   array, so a transform which aliases them is one entry shorter than one which does not;
+   that is what the assertion below measures. Field-sized means "has a column axis", i.e.
+   at least three dimensions -- the grid mirrors and `prefac` are vectors. =#
+function fieldbuffers(t)
+    bufs = Any[]
+    for f in fieldnames(typeof(t))
+        v = getfield(t, f)
+        (v isa AbstractArray && ndims(v) >= 3) && push!(bufs, v)
+    end
+    unique(objectid, bufs)
+end
+
+@testset "the free-space transforms hold three field-sized buffers" begin
+    #= `Eto`, `Pto` and the one oversampled frequency-domain buffer which is both `Eωo`
+       and `Pωo`. Without the aliasing it would be four, which on a 3-D grid is the
+       difference between fitting a run on a device and not (see `docs/src/gpu.md`). =#
+    for (_, t) in (free2dcase(Grid.RealGrid, HostSpec()),
+                   free2dcase(Grid.EnvGrid, HostSpec()),
+                   free3dcase(HostSpec()))
+        @test t.Pωo === t.Eωo
+        @test length(fieldbuffers(t)) == 3
+        @test t.Eto !== t.Pto
+        # ... and the aliased buffer really is the one both passes use
+        @test size(t.Eωo, 1) == length(t.grid.ωo)
+    end
+    # with the modified shot-noise model, two more: the noise and the field+noise buffer
+    grid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
+    Nx = 2^5
+    nfω = Fields.generate_noise_field(grid)
+    nf = zeros(ComplexF64, (length(grid.ω), 2, Nx))
+    nf[grid.sidx, :, :] .= nfω[grid.sidx] .* ones(1, 2, Nx)
+    _, tn = free2dcase(Grid.RealGrid, HostSpec(); noise_field=nf)
+    @test length(fieldbuffers(tn)) == 5
+    @test !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
+end
+
+#= 2-D Cartesian free space end to end on a device, field-resolved and envelope, with the
+   χ⁽²⁾ responses and `boundary=:rate`. This is the exit test of the branch on the 2-D
+   side: the region-(1,3) plans, the two-component response protocol, the crystal-optics
+   normalisation staged through the host, the k-space absorber, the evanescent taper and
+   `CartesianCollar`, all on a `JLArray`. =#
+@testset "2-D free-space χ⁽²⁾ on JLArray" begin
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        href, htr = free2dcase(GT, HostSpec())
+        dref, dtr = free2dcase(GT, JLSpec)
+
+        @test dtr isa NonlinearRHS.TransFree2D
+        @test dtr.Eto isa JLArray{GT === Grid.RealGrid ? Float64 : ComplexF64, 3}
+        @test dtr.Pto isa JLArray
+        @test dtr.Eωo isa JLArray{ComplexF64, 3}
+        @test dtr.Pωo === dtr.Eωo
+        @test dtr.prefac isa JLArray{ComplexF64, 1}
+        @test dtr.gv.towin isa JLArray
+        # the normalisation was retargeted by `Luna.setup` ...
+        @test dtr.normfun.out isa JLArray{ComplexF64, 3}
+        @test dtr.normfun.kperp2m isa JLArray
+        @test dtr.normfun.sidxm isa JLArray{Bool}
+        # ... and the crystal-optics fill staged its host result through `ohost`
+        @test dtr.normfun.ohost isa Array{ComplexF64, 3}
+        @test maximum(abs, Array(dtr.normfun.out) .- htr.normfun.out) == 0
+        # ... while the host transform still aliases the grid's own vectors
+        @test htr.gv.ω === htr.grid.ω
+
+        # both polarisation components carry field: the second harmonic is on x
+        @test size(href["Eω"], 2) == 2
+        for ip in 1:2
+            @test maximum(abs, href["Eω"][:, ip, :, end]) > 0
+        end
+        @test size(dref["Eω"]) == size(href["Eω"])
+        @test dref["z"] ≈ href["z"]
+        @test radialdiff(href, dref) < 1e-10
+    end
+end
+
+@testset "3-D free-space Kerr on JLArray" begin
+    href, htr = free3dcase(HostSpec())
+    dref, dtr = free3dcase(JLSpec)
+
+    @test dtr isa NonlinearRHS.TransFree
+    @test dtr.Eto isa JLArray{ComplexF64, 4}
+    @test dtr.Eωo isa JLArray{ComplexF64, 4}
+    @test dtr.Pωo === dtr.Eωo
+    @test dtr.normfun.out isa JLArray{ComplexF64, 4}
+    @test Luna.all_resident(JLSpec, dtr.Eto, dtr.Pto, dtr.Eωo, dtr.prefac, dtr.gv.towin)
+    # the isotropic normalisation fill is a broadcast, so no host staging buffer is needed
+    @test isnothing(htr.normfun.ohost)
+
+    @test size(dref["Eω"]) == size(href["Eω"])
+    @test ndims(dref["Eω"]) == 5 # (ω, pol, kx, ky, z)
+    @test dref["z"] ≈ href["z"]
+    @test radialdiff(href, dref) < 1e-10
+end
+
+#= The transverse collar of the Cartesian grids. Unlike the radial one it does not
+   transform: the joint FFT has already put the state in `(t, x[, y])` when `RateAbsorber`
+   applies it, so it is one broadcast and two reductions over the grid's own window. =#
+@testset "the Cartesian collar on JLArray" begin
+    grid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
+    for sg in (Grid.Free2DGrid(80e-6, 32), Grid.FreeGrid(1e-3, 8, 1e-3, 6))
+        xyshape = sg isa Grid.Free2DGrid ? (length(sg.x),) : (length(sg.x), length(sg.y))
+        αr = Boundaries.rate(Boundaries.rprofile(sg, 0.1), 1e-3)
+        Eth = zeros(Float64, (length(grid.t), 2, xyshape...))
+        Etd = Luna.alloc(JLSpec, Float64, size(Eth))
+        hc = Boundaries.spatialcollar(sg, αr, grid, Eth)
+        dc = Boundaries.spatialcollar(sg, αr, grid, Etd)
+        @test hc isa Boundaries.CartesianCollar
+        @test dc isa Boundaries.CartesianCollar
+        @test dc.αxy isa JLArray{Float64}
+        @test dc.fac isa JLArray{Float64}
+        @test hc.αxy === αr # the host path does not copy
+
+        E = randn(size(Eth))
+        Eth .= E
+        copyto!(Etd, E)
+        Boundaries.apply_realspace!(hc, Eth, 1e-4)
+        Boundaries.apply_realspace!(dc, Etd, 1e-4)
+        @test maximum(abs, Array(Etd) .- Eth)/maximum(abs, Eth) < 1e-14
+        @test dc.reference[] ≈ hc.reference[] rtol=1e-12
+        @test dc.removed[] ≈ hc.removed[] rtol=1e-12
+        @test hc.removed[] > 0 # the collar really absorbed something
+    end
+end
+
+#= The modified shot-noise path of the Cartesian transforms: the noise field is uploaded,
+   taken to the oversampled real-space time domain by the transform's own inverse plan
+   (which does ω -> t and k -> x in one), and a second block-sized buffer holds
+   field+noise. The same host noise field goes into both runs. =#
+@testset "the 2-D free-space noise field on JLArray" begin
+    grid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
+    Nx = 2^5
+    nfω = Fields.generate_noise_field(grid)
+    nf = zeros(ComplexF64, (length(grid.ω), 2, Nx))
+    nf[grid.sidx, :, :] .= nfω[grid.sidx] .* ones(1, 2, Nx)
+
+    href, htr = free2dcase(Grid.RealGrid, HostSpec(); Nx, noise_field=nf)
+    dref, dtr = free2dcase(Grid.RealGrid, JLSpec; Nx, noise_field=nf)
+
+    @test dtr.Et_noise isa JLArray{Float64, 3}
+    @test dtr.Et_nl isa JLArray{Float64, 3}
+    @test size(dtr.Et_noise) == size(dtr.Eto)
+    @test maximum(abs, Array(dtr.Et_noise)) > 0
+    @test maximum(abs, Array(dtr.Et_noise) .- htr.Et_noise)/
+          maximum(abs, htr.Et_noise) < 1e-14
+    @test radialdiff(href, dref) < 1e-10
+    # a noise field of the wrong shape is refused, not silently broadcast
+    @test_throws ErrorException free2dcase(Grid.RealGrid, HostSpec();
+                                           Nx, noise_field=nf[:, 1:1, :])
+end
