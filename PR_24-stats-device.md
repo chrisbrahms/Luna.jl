@@ -539,7 +539,7 @@ allocated, which is what Luna has always done.
 | what | result |
 | --- | --- |
 | `test/test_regression.jl` vs `fa556e6f` | **460 pass, 0 fail**, `0.000e+00` on every row, statistics class included |
-| `test/test_device.jl` (JLArrays) | **791 pass, 0 fail, 38 testsets** (741/35 before) |
+| `test/test_device.jl` (JLArrays) | **793 pass, 0 fail, 38 testsets** (741/35 before) |
 | `test/test_metal.jl` (Metal, hardware) | **446 pass, 0 fail, 18 testsets** (415/17 before) |
 | `test/test_stats.jl` | 1 pass, 0 fail |
 | `test/test_output.jl` | 117 pass, 0 fail, 8 testsets |

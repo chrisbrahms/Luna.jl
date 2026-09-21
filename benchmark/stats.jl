@@ -17,16 +17,15 @@
 
    - "host+copy": the state copied to the host and unscaled first, then the host branches
      of `Stats.jl`. This is what `Stats.collect_stats` chooses under `stats_device=:auto`
-     for a single column below `Stats.STATS_DEVICE_MINLEN`, which is every mode-averaged
-     run, so on those it is what a propagation actually pays.
+     for a state below `Stats.STATS_DEVICE_MINLEN`, which is every state Luna currently
+     puts on a device, so it is what a propagation actually pays.
    - "device": the statistics evaluated on the state where it is
-     (`stats_device=:device`), which `:auto` chooses for a state with more than one
-     column.
+     (`stats_device=:device`), which `:auto` chooses at or above that threshold.
 
    The "step" column is one RK45 step of the same propagation, so that the overhead can
    be read as a fraction of a step rather than in the abstract. The last block sweeps the
-   column count on a synthetic state, which is what the `:auto` threshold is set from --
-   no transform on this branch produces a multi-column device state yet.
+   column count on a synthetic state; it is why the `:auto` rule is the size of the state
+   and nothing else -- extra columns on their own do not make the device path pay.
 
    As for `run.jl` and `device.jl`: one Julia thread, one FFTW thread, one BLAS thread,
    `:estimate` planning and no wisdom, or the numbers are not comparable between runs.
@@ -171,9 +170,10 @@ end
 #= How the cost of the two paths moves with the column count. No transform on this branch
    produces a multi-column device state -- the radial, free-space and multimode transforms
    are host-only until gpu/20-22 -- so this builds the state by hand and calls the
-   statistics set directly. It is what `Stats.STATS_DEVICE_MINLEN` and the "more than one
-   column" rule in `Stats.collect_stats` are set from: the device columns are flat in the
-   problem size (they are round trips), the host column is not (it is a copy). =#
+   statistics set directly. It is why `Stats.collect_stats` decides on the size of the
+   state alone: the device column is dominated by a fixed number of round trips, and the
+   extra columns do not close the gap, because `fwhm_t` copies the time-domain intensity
+   to the host on either path and its per-column root-finding is host work either way. =#
 @printf("\nthe two paths against the column count, %d-point time grid\n\n", 1<<10)
 @printf("%-14s %8s %10s %12s %12s\n", "device", "columns", "state", "host+copy", "device")
 @printf("%s\n", "-"^60)
