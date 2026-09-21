@@ -3176,3 +3176,133 @@ end
     @test_throws ErrorException free3dcase(HostSpec();
                                            Nx, Ny, noise_field=nf[:, 1, :, :])
 end
+
+#= The radial and free-space default statistics on JLArray. `Stats.beam_profile` is the
+   one member with no device form, so it is left out here (`beam_profile=false`): with it
+   the set is host-only whatever `stats_device` says, which is what the last assertion
+   checks. As elsewhere in this file, `stats_device=:device` forces the device path on a
+   state far below `Stats.STATS_DEVICE_MINLEN`. =#
+function freestatsstate(spec; geom=:radial, GT=Grid.RealGrid, N=8, R=400e-6, gas=:Ar,
+                        pres=1.0, λ0=800e-9, w0=100e-6, energy=1e-9, plasma=false,
+                        npol=1, windows=nothing, beam_profile=false,
+                        stats_device=:auto)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (200e-9, 3000e-9), 100e-15) :
+        Grid.EnvGrid(λ0, (200e-9, 3000e-9), 100e-15)
+    sg = geom === :radial ? Grid.RadialGrid(R, N) :
+         geom === :free2d ? Grid.Free2DGrid(R, N) : Grid.FreeGrid(R, N)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = GT === Grid.RealGrid ?
+        Any[Nonlinear.Kerr_field(PhysData.γ3_gas(gas))] :
+        Any[Nonlinear.Kerr_env(PhysData.γ3_gas(gas))]
+    plasma && push!(resp, Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)),
+                                                   tablerate(),
+                                                   PhysData.ionisation_potential(gas)))
+    nfunλ = PhysData.ref_index_fun(gas, pres)
+    nfun = npol == 2 ? ((λ; z=0.0) -> (nfunλ(λ), nfunλ(λ))) : ((λ; z=0.0) -> nfunλ(λ))
+    linop = LinearOps.make_const_linop(grid, sg, nfun)
+    normfun = geom === :radial ? NonlinearRHS.const_norm_radial(grid, sg, nfun) :
+              geom === :free2d ? NonlinearRHS.const_norm_free2D(grid, sg, nfun) :
+                                 NonlinearRHS.const_norm_free(grid, sg, nfun)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0,
+                                    θ=npol == 2 ? π/6 : 0.0)
+    Eω, transform, FT = Luna.setup(grid, sg, dens, normfun, Tuple(resp), inputs;
+                                   device=spec)
+    sf = Stats.default(grid, Eω, transform, linop;
+                       gas, windows, beam_profile, stats_device)
+    (grid, Eω, sf)
+end
+
+@testset "radial and free-space statistics on JLArray" begin
+    for (nm, kw) in (("radial, field-resolved", (;)),
+                     ("radial, envelope", (; GT=Grid.EnvGrid)),
+                     ("radial, two polarisation components", (; npol=2)),
+                     ("radial, plasma", (; N=16, R=200e-6, w0=40e-6, energy=20e-6,
+                                           plasma=true)),
+                     ("radial, energy window", (; windows=((600e-9, 1000e-9),))),
+                     ("2-D free space", (; geom=:free2d)),
+                     ("2-D free space, envelope", (; geom=:free2d, GT=Grid.EnvGrid)),
+                     ("3-D free space", (; geom=:free3d, N=6)))
+        _, Eh, sfh = freestatsstate(HostSpec(); kw...)
+        _, Ed, sfd = freestatsstate(JLSpec; kw..., stats_device=:device)
+        copyto!(Ed, Eh) # the same state on both paths
+        @test (nm, Stats.device_capable(sfd)) == (nm, true)
+        @test isempty(Stats.host_statistics(sfd))
+        dh = sfh(Eh, 0.1, 1e-4)
+        dd = sfd(Ed, 0.1, 1e-4)
+        @test sort(collect(keys(dd))) == sort(collect(keys(dh)))
+        for key in sort(collect(keys(dh)))
+            #= Shape as well as value: a reduction over several axes leaves them as
+               singletons, and one per column has to come back as a vector over the
+               column axis whichever branch produced it. =#
+            @test (nm, key, size(dd[key])) == (nm, key, size(dh[key]))
+            err = statserr(dd[key], dh[key])
+            @test (nm, key, err <= 1e-10) == (nm, key, true)
+        end
+        if get(kw, :plasma, false)
+            @test dh["electrondensity"]/PhysData.density(:Ar, 1.0) > 1e-8
+        end
+        @test length(dd["energy"]) == (get(kw, :npol, 1))
+    end
+
+    # the beam profile has no device form, and it is what makes the set host-only
+    _, Ed, sfp = freestatsstate(JLSpec; beam_profile=true, stats_device=:device)
+    @test !Stats.device_capable(sfp)
+    @test Stats.host_statistics(sfp) == ["BeamProfile"]
+    @test !Stats.device_capable(Stats.beam_profile(Grid.RealGrid(800e-9, (200e-9, 3e-6),
+                                                                100e-15),
+                                                   Grid.RadialGrid(400e-6, 8)))
+end
+
+#= The unit scaling a free-space device branch has to undo, by the same construction as
+   the mode-averaged testset above: the same set built for `E_ref = r` and given the
+   state divided by `r` must give the physical answers back. =#
+@testset "the free-space device statistics undo the unit scaling" begin
+    r = 1024.0
+    for geom in (:radial, :free2d, :free3d)
+        grid, Eω, _ = freestatsstate(JLSpec; geom, N=6, plasma=(geom === :radial),
+                                     stats_device=:device)
+        sg = geom === :radial ? Grid.RadialGrid(400e-6, 6) :
+             geom === :free2d ? Grid.Free2DGrid(400e-6, 6) : Grid.FreeGrid(400e-6, 6)
+        dens = z -> PhysData.density(:Ar, 1.0)
+        _, energyω = Fields.energyfuncs(grid, sg)
+        funs = (Stats.energy(grid, sg, energyω),
+                Stats.onaxis(Stats.ω0(grid), sg),
+                Stats.onaxis(Stats.peakintensity(grid), sg),
+                Stats.onaxis(Stats.fwhm_t(grid), sg),
+                Stats.onaxis(Stats.electrondensity(grid, tablerate(), dens), sg),
+                Stats.energy_λ(grid, sg, energyω, (600e-9, 1000e-9)))
+        unscaled = Stats.collect_stats(grid, Eω, funs...; stats_device=:device)
+        scaled = Stats.collect_stats(grid, Eω, funs...; Eref=r, stats_device=:device)
+        d1 = unscaled(Eω, 0.1, 1e-4)
+        d2 = scaled(Eω ./ r, 0.1, 1e-4)
+        @test sort(collect(keys(d2))) == sort(collect(keys(d1)))
+        for key in sort(collect(keys(d1)))
+            err = statserr(d2[key], d1[key])
+            @test (geom, key, err <= 1e-10) == (geom, key, true)
+        end
+        @test d1["peakintensity"] > 0
+    end
+end
+
+#= `Stats.transverse_integral_error` is host-only, but the transform it evaluates may be
+   on a device: the statistic stages the host state into the transform's units and array
+   type and scales the absolute error back. =#
+@testset "the transverse integral error on a device transform" begin
+    hEω, _, htr = modalrhs(Grid.RealGrid, HostSpec(); nr=33, kronrod=true)
+    dEω, _, dtr = modalrhs(Grid.RealGrid, JLSpec; nr=33, kronrod=true)
+    @test dtr.err isa JLArray{ComplexF64, 2}
+    hs = Stats.collect_stats(Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15), hEω,
+                             Stats.transverse_integral_error(htr))
+    ds = Stats.collect_stats(Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15), hEω,
+                             Stats.transverse_integral_error(dtr))
+    @test !Stats.device_capable(ds) # the statistic, and so the set, is host-only
+    dh = hs(hEω, 0.1, 1e-4)
+    dd = ds(hEω, 0.1, 1e-4) # a host state, with a device transform behind it
+    for key in sort(collect(keys(dh)))
+        @test (key, statserr(dd[key], dh[key]) <= 1e-10) == (key, true)
+    end
+    @test dh["transverse_points"] == 33
+    @test 0 < dh["transverse_integral_error_rel"] < 1e-3
+end

@@ -466,8 +466,10 @@ function _weightedenergy(ew, Eref2, Eω)
     fac = ew.prefac*Eref2
     isnothing(ew.dims) &&
         return fac*Float64(_zipreduce(_ekernel(ew.w), +, zero(RT), ew.w..., Eω))
+    #= `vec`: the reduction leaves the axes it reduced as singletons, and the result is
+       one number per column, in the order the column axis has them. =#
     s = Array(_zipreducedims(_ekernel(ew.w), +, zero(RT), ew.dims, ew.w..., Eω))
-    [fac*Float64(x) for x in s]
+    [fac*Float64(x) for x in vec(s)]
 end
 
 """
