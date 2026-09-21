@@ -236,6 +236,7 @@ end
 
 #= Which kernel the reduction folds over depends only on how many weight vectors there
    are, which is a property of the tuple's type. =#
+_ekernel(::Tuple{}) = abs2
 _ekernel(::Tuple{Any}) = _wabs2
 _ekernel(::Tuple{Any, Any}) = _w2abs2
 
@@ -250,9 +251,11 @@ form.
 `spacegrid` is `nothing` for a mode-averaged or multimode state, whose functional
 integrates over frequency alone; a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid) adds
 the quadrature weights of the reciprocal radial axis
-([`Grid.integrate_k`](@ref Luna.Grid.integrate_k)); the Cartesian transverse grids add
-nothing but a prefactor, because their functional is a plain sum over every axis --
-including the frequency axis, which is why they do not take this grid's Simpson weights.
+([`Grid.integrate_k`](@ref Luna.Grid.integrate_k)); the Cartesian transverse grids have
+**no** weight vectors, only a prefactor, because their functional is a plain sum over every
+axis -- including the frequency axis, which is why they do not take this grid's Simpson
+weights. An empty weight tuple makes the reduction `sum(abs2, Eω; dims)`, which is what a
+vector of ones would have cost a multiply per element per reduction to reach.
 """
 function _energy_weights(grid, ::Nothing)
     ws = _spectral_weights(grid)
@@ -272,16 +275,14 @@ function _energy_weights(grid, sg::Grid.Free2DGrid)
     ws = _spectral_weights(grid)
     isnothing(ws) && return nothing
     _, prefacω = ws
-    ((ones(length(grid.ω)),), (1,),
-     c*ε_0/2 * prefacω * _kfactor(sg.kx), (1, 3))
+    ((), (), c*ε_0/2 * prefacω * _kfactor(sg.kx), (1, 3))
 end
 
 function _energy_weights(grid, sg::Grid.FreeGrid)
     ws = _spectral_weights(grid)
     isnothing(ws) && return nothing
     _, prefacω = ws
-    ((ones(length(grid.ω)),), (1,),
-     c*ε_0/2 * prefacω * _kfactor(sg.kx) * _kfactor(sg.ky), (1, 3, 4))
+    ((), (), c*ε_0/2 * prefacω * _kfactor(sg.kx) * _kfactor(sg.ky), (1, 3, 4))
 end
 
 _energy_weights(grid, spacegrid) = nothing
@@ -290,6 +291,34 @@ _energy_weights(grid, spacegrid) = nothing
 function _kfactor(k)
     δk = k[2] - k[1]
     2π*δk/(length(k)*δk)^2
+end
+
+"""
+    _hasform(ctx, spacegrid)
+
+Whether an energy functional of `ctx.grid` over `spacegrid` has a weighted-reduction form
+at all -- the structural half of [`device_capable`](@ref), answered from the grids alone.
+
+[`_devenergy`](@ref) answers the other half, that the functional the caller actually
+passed *is* that one, and it needs a probe state of the run's own shape to do it. On a
+3-D free-space grid that probe and the `abs2` the functional takes of it are two transient
+host arrays the size of the state -- 134 MB and 67 MB on 512 x 128 x 128 -- so it is built
+only when the device path is the one being taken. Review round 1, finding 2.
+
+The trait is documented as structural ("it does not depend on the array type a statistic
+was prepared for"), so this is what it has to report on the host path. The consequence is
+that a *host-built* statistic reports a device form for a foreign functional, which the
+probe would have refused. Nothing reads it there: a host-built set never evaluates the
+weights (`_onstate` refuses), `Luna.ScaledOutput` reads the set's chosen path rather than
+its members' capability, and a device run which would take the device path builds the
+probe and gets the checked answer.
+"""
+function _hasform(ctx::StatsContext, spacegrid)
+    ews = _energy_weights(ctx.grid, spacegrid)
+    isnothing(ews) && return false
+    _, waxes, _, rdims = ews
+    nd = ndims(ctx.proto)
+    all(<=(nd), waxes) && all(<=(nd), rdims)
 end
 
 """
@@ -329,7 +358,14 @@ function _devenergy(ctx::StatsContext, spacegrid, energyfun_ω, window=nothing)
        folds into the frequency weights: one vector and one reduction, and no windowed
        copy of the field. It does not affect the check above, which is the identity
        between the unwindowed functional and the weights. =#
-    wh = isnothing(window) ? wh : ((wh[1] .* abs2.(window)), Base.tail(wh)...)
+    if !isnothing(window)
+        if isempty(wh)
+            # a Cartesian functional has no weight vector for the window to fold into
+            wh, waxes = (abs2.(window),), (1,)
+        else
+            wh = ((wh[1] .* abs2.(window)), Base.tail(wh)...)
+        end
+    end
     wd = map((v, ax) -> reshape(Luna.todevice(ctx.spec, v),
                                 _axisshape(length(v), ax, nd)), wh, waxes)
     EnergyWeights(wd, nd == 1 ? nothing : rdims, prefac)
@@ -408,7 +444,8 @@ end
 struct SpectralEnergy{F, S, W}
     energyfun_ω::F
     sg::S           # the transverse grid the functional integrates over, or `nothing`
-    ew::W           # the device form of the functional, or `nothing`
+    ew::W           # the device form of the functional, or `nothing` (see `hasform`)
+    hasform::Bool   # whether there is a device form, built or not
     Eref2::Float64  # E_ref^2: the energy is quadratic in the field
     key::String
     ondevice::Bool
@@ -431,18 +468,21 @@ the scalar prefactor and the square of the unit scaling are applied to the resul
 `Float64`.
 """
 energy(grid, energyfun_ω) =
-    SpectralEnergy(energyfun_ω, nothing, nothing, 1.0, "energy", false)
+    SpectralEnergy(energyfun_ω, nothing, nothing, false, 1.0, "energy", false)
 
 energy(grid, spacegrid, energyfun_ω) =
-    SpectralEnergy(energyfun_ω, spacegrid, nothing, 1.0, "energy", false)
+    SpectralEnergy(energyfun_ω, spacegrid, nothing, false, 1.0, "energy", false)
 
 function prepare(f::SpectralEnergy, ctx::StatsContext)
+    ctx.ondevice || return SpectralEnergy(f.energyfun_ω, f.sg, nothing, _hasform(ctx, f.sg),
+                                          1.0, f.key, false)
     ew = _devenergy(ctx, f.sg, f.energyfun_ω)
-    isnothing(ew) && return SpectralEnergy(f.energyfun_ω, f.sg, nothing, 1.0, f.key, false)
-    SpectralEnergy(f.energyfun_ω, f.sg, ew, ctx.Eref^2, f.key, ctx.ondevice)
+    isnothing(ew) && return SpectralEnergy(f.energyfun_ω, f.sg, nothing, false, 1.0,
+                                           f.key, false)
+    SpectralEnergy(f.energyfun_ω, f.sg, ew, true, ctx.Eref^2, f.key, ctx.ondevice)
 end
 
-device_capable(f::SpectralEnergy) = !isnothing(f.ew)
+device_capable(f::SpectralEnergy) = f.hasform
 needs_time(::SpectralEnergy) = false
 statlabel(f::SpectralEnergy) = f.key
 
@@ -507,6 +547,7 @@ struct SpectralEnergyWindow{F, S, V, W}
     sg::S           # the transverse grid the functional integrates over, or `nothing`
     window::V       # the host window, as given
     ew::W           # the device form with the window folded in, or `nothing`
+    hasform::Bool   # whether there is a device form, built or not
     Eref2::Float64
     key::String
     ondevice::Bool
@@ -521,22 +562,24 @@ be named `energy_[label]`. The second form is for a radial or free-space state, 
 [`energy`](@ref).
 """
 energy_window(grid, energyfun_ω, window::AbstractVector{<:Real}; label) =
-    SpectralEnergyWindow(energyfun_ω, nothing, window, nothing, 1.0, "energy_$label",
-                         false)
+    SpectralEnergyWindow(energyfun_ω, nothing, window, nothing, false, 1.0,
+                         "energy_$label", false)
 
 energy_window(grid, spacegrid, energyfun_ω, window::AbstractVector{<:Real}; label) =
-    SpectralEnergyWindow(energyfun_ω, spacegrid, window, nothing, 1.0, "energy_$label",
-                         false)
+    SpectralEnergyWindow(energyfun_ω, spacegrid, window, nothing, false, 1.0,
+                         "energy_$label", false)
 
 function prepare(f::SpectralEnergyWindow, ctx::StatsContext)
+    ctx.ondevice || return SpectralEnergyWindow(f.energyfun_ω, f.sg, f.window, nothing,
+                                                _hasform(ctx, f.sg), 1.0, f.key, false)
     ew = _devenergy(ctx, f.sg, f.energyfun_ω, f.window)
     isnothing(ew) && return SpectralEnergyWindow(f.energyfun_ω, f.sg, f.window, nothing,
-                                                 1.0, f.key, false)
-    SpectralEnergyWindow(f.energyfun_ω, f.sg, f.window, ew, ctx.Eref^2, f.key,
+                                                 false, 1.0, f.key, false)
+    SpectralEnergyWindow(f.energyfun_ω, f.sg, f.window, ew, true, ctx.Eref^2, f.key,
                          ctx.ondevice)
 end
 
-device_capable(f::SpectralEnergyWindow) = !isnothing(f.ew)
+device_capable(f::SpectralEnergyWindow) = f.hasform
 needs_time(::SpectralEnergyWindow) = false
 statlabel(f::SpectralEnergyWindow) = f.key
 
@@ -721,23 +764,31 @@ struct FWHMt{V, B, H}
     t::V
     Pd::B       # |Et|^2 on the state's array type
     Ph::H       # the same on the host
+    combined::String # what to call the duration of the columns added together
     ondevice::Bool
 end
 
 """
-    fwhm_t(grid)
+    fwhm_t(grid; combined="allmodes")
 
 Create stats function to calculate the temporal FWHM (pulse duration) for mode average.
+
+For a field with more than one column it records `fwhm_t_min` and `fwhm_t_max` per column
+and the duration of the columns added together as `fwhm_t_min_[combined]` and
+`fwhm_t_max_[combined]`. The columns are modes in a multimode propagation, which is what
+the default name says; a radial or free-space state projected onto the propagation axis
+([`onaxis`](@ref)) has polarisation components instead, and
+[`default`](@ref) names them `allpol` there.
 
 On a device only `|E|^2` is copied to the host; the FWHM itself is then found by the same
 root-finding on the same samples as on the host.
 """
-fwhm_t(grid) = FWHMt(grid.t, nothing, nothing, false)
+fwhm_t(grid; combined="allmodes") = FWHMt(grid.t, nothing, nothing, combined, false)
 
 function prepare(f::FWHMt, ctx::StatsContext)
-    ctx.ondevice || return FWHMt(f.t, nothing, nothing, false)
+    ctx.ondevice || return FWHMt(f.t, nothing, nothing, f.combined, false)
     Pd = Luna.alloc(ctx.spec, Luna.realtype(ctx.spec), _timedims(ctx))
-    FWHMt(f.t, Pd, Array{Luna.realtype(ctx.spec)}(undef, size(Pd)), true)
+    FWHMt(f.t, Pd, Array{Luna.realtype(ctx.spec)}(undef, size(Pd)), f.combined, true)
 end
 
 device_capable(::FWHMt) = true
@@ -756,8 +807,8 @@ function (f::FWHMt)(d, Eω, Et, z, dz)
                           for i=1:size(Pt, 2)]
         d["fwhm_t_max"] = [Maths.fwhm(f.t, Pt[:, i], method=:linear, minmax=:max)
                           for i=1:size(Pt, 2)]
-        d["fwhm_t_min_allmodes"] = Maths.fwhm(f.t, Ptsum, method=:linear)
-        d["fwhm_t_max_allmodes"] = Maths.fwhm(f.t, Ptsum, method=:linear, minmax=:max)
+        d["fwhm_t_min_"*f.combined] = Maths.fwhm(f.t, Ptsum, method=:linear)
+        d["fwhm_t_max_"*f.combined] = Maths.fwhm(f.t, Ptsum, method=:linear, minmax=:max)
     else
         d["fwhm_t_min"] = Maths.fwhm(f.t, Pt, method=:linear, minmax=:min)
         d["fwhm_t_max"] = Maths.fwhm(f.t, Pt, method=:linear, minmax=:max)
@@ -1075,16 +1126,20 @@ end
 """
     _axisweights(x)
 
-The weights which take a field held as its DFT along a Cartesian transverse axis to its
-sample at `x = 0`.
+The weights which take a field held as its DFT along a Cartesian transverse axis to the
+sample of `x` nearest the propagation axis.
 
 `FFTW.ifft` is `E[n] = (1/N) Σ_m Ek[m] exp(2πi(n-1)(m-1)/N)`, which is the transform that
-takes a free-space state back to real space, so the on-axis sample is that sum with `n`
-the index at which `x` is zero. [`Grid.FreeGrid`](@ref Luna.Grid.FreeGrid) and
-[`Grid.Free2DGrid`](@ref Luna.Grid.Free2DGrid) centre their transverse axes, so `n - 1` is
-`N/2` and the weights are exactly `±1/N` -- `cispi` of an integer is exactly `±1`, so
-nothing rounds. An axis which does not contain `x = 0` gives genuinely complex weights,
-which is the correct interpolation to the axis rather than an approximation of it.
+takes a free-space state back to real space, so this is that sum with `n` the index of the
+sample nearest `x = 0`. [`Grid.FreeGrid`](@ref Luna.Grid.FreeGrid) and
+[`Grid.Free2DGrid`](@ref Luna.Grid.Free2DGrid) centre their transverse axes on an even
+number of points, so that sample *is* `x = 0`, `n - 1` is `N/2`, and the weights are
+exactly `±1/N` -- `cispi` of an integer is exactly `±1`, so nothing rounds.
+
+An axis which does not contain `x = 0` gives complex weights and the **nearest sample**,
+which is half a cell off the axis, not an interpolation onto it: the band-limited
+interpolation to `x = 0` would be the all-`1/N` weights, which is a different vector. No
+transverse grid Luna builds is of that kind.
 """
 function _axisweights(x)
     N = length(x)
@@ -1326,6 +1381,19 @@ for both a width and a ratio:
   rounding level of the run: a beam far inside the aperture records ~1e-18 of its energy in
   the collar in `Float64` and ~1e-14 in `Float32`, both of which mean "nothing has reached
   the collar" and neither of which is a number to compare.
+
+  It is the fluence fraction in the **nominal** collar region, whether or not an absorber
+  is active there. This statistic is built before `Luna.run` is called, so it cannot see
+  `boundary` or `rcollar`: with `boundary=:none` or `:legacy` it reports the fraction in a
+  region where nothing is being absorbed, and with `boundary=:rate` it uses the `collar`
+  given here, which is `Luna.run`'s default and has to be set by hand if `rcollar` was.
+
+!!! note "Undersampled transverse grids"
+    `Maths.fwhm` returns `NaN` when it cannot bracket the half-maximum, which is what a
+    transverse grid with a handful of samples across the beam gives: a `w0 = 100 µm` beam
+    on a `Grid.FreeGrid(400e-6, 8, 400e-6, 6)` records `fwhm_x = fwhm_y = NaN`. That is the
+    honest answer -- there is no width to measure on two samples -- and it is silent, as it
+    is everywhere else `Maths.fwhm` is used.
 
 Host-only, and the one expensive statistic in the free-space set: it applies the inverse
 transverse transform to the whole state, which is a `N×N` matrix product on a radial grid
@@ -1909,7 +1977,9 @@ It records
   `Fields.energyfuncs(grid, spacegrid)[2]` -- one number per polarisation component;
 - `peakintensity`, `ω0`, `fwhm_t_min` and `fwhm_t_max` **on the propagation axis** (see
   [`onaxis`](@ref)), because those are properties of the pulse and a transverse average of
-  them is not one;
+  them is not one. With two polarisation components `ω0` and the two durations are one
+  number per component, and `fwhm_t_min_allpol`/`fwhm_t_max_allpol` are the duration of the
+  two added together;
 - `fwhm_r` (or `fwhm_x`/`fwhm_y` on a Cartesian transverse grid) and
   `collar_energy_fraction`, the beam size and how much of the beam has reached the
   absorbing collar (see [`beam_profile`](@ref));
@@ -1936,6 +2006,17 @@ has no mode and so no zero-dispersion wavelength to record.
   the set can be evaluated on a device state; `false` makes the rest of the set
   device-capable.
 - `stats_device=:auto`: as for the modal methods, see [`collect_stats`](@ref)
+
+# Cost per step
+The set is host-only (see `beam_profile` above), so the state is copied from a device on
+every step the statistics fire. Two of the host branches then allocate: `beam_profile`
+needs one more array the size of the state for the transverse real-space field, and
+`energy` -- and each energy window -- copies one `(nω, nk...)` slice per polarisation
+component, because the energy functionals reshape what they are given, and the functional
+then materialises `abs2` of it. On a large transverse grid that is the dominant per-step
+statistics cost; `Output.PeriodicStats` (`stats_period` on `prop_capillary`, or
+[`Output.maybe_periodic`](@ref Luna.Output.maybe_periodic)) is the lever, and
+`Output.nostats` switches them off.
 """
 function default(grid, Eω, transform::Union{TransRadial, TransFree, TransFree2D}, linop;
                  windows=nothing, gas=nothing, userfuns=Any[],
@@ -1946,7 +2027,7 @@ function default(grid, Eω, transform::Union{TransRadial, TransFree, TransFree2D
     funs = Any[energy(grid, sg, energyfunω),
                onaxis(ω0(grid), sg),
                onaxis(peakintensity(grid), sg),
-               onaxis(fwhm_t(grid), sg),
+               onaxis(fwhm_t(grid; combined="allpol"), sg),
                density(transform.densityfun)]
     # `Stats.` because the keyword argument of the same name shadows the function here
     if beam_profile
