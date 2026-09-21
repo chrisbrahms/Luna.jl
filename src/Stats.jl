@@ -1042,10 +1042,24 @@ device path for any state with more than one column, which the column sweep in
 host on either path and its per-column root-finding is host work either way, so extra
 columns alone do not make the device path pay. `stats_device=:device` forces it regardless.
 
-Every device state Luna produces today is a single mode-averaged column, far below this, so
-in practice the host path is taken. `gpu/int-E` should re-measure this on real radial and
-free-space device states, where the transfer is much larger relative to the per-statistic
-round trips, and may well lower the threshold.
+Re-measured on `gpu/int-E`, once the radial and free-space transforms could produce a
+multi-column device state (M1 Pro, Metal 1.11, the device-capable part of the default set,
+one call):
+
+| state | elements | host + copy | device |
+| --- | ---: | ---: | ---: |
+| radial, 256 radial points | 33024 | 2.03 ms | 333 ms |
+| radial, 1024 radial points | 132096 | 7.65 ms | 1.44 s |
+| 3-D, 64 x 64 | 524288 | 662 ms | 615 ms |
+| 3-D, 128 x 128 | 2097152 | 5.23 s | 4.88 s |
+
+The threshold stays where it was: the device path does not pay at any of these sizes. On a
+radial state it is two orders of magnitude worse, and the whole of that is [`fwhm_t`](@ref)
+-- its device branch reduces the *scaled* field, so the columns far off axis
+underflow to exactly zero in `Float32` and the host root-finding which follows is far
+slower on them than on the small but non-zero numbers the host path gives it. On a
+many-column state both paths are dominated by that same per-column host root-finding, so
+`stats_period` (or `Output.nostats`) is the lever there rather than this switch.
 """
 const STATS_DEVICE_MINLEN = 1 << 22
 

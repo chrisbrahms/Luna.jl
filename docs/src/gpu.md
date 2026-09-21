@@ -268,16 +268,34 @@ mode-averaged one, the three free-space ones and the fixed-quadrature multimode 
     mode-averaged Kerr case that is the difference between a 2.3 ms and a 4.6 ms accepted
     step.
 
-  Every device state Luna produces today is one mode-averaged column, far below the
-  threshold, so in practice the host path is taken; the threshold is set from where the
-  transfer of the state costs as much as the round trips, and will be re-measured when the
-  radial and free-space transforms become device-capable. To override the choice,
-  `stats_kwargs=Dict(:stats_device => :device)` (or `:host`) reaches
+  In practice the host path is taken for everything Luna produces today. The threshold
+  was re-measured on `gpu/int-E` on real radial and 3-D Metal states (M1 Pro, Metal 1.11,
+  one call of a set of `ω0`, `energy`, `peakpower`, `fwhm_t` and `density`, against one
+  RK45 step of the same propagation):
+
+  | state | elements | host + copy | device | one step |
+  | --- | ---: | ---: | ---: | ---: |
+  | radial, 256 radial points | 33024 | 2.03 ms | 333 ms | 3.5 ms |
+  | radial, 1024 radial points | 132096 | 7.65 ms | 1.44 s | 10.5 ms |
+  | 3-D, 64 x 64 | 524288 | 661 ms | 615 ms | 9.3 ms |
+  | 3-D, 128 x 128 | 2097152 | 5.23 s | 4.88 s | 26.1 ms |
+
+  so the device path does not pay at any of them and the threshold stays at 2^22. Two
+  things to read off it. On a radial state the device path is two orders of magnitude
+  worse, and all of it is `fwhm_t` (303 ms of the 333): its device branch reduces the
+  *scaled* field, so the columns far off axis underflow to exactly zero in `Float32` and
+  the host root-finding which follows is far slower on them than on the small but non-zero
+  numbers the host path gives it. And on a many-column state both paths are dominated by
+  that same per-column root-finding on the host -- 0.6 s at 4096 columns and 5 s at 16384,
+  against a 9 ms and a 26 ms step -- so per-step statistics are not usable on a large
+  free-space grid on either path. Raise `stats_period`, or use `Output.nostats`. To
+  override the choice, `stats_kwargs=Dict(:stats_device => :device)` (or `:host`) reaches
   `Stats.collect_stats` through `prop_capillary`.
 
   `fwhm_r` and the modal reconstruction error have no device form at all and keep their
-  algorithms on the host; both belong to the multimode set, whose transform is host-only
-  anyway. A statistics function *you* write is host code too: the whole set is then
+  algorithms on the host, so a multimode set is computed on a host copy whichever
+  transverse integral it came from. A statistics function *you* write is host code too:
+  the whole set is then
   computed on a host copy of the field on every step the statistics fire, and `Luna.run`
   warns once, naming it (`userfuns[1]`), when that happens. Use `stats_period` to reduce
   how often they run (below), or `Output.nostats` to switch them off.

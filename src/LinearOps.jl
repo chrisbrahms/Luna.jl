@@ -920,7 +920,7 @@ Tabulating it bounds that at the number of nodes and takes the quadrature out of
 
 `src` is the callable the table was built from, kept so that a table can be rebuilt over a
 wider span without going through the interpolant. `NonlinearRHS.tabulate` does that when
-[`Luna.prop_capillary`](@ref) has already tabulated `Aeff` over the fibre for the
+[`prop_capillary`](@ref Luna.Interface.prop_capillary) has already tabulated `Aeff` over the fibre for the
 statistics and the propagation needs it a little past the end.
 """
 struct TabulatedScalar{F}

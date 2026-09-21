@@ -246,24 +246,6 @@ length, used only to derive the reference length from `N` (see [`reflength`](@re
 temporal_rate(grid, zmax; N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR) =
     rate(tprofile(grid; collar), reflength(zmax, N, ℓ))
 
-"""
-    addloss(linop, α)
-
-Add the power absorption coefficient `α` (a vector over ω) to a linear operator as
-`-α/2`, which is how loss enters a linop everywhere in Luna (see `LinearOps`). Returns a
-linop of the same kind, so that `RK45.make_prop!` dispatch and `Luna.linoptype` are
-unchanged. Handles both forms Luna uses: a materialised `AbstractArray` and a closure
-`linop!(out, z)`.
-
-ω is axis 1 for every linop shape — `(Nω,)` mode-averaged, `(Nω, nmodes)` multimode,
-`(Nω, q.N)` radial, `(Nω, Nky, Nkx)` free-space — so one broadcast covers all of them.
-
-The array method **allocates a copy** rather than subtracting in place:
-`Interface.prop_capillary_args` is documented as being for repeated simulations in an
-identical fibre, i.e. the same linop is deliberately reused across `Luna.run` calls, and an
-in-place subtraction would compound the absorber on every reuse.
-"""
-
 #= `Boundaries.setup` is called by `Luna.run` before the operator is uploaded, so in a
    propagation these three see a host `Float64` operator and the conversions below are
    identities. A caller who uploads the operator first (or builds it on a device) hands
@@ -284,6 +266,23 @@ function _cachedlike(cache::Ref, op, x)
     cache[]
 end
 
+"""
+    addloss(linop, α)
+
+Add the power absorption coefficient `α` (a vector over ω) to a linear operator as
+`-α/2`, which is how loss enters a linop everywhere in Luna (see `LinearOps`). Returns a
+linop of the same kind, so that `RK45.make_prop!` dispatch and `Luna.linoptype` are
+unchanged. Handles both forms Luna uses: a materialised `AbstractArray` and a closure
+`linop!(out, z)`.
+
+ω is axis 1 for every linop shape — `(Nω,)` mode-averaged, `(Nω, nmodes)` multimode,
+`(Nω, q.N)` radial, `(Nω, Nky, Nkx)` free-space — so one broadcast covers all of them.
+
+The array method **allocates a copy** rather than subtracting in place:
+`Interface.prop_capillary_args` is documented as being for repeated simulations in an
+identical fibre, i.e. the same linop is deliberately reused across `Luna.run` calls, and an
+in-place subtraction would compound the absorber on every reuse.
+"""
 addloss(linop::AbstractArray, α) = linop .- _likeop(linop, α)./2
 
 function addloss(linop!, α)
