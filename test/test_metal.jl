@@ -100,7 +100,8 @@ end
    branch. =#
 function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
                    precision=nothing, thg=false, boundary=:none, stats=false, fixed=false,
-                   extraresp=(), plasma=false, raman=false, nothg=false)
+                   extraresp=(), plasma=false, raman=false, nothg=false,
+                   stats_device=:auto)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15; thg)
@@ -147,7 +148,8 @@ function metalcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=8
     #= The state itself: `Stats.default` builds its buffers and plans its transform for
        the array type and precision `Eω` has, so the default statistics run on the
        device with the state left where it is (gpu/24). =#
-    statsfun = stats ? Stats.default(grid, Eω, m, linop, transform; gas) : Output.nostats
+    statsfun = stats ?
+        Stats.default(grid, Eω, m, linop, transform; gas, stats_device) : Output.nostats
     out = Output.MemoryOutput(0, flength, 5, statsfun)
     #= `fixed=true`: min_dz == max_dz == init_dz bypasses the step-size controller
        (RK45.steplims!), so every difference between two runs is attributable to the
@@ -171,7 +173,8 @@ end
    host-buffer branch -- the two pieces which still upload from the host on every stage
    until gpu/23. Fixed steps, so the runs differ only in arithmetic. =#
 function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, energy=1e-6, flength=1e-2,
-                           λ0=800e-9, boundary=:none, stats=false, fixed=true)
+                           λ0=800e-9, boundary=:none, stats=false, fixed=true,
+                           stats_device=:auto)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
     coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
     m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
@@ -184,7 +187,8 @@ function metalgradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, energy=1e-6, flengt
     #= The state itself: `Stats.default` builds its buffers and plans its transform for
        the array type and precision `Eω` has, so the default statistics run on the
        device with the state left where it is (gpu/24). =#
-    statsfun = stats ? Stats.default(grid, Eω, m, linop, transform; gas) : Output.nostats
+    statsfun = stats ?
+        Stats.default(grid, Eω, m, linop, transform; gas, stats_device) : Output.nostats
     out = Output.MemoryOutput(0, flength, 5, statsfun)
     dz = flength/20
     if fixed
@@ -1034,16 +1038,17 @@ end
 @testset "default statistics on Metal" begin
     capkw = (; λ0=800e-9, energy=300e-6, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
              trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=false)
-    function statsprop(spec; flength=0.1)
+    function statsprop(spec; flength=0.1, stats_device=:auto)
         Eω, grid, linop, tr, FT, o = Luna.Interface.prop_capillary_args(
-            125e-6, flength, :He, 5.0; capkw..., device=spec)
+            125e-6, flength, :He, 5.0; capkw..., device=spec,
+            stats_kwargs=Dict{Symbol, Any}(:stats_device => stats_device))
         h = flength/20
         Luna.run(Eω, grid, linop, tr, FT, o;
                  zmax=flength, init_dz=h, min_dz=h, max_dz=h, status_period=1e6)
         o
     end
     h32 = statsprop(DeviceSpec(Array, Float32))
-    dm = statsprop(MetalSpec)
+    dm = statsprop(MetalSpec; stats_device=:device)
     @test length(dm["stats"]["z"]) == length(h32["stats"]["z"])
     @test sort(collect(keys(dm["stats"]))) == sort(collect(keys(h32["stats"])))
     for key in sort(collect(keys(h32["stats"])))
@@ -1068,7 +1073,7 @@ end
     inputs = Fields.GaussField(λ0=800e-9, τfwhm=10e-15, energy=300e-6)
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                    constβ=true, device=MetalSpec)
-    sf = Stats.default(grid, Eω, m, linop, transform; gas=:He)
+    sf = Stats.default(grid, Eω, m, linop, transform; gas=:He, stats_device=:device)
     @test Stats.device_capable(sf)
     @test isempty(Stats.host_statistics(sf))
     out = Output.MemoryOutput(0, 1.0, 2, sf)
@@ -1089,9 +1094,10 @@ end
     #= A user statistic has no device form, so the copy comes back and the warning names
        it. This is the fallback path on real hardware. =#
     uf = (d, Eω, Et, z, dz) -> d["mine"] = maximum(abs2, Et)
-    sfu = Stats.default(grid, Eω, m, linop, transform; gas=:He, userfuns=Any[uf])
+    sfu = Stats.default(grid, Eω, m, linop, transform;
+                        gas=:He, userfuns=Any[uf], stats_device=:device)
     @test !Stats.device_capable(sfu)
-    @test length(Stats.host_statistics(sfu)) == 1
+    @test Stats.host_statistics(sfu) == ["userfuns[1]"]
     outu = Output.MemoryOutput(0, 1.0, 2, sfu)
     sou = Luna.ScaledOutput(outu, Eω, Luna.runscaling(transform).Eref)
     @test !sou.devstats
@@ -1104,6 +1110,45 @@ end
     end
     @test sou.warned[]
     @test haskey(outu["stats"], "mine")
+
+    #= `:auto` chooses the host path for this state: it is a single column well below
+       `Stats.STATS_DEVICE_MINLEN`, where six device-to-host round trips cost more than
+       the copy (review round 1, finding 3). =#
+    sfa = Stats.default(grid, Eω, m, linop, transform; gas=:He)
+    @test !Stats.device_capable(sfa)
+    @test isempty(Stats.host_statistics(sfa))   # capable, but not the chosen path
+    soa = Luna.ScaledOutput(Output.MemoryOutput(0, 1.0, 2, sfa), Eω,
+                            Luna.runscaling(transform).Eref)
+    @test !soa.devstats
+end
+
+#= Review round 1, finding 1: `prop_capillary(…; filepath=…)` builds an `HDF5Output` with
+   a resume cache, which writes the per-step `y` to the file *and* passes it to its
+   statistics function. On this branch's first version that made `ScaledOutput` hand a
+   host array to a set built for the device, and Metal threw. Both paths are covered:
+   `:auto` (the host path, which is what a user gets) and `:device` (the fixed one). =#
+@testset "HDF5 file output with statistics on Metal" begin
+    capkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
+             trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=false)
+    mem = Luna.prop_capillary(125e-6, 1e-2, :He, 1.0; capkw..., device=MetalSpec)
+    mktempdir() do dir
+        for (nm, sd) in (("auto", :auto), ("device", :device))
+            fp = joinpath(dir, "metal_$nm.h5")
+            out = Luna.prop_capillary(
+                125e-6, 1e-2, :He, 1.0; capkw..., device=MetalSpec, filepath=fp,
+                stats_kwargs=Dict{Symbol, Any}(:stats_device => sd))
+            @test isfile(fp)
+            @test eltype(out["Eω"]) === ComplexF32
+            @test length(out["stats"]["z"]) == length(mem["stats"]["z"])
+            for key in sort(collect(keys(mem["stats"])))
+                h = mem["stats"][key]
+                d = out["stats"][key]
+                scale = maximum(abs, h)
+                err = scale > 0 ? maximum(abs, d .- h)/scale : maximum(abs, d .- h)
+                @test (nm, key, err <= 1e-3) == (nm, key, true)
+            end
+        end
+    end
 end
 
 #= `Luna.set_device(:cpu)` opts out, whatever `settings["device"]` is otherwise: this is

@@ -8,7 +8,10 @@ import Luna.Capillary: MarcatiliMode
 import FFTW
 import LinearAlgebra: mul!
 import Printf: @sprintf
+import Logging
 import Logging: @warn
+import Base.Broadcast
+import Luna.RK45: _zipreduce
 
 #=================================================#
 #==========  THE STATISTICS PROTOCOL  ============#
@@ -43,6 +46,11 @@ on every step whose statistics fire.
 The trait is structural: it does not depend on the array type a statistic was prepared
 for, only on whether its algorithm has a device form. `fwhm_r` and
 `mode_reconstruction_error` are the two statistics in the default sets which do not.
+
+Which path a statistic actually *takes* is a separate, fixed decision -- see
+[`collect_stats`](@ref) and `Stats._onstate`. For a whole set,
+[`device_capable`](@ref)`(::StatsCollector)` reports the path, because that is what
+`Luna.ScaledOutput` has to know.
 """
 device_capable(f) = false
 
@@ -76,6 +84,36 @@ unchanged, which is what a user closure needs.
 """
 prepare(f, ctx) = f
 
+#= Which branch a statistic takes is decided once, at `prepare`, and carried in its
+   `ondevice` field -- not read off the array it is handed. The two can disagree (review
+   round 1, finding 1: an `HDF5Output` with a resume cache used to hand a host copy to a
+   set built for the device, which threw on Metal and silently applied `E_ref^2` twice on
+   JLArrays), and a statistic which reads the array type cannot tell a legitimate call
+   from a mistake. `Utils.isdevice` is a type-level trait, so the check costs nothing once
+   the method is specialised. =#
+@inline function _onstate(f, x)
+    f.ondevice === Utils.isdevice(x) || _branchmismatch(f, x)
+    f.ondevice
+end
+
+@noinline _branchmismatch(f, x) = error(
+    "the statistic $(statlabel(f)) was prepared for a $(f.ondevice ? "device" : "host") "*
+    "state but was called with a $(typeof(x)). The array a statistics set is called with "*
+    "is fixed for the propagation: `Stats.collect_stats` builds the set for it and "*
+    "`Luna.stats_device_capable` tells `Luna.ScaledOutput` which one it is.")
+
+#= `mapreduce` over a lazy `Broadcasted` rather than over `a .* b`, which materialises a
+   field-sized temporary before reducing (GPU_PLAN.md section 11, the amendment which added
+   `RK45._zipreduce` for the stepper norms). `RK45._zipreduce` is the whole-array form;
+   this is the same thing reducing along the frequency axis only, for a state with more
+   than one column. =#
+@inline _zipreduce1(f, op, init, arrs...) = mapreduce(
+    identity, op, Broadcast.instantiate(Broadcast.broadcasted(f, arrs...));
+    init=init, dims=1)
+
+@inline _wabs2(w, e) = w*abs2(e)
+@inline _wmul(w, x) = w*x
+
 """
     StatsContext(grid, Eω, Eref=1.0)
 
@@ -87,7 +125,11 @@ What a statistic has to know about the run it is being built for:
   buffers are allocated with;
 - `Eref`, the field unit the state is expressed in ([`Luna.UnitScaling`](@ref)). `1.0` for
   every `Float64` run. **It applies to the device branches only**: on the host the state
-  has already been unscaled by `Luna.ScaledOutput` before the statistics see it.
+  has already been unscaled by `Luna.ScaledOutput` before the statistics see it;
+  [`collect_stats`](@ref) passes `1.0` when it builds a set for the host.
+- `ondevice`, whether the set being built will be called with the device state. Each
+  statistic stores it and branches on it, rather than on the array type of what it is
+  handed (see `Stats._onstate`).
 
 [`collect_stats`](@ref) builds one and passes it to [`prepare`](@ref).
 """
@@ -96,9 +138,11 @@ struct StatsContext{G, A, S}
     proto::A
     spec::S
     Eref::Float64
+    ondevice::Bool
 end
 
-StatsContext(grid, Eω, Eref=1.0) = StatsContext(grid, Eω, _specof(Eω), Float64(Eref))
+StatsContext(grid, Eω, Eref=1.0, ondevice=Utils.isdevice(Eω)) =
+    StatsContext(grid, Eω, _specof(Eω), Float64(Eref), ondevice)
 
 #= The `DeviceSpec` a state array belongs to. `Luna.todevice`/`Luna.alloc` are written
    against a spec rather than an array, and the statistics are the only place which has
@@ -191,6 +235,7 @@ end
 struct CentreOfMass{V, W}
     ω::V        # the frequency axis, as `Maths.moment` takes it (host)
     ωd::W       # the same on the state's array type and precision
+    ondevice::Bool
 end
 
 """
@@ -199,21 +244,28 @@ end
 Create stats function to calculate the centre of mass (first moment) of the spectral power
 density.
 """
-ω0(grid) = CentreOfMass(grid.ω, grid.ω)
+ω0(grid) = CentreOfMass(grid.ω, grid.ω, false)
 
 prepare(f::CentreOfMass, ctx::StatsContext) =
-    CentreOfMass(f.ω, Luna.todevice(ctx.spec, f.ω))
+    CentreOfMass(f.ω, Luna.todevice(ctx.spec, f.ω), ctx.ondevice)
 
 device_capable(::CentreOfMass) = true
 needs_time(::CentreOfMass) = false
 
 function (f::CentreOfMass)(d, Eω, Et, z, dz)
-    if Utils.isdevice(Eω)
-        #= One fused reduction for each of the two sums `Maths.moment` takes, instead of
-           materialising `abs2.(Eω)`. The ratio does not depend on the unit scaling. =#
-        num = Array(sum(f.ωd .* abs2.(Eω); dims=1))
-        den = Array(sum(abs2.(Eω); dims=1))
-        d["ω0"] = squeeze(Float64.(num) ./ Float64.(den))
+    if _onstate(f, Eω)
+        #= The two sums `Maths.moment` takes, each as one reduction over a lazy
+           `Broadcasted`: nothing field-sized is materialised. The ratio does not depend
+           on the unit scaling. =#
+        RT = real(eltype(Eω))
+        if ndims(Eω) > 1
+            num = Array(_zipreduce1(_wabs2, +, zero(RT), f.ωd, Eω))
+            den = Array(sum(abs2, Eω; dims=1))
+            d["ω0"] = squeeze(Float64.(num) ./ Float64.(den))
+        else
+            num = _zipreduce(_wabs2, +, zero(RT), f.ωd, Eω)
+            d["ω0"] = Float64(num)/Float64(sum(abs2, Eω))
+        end
     else
         d["ω0"] = squeeze(Maths.moment(f.ω, abs2.(Eω); dim=1))
     end
@@ -228,6 +280,7 @@ struct SpectralEnergy{F, W}
     prefac::Float64
     Eref2::Float64  # E_ref^2: the energy is quadratic in the field
     key::String
+    ondevice::Bool
 end
 
 """
@@ -236,16 +289,17 @@ end
 Create stats function to calculate the total energy.
 
 On a device the integral is the same rule as `energyfun_ω`'s written as one weighted
-reduction (see `Stats._devenergy`); the scalar prefactor and the square of the unit
-scaling are applied to the result, in `Float64`.
+reduction over a lazy `Broadcasted` (see `Stats._devenergy`); the scalar prefactor and the
+square of the unit scaling are applied to the result, in `Float64`.
 """
-energy(grid, energyfun_ω) = SpectralEnergy(energyfun_ω, nothing, 1.0, 1.0, "energy")
+energy(grid, energyfun_ω) = SpectralEnergy(energyfun_ω, nothing, 1.0, 1.0, "energy", false)
 
 function prepare(f::SpectralEnergy, ctx::StatsContext)
     we = _devenergy(ctx.grid, f.energyfun_ω)
-    isnothing(we) && return SpectralEnergy(f.energyfun_ω, nothing, 1.0, 1.0, f.key)
+    isnothing(we) && return SpectralEnergy(f.energyfun_ω, nothing, 1.0, 1.0, f.key, false)
     w, prefac = we
-    SpectralEnergy(f.energyfun_ω, Luna.todevice(ctx.spec, w), prefac, ctx.Eref^2, f.key)
+    SpectralEnergy(f.energyfun_ω, Luna.todevice(ctx.spec, w), prefac, ctx.Eref^2, f.key,
+                   ctx.ondevice)
 end
 
 device_capable(f::SpectralEnergy) = !isnothing(f.w)
@@ -253,7 +307,7 @@ needs_time(::SpectralEnergy) = false
 statlabel(f::SpectralEnergy) = f.key
 
 function (f::SpectralEnergy)(d, Eω, Et, z, dz)
-    if Utils.isdevice(Eω)
+    if _onstate(f, Eω)
         d[f.key] = _weightedenergy(f.w, f.prefac*f.Eref2, Eω)
     elseif ndims(Eω) > 1
         d[f.key] = [f.energyfun_ω(Eω[:, i]) for i=1:size(Eω, 2)]
@@ -262,18 +316,20 @@ function (f::SpectralEnergy)(d, Eω, Et, z, dz)
     end
 end
 
-#= One fused reduction along the frequency axis. The prefactors are applied on the host,
-   in Float64, to the result: in a scaled Float32 run the field is deliberately of order
-   one and the physical units (up to 1e20 apart) would not survive being put back on it. =#
+#= One reduction along the frequency axis over a lazy `Broadcasted`, so nothing
+   field-sized is materialised. The prefactors are applied on the host, in Float64, to the
+   result: in a scaled Float32 run the field is deliberately of order one and the physical
+   units (up to 1e20 apart) would not survive being put back on it. =#
 function _weightedenergy(w, fac, Eω)
     isnothing(w) && error(
         "this energy statistic was built from an energy functional with no device form, "*
         "so it cannot be evaluated on a $(typeof(Eω)).")
+    RT = real(eltype(Eω))
     if ndims(Eω) > 1
-        s = Array(sum(w .* abs2.(Eω); dims=1))
+        s = Array(_zipreduce1(_wabs2, +, zero(RT), w, Eω))
         return [fac*Float64(s[1, i]) for i in axes(s, 2)]
     end
-    fac*Float64(sum(w .* abs2.(Eω)))
+    fac*Float64(_zipreduce(_wabs2, +, zero(RT), w, Eω))
 end
 
 """
@@ -300,6 +356,7 @@ struct SpectralEnergyWindow{F, V, W}
     prefac::Float64
     Eref2::Float64
     key::String
+    ondevice::Bool
 end
 
 """
@@ -308,19 +365,19 @@ end
 Create stats function to calculate the energy filtered by a `window`. The stats dataset will
 be named `energy_[label]`.
 """
-energy_window(grid, energyfun_ω, window::Vector{<:Real}; label) =
-    SpectralEnergyWindow(energyfun_ω, window, nothing, 1.0, 1.0, "energy_$label")
+energy_window(grid, energyfun_ω, window::AbstractVector{<:Real}; label) =
+    SpectralEnergyWindow(energyfun_ω, window, nothing, 1.0, 1.0, "energy_$label", false)
 
 function prepare(f::SpectralEnergyWindow, ctx::StatsContext)
     we = _devenergy(ctx.grid, f.energyfun_ω)
-    isnothing(we) &&
-        return SpectralEnergyWindow(f.energyfun_ω, f.window, nothing, 1.0, 1.0, f.key)
+    isnothing(we) && return SpectralEnergyWindow(f.energyfun_ω, f.window, nothing,
+                                                 1.0, 1.0, f.key, false)
     w, prefac = we
     #= The window multiplies the field, so it enters the reduction squared and folds into
-       the weights: one vector and one fused reduction, no windowed copy of the field. =#
+       the weights: one vector and one reduction, no windowed copy of the field. =#
     SpectralEnergyWindow(f.energyfun_ω, f.window,
                          Luna.todevice(ctx.spec, w .* abs2.(f.window)),
-                         prefac, ctx.Eref^2, f.key)
+                         prefac, ctx.Eref^2, f.key, ctx.ondevice)
 end
 
 device_capable(f::SpectralEnergyWindow) = !isnothing(f.w)
@@ -328,7 +385,7 @@ needs_time(::SpectralEnergyWindow) = false
 statlabel(f::SpectralEnergyWindow) = f.key
 
 function (f::SpectralEnergyWindow)(d, Eω, Et, z, dz)
-    if Utils.isdevice(Eω)
+    if _onstate(f, Eω)
         d[f.key] = _weightedenergy(f.w, f.prefac*f.Eref2, Eω)
     elseif ndims(Eω) > 1
         d[f.key] = [f.energyfun_ω(Eω[:, i].*f.window) for i=1:size(Eω, 2)]
@@ -340,6 +397,7 @@ end
 struct PeakPower{V}
     t::V
     Eref2::Float64
+    ondevice::Bool
 end
 
 """
@@ -347,18 +405,20 @@ end
 
 Create stats function to calculate the peak power.
 """
-peakpower(grid) = PeakPower(grid.t, 1.0)
+peakpower(grid) = PeakPower(grid.t, 1.0, false)
 
-prepare(f::PeakPower, ctx::StatsContext) = PeakPower(f.t, ctx.Eref^2)
+prepare(f::PeakPower, ctx::StatsContext) = PeakPower(f.t, ctx.Eref^2, ctx.ondevice)
 
 device_capable(::PeakPower) = true
 
 function (f::PeakPower)(d, Eω, Et, z, dz)
-    if Utils.isdevice(Et)
+    if _onstate(f, Et)
         if ndims(Et) > 1
-            pp = Array(maximum(abs2.(Et), dims=1))
+            # `maximum(abs2, Et; dims=1)`, not `maximum(abs2.(Et), dims=1)`: the second
+            # materialises the whole block first
+            pp = Array(maximum(abs2, Et; dims=1))
             d["peakpower"] = [f.Eref2*Float64(pp[1, i]) for i in axes(pp, 2)]
-            d["peakpower_allmodes"] = f.Eref2*Float64(maximum(sum(abs2.(Et), dims=2)))
+            d["peakpower_allmodes"] = f.Eref2*Float64(maximum(sum(abs2, Et; dims=2)))
         else
             d["peakpower"] = f.Eref2*Float64(maximum(abs2, Et))
         end
@@ -422,6 +482,7 @@ end
 struct PeakIntensityAeff{A}
     aeff::A
     Eref2::Float64
+    ondevice::Bool
 end
 
 """
@@ -430,14 +491,15 @@ end
 Create stats function to calculate the mode-averaged peak intensity given the effective area
 `aeff(z)`.
 """
-peakintensity(grid, aeff) = PeakIntensityAeff(aeff, 1.0)
+peakintensity(grid, aeff) = PeakIntensityAeff(aeff, 1.0, false)
 
-prepare(f::PeakIntensityAeff, ctx::StatsContext) = PeakIntensityAeff(f.aeff, ctx.Eref^2)
+prepare(f::PeakIntensityAeff, ctx::StatsContext) =
+    PeakIntensityAeff(f.aeff, ctx.Eref^2, ctx.ondevice)
 
 device_capable(::PeakIntensityAeff) = true
 
 function (f::PeakIntensityAeff)(d, Eω, Et, z, dz)
-    if Utils.isdevice(Et)
+    if _onstate(f, Et)
         d["peakintensity"] = f.Eref2*Float64(maximum(abs2, Et))/f.aeff(z)
     else
         d["peakintensity"] = maximum(abs2, Et)/f.aeff(z)
@@ -448,6 +510,7 @@ struct PeakIntensityModes{T, B}
     tospace::T
     Et0::B          # host buffer for the projected field
     Eref2::Float64
+    ondevice::Bool
 end
 
 """
@@ -461,16 +524,17 @@ factor per polarisation component and comes out of the reduction.
 function peakintensity(grid, modes::Modes.ModeCollection; components=:y)
     tospace = Modes.ToSpace(modes, components=components)
     Et0 = zeros(ComplexF64, (length(grid.t), tospace.npol))
-    PeakIntensityModes(tospace, Et0, 1.0)
+    PeakIntensityModes(tospace, Et0, 1.0, false)
 end
 
 prepare(f::PeakIntensityModes, ctx::StatsContext) =
-    PeakIntensityModes(f.tospace, f.Et0, ctx.Eref^2)
+    PeakIntensityModes(f.tospace, f.Et0, ctx.Eref^2,
+                       ctx.ondevice && device_capable(f))
 
 device_capable(f::PeakIntensityModes) = f.tospace.nmodes == 1
 
 function (f::PeakIntensityModes)(d, Eω, Et, z, dz)
-    if Utils.isdevice(Et)
+    if _onstate(f, Et)
         d["peakintensity"] = c*ε_0/2 * f.Eref2 * _onaxisfactor(f.tospace, z) *
                              Float64(maximum(abs2, Et))
     else
@@ -503,6 +567,7 @@ struct FWHMt{V, B, H}
     t::V
     Pd::B       # |Et|^2 on the state's array type
     Ph::H       # the same on the host
+    ondevice::Bool
 end
 
 """
@@ -513,17 +578,18 @@ Create stats function to calculate the temporal FWHM (pulse duration) for mode a
 On a device only `|E|^2` is copied to the host; the FWHM itself is then found by the same
 root-finding on the same samples as on the host.
 """
-fwhm_t(grid) = FWHMt(grid.t, nothing, nothing)
+fwhm_t(grid) = FWHMt(grid.t, nothing, nothing, false)
 
 function prepare(f::FWHMt, ctx::StatsContext)
+    ctx.ondevice || return FWHMt(f.t, nothing, nothing, false)
     Pd = Luna.alloc(ctx.spec, Luna.realtype(ctx.spec), _timedims(ctx))
-    FWHMt(f.t, Pd, Array{Luna.realtype(ctx.spec)}(undef, size(Pd)))
+    FWHMt(f.t, Pd, Array{Luna.realtype(ctx.spec)}(undef, size(Pd)), true)
 end
 
 device_capable(::FWHMt) = true
 
 function (f::FWHMt)(d, Eω, Et, z, dz)
-    Pt = if Utils.isdevice(Et)
+    Pt = if _onstate(f, Et)
         f.Pd .= abs2.(Et)
         copyto!(f.Ph, f.Pd)
         f.Ph
@@ -587,6 +653,7 @@ struct ElectronDensityAeff{R, RD, D, A, V, B, W}
     rate::B         # device buffer for the rate
     w::W            # trapezoid weights on the state's array type
     Eref::Float64
+    ondevice::Bool
 end
 
 """
@@ -608,25 +675,25 @@ integral is ever read, and that end point is the trapezoid rule over the whole w
 function electrondensity(grid::Grid.RealGrid, ionrate!, dfun, aeff; oversampling=1)
     to, _ = Maths.oversample(grid.t, complex(grid.t), factor=oversampling)
     ElectronDensityAeff(ionrate!, ionrate!, dfun, aeff, oversampling, grid.t,
-                        to[2]-to[1], similar(to), nothing, nothing, 1.0)
+                        to[2]-to[1], similar(to), nothing, nothing, 1.0, false)
 end
 
 function prepare(f::ElectronDensityAeff, ctx::StatsContext)
-    device_capable(f) || return f
+    (ctx.ondevice && device_capable(f)) || return f
     n = length(f.frac)
     w = ones(n)
     w[1] = w[n] = 0.5
     ElectronDensityAeff(f.ratefunc, Ionisation.device_rate(f.ratefunc, ctx.spec),
                         f.dfun, f.aeff, f.oversampling, f.t, f.δt, f.frac,
                         Luna.alloc(ctx.spec, Luna.realtype(ctx.spec), (n,)),
-                        Luna.todevice(ctx.spec, w), ctx.Eref)
+                        Luna.todevice(ctx.spec, w), ctx.Eref, true)
 end
 
 device_capable(f::ElectronDensityAeff) =
     f.oversampling == 1 && Ionisation.device_capable(f.ratefunc)
 
 function (f::ElectronDensityAeff)(d, Eω, Et, z, dz)
-    if Utils.isdevice(Et)
+    if _onstate(f, Et)
         #= `Eref/sqrt(...)` is what the kernel multiplies each sample by: it takes the
            scaled state to the physical field and the physical field to the one which
            drives the rate. The host branch divides the field itself instead. =#
@@ -634,7 +701,8 @@ function (f::ElectronDensityAeff)(d, Eω, Et, z, dz)
         rk = Ionisation.ratekernel(f.ratedev, Luna.scalar(f.rate, Erate))
         f.rate .= rk.(real.(Et))
         ratemax = Float64(maximum(f.rate))
-        intg = f.δt*Float64(sum(f.w .* f.rate))
+        # one reduction over a lazy `Broadcasted`, so no temporary the size of `rate`
+        intg = f.δt*Float64(_zipreduce(_wmul, +, zero(eltype(f.rate)), f.w, f.rate))
         d["electrondensity"] = (1 - exp(-intg))*f.dfun(z)
         d["peak_ionisation_rate"] = ratemax
     else
@@ -856,6 +924,22 @@ device_capable(::ConstZDW) = true
 needs_time(::ConstZDW) = false
 (f::ConstZDW)(d, Eω, Et, z, dz) = d["zdw"] = f.zdw
 
+"""
+    UserStat(f, label)
+
+A statistics function the user supplied through `Stats.default`'s `userfuns`, wrapped so
+that it has a name. It has no device form, so it is what makes the whole set run on the
+host; the wrapper exists only so that the one-time warning can say `userfuns[1]` instead
+of the gensym an anonymous closure's type carries.
+"""
+struct UserStat{F}
+    f::F
+    label::String
+end
+
+(u::UserStat)(d, Eω, Et, z, dz) = u.f(d, Eω, Et, z, dz)
+statlabel(u::UserStat) = u.label
+
 # convert missing to NaN
 missnan(x) = ismissing(x) ? NaN : x
 
@@ -938,7 +1022,41 @@ struct StatsCollector{F, B, A}
 end
 
 """
-    collect_stats(grid, Eω, funcs...; Eref=1.0)
+    STATS_DEVICE_MINLEN
+
+The number of elements a *single-column* state has to have before [`collect_stats`](@ref)
+evaluates the statistics on the device rather than on a host copy of it. Below it the copy
+is cheaper.
+
+The cost the device path adds is a fixed number of device-to-host round trips -- one per
+statistic that ends in a scalar read, six for the default set -- and a round trip does not
+depend on the grid size. The cost it removes is one transfer of the state, which does.
+Measured on an M1 Pro through Metal (`benchmark/stats.jl`), a round trip is ~400 µs and
+the default set costs 2.7-3.6 ms on the device for 1025 to 16385 elements, against
+0.34-1.31 ms for the copy plus the host branches. The transfer only reaches the ~2.7 ms
+the round trips cost at a few million elements, which is what this threshold is; a
+single-column state that large is not something Luna produces, so in practice a
+mode-averaged run always takes the host path. `stats_device=:device` overrides it.
+
+A state with **more than one column** takes the device path whatever its length. That is a
+forward-looking rule, not one this branch can measure: no transform here produces a
+multi-column device state (the radial, free-space and multimode transforms are host-only
+until `gpu/20`-`gpu/22`). On a synthetic multi-column state the device path is still the
+slower of the two at 16 and 128 columns, because `fwhm_t` copies the time-domain intensity
+to the host on either path and its per-column root-finding is host work either way. See
+`PR_24-stats-device.md`; it is worth re-measuring when a device-capable multi-column
+transform exists.
+"""
+const STATS_DEVICE_MINLEN = 1 << 22
+
+"The number of columns (transverse points, modes) of a state."
+_ncols(x::AbstractArray) = ndims(x) < 2 ? 1 : prod(size(x)[2:end])
+
+"Whether the device path is worth taking for a state of this shape; see `STATS_DEVICE_MINLEN`."
+_devicepays(x) = _ncols(x) > 1 || length(x) >= STATS_DEVICE_MINLEN
+
+"""
+    collect_stats(grid, Eω, funcs...; Eref=1.0, stats_device=:auto)
 
 Create a callable which collects statistics from the individual functions in `funcs`.
 
@@ -956,36 +1074,84 @@ what the buffers and the inverse transform are built for, and every statistic is
 device branches only -- on the host the state is in physical units by the time the
 statistics see it. [`default`](@ref) takes it from the transform.
 
-The inverse transform which produces `Et` is done once per call, and only when at least
-one of `funcs` reads it ([`needs_time`](@ref)).
+The inverse transform which produces `Et` is *applied* once per call, and only when at
+least one of `funcs` reads it ([`needs_time`](@ref)); it is planned and its buffers are
+allocated either way.
 
-If any of `funcs` has no device form ([`device_capable`](@ref)) and `Eω` is a device
-array, everything is built for the *host* instead, because that is what the set will be
-called with: `Luna.ScaledOutput` copies the state down and unscales it for a set which
-cannot run where the state lives.
+# Which array the set is built for
+
+Everything -- buffers, mirrors, the inverse plan, and each statistic's `ondevice` flag --
+is built for one array, decided here and reported by
+[`Luna.stats_device_capable`](@ref), which is what `Luna.ScaledOutput` uses to decide
+whether to copy the state to the host. The device state is used when
+
+- it is a device array, **and**
+- every one of `funcs` has a device form ([`device_capable`](@ref)), **and**
+- `stats_device` allows it.
+
+`stats_device` is `:auto` (the default), `:device` or `:host`. Under `:auto` the device
+state is used only when it has more than one column or at least
+[`STATS_DEVICE_MINLEN`](@ref) elements; that docstring has the measurement behind the
+rule. A single-column mode-averaged state is below both, and there the device path costs
+more than the copy it avoids: every statistic which ends in a device-to-host transfer
+costs the same round trip whatever the grid size (~400 µs on an M1 Pro through Metal), and
+the default set makes six of them, against one transfer of a few tens of kilobytes for the
+host path. `:device` overrides the shape test (the capability test still applies); `:host`
+builds for the host whatever the state is.
+
+Otherwise everything is built for a host copy in physical units, with `Eref = 1`, because
+that is what `Luna.ScaledOutput` will hand it.
 """
-function collect_stats(grid, Eω, funcs...; Eref=1.0)
+function collect_stats(grid, Eω, funcs...; Eref=1.0, stats_device=:auto)
     # make sure z and dz are recorded
     if !(zdz! in funcs)
         funcs = (funcs..., zdz!)
     end
-    ctx = StatsContext(grid, Eω, Eref)
+    stats_device in (:auto, :device, :host) || throw(ArgumentError(
+        "stats_device must be :auto, :device or :host, got :$stats_device"))
+    ondev = Utils.isdevice(Eω) && stats_device !== :host &&
+            (stats_device === :device || _devicepays(Eω))
+    #= A set built for the host is called with a host copy in physical units, so it gets
+       the host prototype and `Eref = 1`. Building it for the device instead would leave
+       its buffers and its plan on the device while the field is not, which JLArrays
+       tolerates silently and real hardware does not (review round 1, finding 1). =#
+    ctx = StatsContext(grid, ondev ? Eω : Luna.tohost(Eω), ondev ? Eref : 1.0, ondev)
     prepped = map(f -> prepare(f, ctx), funcs)
     capable = all(device_capable, prepped)
-    #= A set which is not device-capable is never *called* with the device state:
-       `Luna.ScaledOutput` sees that (through `Luna.stats_device_capable`) and hands it a
-       host copy in physical units instead. Everything then has to be built for the host,
-       or the buffers and the plan would be on the device while the field is not -- which
-       JLArrays tolerates silently and real hardware does not. The scaling goes with it:
-       the copy is already unscaled. =#
-    if !capable && Utils.isdevice(Eω)
-        ctx = StatsContext(grid, Luna.tohost(Eω), 1.0)
+    if ondev && !capable
+        ondev = false
+        ctx = StatsContext(grid, Luna.tohost(Eω), 1.0, false)
         prepped = map(f -> prepare(f, ctx), funcs)
     end
+    hostlist = String[statlabel(f) for f in prepped if !device_capable(f)]
+    _logstatspath(Eω, ondev, hostlist, stats_device)
     Et, analytic! = plan_analytic(grid, ctx.proto)
-    StatsCollector(prepped, Et, analytic!,
-                   any(needs_time, prepped), capable,
-                   String[statlabel(f) for f in prepped if !device_capable(f)])
+    StatsCollector(prepped, Et, analytic!, any(needs_time, prepped), ondev, hostlist)
+end
+
+#= One line per propagation, and only when there is a choice to report: on a host run
+   there is nothing to say. `Luna.ScaledOutput`'s one-time warning covers only the case
+   where a statistic has no device form at all, so the other two reasons for the host
+   path are said here. =#
+function _logstatspath(Eω, ondev, hostlist, stats_device)
+    Utils.isdevice(Eω) || return nothing
+    if ondev
+        Logging.@info("Per-step statistics run on the device.")
+    elseif !isempty(hostlist)
+        Logging.@info(
+            "Per-step statistics run on the host: "*join(hostlist, ", ")*" "*
+            (length(hostlist) == 1 ? "has" : "have")*" no device form, so the field is "*
+            "copied from the device on every step the statistics fire.")
+    elseif stats_device === :host
+        Logging.@info("Per-step statistics run on the host (stats_device=:host).")
+    else
+        Logging.@info(
+            "Per-step statistics run on the host: this state is a single column of "*
+            "$(length(Eω)) elements, below Stats.STATS_DEVICE_MINLEN, where copying it "*
+            "down costs less than the device reductions. Pass stats_device=:device to "*
+            "override.")
+    end
+    nothing
 end
 
 function (c::StatsCollector)(Eω, z, dz)
@@ -997,6 +1163,15 @@ function (c::StatsCollector)(Eω, z, dz)
     return d
 end
 
+"""
+    device_capable(c::StatsCollector) -> Bool
+
+For a whole set this is the *path* it was built for, not only what its members are capable
+of: `false` when every statistic has a device form but [`collect_stats`](@ref) chose the
+host anyway (a single small column, or `stats_device=:host`). `Luna.ScaledOutput` reads it
+to decide whether to copy the state down, so it has to answer "which array will this set
+be called with".
+"""
 device_capable(c::StatsCollector) = c.devicecapable
 statlabel(::StatsCollector) = "statistics"
 
@@ -1028,9 +1203,14 @@ multimode (`mode_s::Modes.ModeCollection`) propagation.
 `Eω` is the propagating state itself, not a host copy of it: the statistics are built for
 its array type and precision, and the unit scaling they have to undo is taken from
 `transform`.
+
+`stats_device` (`:auto`, `:device` or `:host`) is passed to [`collect_stats`](@ref), which
+documents what it chooses and why. `prop_capillary` does not take it directly; reach it
+through `stats_kwargs`.
 """
 function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
-                 windows=nothing, gas=nothing, onaxis=false, userfuns=Any[])
+                 windows=nothing, gas=nothing, onaxis=false, userfuns=Any[],
+                 stats_device=:auto)
     _, energyfunω = Fields.energyfuncs(grid)
     funs = [ω0(grid), energy(grid, energyfunω), peakpower(grid),
             fwhm_t(grid), zdw_linop(mode, linop),
@@ -1057,19 +1237,15 @@ function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
             push!(funs, energy_λ(grid, energyfunω, win))
         end
     end
-    for (idx, uf) in enumerate(userfuns)
-        if uf in funs
-            @warn("userfun $idx is already present in the default set and will be ignored")
-        else
-            push!(funs, uf)
-        end
-    end
-    collect_stats(grid, Eω, funs...; Eref=Luna.runscaling(transform).Eref)
+    _adduserfuns!(funs, userfuns)
+    collect_stats(grid, Eω, funs...;
+                  Eref=Luna.runscaling(transform).Eref, stats_device)
 end
 
 @doc (@doc default)
 function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
-                 windows=nothing, gas=nothing, mode_error=true, userfuns=Any[])
+                 windows=nothing, gas=nothing, mode_error=true, userfuns=Any[],
+                 stats_device=:auto)
     _, energyfunω = Fields.energyfuncs(grid)
     pol = transform.ts.indices == 1:2 ? :xy : transform.ts.indices == 1 ? :x : :y
     funs = [ω0(grid), energy(grid, energyfunω), peakpower(grid),
@@ -1094,14 +1270,26 @@ function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
             push!(funs, energy_λ(grid, energyfunω, win))
         end
     end
+    _adduserfuns!(funs, userfuns)
+    collect_stats(grid, Eω, funs...;
+                  Eref=Luna.runscaling(transform).Eref, stats_device)
+end
+
+#= Each user statistic is wrapped in a `UserStat` carrying `userfuns[i]` as its name, so
+   that the one-time warning about the host copy names the thing the user wrote rather
+   than the gensym an anonymous closure's type carries. The duplicate check compares the
+   functions as given, not the wrappers. =#
+function _adduserfuns!(funs, userfuns)
+    seen = Any[]
     for (idx, uf) in enumerate(userfuns)
-        if uf in funs
-            @warn("userfun $uf is already present in the default set and will be ignored")
+        if (uf in funs) || any(u -> u === uf, seen)
+            @warn("userfun $idx is already present in the default set and will be ignored")
         else
-            push!(funs, uf)
+            push!(seen, uf)
+            push!(funs, UserStat(uf, "userfuns[$idx]"))
         end
     end
-    collect_stats(grid, Eω, funs...; Eref=Luna.runscaling(transform).Eref)
+    funs
 end
 
 # For constant linop, ZDW is also constant

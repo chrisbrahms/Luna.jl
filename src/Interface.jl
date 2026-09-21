@@ -393,11 +393,14 @@ If `raman` is `true`, then the following options apply:
     step (see [`Output.PeriodicStats`](@ref) and [`Output.maybe_periodic`](@ref)). An
     integer (the default, `1`) collects every `stats_period`-th accepted step; a
     non-integer value collects every time the propagation distance has advanced by at
-    least `stats_period` metres. The default statistics are evaluated on the device, so
-    raising this only saves their own cost; a statistics function added through
-    `stats_kwargs[:userfuns]` has no device form and makes every step whose statistics
-    fire copy the field to the host, which is where raising it matters. `Luna.run` warns
-    once per propagation, naming the statistics responsible, when a copy is needed.
+    least `stats_period` metres. On a device this is still the lever it always was: a
+    mode-averaged state is a single column, where computing the default statistics from a
+    host copy of the field costs less than the device reductions, so the field is copied
+    down on every step they fire on (see [`Stats.collect_stats`](@ref
+    Luna.Stats.collect_stats) and `Stats.STATS_DEVICE_MINLEN`; pass
+    `stats_kwargs=Dict(:stats_device => :device)` to override the choice). A statistics
+    function added through `stats_kwargs[:userfuns]` has no device form at all; `Luna.run`
+    warns once per propagation, naming it, when one forces the copy.
 """
 function prop_capillary(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
