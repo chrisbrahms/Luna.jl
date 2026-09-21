@@ -438,6 +438,12 @@ Set up a radially symmetric free-space propagation: plan the transforms, build t
 The input fields are built on the host in `Float64` (`Fields` is host scalar code), so the
 transform they need is planned on the host whatever the run uses; the returned `FT` is the
 plan on the *state's* array type, which is what the absorbing boundaries apply.
+
+!!! note "Statistics"
+    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, transform, linop)` builds the
+    default statistics set for the returned transform: the total energy, the peak
+    intensity, `ω0` and the duration on the propagation axis, the beam size, the energy
+    in the absorbing collar, and the electron density with plasma.
 """
 function setup(grid::Grid.RealGrid, rg::Grid.RadialGrid,
                densityfun, normfun, responses, inputs; kwargs...)
@@ -515,6 +521,12 @@ The joint time-and-space transform is one multi-axis plan — region `(1, 3, 4)`
 The input fields are built on the host in `Float64` (`Fields` is host scalar code), so the
 transform they need is planned on the host whatever the run uses; the returned `FT` is the
 plan on the *state's* array type, which is what the absorbing boundaries apply.
+
+!!! note "Statistics"
+    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, transform, linop)` builds the
+    default statistics set for the returned transform: the total energy, the peak
+    intensity, `ω0` and the duration on the propagation axis, the beam size, the energy
+    in the absorbing collar, and the electron density with plasma.
 """
 function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
                densityfun, normfun, responses, inputs; kwargs...)
