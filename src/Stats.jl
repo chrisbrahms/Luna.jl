@@ -188,17 +188,17 @@ end
 #===============  THE STATISTICS  ================#
 #=================================================#
 
+struct CentreOfMass{V, W}
+    ω::V        # the frequency axis, as `Maths.moment` takes it (host)
+    ωd::W       # the same on the state's array type and precision
+end
+
 """
     ω0(grid)
 
 Create stats function to calculate the centre of mass (first moment) of the spectral power
 density.
 """
-struct CentreOfMass{V, W}
-    ω::V        # the frequency axis, as `Maths.moment` takes it (host)
-    ωd::W       # the same on the state's array type and precision
-end
-
 ω0(grid) = CentreOfMass(grid.ω, grid.ω)
 
 prepare(f::CentreOfMass, ctx::StatsContext) =
@@ -222,6 +222,14 @@ end
 squeeze(ω0::Array{T, 1}) where T = ω0[1]
 squeeze(ω0::Array{T, 2}) where T = ω0[1, :]
 
+struct SpectralEnergy{F, W}
+    energyfun_ω::F
+    w::W            # spectral weights on the state's array type, or `nothing`
+    prefac::Float64
+    Eref2::Float64  # E_ref^2: the energy is quadratic in the field
+    key::String
+end
+
 """
     energy(grid, energyfun_ω)
 
@@ -231,14 +239,6 @@ On a device the integral is the same rule as `energyfun_ω`'s written as one wei
 reduction (see `Stats._devenergy`); the scalar prefactor and the square of the unit
 scaling are applied to the result, in `Float64`.
 """
-struct SpectralEnergy{F, W}
-    energyfun_ω::F
-    w::W            # spectral weights on the state's array type, or `nothing`
-    prefac::Float64
-    Eref2::Float64  # E_ref^2: the energy is quadratic in the field
-    key::String
-end
-
 energy(grid, energyfun_ω) = SpectralEnergy(energyfun_ω, nothing, 1.0, 1.0, "energy")
 
 function prepare(f::SpectralEnergy, ctx::StatsContext)
@@ -293,12 +293,6 @@ function energy_λ(grid, energyfun_ω, λlims; label=nothing, winwidth=0)
     energy_window(grid, energyfun_ω, window; label=label)
 end
 
-"""
-    energy_window(grid, energyfun_ω, window; label)
-
-Create stats function to calculate the energy filtered by a `window`. The stats dataset will
-be named `energy_[label]`.
-"""
 struct SpectralEnergyWindow{F, V, W}
     energyfun_ω::F
     window::V       # the host window, as given
@@ -308,6 +302,12 @@ struct SpectralEnergyWindow{F, V, W}
     key::String
 end
 
+"""
+    energy_window(grid, energyfun_ω, window; label)
+
+Create stats function to calculate the energy filtered by a `window`. The stats dataset will
+be named `energy_[label]`.
+"""
 energy_window(grid, energyfun_ω, window::Vector{<:Real}; label) =
     SpectralEnergyWindow(energyfun_ω, window, nothing, 1.0, 1.0, "energy_$label")
 
@@ -337,16 +337,16 @@ function (f::SpectralEnergyWindow)(d, Eω, Et, z, dz)
     end
 end
 
-"""
-    peakpower(grid)
-
-Create stats function to calculate the peak power.
-"""
 struct PeakPower{V}
     t::V
     Eref2::Float64
 end
 
+"""
+    peakpower(grid)
+
+Create stats function to calculate the peak power.
+"""
 peakpower(grid) = PeakPower(grid.t, 1.0)
 
 prepare(f::PeakPower, ctx::StatsContext) = PeakPower(f.t, ctx.Eref^2)
@@ -419,17 +419,17 @@ function peakpower(grid, Eω, λlims::NTuple{2, <:Real}; label=nothing, winwidth
 end
 
 
+struct PeakIntensityAeff{A}
+    aeff::A
+    Eref2::Float64
+end
+
 """
     peakintensity(grid, aeff)
 
 Create stats function to calculate the mode-averaged peak intensity given the effective area
 `aeff(z)`.
 """
-struct PeakIntensityAeff{A}
-    aeff::A
-    Eref2::Float64
-end
-
 peakintensity(grid, aeff) = PeakIntensityAeff(aeff, 1.0)
 
 prepare(f::PeakIntensityAeff, ctx::StatsContext) = PeakIntensityAeff(f.aeff, ctx.Eref^2)
@@ -444,6 +444,12 @@ function (f::PeakIntensityAeff)(d, Eω, Et, z, dz)
     end
 end
 
+struct PeakIntensityModes{T, B}
+    tospace::T
+    Et0::B          # host buffer for the projected field
+    Eref2::Float64
+end
+
 """
     peakintensity(grid, modes; components=:y)
 
@@ -452,12 +458,6 @@ Create stats function to calculate the peak intensity for several modes.
 Device-capable for a single mode, where projecting onto the transverse plane is a scalar
 factor per polarisation component and comes out of the reduction.
 """
-struct PeakIntensityModes{T, B}
-    tospace::T
-    Et0::B          # host buffer for the projected field
-    Eref2::Float64
-end
-
 function peakintensity(grid, modes::Modes.ModeCollection; components=:y)
     tospace = Modes.ToSpace(modes, components=components)
     Et0 = zeros(ComplexF64, (length(grid.t), tospace.npol))
@@ -499,6 +499,12 @@ function _onaxisfactor(ts::Modes.ToSpace, z)
     sum(abs2, E)
 end
 
+struct FWHMt{V, B, H}
+    t::V
+    Pd::B       # |Et|^2 on the state's array type
+    Ph::H       # the same on the host
+end
+
 """
     fwhm_t(grid)
 
@@ -507,12 +513,6 @@ Create stats function to calculate the temporal FWHM (pulse duration) for mode a
 On a device only `|E|^2` is copied to the host; the FWHM itself is then found by the same
 root-finding on the same samples as on the host.
 """
-struct FWHMt{V, B, H}
-    t::V
-    Pd::B       # |Et|^2 on the state's array type
-    Ph::H       # the same on the host
-end
-
 fwhm_t(grid) = FWHMt(grid.t, nothing, nothing)
 
 function prepare(f::FWHMt, ctx::StatsContext)
@@ -544,6 +544,11 @@ function (f::FWHMt)(d, Eω, Et, z, dz)
     end
 end
 
+struct FWHMr{T, B}
+    tospace::T
+    Eω0::B
+end
+
 """
     fwhm_r(grid, modes; components=:y)
 
@@ -554,11 +559,6 @@ evaluation of which projects the whole spectrum onto one transverse point. There
 reduction over the state to move to a device, and the modal transform which produces such
 a state is host-only in any case.
 """
-struct FWHMr{T, B}
-    tospace::T
-    Eω0::B
-end
-
 function fwhm_r(grid, modes; components=:y)
     tospace = Modes.ToSpace(modes, components=components)
     FWHMr(tospace, zeros(ComplexF64, (length(grid.ω), tospace.npol)))
@@ -573,6 +573,20 @@ function (f::FWHMr)(d, Eω, Et, z, dz)
         sum(abs2, f.Eω0)
     end
     d["fwhm_r"] = 2*Maths.hwhm(g)
+end
+
+struct ElectronDensityAeff{R, RD, D, A, V, B, W}
+    ratefunc::R     # the rate as given: host, physical units
+    ratedev::RD     # the same in the run's precision and array type
+    dfun::D
+    aeff::A
+    oversampling::Int
+    t::V            # the time axis of the grid, host (what `oversample` is given)
+    δt::Float64     # the step of the *oversampled* axis
+    frac::Vector{Float64}   # host buffer: the rate, then the ionisation fraction
+    rate::B         # device buffer for the rate
+    w::W            # trapezoid weights on the state's array type
+    Eref::Float64
 end
 
 """
@@ -591,20 +605,6 @@ scaling folded into the field reference the kernel multiplies each sample by, an
 the ionisation integral as one weighted reduction: only the end point of the cumulative
 integral is ever read, and that end point is the trapezoid rule over the whole window.
 """
-struct ElectronDensityAeff{R, RD, D, A, V, B, W}
-    ratefunc::R     # the rate as given: host, physical units
-    ratedev::RD     # the same in the run's precision and array type
-    dfun::D
-    aeff::A
-    oversampling::Int
-    t::V            # the time axis of the grid, host (what `oversample` is given)
-    δt::Float64     # the step of the *oversampled* axis
-    frac::Vector{Float64}   # host buffer: the rate, then the ionisation fraction
-    rate::B         # device buffer for the rate
-    w::W            # trapezoid weights on the state's array type
-    Eref::Float64
-end
-
 function electrondensity(grid::Grid.RealGrid, ionrate!, dfun, aeff; oversampling=1)
     to, _ = Maths.oversample(grid.t, complex(grid.t), factor=oversampling)
     ElectronDensityAeff(ionrate!, ionrate!, dfun, aeff, oversampling, grid.t,
@@ -658,6 +658,17 @@ function _ionfrac!(out, ionrate!, Et, δt)
     return ratemax
 end
 
+struct ElectronDensityModes{R, D, T, V, B}
+    ratefunc::R
+    dfun::D
+    tospace::T
+    oversampling::Int
+    t::V            # the time axis of the grid, host (what `oversample` is given)
+    δt::Float64     # the step of the *oversampled* axis
+    frac::Vector{Float64}
+    Et0::B
+end
+
 """
     electrondensity(grid, ionrate, dfun, modes; oversampling=1)
 
@@ -670,17 +681,6 @@ If oversampling > 1, the field is oversampled before the calculation
 Host-only: the field has to be projected onto the transverse plane first, and the modal
 transform which produces the state is host-only in any case.
 """
-struct ElectronDensityModes{R, D, T, V, B}
-    ratefunc::R
-    dfun::D
-    tospace::T
-    oversampling::Int
-    t::V            # the time axis of the grid, host (what `oversample` is given)
-    δt::Float64     # the step of the *oversampled* axis
-    frac::Vector{Float64}
-    Et0::B
-end
-
 function electrondensity(grid::Grid.RealGrid, ionrate!, dfun,
                          modes::Modes.ModeCollection;
                          components=:y, oversampling=1)
@@ -706,6 +706,13 @@ function (f::ElectronDensityModes)(d, Eω, Et, z, dz)
     d["peak_ionisation_rate"] = ratemax
 end
 
+struct ModeReconstructionError{T, A, B}
+    t::T
+    Prω_recon::A
+    difference::A
+    nl::B
+end
+
 """
     mode_reconstruction_error(t::TransModal)
 
@@ -714,13 +721,6 @@ induced polarisation on axis at every step.
 
 Host-only: it evaluates the modal transform itself, which is host code.
 """
-struct ModeReconstructionError{T, A, B}
-    t::T
-    Prω_recon::A
-    difference::A
-    nl::B
-end
-
 function mode_reconstruction_error(t::TransModal)
     Prω_recon = similar(t.Prω)
     ModeReconstructionError(t, Prω_recon, similar(Prω_recon), similar(t.Emω))
@@ -750,19 +750,24 @@ end
 #= The statistics which read nothing but `z`: they never touch the state, so they run
    wherever it lives. =#
 
+struct Density{D}
+    dfun::D
+end
+
 """
     density(dfun)
 
 Create stats function to capture the gas density as defined by `dfun(z)`
 """
-struct Density{D}
-    dfun::D
-end
-
 density(dfun) = Density(dfun)
 device_capable(::Density) = true
 needs_time(::Density) = false
 (f::Density)(d, Eω, Et, z, dz) = d["density"] = f.dfun(z)
+
+struct Pressure{D, G}
+    dfun::D
+    gas::G
+end
 
 """
     pressure(dfun, gas)
@@ -770,11 +775,6 @@ needs_time(::Density) = false
 Create stats function to capture the pressure. Like [`density`](@ref) but converts to
 pressure. A `Tuple` of gases (a mixture) records one dataset per component.
 """
-struct Pressure{D, G}
-    dfun::D
-    gas::G
-end
-
 pressure(dfun, gas) = Pressure(dfun, gas)
 device_capable(::Pressure) = true
 needs_time(::Pressure) = false
@@ -788,22 +788,27 @@ function (f::Pressure{D, <:Tuple})(d, Eω, Et, z, dz) where {D}
     end
 end
 
+struct CoreRadius{A}
+    a::A
+end
+
 """
     core_radius(a)
 
 Create stats function to capture core radius as defined by `a` (either a `Number` or a
 callable `a(z)`)
 """
-struct CoreRadius{A}
-    a::A
-end
-
 core_radius(a) = CoreRadius(a)
 device_capable(::CoreRadius) = true
 needs_time(::CoreRadius) = false
 
 (f::CoreRadius{<:Number})(d, Eω, Et, z, dz) = d["core_radius"] = f.a
 (f::CoreRadius)(d, Eω, Et, z, dz) = d["core_radius"] = f.a(z)
+
+mutable struct ZDW{M, L}
+    mode_s::M
+    λ00::L      # the last ZDW found, as the next root-finding guess
+end
 
 """
     zdw(mode; λmin, λmax)
@@ -814,11 +819,6 @@ each of several modes. The previous step's ZDW is the starting guess for the nex
 !!! warning
     Since [`Modes.zdw`](@ref) is based on root-finding of a derivative, this can be slow!
 """
-mutable struct ZDW{M, L}
-    mode_s::M
-    λ00::L      # the last ZDW found, as the next root-finding guess
-end
-
 function zdw(mode::Modes.AbstractMode; λmin=100e-9, λmax=3000e-9)
     λ00 = Modes.zdw(mode; λmin=λmin, λmax=λmax, z=0)
     ZDW(mode, ismissing(λ00) ? λmin : λ00)
@@ -928,6 +928,15 @@ end
 #==============  THE COLLECTOR  ==================#
 #=================================================#
 
+struct StatsCollector{F, B, A}
+    funcs::F
+    Et::B
+    analytic!::A
+    needtime::Bool
+    devicecapable::Bool
+    hostlist::Vector{String}
+end
+
 """
     collect_stats(grid, Eω, funcs...; Eref=1.0)
 
@@ -955,15 +964,6 @@ array, everything is built for the *host* instead, because that is what the set 
 called with: `Luna.ScaledOutput` copies the state down and unscales it for a set which
 cannot run where the state lives.
 """
-struct StatsCollector{F, B, A}
-    funcs::F
-    Et::B
-    analytic!::A
-    needtime::Bool
-    devicecapable::Bool
-    hostlist::Vector{String}
-end
-
 function collect_stats(grid, Eω, funcs...; Eref=1.0)
     # make sure z and dz are recorded
     if !(zdz! in funcs)

@@ -665,8 +665,9 @@ is passed through unchanged. It holds two reusable host buffers in the state's e
 type (so a `Float32` run saves `Float32`, not `Float64`):
 
 - `ybuf`, the unscaled host copy of the per-step solution `y`, filled when the handler's
-  statistics need it (`Output.nostats` does not) or when an `HDF5Output`'s resume cache
-  does (gated by `willsave`, since the cache is written only on a save step);
+  statistics need it (`Output.nostats` does not, and neither does a statistics set which
+  runs on the device — see "Statistics" below) or when an `HDF5Output`'s resume cache does
+  (gated by `willsave`, since the cache is written only on a save step);
 - `ibuf`, the unscaled host copy of a *saved* field, filled lazily inside the closure
   `Luna.run`'s `stepfun` already passes as `yfun` — so a step which does not save costs
   nothing, and an `HDF5Output`'s `while save` loop, which can call `yfun` several times
@@ -688,14 +689,76 @@ uploading it back to the state's array type. `HDF5Output`'s `cachehash` includes
 `eltype(y)`, so resuming a run in a different precision than the cache was written in is
 refused rather than silently misinterpreted.
 
-Per-step statistics (`Stats.jl`) are unchanged host code: they do a full inverse FFT and
-host reductions on whatever `y` `ScaledOutput` hands them, which on a device is a copy
-made every accepted step. `ScaledOutput` warns once per propagation when this happens.
 [`Output.PeriodicStats`](@ref) (`prop_capillary`'s/`prop_gnlse`'s `stats_period` keyword)
-reduces how often that copy and the statistics themselves run, by evaluating the wrapped
-function only every `period`-th accepted step and returning `nothing` in between —
+reduces how often the statistics run, by evaluating the wrapped function only every
+`period`-th accepted step and returning `nothing` in between —
 `MemoryOutput`/`HDF5Output` skip appending a `nothing` result rather than erroring on it.
-Device-capable statistics (skipping the copy) are `gpu/24`'s.
+
+## Statistics
+
+`Stats.jl`'s default sets are callable structs, not closures, so that they can carry three
+traits:
+
+| trait | what it says |
+| --- | --- |
+| [`Stats.device_capable`](@ref Luna.Stats.device_capable) | the statistic can be evaluated on the state as the stepper holds it: a device array, in scaled units |
+| [`Stats.needs_time`](@ref Luna.Stats.needs_time) | it reads the time-domain field `Et`, so the inverse transform has to be done |
+| [`Stats.statlabel`](@ref Luna.Stats.statlabel) | what to call it in a diagnostic |
+
+The fallbacks are `false`, `true` and the type's name, which is what a user-written closure
+gets: it is handed a host copy in physical units and works exactly as it always has.
+
+Each struct has two branches. The **host branch** is the code Luna has always run, kept
+arithmetically identical to it. The **device branch** is reductions and broadcasts over the
+state. Which one runs is decided by `Utils.isdevice`, not by precision, so a `Float32` run
+on the host takes the host branch too and the CPU output does not move at all (the
+regression gate is exactly `0.000e+00` on every row).
+
+The device branches are:
+
+| statistic | on a device |
+| --- | --- |
+| `ω0` | two fused reductions, instead of materialising `abs2.(Eω)` |
+| `energy`, `energy_λ`, `energy_window` | the frequency integral as one weighted reduction; a window folds into the weights squared |
+| `peakpower`, `peakintensity` | one `maximum`; the on-axis form takes the single mode's transverse field out of the reduction as a scalar |
+| `fwhm_t` | `abs2` into a device buffer, one copy of *that* to the host, then the same root-finding on the same samples |
+| `electrondensity` (mode-averaged) | one broadcast of the ionisation-rate kernel off the state, then two reductions |
+| `density`, `pressure`, `core_radius`, `zdw`, `zdz!` | they read only `z` |
+| `fwhm_r`, `mode_reconstruction_error` | **not device-capable**: they keep their algorithms on the host |
+
+`Fields.energyfuncs(grid)[2]` integrates the spectral power density with
+`NumericalIntegration`'s `SimpsonEven` (a `RealGrid`) or a plain `sum` (an `EnvGrid`).
+`SimpsonEven` is the alternative extended Simpson rule — every sample with weight 1 except
+the first four and last four — so as a weight vector it is one fused reduction.
+`Stats.energy` takes the energy functional as an argument, so the weights are *checked*
+against it on a probe spectrum at construction: a functional which is not the grid's own
+gives a host-only statistic rather than a silently different quantity.
+
+`electrondensity` only ever reads the end point of the cumulative ionisation integral, and
+that end point is the trapezoid rule over the whole window, so the device branch is one
+weighted reduction rather than a prefix scan followed by a scalar read of the last element
+(which a device array refuses). The intensity conversion and the unit scaling are folded
+into the field reference `Ionisation.ratekernel` multiplies each sample by, so the field
+itself is never rescaled.
+
+On a device the state is **scaled** (`e = E/E_ref`), because nothing has unscaled it —
+`ScaledOutput` unscales only into a host buffer, which is the copy these branches exist to
+avoid. The device branches therefore apply `E_ref` themselves, always to the scalar result
+of a reduction and in `Float64`, never to the field: in a `Float32` run the field is
+deliberately of order one and the physical units, up to 1e20 apart, would not survive being
+put back on it. `Stats.StatsContext` carries `E_ref`; `Stats.collect_stats` takes it as a
+keyword and `Stats.default` reads it off the transform.
+
+`Stats.plan_analytic` builds its buffers with `similar`/`Luna.alloc` and plans through
+`Utils.plan_ft`/`Utils.plan_ift`, so the analytic signal is one inverse FFT on whatever the
+state lives on, shared by every statistic which needs it — and skipped entirely when none
+does.
+
+`ScaledOutput` asks [`Luna.stats_device_capable`](@ref) once, at construction, whether the
+whole set can run where the state is, and skips the per-step copy when it can. It is only
+ever true for a state on a device: a scaled *host* run (`Float32` on the CPU) still copies
+and unscales, because the statistics would otherwise take their host branches on a scaled
+field. When a copy is forced, the one-time warning names the statistics responsible.
 
 ## The extension and hook mechanism
 

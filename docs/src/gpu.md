@@ -147,10 +147,16 @@ statistics *do* run with a device state, for the mode-averaged transform:
 
 - `Boundaries.RateAbsorber`/`LegacyAbsorber` and the transverse collars are broadcasts
   and reductions over mirrored arrays (`Boundaries.jl`), like everything else per-step.
-- Per-step statistics (`Stats.jl`) are still host code: the field is copied to the host
-  every accepted step to compute them, and `Luna.run` warns once when this happens. Use
-  `stats_period` to reduce how often they run (below), or `Output.nostats` to disable
-  them; device statistics (computing them without the copy) are `gpu/24`'s.
+- The default per-step statistics (`Stats.jl`) are computed on the device: the energies,
+  the peak power and intensity, the temporal FWHM, the electron density and the
+  z-dependent quantities are reductions and broadcasts over the state where it is, so
+  nothing is copied to the host for them. `fwhm_t` copies only the time-domain intensity;
+  `fwhm_r` and the modal reconstruction error keep their algorithms on the host, and both
+  belong to the multimode set, whose transform is host-only anyway. A statistics function
+  *you* write is host code: it is handed a copy of the field in physical units every step
+  whose statistics fire, and `Luna.run` warns once, naming it, when that happens. Use
+  `stats_period` to reduce how often it runs (below), or `Output.nostats` to switch the
+  statistics off.
 - The output itself never sees a device array or a scaled one: `Luna.run` wraps it in
   `Luna.ScaledOutput`, which copies to the host and, for a `Float32` run, unscales, before
   handing it to `Output.MemoryOutput`/`HDF5Output`. A `Float32` run's saved field is
@@ -246,9 +252,10 @@ out = prop_capillary(...; stats_period=10)
 
 Collects the default statistics every 10th accepted step instead of every step
 (`Output.PeriodicStats`). The recorded statistics arrays are correspondingly shorter; the
-saved field (`saveN`, `out["Eω"]`) is unaffected. Worth raising on a device, where
-per-step statistics force a host copy every accepted step regardless of how often the
-propagation actually saves the field.
+saved field (`saveN`, `out["Eω"]`) is unaffected. The default statistics run on the device,
+so raising this only saves their own cost; it is worth raising when you have added a
+statistics function of your own, which is host code and forces the field to be copied down
+on every step it fires on.
 
 ## Performance
 

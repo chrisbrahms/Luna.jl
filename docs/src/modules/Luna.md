@@ -61,6 +61,8 @@ Luna.runscaling
 Luna.ScaledOutput
 Luna.needs_host_y
 Luna.needs_host_cache
+Luna.stats_device_capable
+Luna.stats_host_list
 ```
 
 ```@docs
