@@ -461,9 +461,11 @@ The two modes are the `m = 1` and `m = 3` modes of the `x` index -- the coordina
 guide is wide in, which is the one the in-domain test is applied to -- with the same `y`
 index and the same polarisation, so that the Kerr product of the fundamental projects
 onto the second mode. At 5 µJ over 3 cm the second mode reaches 7 % of the fundamental's
-peak `|Eω|`, and the 20-step fixed run agrees with the adaptive one to 3e-4, so the case
-is resolved at the fixed step size. There is no plasma response: the matrix already has
-four ionising cases, and this one is here for the transverse integral.
+peak `|Eω|`, and the 20-step fixed run agrees with the adaptive one to 1.7e-3 in the
+gate's metric (the maximum difference normalised per mode and per save; 2e-4 normalised
+over the whole field), so the case is resolved at the fixed step size. There is no
+plasma response: the matrix already has four ionising cases, and this one is here for the
+transverse integral.
 
 This is the matrix's only Cartesian transverse domain, and so the only case which reaches
 the `:cartesian` branch of `NonlinearRHS._points!`; every other multimode case is polar,

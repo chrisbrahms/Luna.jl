@@ -26,10 +26,13 @@ uses 50 × 12.5 µm but only for mode properties, and `test_device.jl`'s 50 × 2
 only reaches `TransModalFixed`. The example
 `examples/low_level_interface/rectangular/rectangular_modal.jl` does -- 50 × 10 µm, 18
 modes, `full=true` -- so that example has been running with 40 % of the guide's area
-excluded from the transverse integral.
+excluded from the transverse integral. Measured: its in-domain point count at z = 0 goes
+from 365 to 527, the nonlinear polarisation at z = 0 changes by 3.7e-1, and after 1.5 cm
+the field changes by 1.1e-1 normalised over the whole field and by O(1) in the weak
+antisymmetric modes. The example is not edited; it now gives the right answer.
 
 It is a pre-existing bug, not something the GPU work introduced: the same condition is in
-`evanescent` at `src/NonlinearRHS.jl:563`. `gpu/22-modal` preserved it deliberately, with
+`evanescent` at `src/NonlinearRHS.jl:295`. `gpu/22-modal` preserved it deliberately, with
 a `NOTE`, and its review reported it as known gap 6; §9 decision 7 is to fix it here, in
 its own branch, with a regression case.
 
@@ -135,11 +138,13 @@ guide made square (`a = b = 60 µm`) and left wide (`100 × 40 µm`):
 | guide | `Eω` bit-identical pre/post | max normalised difference of `Eω` | in-domain cubature points per RHS, pre → post |
 | --- | --- | --- | --- |
 | 60 × 60 µm | yes | 0.0 | 527 → 527 |
-| 100 × 40 µm | no | 2.10e-01 (mode 2, save 2) | 435 → 527 |
+| 100 × 40 µm | no | 2.10e-01 (mode 2, save 2) | 435–447 → 527 |
 
 The point count is `stats/transverse_points`, which is `TransModal.ncalls`, the number of
-points the driver evaluated that the in-domain test accepted. 92 of 527 points — the strip
-`b ≤ x < a` — were being thrown away.
+points the driver evaluated that the in-domain test accepted. Post-fix it is 527 at every
+step; pre-fix it ranges over 435–447 across the steps (435 at the first), because the
+driver subdivides differently when part of the integrand is zeroed. Roughly 90 of 527
+points — the strip `b ≤ x < a` — were being thrown away.
 
 ### The analytic transverse integral
 
@@ -173,6 +178,8 @@ Test Summary: | Pass  Total     Time
 regression    |  466    466  2m36.5s
 largest difference over all cases and modes: 0.000e+00
 ```
+
+Adding `rect_modal_field` costs the gate about 14 s per run, +9 % on its wall time.
 
 Every one of the 22 existing cases is exactly `0.000e+00` in both modes and both classes.
 All of them are polar or mode-averaged, so none reaches the changed branch. The new case

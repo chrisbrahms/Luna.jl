@@ -236,7 +236,7 @@ end
        The `a > b` guide is the one this measures. The Cartesian in-domain test of the
        adaptive driver (`NonlinearRHS._points!`) used to read `x1 >= ul[2]` rather than
        `x2 >= ul[2]`, which treats every point with b ≤ x < a as outside the guide: for
-       a = 2.5b that drops 21 % of ∫ê⁴ dA and the ratio comes out 8.3 % low. =#
+       a = 2.5b that drops 8.3 % of ∫ê⁴ dA, so the ratio comes out 8.3 % low. =#
     "∫ê⁴dA/√N for the fundamental mode of a rectangular guide of half-widths `a`, `b`."
     kerrfactor(a, b) = (9*a*b/16)/sqrt(0.5*sqrt(ε_0/μ_0)*a*b)
 
