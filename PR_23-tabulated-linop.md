@@ -264,10 +264,11 @@ All run with `Luna.set_fftw_mode(:estimate)`, `set_fftw_threads(1)`,
 
 | file | result | how to run |
 | --- | --- | --- |
-| `test/test_linops.jl` | **258 pass, 0 fail** (62 of them new) | `julia --project=$PWD -t 1 -e 'using Luna; include("test/test_linops.jl")'` |
-| `test/test_device.jl` | **651 pass, 0 fail** (36 testsets) | as above, from an environment with `JLArrays` |
+| `test/test_linops.jl` | **270 pass, 0 fail** (74 of them new) | `julia --project=$PWD -t 1 -e 'using Luna; include("test/test_linops.jl")'` |
+| `test/test_device.jl` | **655 pass, 0 fail** (37 testsets) | as above, from an environment with `JLArrays` |
 | `test/test_metal.jl` | **414 pass, 0 fail** (22 of them new) | from an environment with `Metal`, `using Luna, Metal` first |
-| `test/test_gradient.jl`, `test/test_tapers.jl`, `test/test_interface.jl` | **349 pass, 0 fail** between them | as `test_linops.jl` |
+| `test/test_interface.jl` | **351 pass, 0 fail** (11 of them new) | as `test_linops.jl` |
+| `test/test_gradient.jl`, `test/test_tapers.jl` | **9 pass, 0 fail** between them | as `test_linops.jl` |
 
 New in `test/test_linops.jl` (`@testset "tabulated linear operator"`, 62 tests): the table
 against an operator whose integral is known in closed form and which has the same `√z`
@@ -284,6 +285,14 @@ New in `test/test_device.jl`: the tables on `JLArray` for a gradient and a taper
 device run matching the host one to 1e-10 as the untabulated pair does; the "no host work
 per stage" check; and the discretisation comparison above, as a convergence-rate assertion
 rather than a fixed number.
+
+New in `test/test_interface.jl`: that `prop_capillary(...; tabulate_linop=true)` hands
+`Luna.setup` a table rather than the bare callable, so the statistics built from
+`transform.aeff` hold one; and that the memoised `Modes.Aeff` cache stops growing with the
+step count, measured on a delegated (non-Marcatili) tapered mode, whose `Aeff` really does
+go through the memoised cubature. The cache holds 31 entries after a 6-step untabulated run
+and 86 after a 17-step one; with tabulation it holds 33 — the two tables' nodes — after
+both.
 
 New in `test/test_metal.jl` (`@testset "tabulated operator on Metal"`, 22 tests): that
 `Φ`, `dΦ`, the secant and the `β` table are `MtlArray{ComplexF32}`/`MtlArray{Float32}` —
@@ -335,6 +344,58 @@ Without tabulation the counts scale with the stages; with it they do not move at
   for a quantity small at both ends and large in between. Commented, not guarded.
 - `linop_tol` is one knob for two different things (radians for the operator, relative for
   the values). Splitting it would be easy if anyone needs it.
+
+## Changes after review round 1
+
+The review (`scratchpad/reviews/gpu-23-tabulated-linop-1.md`, "approve with minor fixes")
+reproduced the convergence table, the node and evaluation counts and the Metal figures
+exactly, and found no defect in the numerics. Ten findings, all addressed in
+`f75c5fcd`:
+
+1. **A caller-supplied `norm!` made `tabulate_linop=true` throw.** `tabulate` read
+   `t.norm!.aeff` before dispatch could help, so a normalisation that is not one of Luna's
+   own — which `Luna.setup` documents and `NonlinearRHS.check_norm` accepts — aborted the
+   run with a `FieldError`. `_normaeff` returns the field only for `NormModeAvg` and
+   `NormModeAvgGNLSE`, the generic `tabulate` takes the `aeff` keyword the known ones take,
+   and an unknown normalisation is now passed through unchanged. Tested in
+   `test_device.jl` with a wrapper around the standard normalisation.
+2. **The `Float32` justification for the secant subtraction was overstated.** Corrected in
+   the docstring, `docs/src/developer/device_model.md` and the section above: `max|Φ|` is
+   tens to hundreds of radians in the co-moving frame, and the subtraction buys a measured
+   factor of 4 to 11 in the rounding of `ΔΦ`, not usability. The measured ratio of
+   `max|Φ|` to `max|Φ̃|` over the same span is 11.3, not the 10.5 quoted before (which
+   compared a table over `[0, 1.05L]` with `|Φ(L)|`).
+3. **The `transform.aeff` gap is closed rather than documented.** `prop_capillary`
+   tabulates `Aeff` over `[0, flength]` before `Stats.default` closes over it;
+   `TabulatedScalar` keeps its source callable so `NonlinearRHS._aefftab` can rebuild a
+   wider table for the propagation, which needs `Aeff` one step past the end of the fibre.
+   The statistics keep the narrower table, whose end value is held past the fibre — a scale
+   factor on a diagnostic. Tested by the memoised cache's size, above.
+4. **No size guard.** The constructor reports the table's size in the `@info` line and
+   warns above `LinearOps.TABLE_WARN_BYTES` (256 MB), naming `linop_tol` and the shape of
+   the operator. `DEFAULT_MAXNODES` caps nodes, not bytes, and a 10-mode 8192-point
+   operator at 57 nodes is about 260 MB.
+5. **"Works for every mode type" was untested.** `test_linops.jl` now tabulates a 4-mode
+   operator: `size(Φ) == (1025, 4, nnodes)`, the error within tolerance, agreement with a
+   20000-panel midpoint quadrature, and a finite propagator. It is the only test of the
+   `ndims` generality of `_stack`, `selectdim` and `phase!`.
+6. **Going off the end of the table was silent.** `phase!` warns once: the propagator adds
+   the secant term whatever the readback returns, so a step outside the table would
+   propagate with the mean operator over the whole of it. The value tables hold their end
+   value silently, which is what `prop_capillary`'s `Aeff` table does by design; the
+   distinction is documented and tested.
+7. `quiet` is documented.
+8. A comment says why a value table's relative scale comes from its endpoints (`β` and
+   `Aeff` are monotonic in z over any fibre Luna describes).
+9. `prop_capillary`'s keyword documentation no longer implies a uniform fibre is unaffected:
+   reading a constant off a two-node table is `(1-s)f + sf`, not bitwise `f`.
+10. `docs/src/gpu.md` says what is left on the host — an interval lookup and four
+    interpolation weights — instead of "nothing".
+
+Every test file named above and the gate were rerun after the fixes: `test_linops.jl`
+270 pass, `test_device.jl` 655 pass, `test_interface.jl` 351 pass, `test_metal.jl` 414 pass
+(unchanged), `test_gradient.jl` + `test_tapers.jl` 9 pass, and the gate against `fa556e6f`
+460 pass with `0.000e+00` on every case.
 
 ## Deviations from GPU_PLAN.md
 
