@@ -1023,12 +1023,12 @@ condition in θ, which is checked against
 [`Modes.azimuthal_order`](@ref Luna.Modes.azimuthal_order) at construction.
 
 !!! note "Statistics"
-    `Stats.default` has to be called with `mode_error=false` for this transform.
-    `Stats.mode_reconstruction_error` re-evaluates the transform at a single transverse
-    point and records the cubature's own error estimate, neither of which a fixed rule
-    has, and it is typed on [`TransModal`](@ref), so leaving it on gives a `MethodError`.
-    `prop_capillary` does this for you. The fixed rule's own embedded estimate is
-    [`integral_error!`](@ref); it becomes a statistic in a later branch of the GPU work.
+    `Stats.default`'s `mode_error=true` records
+    [`Stats.transverse_integral_error`](@ref Luna.Stats.transverse_integral_error) for
+    this transform, which is [`integral_error!`](@ref) per accepted step, rather than
+    `Stats.mode_reconstruction_error`: that one re-evaluates the transform at a single
+    transverse point and records the cubature's own error estimate, neither of which a
+    fixed rule has.
 
 # Fields of note
 - `quad`: the quadrature rule
@@ -1255,8 +1255,9 @@ transform was built with `kronrod=true`) and every other node in θ (only for `f
 with an even `nθ ≥ 4`); where there is no embedded rule
 ([`has_error_estimate`](@ref)) this fills `t.err` with `NaN` instead.
 
-Nothing calls it per step: this is the quantity `gpu/25` will record as a statistic once
-`Stats` has been refactored.
+[`Stats.transverse_integral_error`](@ref Luna.Stats.transverse_integral_error) records
+it per accepted step, which is what `Stats.default`'s `mode_error=true` builds for this
+transform.
 """
 function integral_error!(t::TransModalFixed)
     if !has_error_estimate(t)

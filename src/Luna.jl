@@ -304,12 +304,13 @@ collection of [`Modes.AbstractMode`](@ref Luna.Modes.AbstractMode)s and `compone
     `setup` above. A device or a `Float32` run needs `modal_integral=:fixed`.
 
 !!! note "Statistics with `modal_integral=:fixed`"
-    `Stats.default` has to be called with `mode_error=false` for a
-    [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed):
-    `Stats.mode_reconstruction_error` is typed on
-    [`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal) and records the
-    adaptive rule's own behaviour, so leaving it at its default of `true` gives a
-    `MethodError`. `prop_capillary` does this for you.
+    `Stats.default`'s `mode_error=true` records the diagnostic the transform has: the
+    mode reconstruction error and the cubature's error estimate for
+    [`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal), and the embedded
+    Gauss--Kronrod estimate
+    ([`Stats.transverse_integral_error`](@ref Luna.Stats.transverse_integral_error)) for
+    a [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed). The
+    latter is `NaN` unless the rule was built with `kronrod=true`.
 """
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components; kwargs...)

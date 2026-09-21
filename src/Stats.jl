@@ -2,7 +2,8 @@ module Stats
 import Luna
 import Luna: Maths, Grid, Modes, Utils, settings, PhysData, Fields, Processing, Ionisation
 import Luna.PhysData: wlfreq, c, ε_0
-import Luna.NonlinearRHS: TransModal, TransModeAvg, Erω_to_Prω!
+import Luna.NonlinearRHS: TransModal, TransModalFixed, TransModeAvg, Erω_to_Prω!,
+                          integral_error!, has_error_estimate
 import Luna.Nonlinear: PlasmaCumtrapz
 import Luna.Capillary: MarcatiliMode
 import FFTW
@@ -815,6 +816,81 @@ function (f::ModeReconstructionError)(d, Eω, Et, z, dz)
         d["transverse_integral_error_abs"]/sqrt(sum(abs2, f.nl)/length(f.nl))
 end
 
+struct TransverseIntegralError{TT, A, B}
+    t::TT           # the TransModalFixed
+    nl::A           # the modal polarisation, where the transform's buffers live
+    Eh::B           # host staging buffer, in the transform's element type
+    Ein::A          # the state in the transform's units and array type (=== Eh on a host
+                    # transform, so that nothing is copied there)
+    Eref::Float64   # the unit scaling the transform works in
+    invEref::Float64
+    haserr::Bool
+    points::Float64
+end
+
+"""
+    transverse_integral_error(t::TransModalFixed)
+
+Create a stats function which records the embedded error estimate of the fixed transverse
+quadrature rule, and the number of nodes that rule uses. It is what
+[`mode_reconstruction_error`](@ref) is for the adaptive transform, and it records the same
+three datasets as that one's error part:
+
+- `transverse_points`: the node count of the rule, which is fixed for the propagation;
+- `transverse_integral_error_abs`: the root-mean-square over `(ω, mode)` of
+  `P_coarse - P_fine`, the difference between the embedded coarse rule and the rule the
+  propagation uses
+  ([`NonlinearRHS.integral_error!`](@ref Luna.NonlinearRHS.integral_error!));
+- `transverse_integral_error_rel`: the same divided by the root-mean-square of the
+  polarisation itself.
+
+Both error datasets are `NaN` when the rule has no embedded coarse rule
+([`NonlinearRHS.has_error_estimate`](@ref Luna.NonlinearRHS.has_error_estimate)), i.e.
+without `modal_kronrod=true` on a radial or Cartesian rule. `transverse_points` is
+recorded either way.
+
+The transform is evaluated once per call on the accepted state, as
+[`mode_reconstruction_error`](@ref) does, so the estimate belongs to the state which was
+saved rather than to whichever stage the stepper last called.
+
+Host-only: like every other statistic in the multimode default set. The transform itself
+may be on a device, in which case the state is staged into the transform's units and array
+type first and the error is scaled back to physical units afterwards.
+"""
+function transverse_integral_error(t::TransModalFixed)
+    nl = similar(t.err)
+    Eh = Array{eltype(t.err)}(undef, size(t.err))
+    Ein = Utils.isdevice(t.err) ? similar(t.err) : Eh
+    Eref = Float64(Luna.runscaling(t).Eref)
+    TransverseIntegralError(t, nl, Eh, Ein, Eref, inv(Eref), has_error_estimate(t),
+                            float(t.ncalls))
+end
+
+device_capable(::TransverseIntegralError) = false
+needs_time(::TransverseIntegralError) = false
+
+function (f::TransverseIntegralError)(d, Eω, Et, z, dz)
+    #= The state arrives on the host in physical units (the set is host-only, so
+       `Luna.ScaledOutput` has unscaled it); the transform works in its own units and on
+       its own array type. `invEref` is exactly 1 for every Float64 run. =#
+    @. f.Eh = Eω * f.invEref
+    f.Ein === f.Eh || copyto!(f.Ein, f.Eh)
+    f.t(f.nl, f.Ein, z)
+    d["transverse_points"] = f.points
+    if f.haserr
+        err = integral_error!(f.t)
+        rms = sqrt(_meanabs2(err))
+        d["transverse_integral_error_abs"] = f.Eref*rms
+        d["transverse_integral_error_rel"] = rms/sqrt(_meanabs2(f.nl))
+    else
+        d["transverse_integral_error_abs"] = NaN
+        d["transverse_integral_error_rel"] = NaN
+    end
+end
+
+"The mean of `abs2` over a whole array, as one reduction, in `Float64`."
+_meanabs2(x) = Float64(sum(abs2, x))/length(x)
+
 #= The statistics which read nothing but `z`: they never touch the state, so they run
    wherever it lives. =#
 
@@ -1216,6 +1292,12 @@ its array type and precision, and the unit scaling they have to undo is taken fr
 `stats_device` (`:auto`, `:device` or `:host`) is passed to [`collect_stats`](@ref), which
 documents what it chooses and why. `prop_capillary` does not take it directly; reach it
 through `stats_kwargs`.
+
+For a multimode propagation, `mode_error=true` (the default) adds the transverse-integral
+diagnostic of whichever transform is in use: [`mode_reconstruction_error`](@ref) for the
+adaptive cubature ([`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal)) and
+[`transverse_integral_error`](@ref) for the fixed quadrature rule
+([`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed)).
 """
 function default(grid, Eω, mode::Modes.AbstractMode, linop, transform;
                  windows=nothing, gas=nothing, onaxis=false, userfuns=Any[],
@@ -1265,7 +1347,7 @@ function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
         push!(funs, pressure(transform.densityfun, gas))
     end
     if mode_error
-        push!(funs, mode_reconstruction_error(transform))
+        push!(funs, _mode_error_stat(transform))
     end
     for resp in transform.resp
         if resp isa PlasmaCumtrapz
@@ -1283,6 +1365,15 @@ function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
     collect_stats(grid, Eω, funs...;
                   Eref=Luna.runscaling(transform).Eref, stats_device)
 end
+
+#= What `mode_error=true` means depends on which transverse integral the transform uses.
+   The adaptive one can reconstruct the polarisation at a single transverse point and
+   carries the cubature's own error estimate; the fixed rule has neither, but it has an
+   embedded coarse rule, which is the same kind of diagnostic. Both record
+   `transverse_points` and `transverse_integral_error_abs`/`_rel`; only the adaptive one
+   records `mode_reconstruction_error`. =#
+_mode_error_stat(transform::TransModal) = mode_reconstruction_error(transform)
+_mode_error_stat(transform::TransModalFixed) = transverse_integral_error(transform)
 
 #= Each user statistic is wrapped in a `UserStat` carrying `userfuns[i]` as its name, so
    that the one-time warning about the host copy names the thing the user wrote rather

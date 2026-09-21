@@ -346,13 +346,13 @@ Two things to check before using it:
   any number of θ nodes will do, and `full=false` (which `prop_capillary` picks for such a
   set) uses a single one.
 
-`modal_integral=:fixed` does not collect the `mode_reconstruction_error`,
-`transverse_points` and `transverse_integral_error_*` statistics: those describe the
-adaptive rule's own behaviour. The fixed rule carries an embedded Gauss--Kronrod error
-estimate instead (`modal_kronrod=true`, which rounds `modal_nr` up to an odd number),
-which `NonlinearRHS.integral_error!` evaluates on demand; it becomes a statistic in a
-later branch. At the low level, `Stats.default` needs `mode_error=false` for this
-transform; `prop_capillary` does that for you.
+`modal_integral=:fixed` does not collect `mode_reconstruction_error`, which describes
+the adaptive rule's own behaviour. It does collect `transverse_points` and
+`transverse_integral_error_abs`/`_rel`, from the rule's embedded Gauss--Kronrod error
+estimate (`Stats.transverse_integral_error`, which calls
+`NonlinearRHS.integral_error!` once per accepted step). The estimate exists only with
+`modal_kronrod=true`, which rounds `modal_nr` up to an odd number; without it the two
+error datasets are `NaN` and only the node count is meaningful.
 
 ### An ad hoc response on a device
 

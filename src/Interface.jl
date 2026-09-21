@@ -597,11 +597,10 @@ function prop_capillary_args(radius, flength, gas, pressure;
     #= The state itself, not a host copy of it: `Stats.default` builds its buffers and
        plans its inverse transform for the array type and precision `Eω` has, and takes
        the unit scaling from `transform`, so that the default statistics run on the
-       device with the state left where it is. `_statskwargs` turns off the mode
-       reconstruction error for `modal_integral=:fixed`, which has no single-point
-       machinery to compute it from. =#
+       device with the state left where it is. `mode_error=true` works for both
+       transverse integrals: `Stats.default` picks the diagnostic the transform has. =#
     stats = Stats.default(grid, Eω, mode_s, linop, transform;
-                          gas=gas, _statskwargs(transform, stats_kwargs)...)
+                          gas=gas, stats_kwargs...)
     stats = Output.maybe_periodic(stats, stats_period)
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
@@ -1139,43 +1138,6 @@ function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false}
                                    modal_integral, nr, nθ, kronrod, device, precision)
     linop, Eω, transform, FT
 end
-
-"""
-    _statskwargs(transform, stats_kwargs)
-
-The keyword arguments for `Stats.default`. `Stats.mode_reconstruction_error` is written
-against [`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal): it re-evaluates
-the transform at one transverse point and compares the result with the modal
-reconstruction, which needs the adaptive transform's single-point machinery, and it
-records the cubature's own error estimate. The fixed quadrature rule has neither. Its own
-embedded error estimate
-([`NonlinearRHS.integral_error!`](@ref Luna.NonlinearRHS.integral_error!)) becomes a
-statistic in a later branch of the GPU work; until then a `modal_integral=:fixed` run
-collects the other default statistics and not this one. An explicit `mode_error` in
-`stats_kwargs` is left alone.
-"""
-_statskwargs(transform, stats_kwargs) = stats_kwargs
-
-function _statskwargs(transform::NonlinearRHS.TransModalFixed, stats_kwargs)
-    if haskey(stats_kwargs, :mode_error)
-        stats_kwargs[:mode_error] && error(
-            "stats_kwargs[:mode_error] = true, but the mode reconstruction error "*
-            "statistic is defined only for the adaptive transverse integral "*
-            "(modal_integral=:adaptive): it re-evaluates the transform at a single "*
-            "transverse point and records the cubature's own error estimate, neither "*
-            "of which the fixed quadrature rule has. Leave `mode_error` out (it is off "*
-            "by default with modal_integral=:fixed) or pass modal_integral=:adaptive.")
-        return stats_kwargs
-    end
-    _mergekw(stats_kwargs)
-end
-
-#= `stats_kwargs` is splatted everywhere else, so a `NamedTuple` works as well as the
-   documented `Dict`; `merge` of a `NamedTuple` with a `Dict` is a `MethodError`. The
-   default goes first in both, so that anything in `stats_kwargs` wins -- there is
-   nothing there to win, by the `haskey` above, but that is the order a reader expects. =#
-_mergekw(kw::AbstractDict) = merge(Dict{Symbol, Any}(:mode_error => false), kw)
-_mergekw(kw) = merge((; mode_error=false), NamedTuple(pairs(kw)))
 
 function makeoutput(flength, saveN, stats, filepath::Nothing, scan::Nothing, scanidx, filename)
     Output.MemoryOutput(0, flength, saveN, stats)

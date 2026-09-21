@@ -624,17 +624,28 @@ end
     @test maximum(abs, ComplexF64.(omf32["Eω"][:, 1, end]) .- omf["Eω"][:, 1, end]) /
           maximum(abs, omf["Eω"][:, 1, end]) < 1e-4
     #= `Stats.mode_reconstruction_error` needs the adaptive transform's single-point
-       machinery and records the cubature's own error estimate; the fixed rule has
-       neither, so `prop_capillary` turns the statistic off for it (the fixed rule's own
-       embedded estimate becomes a statistic in a later branch). =#
+       machinery; the fixed rule has no such thing, and records its own embedded
+       Gauss-Kronrod estimate instead. `modal_kronrod` was not asked for here, so the
+       rule has no embedded coarse rule and the two error datasets are NaN, but the node
+       count is still recorded. =#
     @test haskey(om["stats"], "mode_reconstruction_error")
     @test !haskey(omf["stats"], "mode_reconstruction_error")
     @test haskey(omf["stats"], "energy")
-    # asking for it explicitly is an error which says why
-    @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
-                                            modal_integral=:fixed, modal_nr=32,
-                                            stats_kwargs=Dict{Symbol, Any}(
-                                                :mode_error => true))
+    @test all(omf["stats"]["transverse_points"] .== 32)
+    @test all(isnan, omf["stats"]["transverse_integral_error_rel"])
+    # with the Kronrod rule the estimate is finite, small and not zero
+    omk = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed,
+                         modal_nr=33, modal_kronrod=true)
+    @test all(omk["stats"]["transverse_points"] .== 33)
+    errk = omk["stats"]["transverse_integral_error_rel"]
+    @test all(isfinite, errk)
+    @test 0 < maximum(errk) < 1e-3
+    # turning it off leaves the other statistics alone
+    omn = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed,
+                         modal_nr=32,
+                         stats_kwargs=Dict{Symbol, Any}(:mode_error => false))
+    @test !haskey(omn["stats"], "transverse_points")
+    @test haskey(omn["stats"], "energy")
     # an unknown modal_integral is refused
     @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
                                                modal_integral=:nonsense)
