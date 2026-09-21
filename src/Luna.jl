@@ -2,6 +2,7 @@ module Luna
 import FFTW
 import Hankel
 import Logging
+import Printf: @sprintf
 import LinearAlgebra: mul!, ldiv!
 Logging.disable_logging(Logging.BelowMinLevel)
 
@@ -601,15 +602,16 @@ end
    tabulated integral. The one-point propagator is gone, so the only thing left for it to
    do is to say so; an explicit `linop_integral` wins over it. =#
 function _linop_integral(linop_integral, tabulate_linop)
-    linop_integral in (:tabulated, :quadrature) || error(
-        "linop_integral must be :tabulated or :quadrature, got $(repr(linop_integral))")
+    linop_integral in (:auto, :tabulated, :quadrature) || error(
+        "linop_integral must be :auto, :tabulated or :quadrature, got "*
+        "$(repr(linop_integral))")
     isnothing(tabulate_linop) && return linop_integral
     Logging.@warn(
-        "`tabulate_linop` is deprecated and does nothing: use `linop_integral=:tabulated` "*
-        "(the default) or `linop_integral=:quadrature`. A z-dependent linear operator is "*
+        "`tabulate_linop` is deprecated and does nothing: use `linop_integral=:auto` "*
+        "(the default), `:tabulated` or `:quadrature`. A z-dependent linear operator is "*
         "now always given to the stepper as its integral -- the one-point propagator "*
         "`tabulate_linop=false` selected has been removed -- so both values of the old "*
-        "keyword mean `:tabulated`.", maxlog=1)
+        "keyword mean the default.", maxlog=1)
     linop_integral
 end
 
@@ -716,7 +718,16 @@ how. A constant operator (an array) is left alone -- it is already exact in the 
 [`LinearOps.AbstractIntegratedLinop`](@ref Luna.LinearOps.AbstractIntegratedLinop),
 which is how to use an analytic `Φ`.
 
-- `linop_integral::Symbol=:tabulated`: how `Φ` is obtained from the callable.
+A callable which ignores `z` is recognised as the constant operator it is
+([`LinearOps.constant_linop`](@ref Luna.LinearOps.constant_linop)) and neither integrated
+nor tabulated.
+
+- `linop_integral::Symbol=:auto`: how `Φ` is obtained from the callable.
+    - `:auto` tabulates, but with the node count capped so that the table's peak cost stays
+      within `linop_budget`, and falls back to `:quadrature` with a message if the cap
+      binds before the tolerance is met. That only happens for an operator the size of the
+      whole state -- multimode, radial or free space -- at a tight `linop_tol`; nothing in
+      Luna's own tests or examples reaches it.
     - `:tabulated` tabulates `Φ` on adaptively placed z nodes at setup
       ([`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop)), and with it the
       propagation constant `β(z)` and effective area `Aeff(z)` of a mode-averaged
@@ -744,6 +755,10 @@ which is how to use an analytic `Φ`.
     radians (absolute), and relative for the `β` and `Aeff` tables. With `:tabulated` the
     tables cost `2·length(Eω)·nnodes` numbers for the operator, so a tolerance far below
     the solver's own `rtol` buys nothing and costs memory.
+- `linop_budget::Integer=$(LinearOps.TABLE_BUDGET_BYTES)`: the byte budget `:auto` gives the
+    table, counted at its peak
+    ([`LinearOps.bytes_per_node`](@ref Luna.LinearOps.bytes_per_node), which is dominated by
+    the host copies held while it is built). Ignored by `:tabulated` and `:quadrature`.
 - `tabulate_linop`: **deprecated**, and ignored apart from a warning. Both of its values
     now mean `linop_integral=:tabulated`, because the propagator `false` selected no
     longer exists.
@@ -756,8 +771,8 @@ function run(Eω, grid,
              boundary=:rate, boundary_N=Boundaries.DEFAULT_N, boundary_length=nothing,
              tcollar=Boundaries.DEFAULT_TCOLLAR, kcollar=Boundaries.DEFAULT_KCOLLAR,
              rcollar=Boundaries.DEFAULT_RCOLLAR,
-             linop_integral=:tabulated, linop_tol=LinearOps.DEFAULT_LINOP_TOL,
-             tabulate_linop=nothing)
+             linop_integral=:auto, linop_tol=LinearOps.DEFAULT_LINOP_TOL,
+             linop_budget=LinearOps.TABLE_BUDGET_BYTES, tabulate_linop=nothing)
 
     isnothing(zmax) && error(
         "Luna.run requires the propagation length as the keyword argument zmax, e.g. "*
@@ -873,17 +888,38 @@ function run(Eω, grid,
        are the transform's own z-dependent quantities, which are constant with it; an
        operator the caller has already integrated is used as it is. =#
     if !(linop isa AbstractArray) && !(linop isa LinearOps.AbstractIntegratedLinop)
-        if linop_integral === :tabulated
-            #= `init_dz` as well as `max_dz`: the first step is taken at `init_dz` before
-               `steplims!` has had a chance to clamp it, and `Boundaries.setup` only
-               reduces it to `max_dz` for `boundary=:rate`. =#
-            ztab = zmax + max(max_dz, init_dz)
-            transform = NonlinearRHS.tabulate(transform, z0, ztab, linop_tol, Eω)
-            linop = LinearOps.TabulatedLinop(linop, Eω, z0, ztab; tol=linop_tol)
-        else
+        #= `init_dz` as well as `max_dz`: the first step is taken at `init_dz` before
+           `steplims!` has had a chance to clamp it, and `Boundaries.setup` only reduces
+           it to `max_dz` for `boundary=:rate`. =#
+        ztab = zmax + max(max_dz, init_dz)
+        #= A closure which ignores `z` -- a uniform fibre reached through `make_linop`, a
+           `Capillary.gradient` with the same pressure at both ends, a taper function which
+           returns a constant -- is a constant operator written the long way, and the
+           propagator is exact on the array. Recognising it is five evaluations and it
+           keeps such a run bit-for-bit what it was. =#
+        const_linop = LinearOps.constant_linop(linop, Eω, z0, ztab)
+        if !isnothing(const_linop)
+            linop = const_linop
+        elseif linop_integral === :quadrature
             #= No table, so the transform's own z-dependent quantities are left to be
                evaluated on the host per stage, as they were before tabulation existed. =#
             linop = LinearOps.QuadratureLinop(linop, Eω; tol=linop_tol, z0)
+        else
+            #= `:auto` caps the node count at a byte budget and falls back to the
+               quadrature if the cap binds; `:tabulated` tabulates whatever it costs. =#
+            maxnodes = linop_integral === :auto ?
+                LinearOps.node_budget(Eω, linop_budget) : LinearOps.DEFAULT_MAXNODES
+            tab = LinearOps.TabulatedLinop(linop, Eω, z0, ztab; tol=linop_tol, maxnodes)
+            if linop_integral === :auto && LinearOps.capped(tab, maxnodes)
+                Logging.@info(@sprintf("The linear operator's table hit its %d-node budget (%.0f MB, `linop_budget`) before reaching `linop_tol`; integrating each step by quadrature instead, which holds no table. That saves the memory and costs about %d host evaluations of the operator per step, against one table readback -- for a multimode or free-space operator that is state-sized host work inside every step, and raising `linop_tol` so that the table fits is usually the better answer. `linop_integral=:tabulated` tabulates regardless.",
+                                       maxnodes, linop_budget/1024^2,
+                                       12*(2*LinearOps.DEFAULT_QUAD_ORDER + 1)))
+                tab = nothing
+                linop = LinearOps.QuadratureLinop(linop, Eω; tol=linop_tol, z0)
+            else
+                transform = NonlinearRHS.tabulate(transform, z0, ztab, linop_tol, Eω)
+                linop = tab
+            end
         end
     end
 
@@ -904,11 +940,14 @@ function run(Eω, grid,
     save_modeinfo_maybe(output, transform)
 
     flush(stderr) # flush std error once before starting to show setup steps
-    RK45.solve_precon(
+    result = RK45.solve_precon(
         transform, linop, Eω, z0, init_dz, zmax, stepfun=stepfun,
         max_dt=max_dz, min_dt=min_dz,
         rtol=rtol, atol=atol, safety=safety, norm=norm,
         status_period=status_period)
+    # Anything the operator has to say about the propagation as a whole (see `report_integral`)
+    LinearOps.report_integral(linop)
+    result
 end
 
 # run some code for precompilation

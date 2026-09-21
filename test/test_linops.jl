@@ -675,7 +675,46 @@ end
         @test_throws ArgumentError RK45.make_prop!(cusp!, proto)
     end
 
+    #= A closure which ignores z is a constant operator written the long way, and is
+       recognised as one rather than tabulated: the propagator is then exact on the array,
+       which is what it was before a callable had to be integrated. =#
+    @testset "a z-independent closure is recognised" begin
+        m = Capillary.MarcatiliMode(75e-6, :Ar, 1.0, loss=false)
+        linop!, _ = LinearOps.make_linop(grid, m, 800e-9)
+        cst = LinearOps.constant_linop(linop!, proto, 0.0, L)
+        @test cst isa Array{ComplexF64, 1}
+        ref = similar(proto)
+        linop!(ref, 0.7L)
+        @test cst == ref # bitwise, not approximately
+        # a two-node table of the same operator is not bitwise the operator, which is why
+        tab = LinearOps.TabulatedLinop(linop!, proto, 0.0, L; tol=1e-6, quiet=true)
+        @test length(tab.z) == 2
+        @test Array(tab.secant) != ref
+        @test maximum(abs, Array(tab.secant) .- ref)/maximum(abs, ref) < 1e-15
+        # ... and a genuinely z-dependent operator is not recognised
+        @test isnothing(LinearOps.constant_linop(gradient_linop(0.0, 1.0), proto, 0.0, L))
+        @test isnothing(LinearOps.constant_linop(taper_linop(), proto, 0.0, L))
+        @test isnothing(LinearOps.constant_linop(cusp!, proto, 0.0, L))
+    end
+
+    #= The node budget `linop_integral=:auto` turns into a cap. The peak is dominated by
+       the four host ComplexF64 copies per node held while the table is built, which is
+       what the budget and the size warning count. =#
+    @testset "node budget" begin
+        @test LinearOps.bytes_per_node(proto) == 4nω*16 + 2nω*16
+        f32 = zeros(ComplexF32, nω)
+        @test LinearOps.bytes_per_node(f32) == 4nω*16 + 2nω*8
+        @test LinearOps.node_budget(proto, LinearOps.bytes_per_node(proto)*10) == 10
+        @test LinearOps.node_budget(proto, 1) == 2          # never below two nodes
+        @test LinearOps.node_budget(proto, typemax(Int)) == LinearOps.DEFAULT_MAXNODES
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, L; tol=1e-8, maxnodes=8,
+                                       quiet=true)
+        @test LinearOps.capped(tab, 8)
+        @test !LinearOps.capped(tab, 1024)
+    end
+
     @testset "linop_integral" begin
+        @test Luna._linop_integral(:auto, nothing) === :auto
         @test Luna._linop_integral(:tabulated, nothing) === :tabulated
         @test Luna._linop_integral(:quadrature, nothing) === :quadrature
         @test_throws ErrorException Luna._linop_integral(:hermite, nothing)

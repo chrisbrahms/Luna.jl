@@ -259,12 +259,20 @@ temporal_rate(grid, zmax; N=DEFAULT_N, ℓ=nothing, collar=DEFAULT_TCOLLAR) =
 _likeop(op::AbstractArray, x::Number) = scalar(op, x)
 _likeop(op::AbstractArray, x::AbstractArray) = upload_like(op, x)
 
-#= The converted `α`, built once and reused. `Ref{Any}` rather than a typed field because
-   the operator's array type is only known when the closure is first called; the branch is
-   perfectly predicted and the broadcast which follows it is field-sized. =#
+#= The converted `α`, built once and reused, keyed on the array type and precision it was
+   converted for: the same operator closure can be called with a host buffer and then with
+   a device array, and a cached host copy would make the device broadcast scalar-index or
+   fail. `Ref{Any}` rather than a typed field because that type is only known when the
+   closure is first called; the branch is perfectly predicted and the broadcast which
+   follows it is field-sized. =#
 function _cachedlike(cache::Ref, op, x)
-    isnothing(cache[]) && (cache[] = _likeop(op, x))
-    cache[]
+    key = LinearOps._arraykey(op)
+    c = cache[]
+    if isnothing(c) || c[1] !== key
+        c = (key, _likeop(op, x))
+        cache[] = c
+    end
+    c[2]
 end
 
 """

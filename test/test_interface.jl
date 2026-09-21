@@ -672,6 +672,11 @@ end
     for z in (0.0, 0.037, 0.1)
         @test isapprox(trt.aeff(z), trt.aeff.src(z); rtol=1e-5)
     end
+    #= A misspelled symbol fails before the grid, the FFT plans, the input field and the
+       statistics are built, not after. =#
+    @test_throws ErrorException Luna.Interface.prop_capillary_args(
+        afun, 0.1, :He, 1.0; kw..., linop_integral=:tabluated)
+
     #= A uniform fibre: constant operator, constant `Aeff`, nothing tabulated. This is
        what keeps every uniform case bit-identical to what it was before the default
        changed -- reading a constant off a two-node table is `(1-s)f + sf`, not `f`. =#

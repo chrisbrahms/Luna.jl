@@ -570,6 +570,9 @@ const DEFAULT_MAXNODES = 1024
 "Deepest bisection the adaptive tabulation will go to before giving up and warning."
 const DEFAULT_MAXDEPTH = 40
 
+"The Gauss--Kronrod order [`QuadratureLinop`](@ref) uses: `2n + 1` points per rule."
+const DEFAULT_QUAD_ORDER = 7
+
 """
 Largest number of operator evaluations [`QuadratureLinop`](@ref) will spend on one integral
 before giving up and warning. Over one step, 15 (one Gauss--Kronrod rule) is the usual
@@ -578,11 +581,55 @@ cost.
 const DEFAULT_QUAD_MAXEVALS = 10^4
 
 """
-Table size above which [`TabulatedLinop`](@ref) warns. A mode-averaged operator is a few
-megabytes at any sensible tolerance; a multimode, radial or free-space one is the size of
-the whole state, so the same node count costs `2·nnodes` times that.
+Table size above which [`TabulatedLinop`](@ref) warns, measured as the peak
+[`bytes_per_node`](@ref) times the node cap it was given, i.e. before anything is
+allocated. A mode-averaged operator is a few megabytes at any sensible tolerance; a
+multimode, radial or free-space one is the size of the whole state, so the same node count
+costs several times that.
 """
 const TABLE_WARN_BYTES = 256*1024^2
+
+"""
+The byte budget `linop_integral=:auto` gives the tabulation ([`Luna.run`](@ref)), turned
+into a node cap by [`node_budget`](@ref). If the cap binds -- the refinement wants more
+nodes than the budget allows -- `Luna.run` falls back to [`QuadratureLinop`](@ref).
+"""
+const TABLE_BUDGET_BYTES = 256*1024^2
+
+"""
+    bytes_per_node(proto)
+
+What one node of a [`TabulatedLinop`](@ref) costs at its peak: four `ComplexF64` copies of
+the operator held simultaneously on the host while the table is built (the node
+derivatives, the per-interval integrals, and `Φ` and `dΦ` before they are uploaded) plus
+the two copies kept on `proto`'s array type and precision afterwards.
+
+The host term dominates a `Float32` device run, which is why it is the one the budget and
+the size warning count.
+"""
+function bytes_per_node(proto::AbstractArray)
+    n = length(proto)
+    4n*sizeof(ComplexF64) + 2n*sizeof(Complex{real(eltype(proto))})
+end
+
+"""
+    node_budget(proto, budget=TABLE_BUDGET_BYTES)
+
+The largest node count whose peak cost ([`bytes_per_node`](@ref)) fits in `budget`, clamped
+to `[2, DEFAULT_MAXNODES]`. The size of a table is not knowable before it is built -- the
+nodes are placed adaptively -- so `linop_integral=:auto` bounds it this way and takes the
+`:quadrature` fallback when the bound binds ([`capped`](@ref)).
+"""
+node_budget(proto::AbstractArray, budget=TABLE_BUDGET_BYTES) =
+    clamp(budget ÷ bytes_per_node(proto), 2, DEFAULT_MAXNODES)
+
+"""
+    capped(tab::TabulatedLinop, maxnodes)
+
+Whether the refinement that built `tab` stopped because it ran out of nodes rather than
+because it reached its tolerance. See [`node_budget`](@ref).
+"""
+capped(tab, maxnodes) = length(tab.z) >= maxnodes
 
 _tabmax(x::Number) = abs(x)
 _tabmax(x::AbstractArray) = isempty(x) ? 0.0 : maximum(abs, x)
@@ -834,6 +881,39 @@ end
 #=------------------------- the integrated linear operator -------------------------=#
 
 """
+    constant_linop(linop!, proto, z0, z1)
+
+`linop!(out, z)` materialised as a constant array on `proto`'s array type and precision if
+it does not depend on `z` over `[z0, z1]`, and `nothing` if it does.
+
+A constant operator is propagated exactly by
+[`RK45.make_prop!`](@ref Luna.RK45.make_prop!)`(::AbstractArray, y0)`, so recognising one
+is worth doing: a z-independent closure -- `LinearOps.make_linop` given a refractive index
+which ignores `z`, a `Capillary.gradient` with the same pressure at both ends, a taper
+function that returns a constant -- would otherwise be tabulated, and a two-node table
+holds the constant only to within the rounding of the Simpson sum its secant is computed
+from. [`Luna.run`](@ref) calls this before it converts a callable.
+
+The test is the five z values the tabulation's own first refinement evaluates -- the two
+ends, the midpoint and the two quarter points -- compared for equality. It cannot be
+wrong in a way the two-node table is not already wrong, since the acceptance criterion of
+that table samples the same five points; it costs five evaluations of `linop!`, which the
+tabulation then repeats.
+"""
+function constant_linop(linop!, proto::AbstractArray, z0, z1)
+    z0, z1 = float(z0), float(z1)
+    buf = Array{ComplexF64}(undef, size(proto))
+    linop!(buf, z0)
+    ref = copy(buf)
+    h = z1 - z0
+    for z in (z1, z0 + h/2, z0 + h/4, z0 + 3h/4)
+        linop!(buf, z)
+        buf == ref || return nothing
+    end
+    upload_like(proto, ref)
+end
+
+"""
     TabulatedLinop(linop!, proto, z0, z1; tol, maxdepth, maxnodes)
 
 The integrated linear operator `Φ(z) = ∫_{z0}^{z} linop(z') dz'` of the z-dependent
@@ -898,6 +978,17 @@ function TabulatedLinop(linop!, proto::AbstractArray, z0::Real, z1::Real;
                         maxnodes=DEFAULT_MAXNODES, quiet=false)
     z0, z1 = float(z0), float(z1)
     z1 > z0 || error("TabulatedLinop needs z1 > z0, got $z0 and $z1")
+    #= Before anything is allocated, not after: the build holds four `ComplexF64` copies of
+       the operator per node on the host at once, so an operator big enough to be worth
+       warning about has already asked for all of it by the time a post-hoc check could
+       run. This is the worst case -- the refinement usually stops well short of
+       `maxnodes` -- and the summary below reports what it actually cost. =#
+    peak = maxnodes*bytes_per_node(proto)
+    if peak > TABLE_WARN_BYTES
+        @warn(@sprintf("Tabulating this linear operator can need up to %.1f MB (%d nodes of an operator of size %s, at %.1f MB per node, most of it held on the host while the table is built). Raise `linop_tol` to place fewer nodes, use `linop_integral=:quadrature`, which holds no table, or leave `linop_integral` at :auto, which caps the node count at a byte budget and falls back to the quadrature if the cap binds.",
+                       peak/1024^2, maxnodes, string(size(proto)),
+                       bytes_per_node(proto)/1024^2))
+    end
     sz = size(proto)
     buf = Array{ComplexF64}(undef, sz)
     nevals = Ref(0)
@@ -936,12 +1027,9 @@ function TabulatedLinop(linop!, proto::AbstractArray, z0::Real, z1::Real;
               "largest interpolation error $(worst[]) against a tolerance of $tol. The "*
               "operator may be discontinuous in z; raise `linop_tol` or check it.")
     elseif !quiet
-        @info(@sprintf("Tabulated linear operator: %d nodes over [%.4g, %.4g] m, %d evaluations, largest interpolation error %.2e, largest stored value %.2e, %.1f MB.",
-                       n, z0, z1, nevals[], worst[], scale, bytes/1024^2))
-    end
-    if bytes > TABLE_WARN_BYTES
-        @warn(@sprintf("The tabulated linear operator needs %.1f MB: %d nodes of an operator of size %s. Tabulation stores two copies of the operator per node, which is cheap for a mode-averaged run and not for a multimode or free-space one. Raise `linop_tol` to place fewer nodes, or use `linop_integral=:quadrature` for this geometry, which holds no table.",
-                       bytes/1024^2, n, string(sz)))
+        @info(@sprintf("Tabulated linear operator: %d nodes over [%.4g, %.4g] m, %d evaluations, largest interpolation error %.2e, largest stored value %.2e, %.1f MB kept (%.1f MB host peak).",
+                       n, z0, z1, nevals[], worst[], scale, bytes/1024^2,
+                       n*bytes_per_node(proto)/1024^2))
     end
     TabulatedLinop(znodes, upload_like(proto, Φ), upload_like(proto, dΦ),
                    upload_like(proto, secant), z0, float(tol), worst[], nevals[], scale)
@@ -1045,7 +1133,8 @@ over four node slices. Returns `out`.
 At a node this is exactly the stored `linop(z)`; between nodes it is the derivative of the
 interpolant rather than an interpolation of the derivative, so it is consistent with the
 `Φ` the propagator uses. Outside the table the end value is held, as [`phase!`](@ref)
-does.
+does -- but silently: `phase!` warns because the propagator would then step with the mean
+operator over the whole table, while this is only ever read by diagnostics.
 """
 function derivative!(out, tab::TabulatedLinop, z)
     k, s, h = _locate(tab.z, z)
@@ -1067,7 +1156,7 @@ end
 #=------------------------ the integral by adaptive quadrature ------------------------=#
 
 """
-    QuadratureLinop(linop!, proto; tol, z0, order)
+    QuadratureLinop(linop!, proto; tol, z0, order, maxevals)
 
 The integrated linear operator of `linop!(out, z)` computed on demand rather than
 tabulated: every call to the propagator integrates the operator over the step by adaptive
@@ -1106,6 +1195,8 @@ entrance, and Gauss–Kronrod resolves such a point by bisecting towards it, whi
 - `linop!`: the operator, called as `linop!(out, z)` on a host `ComplexF64` buffer
 - `nevals`: how many times `linop!` has been called
 - `ncalls`: how many quadratures have been run
+- `ncapped`: how many of them stopped at `maxevals` short of the tolerance.
+  [`report_integral`](@ref) prints the total once, at the end of a propagation
 """
 struct QuadratureLinop{F, hT, sT} <: AbstractIntegratedLinop
     linop!::F
@@ -1117,10 +1208,11 @@ struct QuadratureLinop{F, hT, sT} <: AbstractIntegratedLinop
     maxevals::Int
     nevals::Base.RefValue{Int}
     ncalls::Base.RefValue{Int}
+    ncapped::Base.RefValue{Int}
 end
 
 function QuadratureLinop(linop!, proto::AbstractArray; tol=DEFAULT_LINOP_TOL, z0=0.0,
-                         order=7, maxevals=DEFAULT_QUAD_MAXEVALS)
+                         order=DEFAULT_QUAD_ORDER, maxevals=DEFAULT_QUAD_MAXEVALS)
     #= The quadrature runs in Float64 on the host whatever the state's precision: the
        operator itself is host code in Float64, and the sum is what the precision of Φ
        depends on. `stage` is the host buffer in the state's element type, which is what
@@ -1129,7 +1221,7 @@ function QuadratureLinop(linop!, proto::AbstractArray; tol=DEFAULT_LINOP_TOL, z0
     ET = Complex{real(eltype(proto))}
     stage = (isdevice(proto) && ET !== ComplexF64) ? Array{ET}(undef, size(proto)) : nothing
     QuadratureLinop(linop!, host, stage, float(z0), float(tol), Int(order), Int(maxevals),
-                    Ref(0), Ref(0))
+                    Ref(0), Ref(0), Ref(0))
 end
 
 PhaseStyle(::QuadratureLinop) = IncrementalPhase()
@@ -1164,8 +1256,11 @@ function phasediff!(out, q::QuadratureLinop, z1, z2)
     if err > q.tol
         #= `quadgk` returns its best estimate when it runs out of evaluations and says
            nothing, so say it here: the propagation would otherwise carry on with an
-           operator integrated to an unknown accuracy. =#
-        @warn(@sprintf("The linear operator's integral over [%.6g, %.6g] m reached %.2e against a tolerance of %.2e in %d evaluations of the operator. Raise `linop_tol`, or use `linop_integral=:tabulated`, whose bisection resolves a cusp in the operator more cheaply than Gauss--Kronrod does.",
+           operator integrated to an unknown accuracy. The message is `maxlog=1` because
+           there are twelve of these per step; the count is kept and
+           [`report_integral`](@ref) prints the total at the end. =#
+        q.ncapped[] += 1
+        @warn(@sprintf("The linear operator's integral over [%.6g, %.6g] m reached %.2e against a tolerance of %.2e in %d evaluations of the operator. Raise `linop_tol`, or use `linop_integral=:tabulated`, whose bisection resolves a cusp in the operator more cheaply than Gauss--Kronrod does. (Reported once; the total is reported at the end of the propagation.)",
                        z1, z2, err, q.tol, q.maxevals), maxlog=1)
     end
     _upload!(out, q)
@@ -1205,6 +1300,26 @@ function _upload!(out, q::QuadratureLinop)
         copyto!(out, q.stage)
     end
     out
+end
+
+"""
+    report_integral(op)
+
+Report anything the operator accumulated over a propagation that is worth one line at the
+end of it. [`Luna.run`](@ref) calls this after the stepper returns; the generic method does
+nothing.
+
+For a [`QuadratureLinop`](@ref) it is the number of integrals which stopped at `maxevals`
+short of their tolerance, which the per-call warning only reports once.
+"""
+report_integral(op) = nothing
+
+function report_integral(q::QuadratureLinop)
+    if q.ncapped[] > 0
+        @warn(@sprintf("%d of the %d integrals of the linear operator stopped at maxevals = %d without reaching a tolerance of %.2e, in %d evaluations of the operator in total. The propagation used an operator integrated to an unknown accuracy over those steps. Raise `linop_tol`, or use `linop_integral=:tabulated`.",
+                       q.ncapped[], q.ncalls[], q.maxevals, q.tol, q.nevals[]))
+    end
+    nothing
 end
 
 #=------------------------ a constant added to an integrated operator ------------------------=#
@@ -1259,15 +1374,36 @@ function derivative!(out, w::OffsetLinop, z)
     out
 end
 
-#= `δ` in the array type of whatever it is being broadcast against, built on first use.
-   `Ref{Any}` because that type is not known until then; the branch is perfectly predicted
-   next to the field-sized broadcast which follows it. =#
+#= `δ` in the array type of whatever it is being broadcast against, built on first use and
+   keyed on that type: an operator inspected with a host buffer before a device propagation
+   starts would otherwise keep the host copy and the first device broadcast would scalar-index
+   or fail. `Ref{Any}` because the type is not known until the first call; the branch is
+   perfectly predicted next to the field-sized broadcast which follows it. =#
 function _δlike(w::OffsetLinop, proto)
-    isnothing(w.cache[]) && (w.cache[] = upload_like(proto, w.δ))
-    w.cache[]
+    key = _arraykey(proto)
+    c = w.cache[]
+    if isnothing(c) || c[1] !== key
+        c = (key, upload_like(proto, w.δ))
+        w.cache[] = c
+    end
+    c[2]
 end
 
+"A key identifying the array type and precision an object was converted for."
+_arraykey(x::AbstractArray) = (Base.typename(typeof(x)).wrapper, real(eltype(x)))
+
 #=--------------------------- tabulated values (not integrals) ---------------------------=#
+
+#= Said once, as `phase!` says it for the operator table. A value table read outside its
+   span is not necessarily wrong -- `prop_capillary` tabulates `Aeff` over the fibre and the
+   last step's statistics are recorded past the end of it, where `TabulatedScalar` calls its
+   source -- but it is never what the propagation should be doing, because `Luna.run` builds
+   the propagation's tables over everything the stepper can ask about. If it happens per
+   stage, the table is short and the host work the table exists to remove is back. =#
+function _outofspan(what, z, zs)
+    @warn(@sprintf("%s was read at z = %.6g m, outside the [%.6g, %.6g] m it was built for. (Reported once.)",
+                   what, z, zs[1], zs[end]), maxlog=1)
+end
 
 #= β and Aeff are needed as values, not as integrals, and no derivative of either is
    available: the mode interface gives the quantity and nothing else. The interpolant is
@@ -1326,7 +1462,7 @@ function _tabulate_value(f, z0, z1, rtol, maxdepth, maxnodes)
 end
 
 """
-    TabulatedScalar(f, z0, z1; tol, maxdepth, maxnodes)
+    TabulatedScalar(f, z0, z1; tol, maxdepth, maxnodes, quiet)
 
 A scalar function of `z` -- the effective area of a tapered or pressure-graded waveguide --
 tabulated on adaptively placed nodes covering `[z0, z1]` and read back by linear
@@ -1342,6 +1478,13 @@ table can be rebuilt over a wider span without going through the interpolant --
 [`prop_capillary`](@ref Luna.Interface.prop_capillary) has already tabulated `Aeff` over
 the fibre for the statistics and the propagation needs it a little past the end -- and so
 that a read outside the table returns the true value rather than the nearest end one.
+
+`quiet=true` suppresses the warning such a read otherwise produces. It is for a table which
+is *expected* to be read outside its span: `prop_capillary` tabulates `Aeff` over the
+fibre for the statistics, and the statistics of the last accepted step are recorded a
+fraction of a step past the end of it. The table the propagation uses is a different one,
+built over everything the stepper can ask about, and it is not quiet -- a read outside
+*that* one means host work per stage that the table exists to remove.
 """
 struct TabulatedScalar{F}
     z::Vector{Float64}
@@ -1350,13 +1493,14 @@ struct TabulatedScalar{F}
     tol::Float64
     err::Float64
     nevals::Int
+    quiet::Bool
 end
 
 function TabulatedScalar(f, z0, z1; tol=DEFAULT_LINOP_TOL, maxdepth=DEFAULT_MAXDEPTH,
-                         maxnodes=DEFAULT_MAXNODES)
+                         maxnodes=DEFAULT_MAXNODES, quiet=false)
     zs, vs, err, nevals = _tabulate_value(z -> float(f(z)), z0, z1, float(tol),
                                           maxdepth, maxnodes)
-    TabulatedScalar(zs, _stack(vs), f, float(tol), err, nevals)
+    TabulatedScalar(zs, _stack(vs), f, float(tol), err, nevals, quiet)
 end
 
 function (t::TabulatedScalar)(z)
@@ -1368,7 +1512,10 @@ function (t::TabulatedScalar)(z)
        a propagation can reach this -- `Luna.run` rebuilds the table over everything the
        stepper can ask about -- so it costs one host call per out-of-range diagnostic and
        nothing per stage. =#
-    (z < t.z[1] || z > t.z[end]) && return float(t.src(z))
+    if z < t.z[1] || z > t.z[end]
+        t.quiet || _outofspan("A z table", z, t.z)
+        return float(t.src(z))
+    end
     k, s, _ = _locate(t.z, z)
     (1 - s)*t.f[k] + s*t.f[k+1]
 end
@@ -1414,6 +1561,7 @@ end
 
 function (t::TabulatedVector)(z)
     if t.lastz[] != z
+        (z < t.z[1] || z > t.z[end]) && _outofspan("The tabulated β", z, t.z)
         k, s, _ = _locate(t.z, z)
         w0 = scalar(t.buf, 1 - s)
         w1 = scalar(t.buf, s)

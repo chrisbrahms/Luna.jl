@@ -384,17 +384,20 @@ If `raman` is `true`, then the following options apply:
 - `boundary_length`: Absorber reference length in metres, overriding `boundary_N`.
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
-- `linop_integral::Symbol=:tabulated`: how the integral `Φ(z) = ∫linop dz'` of a tapered
+- `linop_integral::Symbol=:auto`: how the integral `Φ(z) = ∫linop dz'` of a tapered
     or pressure-graded capillary's z-dependent linear operator is obtained. The stepper
     propagates the linear part by `exp(Φ(t2) − Φ(t1))`, which is exact.
     `:tabulated` builds a table of `Φ` at setup, along with the propagation constant and
     effective area, so that the propagation does no host work per stage -- which is what
     makes such a run go entirely on a device; `:quadrature` integrates the operator over
     each step instead, with no table and no setup pass but around fifteen host
-    evaluations of the operator per stage. See [`Luna.run`](@ref).
+    evaluations of the operator per stage; `:auto` (the default) tabulates unless the
+    table would not fit in a byte budget, in which case it falls back to the quadrature and
+    says so. See [`Luna.run`](@ref). A mode-averaged capillary always tabulates.
 
     A uniform fibre has a constant operator, which is already exact in the propagator, and
-    is not affected by this keyword at all.
+    is not affected by this keyword at all. `prop_gnlse` does not accept the keyword: its
+    operator is always constant.
 - `linop_tol::Real`: the tolerance `Φ` is computed to, in radians. See [`Luna.run`](@ref).
 - `tabulate_linop`: **deprecated** and ignored; see [`Luna.run`](@ref).
 - `device`: where to run: `:cpu`, `:auto`, `:metal`, `:cuda` or a [`Luna.DeviceSpec`](@ref).
@@ -520,10 +523,15 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
                         boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR,
-                        linop_integral=:tabulated,
+                        linop_integral=:auto,
                         linop_tol=LinearOps.DEFAULT_LINOP_TOL,
                         tabulate_linop=nothing,
                         device=nothing, precision=nothing, stats_period=1)
+
+    #= Validated here rather than only inside `Luna.run`, so that a misspelled symbol fails
+       before the grid, the FFT plans, the input field and the statistics are built.
+       `Luna.run` resolves it again, which is idempotent. =#
+    linop_integral = Luna._linop_integral(linop_integral, tabulate_linop)
 
     # do we have energy in the orthogonal polarisation states, or just the fundamental?
     # if so, we need to treat double the number of modes
@@ -594,7 +602,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
        A uniform fibre is left alone: its `Aeff` is a constant, `Luna.run` tabulates
        nothing for it, and reading the constant off a two-node table would be
        `(1-s)f + sf` rather than `f` -- a rounding difference for no gain. =#
-    tabvalues = (linop_integral === :tabulated) &&
+    tabvalues = (linop_integral !== :quadrature) &&
                 (const_linop(radius, pressure) === Val(false))
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
@@ -1051,7 +1059,12 @@ function makeaeff(mode, aefftol::Nothing, aeffspan)
 end
 
 function makeaeff(mode, aefftol, aeffspan)
-    LinearOps.TabulatedScalar(z -> Modes.Aeff(mode, z=z), aeffspan...; tol=aefftol)
+    #= `quiet`: this table spans the fibre and the statistics of the last accepted step are
+       recorded a fraction of a step past the end of it, by design. The table the
+       propagation uses is rebuilt by `NonlinearRHS._aefftab` over the whole of what the
+       stepper can reach, and that one is not quiet. =#
+    LinearOps.TabulatedScalar(z -> Modes.Aeff(mode, z=z), aeffspan...; tol=aefftol,
+                              quiet=true)
 end
 
 #= `rtol` and the `modal_integral`/quadrature keywords describe the transverse integral

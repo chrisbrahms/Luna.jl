@@ -100,11 +100,8 @@ Luna.run(Eω, grid, linop, transform, FT, output, status_period=10, zmax=L)
 abs2.(output["Eω"])
 end
 
-#= `afun` is constant, so these are the same propagation. Compared per save on the
-   largest value in that save rather than elementwise: since gpu/27 the z-dependent path
-   propagates with the integral of the operator, whose two-node table holds the constant
-   to within the rounding of a Simpson sum rather than bitwise. =#
-@test maximum(axes(Iωavg, 2)) do i
-    maximum(abs, Iωavg[:, i] .- Iωavg_c[:, i])/maximum(Iωavg_c[:, i])
-end < 1e-12
+#= `afun` is constant, so this is the same propagation as the constant-radius one:
+   `Luna.run` recognises a closure which ignores `z` (`LinearOps.constant_linop`) and
+   propagates the constant array exactly. =#
+@test all(Iωavg .≈ Iωavg_c)
 end

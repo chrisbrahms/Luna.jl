@@ -1216,6 +1216,7 @@ end
    The third element of the return value counts the host calls each run made. =#
 function zcase(spec; kind=:gradient, gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9,
                precision=nothing, linop_integral=:tabulated, onepoint=false,
+               linop_budget=LinearOps.TABLE_BUDGET_BYTES,
                linop_tol=LinearOps.DEFAULT_LINOP_TOL, nsteps=20, maxdz=nothing, rtol=1e-6)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
     if kind === :gradient
@@ -1246,7 +1247,7 @@ function zcase(spec; kind=:gradient, gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, �
     lop = onepoint ? onepoint_linop(linop, Eω) : linop
     Luna.run(Eω, grid, lop, transform, FT, out;
              zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=mdz, rtol,
-             linop_integral, linop_tol)
+             linop_integral, linop_tol, linop_budget)
     out, transform, (; linop=linop.n, β=βfun!.n, aeff=aeff.n, rhs=dens.n)
 end
 
@@ -1883,6 +1884,40 @@ end
     @test terr[1] < 0.5*eerr[3]
     # and does not change with the step count, because its linear step is exact
     @test terr[3] > 0.5*terr[1]
+end
+
+#= gpu/27, `linop_integral=:auto` (the default): the node count is capped so that the
+   table's peak cost stays inside `linop_budget`, and the quadrature is used instead when
+   the cap binds before the tolerance is met. Nothing in Luna's own tests or examples is
+   big enough to reach that, so the budget is made tiny here to force it. The two are the
+   same integral computed two ways, so the propagation must agree with the tabulated one
+   to the tolerance each was computed to. =#
+@testset "linop_integral=:auto falls back to the quadrature: $kind" for (kind, mk) in (
+        ("gradient", gradientcase), ("taper", tapercase))
+    flength = 1e-2
+    tab, _, ctab = mk(HostSpec(); flength, linop_integral=:tabulated)
+    #= Four nodes' worth of budget for this state (2049 frequencies): a gradient needs about
+       34 nodes at the default tolerance, so the cap binds and the fallback is taken. What
+       the fallback did is established by counting host calls, not by reading types --
+       `Luna.run` tabulates into a transform of its own and leaves the caller's alone. =#
+    budget = 4*LinearOps.bytes_per_node(zeros(ComplexF64, 2049))
+    auto, _, cauto = mk(HostSpec(); flength, linop_integral=:auto, linop_budget=budget)
+    #= Nothing was tabulated: the operator is integrated on the host at every stage and the
+       transform's own quantities are evaluated there too, as with `:quadrature`. =#
+    @test cauto.linop > 5*ctab.linop
+    @test cauto.β > 2*ctab.β
+    #= `Aeff` is not counted here: a linear taper's `Aeff` table needs 513 nodes, which is
+       more evaluations than the fallback's per-stage calls, so the count does not separate
+       the two cases the way the operator's and `β`'s do. =#
+    # ... and it is the same integral, so the propagation agrees to the two tolerances
+    for idx in axes(tab["Eω"], 2)
+        t = tab["Eω"][:, idx]
+        @test maximum(abs, auto["Eω"][:, idx] .- t)/maximum(abs, t) < 1e-6
+    end
+    # with a budget that fits, `:auto` is the tabulated run exactly
+    fits, _, cfits = mk(HostSpec(); flength, linop_integral=:auto)
+    @test fits["Eω"] == tab["Eω"]
+    @test cfits == ctab
 end
 
 #= gpu/27: the other two ways of supplying Φ, on a device. `:quadrature` integrates the
