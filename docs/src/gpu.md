@@ -435,65 +435,116 @@ In single precision the Raman coefficients need care: the response function is a
 coefficient so that no factor a kernel sees is subnormal. The developer guide has the
 audit; there is nothing to set.
 
-### Tapers and pressure gradients (`tabulate_linop`)
+### Tapers and pressure gradients (`linop_integral`)
 
 ```julia
-out = prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); ..., tabulate_linop=true)
+out = prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); ...)                            # tabulated
+out = prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); ..., linop_integral=:quadrature) # or this
 ```
 
-A capillary whose radius or pressure changes along `z` has a linear operator which changes
-with it. By default that operator is host code — a scalar loop over `Modes.neff` — and it is
-evaluated, in the propagation's own precision, at every stage of every step and copied to
-the device; so are the propagation constant `β(z)` and the effective area `Aeff(z)` the
-mode-averaged nonlinear normalisation needs. Six host evaluations and six copies per step
-serialise a device run against the host and are the slowest thing in it.
+A capillary whose radius or pressure changes along `z` has a linear operator `L(z)` which
+changes with it. The stepper propagates the linear part of a step by
 
-`tabulate_linop=true` evaluates all three at setup instead, on `z` nodes placed by adaptive
-bisection, and stores the tables where the state lives. What is left inside the propagation
-is an interval lookup and four interpolation weights per readback — scalar host arithmetic,
-no mode evaluation and no copy between host and device. It works for every mode type
-(mode-averaged, multimode, radial and free space; the operator is tabulated whatever its
-shape, and `β` and `Aeff` exist only for the mode-averaged transform) and for a uniform
-fibre too, where the operator is already constant and only a two-node table of `Aeff` is
-built.
+```
+exp(Φ(t2) − Φ(t1)),   Φ(z) = ∫ L dz',
+```
 
-**It changes the discretisation of the linear step, which is why it is not the default.**
-What is tabulated is the *integrated* operator `Φ(z) = ∫ linop dz'`, and the propagator
-becomes `exp(Φ(t2) − Φ(t1))`: the exact interaction-picture propagator of the linear part
-over the step. The default is `exp(linop(t2)·(t2 − t1))`, a one-point rule, whose error is
-first order in the step size. The two converge to the same solution as the step shrinks,
-but not at the same rate, and the difference between them at a usable step size is not
-small:
+which is exact, so what it needs is not the operator but its integral. `linop_integral`
+says how that integral is obtained, and there are two built-in answers plus the option of
+writing your own.
 
-| 0.1 m Ar capillary, fixed steps | 20 steps | 80 steps | 320 steps | 1280 steps |
+**What changed.** Until this release Luna propagated a z-dependent operator with
+`exp(L(t2)·(t2 − t1))`, a one-point rule. It is first order in the step size, and — this is
+the part which matters in practice — its error is common to both of the embedded
+Runge–Kutta solutions the step-size controller forms its error estimate from, so it cancels
+out of the estimate and no value of `rtol` responds to it. **Every taper and pressure
+gradient result therefore changes**, by the amount that rule was wrong:
+
+| 0.1 m Ar capillary, fixed steps, difference from a 10240-step reference | 20 steps | 80 | 320 | 1280 |
 | --- | --- | --- | --- | --- |
-| pressure gradient, default | 7.5e-2 | 2.0e-2 | 4.9e-3 | 1.1e-3 |
-| pressure gradient, `tabulate_linop=true` | 1.6e-4 | 1.6e-4 | 1.6e-4 | 1.6e-4 |
-| taper 75 → 50 µm, default | 4.1e-1 | 1.0e-1 | 2.5e-2 | 5.6e-3 |
-| taper, `tabulate_linop=true` | 8.0e-4 | 8.0e-4 | 8.0e-4 | 8.0e-4 |
+| pressure gradient, one-point rule (before) | 7.5e-2 | 2.0e-2 | 4.9e-3 | 1.1e-3 |
+| pressure gradient, `:tabulated` or `:quadrature` (now) | 1.6e-4 | 1.6e-4 | 1.6e-4 | — |
+| taper 75 → 50 µm, one-point rule (before) | 4.1e-1 | 1.0e-1 | 2.5e-2 | 5.6e-3 |
+| taper, `:tabulated` or `:quadrature` (now) | 8.0e-4 | 8.0e-4 | 8.0e-4 | — |
 
-(largest relative difference of `Eω` from a 10240-step run of the same kind, per save;
-gradient 0 → 1 bar, Kerr only, `boundary=:none`.) The tabulated run is at the well resolved
-answer from the coarsest step count tried; the default path needs about a thousand steps to
-get there. The step-size controller does not close this gap on its own: the propagator's
-error is common to both of the embedded Runge–Kutta solutions the error estimate is formed
-from, so it cancels out of the estimate and `rtol` does not see it.
+(largest relative difference of `Eω` per save; gradient 0 → 1 bar, Kerr only,
+`boundary=:none`. The reference is itself a 10240-step run of the old rule, so the 1.6e-4
+and 8.0e-4 left in the second and fourth rows are mostly the reference's own remaining
+error.) The new propagator is at the well resolved answer from the coarsest step count
+tried; the old one needed about a thousand steps to get there. A result computed now is
+therefore *not* comparable element by element with one stored before, and the difference is
+larger than any tolerance — the regression gate records 8.0e-3 for its gradient case and
+9.2e-2 for its taper case. A uniform fibre has a constant operator, which was always exact
+in the propagator, and is bit-for-bit unchanged.
 
-So the two are not comparable element by element, and a result computed with
-`tabulate_linop=true` should not be compared against a stored one computed without it. It
-is off by default so that existing scripts keep producing what they produced before.
+**`:tabulated` (the default)** evaluates `Φ` at setup on `z` nodes placed by adaptive
+bisection and stores the table where the state lives, together with the propagation
+constant `β(z)` and effective area `Aeff(z)` the mode-averaged nonlinear normalisation
+needs. What is left inside the propagation is an interval lookup and four interpolation
+weights per readback — scalar host arithmetic, no mode evaluation and no copy between host
+and device. This is what makes a tapered or pressure-graded run go entirely on a GPU: the
+alternative is six host evaluations of `Modes.neff` and six uploads per step, which
+serialise a device run against the host.
 
-`linop_tol` (default `1e-6`) sets how accurate the tables are: absolute, in radians, for the
-integrated operator, and relative for `β` and `Aeff`. The bisection checks the interpolant
-it will actually read back against a directly computed value at each candidate interval's
-midpoint, and refines until it agrees to the tolerance, so a kink — the `1/√z` cusp in the
-density of a gradient filled from vacuum, a junction in a multi-section fill — costs a
-handful of extra intervals where it is rather than a finer grid everywhere. A 0.1 m gradient
-takes about 60 nodes at the default tolerance and a taper about 30. The tables cost
-`2·length(Eω)·nnodes` numbers in the state's precision, which for a mode-averaged run is a
-few megabytes; for a multimode or free-space operator, whose `linop` is the size of the
-whole state, it is `nnodes` times that, so tabulation is worth thinking about before turning
-it on there.
+`linop_tol` (default `1e-6`) sets how accurate the table is: absolute, in radians, for
+`Φ`, and relative for `β` and `Aeff`. The bisection checks the interpolant it will actually
+read back against a directly computed value at each candidate interval's midpoint, so a
+kink — the `1/√z` cusp in the density of a gradient filled from vacuum, a junction in a
+multi-section fill — costs a handful of extra intervals where it is rather than a finer
+grid everywhere. A 0.1 m gradient takes about 60 nodes at the default tolerance and a taper
+about 30.
+
+The table costs `2·length(Eω)·nnodes` numbers in the state's precision. For a mode-averaged
+run that is a few megabytes. For a multimode, radial or free-space operator, whose `linop`
+is the size of the whole state, it is `2·nnodes` times the state, and Luna warns above 256
+MB; that is the case for `:quadrature`.
+
+**`:quadrature`** integrates the operator over each step instead, by adaptive
+Gauss–Kronrod quadrature on the host, and uploads the result. It holds no table, needs no
+setup pass and makes no assumption about how the operator behaves in `z`, but it costs
+about fifteen host evaluations of the operator per stage against one table readback, and
+`β` and `Aeff` are evaluated per stage as well. It computes the same integral as the table
+does — the two agree to 1e-7 of each other on the cases above — so it is the thing to check
+a tabulated result against, and the thing to use when the table would be too large.
+
+**Your own `Φ`.** If you know the integral in closed form, define a subtype of
+`LinearOps.AbstractIntegratedLinop` and pass it to `Luna.run` in place of the callable; it
+is used as it is, and neither `β` nor `Aeff` is tabulated for it. The interface is three
+functions:
+
+```julia
+import Luna: LinearOps, scalar
+
+struct MyLinop{aT} <: LinearOps.AbstractIntegratedLinop
+    L0::aT   # L(z) = L0 + L1*z, so Φ(z) = L0*z + L1*z^2/2
+    L1::aT
+end
+
+function LinearOps.phase!(out, op::MyLinop, z)      # Φ(z)
+    a = scalar(out, z); b = scalar(out, z^2/2)
+    L0, L1 = op.L0, op.L1
+    @. out = L0*a + L1*b
+end
+
+function LinearOps.derivative!(out, op::MyLinop, z) # L(z) itself, for the diagnostics
+    a = scalar(out, z)
+    L0, L1 = op.L0, op.L1
+    @. out = L0 + L1*a
+end
+```
+
+`phase!` and `derivative!` must be broadcasts (or other kernels) over `out`'s array type,
+and every scalar must go through `Luna.scalar`, which converts it to the state's real
+element type; that is all it takes for the same type to run on a GPU. An operator which
+can only give *differences* of `Φ` — a quadrature — declares
+`LinearOps.PhaseStyle(::MyLinop) = LinearOps.IncrementalPhase()` and implements
+`phasediff!(out, op, z1, z2)` instead of `phase!`. See the developer guide.
+
+Two limits on a caller-supplied operator. An absorbing boundary adds a constant to the
+operator, which Luna folds into the integral exactly, so `boundary=:rate` works with one;
+but the free-space evanescent clamp is not linear in the operator, cannot be pushed through
+an integral, and raises rather than propagating something wrong — for free space, pass the
+callable and let `linop_integral` do the integrating.
 
 ### `stats_period`
 

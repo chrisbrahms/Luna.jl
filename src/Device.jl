@@ -515,9 +515,10 @@ A length-`n` vector which is filled on the host in `Float64` and then made avail
 `spec`'s array type and precision by [`upload!`](@ref).
 
 This is the mechanism for quantities which are evaluated by host scalar code on every
-right-hand side -- the propagation constant `β` of a tapered or pressure-graded waveguide,
-and a user-supplied `linop!`. `Luna.run(...; tabulate_linop=true)` replaces them with
-tables over `z` (`LinearOps.TabulatedVector`) and then no host code runs per stage at all.
+right-hand side -- the propagation constant `β` of a tapered or pressure-graded
+waveguide. `Luna.run`'s default `linop_integral=:tabulated` replaces them with
+tables over `z` (`LinearOps.TabulatedVector`) and then no host code runs per stage at all;
+`:quadrature` leaves them here.
 On `DeviceSpec(Array, Float64)` the device array *is* the host buffer and `upload!` does
 nothing, so the CPU path pays neither a copy nor a conversion.
 

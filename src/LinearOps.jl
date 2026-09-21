@@ -842,11 +842,11 @@ read back with a cubic Hermite interpolant. `proto` is the propagating field, wh
 type and element type the tables are built in (so they are device-resident for a device
 run).
 
+It is an [`AbstractIntegratedLinop`](@ref) of the [`AbsolutePhase`](@ref) kind, and
 [`RK45.make_prop!`](@ref Luna.RK45.make_prop!) builds the interaction-picture propagator
-`exp(Φ(t2) − Φ(t1))` from it. That is the exact propagator of the linear part over the
-step, where the untabulated path uses `exp(linop(t2)·(t2 − t1))`, a one-point rule; it is
-a different discretisation of the same equation, and it is opt-in
-(`tabulate_linop=true` on [`Luna.run`](@ref)) for that reason.
+`exp(Φ(t2) − Φ(t1))` from it. This is what `linop_integral=:tabulated` -- the default of
+[`Luna.run`](@ref) -- builds from a `linop!(out, z)` callable, and
+[`QuadratureLinop`](@ref) is the alternative.
 
 # What is stored
 `Φ` holds not the integral itself but its deviation from the straight line through the two
@@ -940,7 +940,7 @@ function TabulatedLinop(linop!, proto::AbstractArray, z0::Real, z1::Real;
                        n, z0, z1, nevals[], worst[], scale, bytes/1024^2))
     end
     if bytes > TABLE_WARN_BYTES
-        @warn(@sprintf("The tabulated linear operator needs %.1f MB: %d nodes of an operator of size %s. Tabulation stores two copies of the operator per node, which is cheap for a mode-averaged run and not for a multimode or free-space one. Raise `linop_tol` to place fewer nodes, or leave `tabulate_linop` off for this geometry.",
+        @warn(@sprintf("The tabulated linear operator needs %.1f MB: %d nodes of an operator of size %s. Tabulation stores two copies of the operator per node, which is cheap for a mode-averaged run and not for a multimode or free-space one. Raise `linop_tol` to place fewer nodes, or use `linop_integral=:quadrature` for this geometry, which holds no table.",
                        bytes/1024^2, n, string(sz)))
     end
     TabulatedLinop(znodes, upload_like(proto, Φ), upload_like(proto, dΦ),
@@ -1336,10 +1336,12 @@ interpolation. Callable as `t(z)`.
 distinct `z` it is asked about, i.e. per stage of every step, for the whole propagation.
 Tabulating it bounds that at the number of nodes and takes the quadrature out of the step.
 
-`src` is the callable the table was built from, kept so that a table can be rebuilt over a
-wider span without going through the interpolant. `NonlinearRHS.tabulate` does that when
-[`prop_capillary`](@ref Luna.Interface.prop_capillary) has already tabulated `Aeff` over the fibre for the
-statistics and the propagation needs it a little past the end.
+`src` is the callable the table was built from. It is kept for two reasons: so that a
+table can be rebuilt over a wider span without going through the interpolant --
+`NonlinearRHS.tabulate` does that when
+[`prop_capillary`](@ref Luna.Interface.prop_capillary) has already tabulated `Aeff` over
+the fibre for the statistics and the propagation needs it a little past the end -- and so
+that a read outside the table returns the true value rather than the nearest end one.
 """
 struct TabulatedScalar{F}
     z::Vector{Float64}
@@ -1358,6 +1360,15 @@ function TabulatedScalar(f, z0, z1; tol=DEFAULT_LINOP_TOL, maxdepth=DEFAULT_MAXD
 end
 
 function (t::TabulatedScalar)(z)
+    #= Outside the table the source callable is evaluated directly rather than the end
+       value held. `prop_capillary` tabulates `Aeff` over the fibre for the statistics, and
+       the statistics of the last accepted step are recorded a fraction of a step past the
+       end of it, where a held end value is a visible error: 2.8e-2 on the peak intensity
+       of the regression gate's taper case, against the untabulated answer. Nothing inside
+       a propagation can reach this -- `Luna.run` rebuilds the table over everything the
+       stepper can ask about -- so it costs one host call per out-of-range diagnostic and
+       nothing per stage. =#
+    (z < t.z[1] || z > t.z[end]) && return float(t.src(z))
     k, s, _ = _locate(t.z, z)
     (1 - s)*t.f[k] + s*t.f[k+1]
 end

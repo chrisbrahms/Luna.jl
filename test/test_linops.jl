@@ -440,9 +440,13 @@ end
         @test_logs (:warn, r"outside") LinearOps.phase!(out, tab, 1.5L)
         LinearOps.phase!(ref, tab, L)
         @test out == ref
-        # ... and the value tables hold their end value silently, which is deliberate
+        #= ... and a value table calls its source outside its span rather than holding its
+           end value, so that a diagnostic recorded a fraction of a step past the end of
+           the fibre is still right. =#
         atab = LinearOps.TabulatedScalar(z -> 1 + z^2, 0.0, L; tol=1e-6)
-        @test atab(1.5L) == atab(L)
+        @test atab(1.5L) == 1 + (1.5L)^2
+        @test atab(-0.1L) == 1 + (-0.1L)^2
+        @test atab(L) != atab(1.5L)
     end
 
     #= The value tables: β and Aeff are interpolated rather than integrated, to a

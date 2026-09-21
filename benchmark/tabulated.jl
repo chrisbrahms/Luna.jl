@@ -1,5 +1,6 @@
-#= A pressure-graded and a tapered mode-averaged propagation timed with and without
-   `tabulate_linop`, on each device and precision.
+#= A pressure-graded and a tapered mode-averaged propagation timed with the two ways of
+   integrating a z-dependent linear operator, `linop_integral=:tabulated` and
+   `:quadrature`, on each device and precision.
 
    Usage (CPU only, from the repository root):
 
@@ -10,16 +11,17 @@
 
        julia --project=<metalenv> -t 1 -e 'using Metal; include("benchmark/tabulated.jl")'
 
-   These are the cases GPU_PLAN.md section 4.5 is about. Without tabulation a z-dependent
-   operator is a host scalar loop over `Modes.neff` evaluated at every stage, plus a host
-   evaluation and upload of β at every right-hand side; with it, both are interpolations in
-   a table which lives where the state does. On a device that is the difference between a
-   propagation which synchronises with the host six times per step and one which does not.
+   These are the cases GPU_PLAN.md section 4.5 is about. With `:quadrature` a z-dependent
+   operator is a host scalar loop over `Modes.neff` run fifteen times per Gauss--Kronrod
+   rule at every stage, plus a host evaluation and upload of β at every right-hand side;
+   with `:tabulated`, both are interpolations in a table which lives where the state does.
+   On a device that is the difference between a propagation which synchronises with the
+   host at every stage and one which does not.
 
-   Two numbers are reported per row: the setup cost of the tables (paid once) and the time
-   for a fixed-step propagation. The two discretisations are not the same -- the tabulated
-   propagator is the exact `exp(∫linop dz)` and the other a one-point rule -- so this is a
-   comparison of cost, not of two ways to compute the same thing; see `docs/src/gpu.md`.
+   The two compute the same integral to their tolerances (agreement measured at 1e-7 on
+   these cases), so unlike the one-point rule they replaced this is a like-for-like
+   comparison of cost. Two numbers are reported per row: the setup cost of the tables,
+   paid once, and the time for a fixed-step propagation.
 
    As for the other benchmark scripts: one Julia thread, one FFTW thread, one BLAS thread,
    `:estimate` planning and no wisdom, or the numbers are not comparable between runs.
@@ -77,7 +79,7 @@ end
 #= The propagation, and separately the setup of the tables. `Luna.run` builds them, so the
    setup cost is measured as a run of one step: everything before the stepping is the same
    and the difference between the two is the table build. =#
-function proptime(spec, trange; kind=:gradient, tabulate_linop=false, samples=3)
+function proptime(spec, trange; kind=:gradient, linop_integral=:tabulated, samples=3)
     minimum(1:samples) do _
         Eω, linop, transform, grid, FT = prepare(spec, trange; kind)
         out = Output.MemoryOutput(0, FLENGTH, 3, Output.nostats)
@@ -86,7 +88,7 @@ function proptime(spec, trange; kind=:gradient, tabulate_linop=false, samples=3)
         t = @elapsed quiet() do
             Luna.run(Eω, grid, linop, transform, FT, output;
                      zmax=FLENGTH, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz,
-                     tabulate_linop)
+                     linop_integral)
             sync(spec)
         end
         t
@@ -121,12 +123,12 @@ for kind in (:gradient, :taper)
     @printf("\n%s\n\n", kind === :gradient ? "pressure gradient 1 -> 0 bar" :
                                              "taper 75 -> 50 um")
     @printf("%-14s %8s %10s %12s %12s %8s %12s\n",
-            "device", "trange", "state", "prop", "prop (tab)", "speedup", "table setup")
+            "device", "trange", "state", "quadrature", "tabulated", "speedup", "table setup")
     @printf("%s\n", "-"^82)
     for trange in TRANGES, (name, spec) in specs
         n = length(prepare(spec, trange; kind)[1])
-        t0 = proptime(spec, trange; kind, tabulate_linop=false)
-        t1 = proptime(spec, trange; kind, tabulate_linop=true)
+        t0 = proptime(spec, trange; kind, linop_integral=:quadrature)
+        t1 = proptime(spec, trange; kind, linop_integral=:tabulated)
         ts = tabletime(spec, trange; kind)
         @printf("%-14s %6.0f fs %10d %12s %12s %7.2fx %12s\n",
                 name, trange*1e15, n, fmttime(t0), fmttime(t1), t0/t1, fmttime(ts))

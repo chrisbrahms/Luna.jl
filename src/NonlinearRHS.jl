@@ -1502,7 +1502,7 @@ the linear operator is constant, i.e. for a waveguide of fixed radius at fixed p
 runs inside the right-hand side. With `constβ=false` (the default, and what a taper or a
 pressure gradient needs) `βfun!` is called on every evaluation and its result uploaded,
 unless [`tabulate`](@ref) has replaced the mirror with a table over `z`
-(`tabulate_linop=true` on [`Luna.run`](@ref)).
+(`linop_integral=:tabulated` on [`Luna.run`](@ref), the default).
 """
 function norm_mode_average(grid, βfun!, aeff; shock=true, spec=HostSpec(),
                            scaling=UNIT_SCALING, constβ=false)
@@ -1574,7 +1574,7 @@ end
 #= `β` at `z`, on the array type the kernel broadcasts against. Two sources: a
    `Luna.HostMirror`, filled by host scalar code and uploaded on every evaluation, or a
    `LinearOps.TabulatedVector`, which reads it out of a z table and never touches the host
-   (`tabulate_linop=true`; the table ignores `βfun!`, which it was built from). =#
+   (`linop_integral=:tabulated`; the table ignores `βfun!`, which it was built from). =#
 _βdev(m::HostMirror, βfun!, z) = (βfun!(m.host, z); upload!(m))
 _βdev(tab, βfun!, z) = tab(z)
 
@@ -2537,7 +2537,8 @@ The transform with every z-dependent host quantity it evaluates inside the right
 replaced by a table over `[z0, z1]` built to relative tolerance `tol`, on the array type
 and precision of the propagating field `proto`.
 
-[`Luna.run`](@ref) calls this when `tabulate_linop=true`. The generic method returns the
+[`Luna.run`](@ref) calls this when `linop_integral=:tabulated` and the operator depends
+on z. The generic method returns the
 transform unchanged: only the mode-averaged transform has such quantities (the propagation
 constant `β(z)` and the effective area `Aeff(z)`), and only it is device-capable so far.
 A transform which is already z-independent gets a two-node table, which costs nothing and
@@ -2577,7 +2578,8 @@ otherwise a new one over `[z0, z1]`.
 A table which already covers the span is kept as it is. One which does not is rebuilt from
 its own source callable rather than from itself: `Luna.prop_capillary` tabulates `Aeff` over
 `[0, flength]` so that the statistics hold a table (see [`Luna.run`](@ref)'s
-`tabulate_linop`), and the propagation needs it up to one step past the end of the fibre.
+`linop_integral=:tabulated`), and the propagation needs it up to one step past the end of
+the fibre.
 Rebuilding through the interpolant instead would place nodes at every kink of the
 interpolant it was reading.
 """

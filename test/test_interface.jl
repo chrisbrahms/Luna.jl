@@ -738,8 +738,12 @@ end
            the cache holds at least one entry per accepted step, and grows =#
         @test u5 > n5
         @test u20 > 2*u5
-        # with one, the entries are the tables' nodes: the propagation adds none
-        @test t20 == t5
+        #= with one, the entries are the tables' nodes: the propagation adds none. The two
+           runs can differ by one, because the statistics of the last accepted step are
+           recorded past the end of the fibre, where the table built over the fibre calls
+           `Modes.Aeff` directly rather than holding its end value -- one distinct `z` per
+           run, and the two runs end at different ones. =#
+        @test t20 <= t5 + 1
         empty!(cache)
     end
 end

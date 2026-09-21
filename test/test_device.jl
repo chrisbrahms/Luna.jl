@@ -1885,6 +1885,116 @@ end
     @test terr[3] > 0.5*terr[1]
 end
 
+#= gpu/27: the other two ways of supplying Φ, on a device. `:quadrature` integrates the
+   operator on the host and uploads the result, so it is the path which is *not* meant to
+   be fast on a device -- what is checked is that it runs there and gives the same answer
+   as the table, which is the same discretisation computed a different way. =#
+@testset "quadrature on JLArray: $kind" for (kind, mk) in (
+        ("gradient", gradientcase), ("taper", tapercase))
+    flength = 1e-2
+    hq, hqtr, _ = mk(HostSpec(); flength, linop_integral=:quadrature)
+    dq, dqtr, _ = mk(JLSpec; flength, linop_integral=:quadrature)
+    ht, _, _ = mk(HostSpec(); flength)
+
+    # nothing is tabulated: `β` still goes through the host mirror it did before gpu/23
+    @test hqtr.norm!.β isa Luna.HostMirror
+    @test dqtr.norm!.β isa Luna.HostMirror
+    @test dqtr.norm!.β.dev isa JLArray{Float64, 1}
+    @test !(dqtr.aeff isa LinearOps.TabulatedScalar)
+
+    for idx in axes(hq["Eω"], 2)
+        h = hq["Eω"][:, idx]
+        d = dq["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+        #= ... and the quadrature and the table are the same propagator computed two ways,
+           so they agree to the tolerance each was computed to rather than to the
+           discretisation difference the one-point rule shows above. =#
+        @test maximum(abs, d .- ht["Eω"][:, idx])/maximum(abs, h) < 1e-6
+    end
+end
+
+#= A caller-written `AbstractIntegratedLinop` of the `AbsolutePhase` kind -- the third
+   source of Φ, and the one the interface exists for. `L(z) = L0 + L1·z` has the
+   elementary integral `L0·z + L1·z²/2`; `L0` and `L1` are taken from a real capillary
+   operator so that what it drives is a real propagation. Every scalar goes through
+   `Luna.scalar`, which is what lets the same type run on a device. =#
+struct LinearZLinop{aT} <: LinearOps.AbstractIntegratedLinop
+    L0::aT
+    L1::aT
+end
+
+function LinearOps.phase!(out, op::LinearZLinop, z)
+    a = Luna.scalar(out, z)
+    b = Luna.scalar(out, z^2/2)
+    L0, L1 = op.L0, op.L1
+    @. out = L0*a + L1*b
+    out
+end
+
+function LinearOps.derivative!(out, op::LinearZLinop, z)
+    a = Luna.scalar(out, z)
+    L0, L1 = op.L0, op.L1
+    @. out = L0 + L1*a
+    out
+end
+
+@testset "a caller-supplied integrated operator on JLArray" begin
+    flength = 1e-2
+    λ0 = 800e-9
+    grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
+    coren, densityfun = Capillary.gradient(:Ar, flength, 1.0, 0.0)
+    m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+    linop!, βfun! = LinearOps.make_linop(grid, m, λ0)
+    L0 = zeros(ComplexF64, length(grid.ω))
+    Lend = similar(L0)
+    linop!(L0, 0.0)
+    linop!(Lend, flength)
+    L1 = (Lend .- L0)./flength
+
+    # the closed form, on the host and on the device
+    for (proto, T) in ((zeros(ComplexF64, length(grid.ω)), Array),
+                       (Luna.todevice(JLSpec, zeros(ComplexF64, length(grid.ω))), JLArray))
+        op = LinearZLinop(Luna.upload_like(proto, L0), Luna.upload_like(proto, L1))
+        @test LinearOps.PhaseStyle(op) === LinearOps.AbsolutePhase()
+        @test LinearOps.secant(op) === nothing
+        out = similar(proto)
+        z1, z2 = 0.3flength, 0.35flength
+        LinearOps.phasediff!(out, op, z1, z2)
+        ref = L0.*(z2 - z1) .+ L1.*(z2^2 - z1^2)/2
+        @test Array(out) ≈ ref
+        LinearOps.derivative!(out, op, z2)
+        @test Array(out) ≈ L0 .+ L1.*z2
+        y0 = fill!(similar(proto), 1)
+        y = copy(y0)
+        RK45.make_prop!(op, y0)(y, z1, z2)
+        @test Array(y) ≈ exp.(ref)
+    end
+
+    #= ... and `Luna.run` uses it as it is: no table is built, the output says so, and the
+       device run matches the host one. =#
+    function runit(spec)
+        aeff(z) = Modes.Aeff(m, z=z)
+        resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),)
+        inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
+        Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
+                                       device=spec)
+        op = LinearZLinop(Luna.upload_like(Eω, L0), Luna.upload_like(Eω, L1))
+        out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+        dz = flength/20
+        Luna.run(Eω, grid, op, transform, FT, out;
+                 zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz)
+        out, transform
+    end
+    ho, htr = runit(HostSpec())
+    do_, _ = runit(JLSpec)
+    @test ho["simulation_type"]["linop"] == "integrated"
+    @test !(htr.aeff isa LinearOps.TabulatedScalar) # nothing is tabulated for it
+    for idx in axes(ho["Eω"], 2)
+        h = ho["Eω"][:, idx]
+        @test maximum(abs, do_["Eω"][:, idx] .- h)/maximum(abs, h) < 1e-10
+    end
+end
+
 #= gpu/11's exit condition for this test file: RateAbsorber and the default statistics,
    both broadcasts and reductions now (Boundaries.jl, Stats.jl is untouched but the field
    it is called with is host, unscaled data whatever device the state lives on), run on a

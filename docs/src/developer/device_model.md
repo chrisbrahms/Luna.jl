@@ -80,22 +80,84 @@ transform holds a [`Luna.GridVectors`](@ref) mirror of the vectors its kernels u
 memory.
 
 Quantities which host scalar code has to produce on every right-hand side — `β(z)`
-for a taper or a pressure gradient, a user-supplied `linop!` — go through a
+for a taper or a pressure gradient — go through a
 [`Luna.HostMirror`](@ref): a `Float64` host buffer, an optional staging buffer in the
 device precision, and the device array. On the host in double precision the device array
-*is* the host buffer and `upload!` does nothing. This is the fallback, and the path a
-user-supplied operator takes; `tabulate_linop=true` replaces it with tables (below).
+*is* the host buffer and `upload!` does nothing. This is the fallback, and the path
+`linop_integral=:quadrature` leaves `β` and `Aeff` on; `:tabulated` replaces it with
+tables (below).
+
+## The integrated linear operator
+
+The stepper propagates the linear part of a step by `exp(Φ(t2) − Φ(t1))` with
+`Φ(z) = ∫linop dz'`, which is exact, so a z-dependent operator reaches it as its integral
+and never as the operator itself. [`LinearOps.AbstractIntegratedLinop`](@ref
+Luna.LinearOps.AbstractIntegratedLinop) is that interface and
+[`RK45.make_prop!`](@ref Luna.RK45.make_prop!) has one method for it. A constant operator
+is an array and keeps its own exact method; a bare `linop!(out, z)` callable is refused,
+and `Luna.run` converts one according to `linop_integral`.
+
+`exp(linop(t2)·(t2 − t1))`, the one-point rule Luna used for a callable before gpu/27, is
+removed. Its error is first order in the step and is common to both of the embedded
+Runge–Kutta solutions, so it cancels out of the error estimate and the step controller
+never responds to it; measured, it is 7.5e-2 relative on `Eω` at 20 steps over a 0.1 m
+0 → 1 bar gradient and 4.1e-1 for a 75 → 50 µm taper. Gradient and taper results therefore
+change, which is the one documented exception to the project's rounding-level regression
+gate.
+
+### The interface
+
+A subtype implements one of two styles, declared by `LinearOps.PhaseStyle`:
+
+- `AbsolutePhase()` (the default): `phase!(out, op, z)` fills `out` with `Φ(z)`, less
+  whatever straight line `secant(op)` reports (`nothing` by default). The propagator keeps
+  two buffers and forms the difference itself, reading `Φ(t1)` once per step — the six
+  stages share it — and `Φ(t2)` once per distinct `t2`, and adds `L̄·(t2 − t1)` back in the
+  same broadcast as the exponential.
+- `IncrementalPhase()`: `phasediff!(out, op, z1, z2)` fills `out` with `Φ(z2) − Φ(z1)`
+  directly, and the propagator caches it on the `(t1, t2)` pair, which catches the same
+  repeat. This is for an operator which computes the integral rather than looking it up:
+  integrating from a fixed origin at every stage would cost more and round worse, since
+  the accumulated `Φ` of a metre of fibre is hundreds of radians and the difference over a
+  step is a fraction of one.
+
+Every subtype also implements `derivative!(out, op, z)`, the operator `L(z)` itself.
+Nothing in the propagation needs it; the diagnostics do — a zero-dispersion wavelength, a
+linear propagation applied to an input field — and a caller who replaced the closure with
+an integrated operator has to be able to get the operator back.
+
+`phase!`, `phasediff!` and `derivative!` run at every stage and, on a device run, `out` is
+on the device, so they must be broadcasts or other kernels and every scalar must go through
+`Luna.scalar`.
+
+### The two implementations
+
+[`LinearOps.QuadratureLinop`](@ref Luna.LinearOps.QuadratureLinop) is the
+`IncrementalPhase` one: `QuadGK.quadgk!` over `[z1, z2]` in `Float64` on the host, with an
+absolute tolerance on the max norm, uploaded through a staging buffer in the state's
+element type. One 15-point Gauss–Kronrod rule is the usual cost of a step; `maxevals`
+bounds a pathological one and the constructor's warning says when it was hit. It holds no
+table and no state beyond its buffers, and it is the check on the table: the two agree to
+1e-7 on a gradient and a taper at 20, 80 and 320 fixed steps.
+
+[`LinearOps.OffsetLinop`](@ref Luna.LinearOps.OffsetLinop) wraps an integrated operator
+with a constant added to `L`. That is a straight line added to `Φ`, so
+`Boundaries.addloss` and `addloss_k` fold a spectral or k-space absorption rate into a
+caller-supplied integrated operator exactly and, for an `AbsolutePhase` operator, for
+free — it is the secant. `Boundaries.clampdecay` is not linear in the operator, cannot be
+pushed through the integral, and raises.
 
 ## Tabulated z-dependent quantities
 
-`Luna.run(...; tabulate_linop=true)` replaces every host quantity the step would otherwise
-evaluate with a table over `z`, built at setup and held on the state's array type:
+`linop_integral=:tabulated` — the default — replaces every host quantity the step would
+otherwise evaluate with a table over `z`, built at setup and held on the state's array
+type:
 
 - [`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop): the integrated operator
-  `Φ(z) = ∫ linop dz'`, read back with a cubic Hermite interpolant, from which
-  `RK45.make_prop!` builds `exp(Φ(t2) − Φ(t1))` — the exact interaction-picture propagator,
-  where the untabulated path's `exp(linop(t2)·Δz)` is a one-point rule. `Φ(t1)` is read once
-  per step (the six stages share it) and `Φ(t2)` once per distinct `t2`.
+  `Φ(z) = ∫ linop dz'`, read back with a cubic Hermite interpolant. This is the
+  `AbsolutePhase` implementation of the interface above; `derivative!` differentiates the
+  same interpolant, so the operator it reports is consistent with the `Φ` the propagator
+  uses and is exact at a node.
 - [`LinearOps.TabulatedVector`](@ref Luna.LinearOps.TabulatedVector) for `β(z)` and
   [`LinearOps.TabulatedScalar`](@ref Luna.LinearOps.TabulatedScalar) for `Aeff(z)`, put in
   place by `NonlinearRHS.tabulate`. These are values rather than integrals and no
@@ -121,6 +183,12 @@ between working and not working, and it costs nothing: a cubic Hermite is exact 
 function, so the node placement and the interpolation error are unchanged, and a
 z-independent operator ends up storing nothing at all.
 
+The `β` and `Aeff` tables are tied to `:tabulated`: `:quadrature` and a caller-supplied
+operator leave them evaluated per stage, as they were before tabulation existed. A constant
+operator is not tabulated at all, and neither are its `β` and `Aeff` — reading a constant
+off a two-node table is `(1-s)f + sf`, not `f`, and a uniform fibre is meant to be
+bit-for-bit what it was.
+
 `Luna.run` tabulates into a transform of its own and leaves the caller's object alone, so a
 statistics function built from `transform.aeff` before the run would keep calling the
 untabulated one. `prop_capillary` therefore tabulates `Aeff` itself, over `[0, flength]`,
@@ -129,8 +197,22 @@ that one's `src` for the propagation, which needs `Aeff` up to one step past the
 fibre. A low-level caller who builds statistics by hand and wants the same has to pass a
 `LinearOps.TabulatedScalar` to `Luna.setup` as `aeff`, which is all `prop_capillary` does.
 
+The statistics of the last accepted step are recorded a fraction of a step past the end of
+the fibre, i.e. outside the `[0, flength]` table `prop_capillary` built for them. A value
+table read outside its span calls its source callable rather than holding its end value,
+so that point is the same number the untabulated path gave; holding it is worth 2.8e-2 on
+the peak intensity of the regression gate's taper case. Nothing inside a propagation can
+reach that branch, since `Luna.run` rebuilds the table over everything the stepper can
+ask about. The *operator* table holds instead, and warns: the propagator adds the secant
+term whatever the readback returns, so a step outside it would propagate with the mean
+operator over the whole table.
+
 What this does not cover: a `linop!` which is genuinely discontinuous in `z` cannot be
 tabulated to tolerance, and the bisection stops at its depth or node limit and warns.
+Nor is the table free for a geometry whose operator is the size of the whole state — a
+multimode, radial or free-space one — where it is `2·nnodes` copies of it; the constructor
+reports its size and warns above `LinearOps.TABLE_WARN_BYTES` (256 MB), and
+`linop_integral=:quadrature` is the way out.
 
 ## Unit scaling
 
