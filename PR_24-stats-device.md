@@ -43,15 +43,17 @@ Each struct has two branches:
 - the **host branch** is the code Luna has always run, transcribed unchanged;
 - the **device branch** is reductions and broadcasts over the state.
 
-Which one runs is decided by `Utils.isdevice`, not by precision. A `Float32` run on the
-host therefore also takes the host branch, and nothing about the CPU output moves — which
-is why the gate is exactly zero rather than merely within tolerance.
+Which one runs is fixed at `Stats.prepare` (see "Changes after review round 1"), by array
+type and not by precision. A `Float32` run on the host therefore also takes the host
+branch, and the `Float64` gate is exactly zero rather than merely within tolerance. One
+thing about a `Float32` *host* run does change — the `RealGrid` analytic buffer now follows
+the state's precision; see finding 4 below.
 
 The device branches:
 
 | statistic | device form |
 | --- | --- |
-| `ω0` | the two sums `Maths.moment` takes as two fused reductions, instead of materialising `abs2.(Eω)`. Scale-invariant |
+| `ω0` | the two sums `Maths.moment` takes, each as one reduction over a lazy `Broadcasted`, instead of materialising `abs2.(Eω)`. Scale-invariant |
 | `energy`, `energy_λ`, `energy_window` | the frequency integral as one weighted reduction; a window folds into the weights squared |
 | `peakpower` | one `maximum` (plus one over the polarisation sum for several modes) |
 | `peakintensity` (effective area) | one `maximum` |
@@ -67,7 +69,8 @@ Three of those need a word.
 density with `NumericalIntegration`'s `SimpsonEven` on a `RealGrid` and with a plain `sum`
 on an `EnvGrid`. `SimpsonEven` is the alternative extended Simpson rule: every sample with
 weight 1 except the first four and last four, which carry 17/48, 59/48, 43/48 and 49/48.
-As a weight vector that is one fused reduction on any array type. But `Stats.energy` takes
+As a weight vector that is one reduction over a lazy `Broadcasted` on any array type (see
+"Changes after review round 1"). But `Stats.energy` takes
 the functional as an *argument*, so the weights could be the wrong quantity for the
 functional the caller passed (`Fields.energyfuncs(grid, spacegrid)[2]`, or their own). They
 are therefore checked against it at construction, on a deterministic probe spectrum; if
@@ -293,8 +296,10 @@ read costs ~400 µs on Metal, and the default set does six of them (`ω0` twice,
 *one* transfer, of 8-128 kB, and then does the whole set in FFTW and host reductions.
 
 So for the one geometry Luna can currently put on a GPU -- mode-averaged, a single column
--- this branch meets its exit criterion (no per-step copy of the state) but costs more
-wall time than the copy it removes. What to do about it is in "Known gaps" below.
+-- the device path costs more wall time than the copy it removes: 2.30 ms of statistics
+and step against 4.60 ms, a **1.99x slower accepted step**. Review round 1 reproduced that
+independently. `Stats.collect_stats` therefore no longer chooses it for such a state; see
+"Changes after review round 1".
 
 ## Known gaps and open questions
 
@@ -376,3 +381,160 @@ wall time than the copy it removes. What to do about it is in "Known gaps" below
    statistics are built for and there is no way to build device statistics without it.
 5. **`benchmark/stats.jl` is a new file** rather than a section of `benchmark/device.jl`,
    so that the statistics can be timed without re-running the response benchmarks.
+
+## Changes after review round 1
+
+Review: `scratchpad/reviews/gpu-24-stats-device-1.md`, verdict **request changes**, on
+`e151267f`.
+
+### 1 (blocker) — a device-capable set was handed a *host* array on every save step of an `HDF5Output` with a cache
+
+`HDF5Output` defaults to `cache=true`, and `Interface.makeoutput` builds it with the
+defaults whenever `filepath` is given, so this was the ordinary file-output case and
+`ScanHDF5Output` too. Its call operator passes the same `y` to `o.statsfun(y, t, dt)` and
+to the resume-cache write, so `ScaledOutput` had to hand it the unscaled *host* copy. A
+set built for the device then found a host field and a device buffer in the same
+broadcast: `prop_capillary(…; device=:metal, filepath=…)` threw, and under JLArrays it
+silently recorded `peakpower`, `peakintensity` and `electrondensity` larger by `E_ref²` on
+every save step, because each statistic chose its branch from the array type of what it
+was handed while `ScaledOutput` had decided otherwise.
+
+Both halves of the reviewer's recommendation are implemented.
+
+**(a) The two arrays are separated.** `Output.HDF5Output`'s call operator and its
+`initialise` take a `cache_y` keyword which defaults to `y`; only the resume cache is
+written from it. `ScaledOutput` passes the state itself as `y` and the host copy as
+`cache_y` when its statistics are on the device, and the host copy as both otherwise,
+which is what every unwrapped caller gets. `Output.jl` is still device-unaware: the
+keyword says "the array the cache is written from", not "the host one".
+
+**(c) The branch is a fixed decision, not an inference.** Every statistic with two
+branches carries `ondevice::Bool`, set by `Stats.prepare` from the `StatsContext`.
+`Stats._onstate(f, x)` returns it and *errors* if the array it is handed disagrees, so a
+mismatch is a loud failure rather than a wrong number. `Utils.isdevice` is a type-level
+trait, so the check costs nothing once the method is specialised. No statistic reads
+`isdevice` any more.
+
+Covered by `test_device.jl`'s **"HDF5 resume cache with device statistics"** (32
+assertions: `E_ref = 2` throughout, the same set through a `MemoryOutput`, through an
+`HDF5Output` with a cache, and against a host reference in physical units, plus the
+assertion that the cache really was written from the unscaled host copy) and **"a
+statistic refuses the array it was not built for"** (3), and by `test_metal.jl`'s
+**"HDF5 file output with statistics on Metal"** (the review's own reproduction:
+`prop_capillary(…; filepath=…)` on Metal, under both `:auto` and `:device`, with every
+statistic compared against the in-memory run).
+
+### 2 (major) — the device reductions were not fused
+
+`sum(w .* abs2.(Eω))` materialises `w .* abs2.(Eω)` before reducing: `sum` is not part of
+the dotted expression, so the broadcast is not lazy across it. That was a field-sized
+allocation per reduction per step, in `ω0` (twice), `energy`, `energy_window`,
+`electrondensity` and `peakpower`'s multi-column branch — and the project already has
+`RK45._zipreduce` for exactly this (GPU_PLAN.md §11, the stepper-norm amendment).
+
+Every weighted reduction now folds over a lazy `Broadcast.Broadcasted`:
+`RK45._zipreduce` for a whole-array reduction and a new `Stats._zipreduce1` for one along
+the frequency axis (`mapreduce(identity, op, bc; dims=1, init)`, which GPUArrays and Base
+both accept). The unweighted ones use the `mapreduce` forms that were already
+allocation-free: `sum(abs2, Eω)`, `sum(abs2, Eω; dims=1)`, `maximum(abs2, Et; dims=1)`,
+`sum(abs2, Et; dims=2)`. The three claims of fusion in this file, the code comments and
+`device_model.md` are corrected. Host branches are untouched and the gate is still exactly
+zero.
+
+### 3 (major) — the device path is not chosen where it costs more than the copy
+
+`Stats.collect_stats` now decides which array the whole set will be built for, and a
+device state is used only when
+
+- every statistic in the set has a device form, **and**
+- `stats_device` allows it: `:auto` (default) requires more than one column or at least
+  `Stats.STATS_DEVICE_MINLEN` elements, `:device` requires only the capability, `:host`
+  never.
+
+A single-column mode-averaged state is below the threshold, so **`prop_capillary` on Metal
+is back to `gpu/int-D`'s behaviour**: the field is copied down and the host branches run,
+at 0.34 ms against a 2.36 ms step instead of 2.73 ms against it. The keyword is on
+`Stats.collect_stats` and `Stats.default`; it is reachable from `prop_capillary` through
+`stats_kwargs=Dict(:stats_device => :device)` and is deliberately not a `prop_capillary`
+keyword of its own. `Luna.setup` does not build statistics, so there is nothing to thread
+through it. A device run logs once which path it took and why.
+
+`Luna.stats_device_capable` now reports the *path*, not the capability, which is what
+`ScaledOutput` needs and what finding 1 needs too — one decision, one place. The one-time
+warning is emitted only when a statistic genuinely has no device form; the shape decision
+is an `@info` line, since there is nothing the user did wrong.
+
+`docs/src/gpu.md` is corrected: it now says which path a run takes and why, gives the
+measured step cost, and says `stats_period` is still the lever. `device_model.md` records
+the two-phase batched-transfer protocol as the fix that would make the device path win on
+a single column.
+
+**The multi-column arm of the rule is not supported by a measurement**, and the PR says
+so. `benchmark/stats.jl` gained a column sweep (no transform on this branch produces a
+multi-column device state, so the state is synthetic):
+
+| device | columns | state | host+copy | device |
+| --- | ---: | ---: | ---: | ---: |
+| CPU Float64 | 1 | 1025 | 107.9 µs | 107.5 µs |
+| CPU Float64 | 16 | 16400 | 2.824 ms | 2.872 ms |
+| CPU Float64 | 128 | 131200 | 14.226 ms | 14.090 ms |
+| Metal Float32 | 1 | 1025 | 366.6 µs | 2.747 ms |
+| Metal Float32 | 16 | 16400 | 2.859 ms | 5.451 ms |
+| Metal Float32 | 128 | 131200 | 16.093 ms | 18.841 ms |
+
+The device path is still the slower of the two at 128 columns on Metal. The absolute gap
+is constant (~2.7 ms, the six round trips) while both sides grow, so the *relative*
+penalty falls from 7.5× to 1.17×, but it does not cross: `fwhm_t` copies the time-domain
+intensity to the host on either path and its per-column root-finding is host work either
+way, and the state transfer the device path saves is only ~1 MB at 128 columns. The
+`ncols > 1` rule is therefore a forward-looking bet on `gpu/20`–`gpu/22`, whose states are
+far larger, and it should be re-measured when one of them exists; `stats_device=:host` is
+the escape hatch until then. `STATS_DEVICE_MINLEN` is `2^22`, the size at which the
+transfer alone reaches the round-trip constant — for a single column that is effectively
+"always the host", which is what the measurement says.
+
+### 4 (minor) — a `Float32` host run's analytic transform changed precision
+
+Kept, and now stated rather than contradicted. `plan_analytic` allocates the `RealGrid`
+analytic buffer with `similar(Eω)`, so it follows the state; at `90826dc4` it was
+`ComplexF64` whatever the state was. In a `Float32` *host* run every statistic that reads
+`Et` therefore reduces a `Float32` analytic field: ~1.2e-8 relative on `peakpower` and
+`peakintensity`, ~5.4e-8 on `fwhm_t`, measured by the reviewer. It is deliberate — it is
+what makes a Metal run and a CPU `Float32` run comparable, it is what the `EnvGrid` method
+always did, and it is what lets the transform be planned for the array type it will be
+applied to. The gate's 21 cases are all `Float64` and do not see it. `device_model.md` says
+so too; the earlier claim that "the CPU output does not move at all" applied to `Float64`
+and is now qualified.
+
+### 5 (minor) — `energy_window`'s signature
+
+`AbstractVector{<:Real}` again, as at the base.
+
+### 6 (nit) — `zdw` when the ZDW at z = 0 is `missing`
+
+`Stats.zdw` now starts the root-finding from `λmin` when `Modes.zdw` returns `missing` at
+z = 0, where the base passed `missing` itself into the first step's search. Unrequested,
+better, and now recorded here.
+
+### 7 (nit) — the one-time warning named a gensym
+
+`Stats.default` wraps each `userfuns` entry in a `Stats.UserStat` carrying `userfuns[i]`
+as its name, so the warning says `userfuns[1]` instead of `#22#23`. The duplicate check
+still compares the functions as given.
+
+### 8 (nit) — "skipped entirely"
+
+Corrected in `collect_stats`'s docstring and in `device_model.md`: the transform is not
+*applied* when no statistic reads `Et`, but it is still planned and its buffers still
+allocated, which is what Luna has always done.
+
+### Re-run after the changes
+
+| what | result |
+| --- | --- |
+| `test/test_regression.jl` vs `fa556e6f` | **460 pass, 0 fail**, `0.000e+00` on every row, statistics class included |
+| `test/test_device.jl` (JLArrays) | **791 pass, 0 fail, 38 testsets** (741/35 before) |
+| `test/test_metal.jl` (Metal, hardware) | **446 pass, 0 fail, 18 testsets** (415/17 before) |
+| `test/test_stats.jl` | 1 pass, 0 fail |
+| `test/test_output.jl` | 117 pass, 0 fail, 8 testsets |
+| `benchmark/stats.jl` (CPU + Metal) | the tables above |

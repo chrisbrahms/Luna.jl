@@ -15,15 +15,18 @@
    What is timed is one call of the statistics function, which is what `Luna.run` does on
    every accepted step through the output handler. Two columns:
 
-   - "host": the state copied to the host and unscaled first, then the host branches of
-     `Stats.jl` -- what every device run did before `gpu/24`, and what a statistics set
-     containing a user-written closure still does. The copy is included, because it is
-     part of the cost.
-   - "device": the statistics evaluated on the state where it is, which is what the
-     default sets do now.
+   - "host+copy": the state copied to the host and unscaled first, then the host branches
+     of `Stats.jl`. This is what `Stats.collect_stats` chooses under `stats_device=:auto`
+     for a single column below `Stats.STATS_DEVICE_MINLEN`, which is every mode-averaged
+     run, so on those it is what a propagation actually pays.
+   - "device": the statistics evaluated on the state where it is
+     (`stats_device=:device`), which `:auto` chooses for a state with more than one
+     column.
 
    The "step" column is one RK45 step of the same propagation, so that the overhead can
-   be read as a fraction of a step rather than in the abstract.
+   be read as a fraction of a step rather than in the abstract. The last block sweeps the
+   column count on a synthetic state, which is what the `:auto` threshold is set from --
+   no transform on this branch produces a multi-column device state yet.
 
    As for `run.jl` and `device.jl`: one Julia thread, one FFTW thread, one BLAS thread,
    `:estimate` planning and no wisdom, or the numbers are not comparable between runs.
@@ -87,7 +90,8 @@ function prepare(spec, trange; plasma=false)
         inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=150e-6)
         Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                        constβ=true, device=spec)
-        sf = Stats.default(grid, Eω, m, linop, transform; gas=GAS)
+        # forced, so that the device branches are timed even on a single column
+        sf = Stats.default(grid, Eω, m, linop, transform; gas=GAS, stats_device=:device)
         Eref = Luna.runscaling(transform).Eref
         # the host path: the same set built for a host, physical-unit state
         Eh = Array(Eω).*Eref
@@ -160,6 +164,47 @@ for (label, rkw) in (("Kerr", (;)), ("Kerr + plasma (tabulated rate)", (; plasma
         @printf("%-14s %6.0f fs %10d %12s %12s %12s %7.1f%%\n",
                 name, trange*1e15, length(p[1]), fmttime(th), fmttime(td), fmttime(ts),
                 100*td/ts)
+        flush(stdout)
+    end
+end
+
+#= How the cost of the two paths moves with the column count. No transform on this branch
+   produces a multi-column device state -- the radial, free-space and multimode transforms
+   are host-only until gpu/20-22 -- so this builds the state by hand and calls the
+   statistics set directly. It is what `Stats.STATS_DEVICE_MINLEN` and the "more than one
+   column" rule in `Stats.collect_stats` are set from: the device columns are flat in the
+   problem size (they are round trips), the host column is not (it is a copy). =#
+@printf("\nthe two paths against the column count, %d-point time grid\n\n", 1<<10)
+@printf("%-14s %8s %10s %12s %12s\n", "device", "columns", "state", "host+copy", "device")
+@printf("%s\n", "-"^60)
+let trange = 400e-15
+    grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), trange)
+    m = Capillary.MarcatiliMode(75e-6, GAS, PRES, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    ρ = PhysData.density(GAS, PRES)
+    dens = z -> ρ
+    _, energyfunω = Fields.energyfuncs(grid)
+    funs = (Stats.ω0(grid), Stats.energy(grid, energyfunω), Stats.peakpower(grid),
+            Stats.fwhm_t(grid), Stats.density(dens))
+    nω = length(grid.ω)
+    for (name, spec) in specs, ncols in (1, 16, 128)
+        Eh = randn(Complex{Luna.realtype(spec)}, nω, ncols)
+        Ed = Luna.todevice(spec, Eh)
+        sfd = quiet() do
+            Stats.collect_stats(grid, Ed, funs...; stats_device=:device)
+        end
+        sfh = quiet() do
+            Stats.collect_stats(grid, Eh, funs...; stats_device=:host)
+        end
+        buf = similar(Eh)
+        fh = let buf=buf, Ed=Ed, sfh=sfh
+            () -> (copyto!(buf, Ed); sfh(buf, 0.0, 1e-4))
+        end
+        bh = @benchmarkable ($fh(); sync($spec)) seconds=BUDGET
+        bd = @benchmarkable (($sfd)($Ed, 0.0, 1e-4); sync($spec)) seconds=BUDGET
+        @printf("%-14s %10d %10d %12s %12s\n", name, ncols, length(Eh),
+                fmttime(bminimum(brun(bh)).time/1e9),
+                fmttime(bminimum(brun(bd)).time/1e9))
         flush(stdout)
     end
 end

@@ -710,9 +710,20 @@ gets: it is handed a host copy in physical units and works exactly as it always 
 
 Each struct has two branches. The **host branch** is the code Luna has always run, kept
 arithmetically identical to it. The **device branch** is reductions and broadcasts over the
-state. Which one runs is decided by `Utils.isdevice`, not by precision, so a `Float32` run
-on the host takes the host branch too and the CPU output does not move at all (the
-regression gate is exactly `0.000e+00` on every row).
+state. Which one runs is **fixed at `Stats.prepare`** and carried in the statistic's
+`ondevice` field; it is not read off the array the statistic is handed, and a statistic
+called with an array that disagrees errors instead of computing something wrong. The
+branch is chosen by array type, not by precision, so a `Float32` run on the host takes the
+host branch and the `Float64` regression gate is exactly `0.000e+00` on every row.
+
+One thing about a `Float32` *host* run did change: `plan_analytic` now allocates the
+`RealGrid` analytic buffer with `similar(Eω)`, so it follows the state's precision, where
+it used to be `ComplexF64` whatever the state was. Every statistic that reads `Et` in a
+`Float32` host run therefore reduces a `Float32` analytic field; measured against the old
+arithmetic that is ~1.2e-8 on `peakpower` and `peakintensity` and ~5.4e-8 on `fwhm_t`. It
+is deliberate: it is what makes a Metal run and a CPU `Float32` run comparable, it is what
+the `EnvGrid` method always did, and it is what lets the transform be planned for the
+array type it will be applied to. The gate's 21 cases are all `Float64` and do not see it.
 
 The device branches are:
 
@@ -741,6 +752,13 @@ weighted reduction rather than a prefix scan followed by a scalar read of the la
 into the field reference `Ionisation.ratekernel` multiplies each sample by, so the field
 itself is never rescaled.
 
+Every weighted reduction folds over a lazy `Broadcast.Broadcasted` — `RK45._zipreduce` for
+a whole-array reduction, `Stats._zipreduce1` for one along the frequency axis — and never
+over `w .* abs2.(Eω)`, which materialises a field-sized temporary before reducing. That is
+the same reason the stepper norms use `_zipreduce` (see "Amendments" in GPU_PLAN.md). The
+unweighted reductions use the `mapreduce` forms (`sum(abs2, Eω)`,
+`maximum(abs2, Et; dims=1)`), which are already allocation-free.
+
 On a device the state is **scaled** (`e = E/E_ref`), because nothing has unscaled it —
 `ScaledOutput` unscales only into a host buffer, which is the copy these branches exist to
 avoid. The device branches therefore apply `E_ref` themselves, always to the scalar result
@@ -751,14 +769,55 @@ keyword and `Stats.default` reads it off the transform.
 
 `Stats.plan_analytic` builds its buffers with `similar`/`Luna.alloc` and plans through
 `Utils.plan_ft`/`Utils.plan_ift`, so the analytic signal is one inverse FFT on whatever the
-state lives on, shared by every statistic which needs it — and skipped entirely when none
-does.
+state lives on, shared by every statistic which needs it. When no statistic reads `Et` the
+transform is not *applied*, but it is still planned and its buffers still allocated, which
+is what Luna has always done.
 
-`ScaledOutput` asks [`Luna.stats_device_capable`](@ref) once, at construction, whether the
-whole set can run where the state is, and skips the per-step copy when it can. It is only
-ever true for a state on a device: a scaled *host* run (`Float32` on the CPU) still copies
-and unscales, because the statistics would otherwise take their host branches on a scaled
-field. When a copy is forced, the one-time warning names the statistics responsible.
+## Which array a statistics set is built for
+
+`Stats.collect_stats` makes one decision, once, about the array the whole set will be
+called with, and everything — buffers, mirrors, the inverse plan, each statistic's
+`ondevice` flag — is built for it. `Luna.stats_device_capable` reports that decision, and
+`ScaledOutput` asks it once at construction (`devstats`) to decide whether to copy the
+state to the host. The two cannot disagree, which is the point: a set built for the device
+and handed a host array would put a host field and a device buffer in the same broadcast,
+which JLArrays tolerates silently and Metal refuses.
+
+The device state is used when it is a device array, when every statistic in the set has a
+device form, and when `stats_device` allows it. `stats_device` is `:auto` (default),
+`:device` or `:host`; under `:auto` the device state is used only when it has more than one
+column or at least `Stats.STATS_DEVICE_MINLEN` elements. **For a single column the copy is
+cheaper**, and measurably so: on an M1 Pro through Metal every statistic which ends in a
+device-to-host transfer costs ~400 µs regardless of grid size, and the default set makes
+six of them plus one MPSGraph inverse FFT — 2.7–3.6 ms for 1025 to 16385 elements, against
+0.34–1.31 ms for one transfer plus the host branches. On the mode-averaged Kerr case that
+is a 1.99× slower accepted step, so the shape test restores the host path there, which is
+what `gpu/int-D` did. Luna logs which path a device run took, once, at construction.
+
+The "more than one column" arm of the rule is a bet, not a measurement: no transform on
+this branch produces a multi-column device state, and on a synthetic one the device path is
+still slower at 16 and 128 columns, because `fwhm_t` copies the time-domain intensity to
+the host on either path and its per-column root-finding is host work either way. It is
+worth re-measuring when `gpu/20`–`gpu/22` land.
+
+The fix that would make the device path win on a single column is to stop making six round
+trips: a two-phase protocol in which each statistic writes its scalar reductions into one
+small device buffer and the collector transfers that buffer once per call, finishing the
+arithmetic on the host. By the numbers above that would take the default set from ~2.8 ms
+to ~0.6 ms. It is a change to the `(d, Eω, Et, z, dz)` contract every statistic — including
+a user's — is written against, so it is not done here.
+
+Two arrays, not one, on a save step: an `HDF5Output` with a resume cache writes the raw
+per-step `y` into the file as well as passing it to its statistics function, and those need
+different arrays when the statistics are on the device. `ScaledOutput` therefore passes the
+state itself as `y` and the host copy separately, as `Output.jl`'s `cache_y` keyword, which
+defaults to `y` for every caller that does not wrap the output. Without that split, every
+save step of a device run with `filepath=` set would hand a host array to a device set.
+
+When the host path is taken because a statistic has no device form at all, `ScaledOutput`'s
+one-time warning names it (`userfuns[1]` for a user's own). When it is taken because of the
+shape test, only the `@info` line at construction says so — there is nothing the user did
+wrong to warn about.
 
 ## The extension and hook mechanism
 

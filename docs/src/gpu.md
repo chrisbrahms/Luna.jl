@@ -147,16 +147,32 @@ statistics *do* run with a device state, for the mode-averaged transform:
 
 - `Boundaries.RateAbsorber`/`LegacyAbsorber` and the transverse collars are broadcasts
   and reductions over mirrored arrays (`Boundaries.jl`), like everything else per-step.
-- The default per-step statistics (`Stats.jl`) are computed on the device: the energies,
-  the peak power and intensity, the temporal FWHM, the electron density and the
-  z-dependent quantities are reductions and broadcasts over the state where it is, so
-  nothing is copied to the host for them. `fwhm_t` copies only the time-domain intensity;
-  `fwhm_r` and the modal reconstruction error keep their algorithms on the host, and both
-  belong to the multimode set, whose transform is host-only anyway. A statistics function
-  *you* write is host code: it is handed a copy of the field in physical units every step
-  whose statistics fire, and `Luna.run` warns once, naming it, when that happens. Use
-  `stats_period` to reduce how often it runs (below), or `Output.nostats` to switch the
-  statistics off.
+- The default per-step statistics (`Stats.jl`) have a device form -- the energies, the
+  peak power and intensity, the temporal FWHM, the electron density and the z-dependent
+  quantities are reductions and broadcasts over the state where it is -- but **which path
+  a run takes depends on the shape of the state**, and Luna logs which one it chose:
+
+  - a state with **more than one column** (a radial, free-space or multimode grid, once
+    those transforms are device-capable) computes its statistics on the device, with no
+    copy;
+  - a **single-column** state (mode-averaged, which is the only device-capable geometry
+    today) is copied to the host and the statistics are computed there, because the copy
+    is cheaper. Each statistic that ends in a device-to-host transfer costs the same round
+    trip whatever the grid size -- about 400 µs on an M1 Pro through Metal -- and the
+    default set makes six of them, where the host path makes one transfer of a few tens of
+    kilobytes. On the mode-averaged Kerr case that is the difference between a 2.3 ms and
+    a 4.6 ms accepted step.
+
+  The threshold is `Stats.STATS_DEVICE_MINLEN`, and Luna logs which path a device run
+  chose. To override it, `stats_kwargs=Dict(:stats_device => :device)` (or `:host`)
+  reaches `Stats.collect_stats` through `prop_capillary`.
+
+  `fwhm_r` and the modal reconstruction error have no device form at all and keep their
+  algorithms on the host; both belong to the multimode set, whose transform is host-only
+  anyway. A statistics function *you* write is host code too: the whole set is then
+  computed on a host copy of the field on every step the statistics fire, and `Luna.run`
+  warns once, naming it (`userfuns[1]`), when that happens. Use `stats_period` to reduce
+  how often they run (below), or `Output.nostats` to switch them off.
 - The output itself never sees a device array or a scaled one: `Luna.run` wraps it in
   `Luna.ScaledOutput`, which copies to the host and, for a `Float32` run, unscales, before
   handing it to `Output.MemoryOutput`/`HDF5Output`. A `Float32` run's saved field is
@@ -252,10 +268,15 @@ out = prop_capillary(...; stats_period=10)
 
 Collects the default statistics every 10th accepted step instead of every step
 (`Output.PeriodicStats`). The recorded statistics arrays are correspondingly shorter; the
-saved field (`saveN`, `out["Eω"]`) is unaffected. The default statistics run on the device,
-so raising this only saves their own cost; it is worth raising when you have added a
-statistics function of your own, which is host code and forces the field to be copied down
-on every step it fires on.
+saved field (`saveN`, `out["Eω"]`) is unaffected.
+
+This is still the lever it always was on a GPU. On the mode-averaged geometry the
+statistics are computed from a host copy of the field (above), which costs a transfer and
+the host reductions on every step they fire on -- about 0.3 ms against a 2.0 ms step for a
+1025-point grid, i.e. 13% of the step, and more with plasma. Raising `stats_period`
+removes that in proportion. It is worth raising further when you have added a statistics
+function of your own, and further still on a multi-column state, where the statistics run
+on the device but the field is large.
 
 ## Performance
 
