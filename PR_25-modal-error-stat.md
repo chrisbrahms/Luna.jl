@@ -251,6 +251,12 @@ a stacked environment with `JLArrays` for `test_device.jl`, one with `Metal` for
 | `docs/make.jl` | the six unresolved cross-references `gpu/int-E` recorded, and no new ones |
 | the twelve free-space examples | **12 of 12 run**, each recording 11-13 statistics |
 
+The gate, `test_stats.jl`, `test_multimode.jl`, `test_freespace.jl`, `test_device.jl` and
+`test_metal.jl` were re-run on the final commit. `test_interface.jl`, `test_output.jl`,
+`test_modes.jl`, the docs build and the examples were run one and two commits earlier;
+nothing between them and the final commit changes what they exercise (two docstrings and
+`test/test_metal.jl`).
+
 ## Known gaps and open questions
 
 - **A `modal_integral=:fixed` run now pays for a statistic it did not before.**
