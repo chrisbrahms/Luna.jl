@@ -555,24 +555,6 @@ broadening(out) = rmswidth(out["Eω"][:, end])/rmswidth(out["Eω"][:, 1])
     end
     @test isapprox(dgrad["stats"]["energy"], hgrad32["stats"]["energy"]; rtol=1e-3)
 
-    #= gpu/23: the same gradient with `tabulate_linop=true`, which is the keyword a user
-       passes to run a pressure-graded capillary on the GPU with nothing left on the host
-       inside the step. Metal against CPU Float32 at the same tolerance as the untabulated
-       comparison above: the two runs use the same discretisation as each other, so this
-       is the device path and nothing else. The tabulated answer is *not* compared with
-       the untabulated one -- it is a different discretisation of the linear step, and
-       much better resolved; that difference is measured in `test_device.jl`. =#
-    tgrad32 = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
-                                  capkw..., device=DeviceSpec(Array, Float32),
-                                  tabulate_linop=true)
-    tgrad = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
-                                capkw..., device=MetalSpec, tabulate_linop=true)
-    for idx in axes(tgrad32["Eω"], 2)
-        @test maximum(abs, tgrad["Eω"][:, idx] .- tgrad32["Eω"][:, idx]) /
-              maximum(abs, tgrad32["Eω"][:, idx]) < 1e-4
-    end
-    @test isapprox(tgrad["stats"]["energy"], tgrad32["stats"]["energy"]; rtol=1e-3)
-
     #= A visibly nonlinear gradient (300 µJ, 5 bar), adaptive (the step-size controller
        genuinely active, `fixed=false`, well-resolved there -- see the comment above) with
        a documented looser tolerance: review round 1 measured 1.86e-4 for a strongly
@@ -994,6 +976,24 @@ end
               maximum(abs, hgrad64["Eω"][:, idx]) < 3e-4
     end
     @test isapprox(dgrad["stats"]["energy"], hgrad32["stats"]["energy"]; rtol=1e-3)
+
+    #= gpu/23: the same gradient with `tabulate_linop=true`, which is the keyword a user
+       passes to run a pressure-graded capillary on the GPU with nothing left on the host
+       inside the step. Metal against CPU Float32 at the same tolerance as the untabulated
+       comparison above: the two runs use the same discretisation as each other, so this
+       is the device path and nothing else. The tabulated answer is *not* compared with
+       the untabulated one -- it is a different discretisation of the linear step, and
+       much better resolved; that difference is measured in `test_device.jl`. =#
+    tgrad32 = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
+                                  capkw..., device=DeviceSpec(Array, Float32),
+                                  tabulate_linop=true)
+    tgrad = Luna.prop_capillary(125e-6, 0.1, :He, (1.0, 0.0);
+                                capkw..., device=MetalSpec, tabulate_linop=true)
+    for idx in axes(tgrad32["Eω"], 2)
+        @test maximum(abs, tgrad["Eω"][:, idx] .- tgrad32["Eω"][:, idx]) /
+              maximum(abs, tgrad32["Eω"][:, idx]) < 1e-4
+    end
+    @test isapprox(tgrad["stats"]["energy"], tgrad32["stats"]["energy"]; rtol=1e-3)
 
     #= gpu/13's exit condition: Kerr *and* plasma, the default physics of a
        field-resolved `prop_capillary` call in a non-Raman gas, on Metal end to end.

@@ -1543,26 +1543,31 @@ keeps one code path.
 tabulate(t, z0, z1, tol, proto) = t
 
 function tabulate(t::TransModeAvg, z0, z1, tol, proto)
+    atab = LinearOps.TabulatedScalar(t.aeff, z0, z1; tol)
+    #= `Luna.setup` passes the same `aeff` callable to the transform and to the
+       normalisation, so one table serves both and `Modes.Aeff` is called once per node
+       rather than twice. A caller who supplied two different ones gets two tables. =#
+    shared = t.aeff === t.norm!.aeff ? atab : nothing
     TransModeAvg(t.Pto, t.Eto, t.Eωo, t.Pωo, t.FT, t.IFT, t.resp, t.grid, t.gv,
-                 t.densityfun, tabulate(t.norm!, z0, z1, tol, proto),
-                 LinearOps.TabulatedScalar(t.aeff, z0, z1; tol),
+                 t.densityfun, tabulate(t.norm!, z0, z1, tol, proto; aeff=shared), atab,
                  t.Et_noise, t.Et_nl, t.scaling)
 end
 
+"The `Aeff` table: the one already built for the transform, or a new one."
+_aefftab(f, ::Nothing, z0, z1, tol) = LinearOps.TabulatedScalar(f, z0, z1; tol)
+_aefftab(f, tab, z0, z1, tol) = tab
+
 #= With `constβ` the propagation constant is already folded into `pre` and there is no
    `βfun!` to tabulate; only the effective area is left. =#
-tabulate(n::NormModeAvg{vT, mT, Nothing}, z0, z1, tol, proto) where {vT, mT} =
-    NormModeAvg(n.pre, n.mask, n.β, n.βfun!,
-                LinearOps.TabulatedScalar(n.aeff, z0, z1; tol), n.scaling)
+tabulate(n::NormModeAvg{vT, mT, Nothing}, z0, z1, tol, proto; aeff=nothing) where {vT, mT} =
+    NormModeAvg(n.pre, n.mask, n.β, n.βfun!, _aefftab(n.aeff, aeff, z0, z1, tol), n.scaling)
 
-function tabulate(n::NormModeAvg, z0, z1, tol, proto)
+function tabulate(n::NormModeAvg, z0, z1, tol, proto; aeff=nothing)
     β = LinearOps.TabulatedVector(n.βfun!, proto, length(n.mask), z0, z1; tol)
-    NormModeAvg(n.pre, n.mask, β, n.βfun!,
-                LinearOps.TabulatedScalar(n.aeff, z0, z1; tol), n.scaling)
+    NormModeAvg(n.pre, n.mask, β, n.βfun!, _aefftab(n.aeff, aeff, z0, z1, tol), n.scaling)
 end
 
-tabulate(n::NormModeAvgGNLSE, z0, z1, tol, proto) =
-    NormModeAvgGNLSE(n.pre, n.mask, LinearOps.TabulatedScalar(n.aeff, z0, z1; tol),
-                     n.scaling)
+tabulate(n::NormModeAvgGNLSE, z0, z1, tol, proto; aeff=nothing) =
+    NormModeAvgGNLSE(n.pre, n.mask, _aefftab(n.aeff, aeff, z0, z1, tol), n.scaling)
 
 end
