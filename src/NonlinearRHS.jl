@@ -1539,23 +1539,50 @@ transform unchanged: only the mode-averaged transform has such quantities (the p
 constant `β(z)` and the effective area `Aeff(z)`), and only it is device-capable so far.
 A transform which is already z-independent gets a two-node table, which costs nothing and
 keeps one code path.
+
+The same generic method covers a caller-supplied normalisation (`Luna.setup`'s `norm!`
+keyword), which is passed through unchanged rather than inspected: only Luna's own
+normalisations are known to have an `aeff` to tabulate. It takes the `aeff` keyword the
+known ones take so that the call site does not have to know which it has.
 """
-tabulate(t, z0, z1, tol, proto) = t
+tabulate(t, z0, z1, tol, proto; aeff=nothing) = t
 
 function tabulate(t::TransModeAvg, z0, z1, tol, proto)
-    atab = LinearOps.TabulatedScalar(t.aeff, z0, z1; tol)
+    atab = _aefftab(t.aeff, nothing, z0, z1, tol)
     #= `Luna.setup` passes the same `aeff` callable to the transform and to the
        normalisation, so one table serves both and `Modes.Aeff` is called once per node
-       rather than twice. A caller who supplied two different ones gets two tables. =#
-    shared = t.aeff === t.norm!.aeff ? atab : nothing
+       rather than twice. A caller who supplied two different ones, or a normalisation
+       which is not one of Luna's, gets `nothing` and tabulates its own. =#
+    shared = t.aeff === _normaeff(t.norm!) ? atab : nothing
     TransModeAvg(t.Pto, t.Eto, t.Eωo, t.Pωo, t.FT, t.IFT, t.resp, t.grid, t.gv,
                  t.densityfun, tabulate(t.norm!, z0, z1, tol, proto; aeff=shared), atab,
                  t.Et_noise, t.Et_nl, t.scaling)
 end
 
-"The `Aeff` table: the one already built for the transform, or a new one."
+#= The `Aeff` callable of a normalisation, or `nothing` for one Luna did not build: a
+   caller-supplied `norm!` (`Luna.setup`'s keyword, `NonlinearRHS.check_norm`) need not
+   have the field at all, and reading it would abort the run before dispatch could help. =#
+_normaeff(n::Union{NormModeAvg, NormModeAvgGNLSE}) = n.aeff
+_normaeff(n) = nothing
+
+"""
+    _aefftab(f, shared, z0, z1, tol)
+
+The `Aeff` table to use: `shared` if one has already been built for this transform,
+otherwise a new one over `[z0, z1]`.
+
+A table which already covers the span is kept as it is. One which does not is rebuilt from
+its own source callable rather than from itself: `Luna.prop_capillary` tabulates `Aeff` over
+`[0, flength]` so that the statistics hold a table (see [`Luna.run`](@ref)'s
+`tabulate_linop`), and the propagation needs it up to one step past the end of the fibre.
+Rebuilding through the interpolant instead would place nodes at every kink of the
+interpolant it was reading.
+"""
 _aefftab(f, ::Nothing, z0, z1, tol) = LinearOps.TabulatedScalar(f, z0, z1; tol)
 _aefftab(f, tab, z0, z1, tol) = tab
+_aefftab(f::LinearOps.TabulatedScalar, ::Nothing, z0, z1, tol) =
+    (f.z[1] <= z0 && f.z[end] >= z1) ? f :
+        LinearOps.TabulatedScalar(f.src, z0, z1; tol)
 
 #= With `constβ` the propagation constant is already folded into `pre` and there is no
    `βfun!` to tabulate; only the effective area is left. =#

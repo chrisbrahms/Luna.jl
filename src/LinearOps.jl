@@ -569,6 +569,13 @@ const DEFAULT_MAXNODES = 1024
 "Deepest bisection the adaptive tabulation will go to before giving up and warning."
 const DEFAULT_MAXDEPTH = 40
 
+"""
+Table size above which [`TabulatedLinop`](@ref) warns. A mode-averaged operator is a few
+megabytes at any sensible tolerance; a multimode, radial or free-space one is the size of
+the whole state, so the same node count costs `2·nnodes` times that.
+"""
+const TABLE_WARN_BYTES = 256*1024^2
+
 _tabmax(x::Number) = abs(x)
 _tabmax(x::AbstractArray) = isempty(x) ? 0.0 : maximum(abs, x)
 
@@ -586,9 +593,12 @@ end
 #= Locate z in the node vector: the interval index, the normalised position in it and its
    width. Outside the table the nearest end node is returned exactly (s = 0 or 1), i.e. the
    quantity is held constant rather than extrapolated: a cubic Hermite run past its interval
-   diverges, and holding the value is the safe thing to do with an argument that should not
-   occur. `Luna.run` builds the table over everything the stepper can ask for -- `zmax` plus
-   the largest step it can take -- so this is a guard, not a working mode. =#
+   diverges, and holding the value is the safe thing to do.
+
+   For the operator that is a guard and nothing more -- `Luna.run` builds the table over
+   everything the stepper can ask for, and `phase!` warns if it is ever read outside it. For
+   a value table it can be deliberate: `prop_capillary` tabulates `Aeff` over the fibre, and
+   the statistics of the last step are recorded a fraction of a step past the end of it. =#
 function _locate(zs::Vector{Float64}, z::Real)
     if z <= zs[1]
         return 1, 0.0, zs[2] - zs[1]
@@ -629,10 +639,13 @@ ends of the table,
 and `dΦ` holds `linop(z) − L̄`. The propagator adds `L̄·(t2 − t1)` back in the same
 broadcast, so the result is unchanged in exact arithmetic while the tabulated numbers are
 as small as the operator's *variation* along z rather than as large as its accumulated
-phase. That matters in `Float32`: the accumulated phase of a metre of fibre is thousands
-of radians, whose `Float32` spacing is larger than the phase difference over one step. A
+phase. `make_linop` already works in a co-moving frame, so `max|Φ|` is tens to hundreds of
+radians rather than thousands: the subtraction reduces the rounding error of
+`Φ(t2) − Φ(t1)` in `Float32` by a measured factor of 4 to 11 over spans from 0.1 m to 10 m,
+rather than being the difference between working and not working. It costs nothing -- a
 cubic Hermite reproduces a linear function exactly, so subtracting the secant changes
-neither the node placement nor the interpolation error.
+neither the node placement nor the interpolation error -- and it is exact for a
+z-independent operator, which then stores nothing at all.
 
 # Fields
 - `z`: the nodes, ascending, `z[1] == z0` and `z[end] == z1`
@@ -643,6 +656,10 @@ neither the node placement nor the interpolation error.
 - `err`: the largest interpolation error measured while placing them
 - `nevals`: how many times `linop!` was called to build the table
 - `scale`: `maximum(abs, Φ̃)`, the size of the stored numbers
+
+`maxdepth` and `maxnodes` bound the work if `linop!` is discontinuous in z; if either stops
+the refinement before `tol` is met, a warning reports the error achieved. `quiet=true`
+suppresses the summary the constructor otherwise logs, but not the warnings.
 """
 struct TabulatedLinop{aT, sT}
     z::Vector{Float64}
@@ -690,13 +707,21 @@ function TabulatedLinop(linop!, proto::AbstractArray, z0::Real, z1::Real;
         selectdim(dΦ, d, k) .-= secant
     end
     scale = _tabmax(Φ)
+    #= Two tables of `(size(linop)..., nnodes)` in the state's element type. For a
+       mode-averaged operator that is megabytes; for a multimode, radial or free-space one
+       the operator is the size of the whole state and this is `2·nnodes` times it. =#
+    bytes = 2*length(Φ)*sizeof(Complex{real(eltype(proto))})
     if worst[] > tol
         @warn("The tabulated linear operator did not reach its tolerance: $n nodes, "*
               "largest interpolation error $(worst[]) against a tolerance of $tol. The "*
               "operator may be discontinuous in z; raise `linop_tol` or check it.")
     elseif !quiet
-        @info(@sprintf("Tabulated linear operator: %d nodes over [%.4g, %.4g] m, %d evaluations, largest interpolation error %.2e, largest stored value %.2e.",
-                       n, z0, z1, nevals[], worst[], scale))
+        @info(@sprintf("Tabulated linear operator: %d nodes over [%.4g, %.4g] m, %d evaluations, largest interpolation error %.2e, largest stored value %.2e, %.1f MB.",
+                       n, z0, z1, nevals[], worst[], scale, bytes/1024^2))
+    end
+    if bytes > TABLE_WARN_BYTES
+        @warn(@sprintf("The tabulated linear operator needs %.1f MB: %d nodes of an operator of size %s. Tabulation stores two copies of the operator per node, which is cheap for a mode-averaged run and not for a multimode or free-space one. Raise `linop_tol` to place fewer nodes, or leave `tabulate_linop` off for this geometry.",
+                       bytes/1024^2, n, string(sz)))
     end
     TabulatedLinop(znodes, upload_like(proto, Φ), upload_like(proto, dΦ),
                    upload_like(proto, secant), z0, float(tol), worst[], nevals[], scale)
@@ -742,6 +767,15 @@ Fill `out` with the stored deviation `Φ̃(z) = Φ(z) − L̄·(z − z0)` (see
 weights. Returns `out`.
 """
 function phase!(out, tab::TabulatedLinop, z)
+    #= Not an error, because it is recoverable; not silent, because the propagator adds the
+       secant term whatever `phase!` returns, so a step taken outside the table would
+       propagate with the mean operator over the whole table -- a plausible-looking wrong
+       answer rather than a failure. `Luna.run` builds the table over every z the stepper
+       can reach, so this cannot fire from there. =#
+    if z < tab.z[1] || z > tab.z[end]
+        @warn(@sprintf("The tabulated linear operator was read at z = %.6g m, outside the [%.6g, %.6g] m it was built for; the value at the nearest end is used and the propagator adds the mean operator over the table.",
+                       z, tab.z[1], tab.z[end]), maxlog=1)
+    end
     k, s, h = _locate(tab.z, z)
     s2 = s*s
     s3 = s2*s
@@ -853,6 +887,11 @@ function _tabulate_value(f, z0, z1, rtol, maxdepth, maxnodes)
         nevals[] += 1
         f(z)
     end
+    #= The relative tolerance is taken against the two ends of the interval. That is enough
+       for β and Aeff, which are monotonic in z over any fibre Luna describes, so neither is
+       small at both ends and large in between; a quantity which was would be tabulated to
+       an inappropriate absolute tolerance and would need the maximum over the nodes as
+       they are placed instead. =#
     v0, v1 = dat(z0), dat(z1)
     scale = max(_tabmax(v0), _tabmax(v1))
     scale == 0 && (scale = 1.0)
@@ -878,10 +917,16 @@ interpolation. Callable as `t(z)`.
 `Modes.Aeff` is memoised on `(mode, z)`, so a z-dependent mode grows one `Dict` entry per
 distinct `z` it is asked about, i.e. per stage of every step, for the whole propagation.
 Tabulating it bounds that at the number of nodes and takes the quadrature out of the step.
+
+`src` is the callable the table was built from, kept so that a table can be rebuilt over a
+wider span without going through the interpolant. `NonlinearRHS.tabulate` does that when
+[`Luna.prop_capillary`](@ref) has already tabulated `Aeff` over the fibre for the
+statistics and the propagation needs it a little past the end.
 """
-struct TabulatedScalar
+struct TabulatedScalar{F}
     z::Vector{Float64}
     f::Vector{Float64}
+    src::F
     tol::Float64
     err::Float64
     nevals::Int
@@ -891,7 +936,7 @@ function TabulatedScalar(f, z0, z1; tol=DEFAULT_LINOP_TOL, maxdepth=DEFAULT_MAXD
                          maxnodes=DEFAULT_MAXNODES)
     zs, vs, err, nevals = _tabulate_value(z -> float(f(z)), z0, z1, float(tol),
                                           maxdepth, maxnodes)
-    TabulatedScalar(zs, _stack(vs), float(tol), err, nevals)
+    TabulatedScalar(zs, _stack(vs), f, float(tol), err, nevals)
 end
 
 function (t::TabulatedScalar)(z)

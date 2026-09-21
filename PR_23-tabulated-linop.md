@@ -57,8 +57,7 @@ entrance when `p₀ = 0`, and a multi-section fill has a derivative discontinuit
 junction — and bisection costs a number of intervals proportional to the depth a kink is
 resolved to rather than to a resolution imposed everywhere.
 
-**The secant subtraction** is the one thing that is not in PR 440 and is needed here.
-`TabulatedLinop` stores
+**The secant subtraction** is the one thing that is not in PR 440. `TabulatedLinop` stores
 
 ```
 Φ̃(z) = Φ(z) − L̄·(z − z0),   L̄ = Φ(z1)/(z1 − z0)
@@ -66,16 +65,26 @@ resolved to rather than to a resolution imposed everywhere.
 
 and the propagator adds `L̄·(t2 − t1)` back in the same broadcast, formed from the step
 length exactly as the constant propagator forms it. In exact arithmetic the result is
-unchanged; what changes is the size of the stored numbers. PR 440 tabulates a *phase* and
-runs in `Float64`; the full operator over a metre of fibre accumulates thousands of
-radians, whose `Float32` spacing is larger than the phase difference over one step, so a
-`Float32` table of `Φ` itself would be unusable on Metal. Measured on the `p₀ = 0`
-gradient below: `max|Φ̃| = 3.26` against `max|Φ| = 34.2` at 0.1 m and `32.6` against `342` at
-1 m — a factor of 10.5 in both, since the factor is set by the shape of the z dependence
-and not by the length. It is exactly 1/0 for a z-independent operator written as a closure,
-which is why tabulating one stores nothing (`tab.scale < 1e-6`, asserted in
-`test_linops.jl`). A cubic Hermite reproduces a linear function exactly, so the subtraction
-changes neither the node placement nor the interpolation error.
+unchanged; what changes is the size of the stored numbers, which is what a `Float32` table
+rounds. `make_linop` already subtracts the frame, so `max|Φ|` is 34 rad over 0.1 m of
+gradient and 359 rad over 1 m — tens to hundreds of radians, not thousands — and `max|Φ̃|`
+is 11.3 times smaller over the same span. Rounding `ΔΦ` to `Float32` both ways (review
+round 1's measurement, `t1 = L/2`, one step of `L/20`):
+
+| span | max‖Φ̃‖ | max‖Φ‖ | ‖ΔΦ‖ | error with the secant | without |
+| --- | --- | --- | --- | --- | --- |
+| 0.1 m | 3.26 | 35.9 | 1.71 | 2.1e-7 | 1.3e-6 |
+| 1 m | 32.6 | 359 | 17.1 | 2.0e-6 | 1.2e-5 |
+| 10 m | 326 | 3593 | 171 | 2.7e-5 | 1.0e-4 |
+
+So it buys a factor of 4 to 11 in the rounding error of `Φ(t2) − Φ(t1)`, not the difference
+between working and not working: the un-subtracted version would also have been usable at
+these spans. It is kept because it costs nothing — a cubic Hermite reproduces a linear
+function exactly, so the node placement and the interpolation error are unchanged — and
+because it is exactly zero for a z-independent operator, which then stores nothing at all
+(`tab.scale < 1e-6`, asserted in `test_linops.jl`). An earlier version of this description
+claimed the un-subtracted table would be unusable in `Float32`; that was not measured and
+is not true.
 
 ### `src/NonlinearRHS.jl` — the transform's own z-dependent quantities
 
@@ -301,23 +310,29 @@ Without tabulation the counts scale with the stages; with it they do not move at
 
 ## Known gaps
 
-- `Luna.run` tabulates into a transform of its own and does not modify the caller's, so a
-  statistics function built from `transform.aeff` before the run (which is what
-  `Stats.default` does for `peakintensity` and `electrondensity`) keeps calling the
-  untabulated `Aeff` once per accepted step. The statistics are host code and copy the
-  field down anyway (`gpu/24`), so this does not put anything back into the *stage* path,
-  but it does mean the memoised `Modes.Aeff` `Dict` still grows once per accepted step for
-  a z-dependent non-Marcatili mode when statistics are on. Fixing it properly means
-  tabulating before `Stats.default` is built, i.e. in `Interface`, where `zmax` is known
-  but `max_dz` after the absorber is not.
+- `Luna.run` tabulates into a transform of its own and does not modify the caller's. A
+  low-level caller who builds statistics by hand from `transform.aeff` therefore keeps the
+  untabulated callable in them; `prop_capillary` does not (review round 1, finding 3: it
+  tabulates `Aeff` itself before `Stats.default` closes over it), and the recipe for a
+  low-level caller is the same one line — pass a `LinearOps.TabulatedScalar` to
+  `Luna.setup` as `aeff`.
+- `prop_capillary`'s `Aeff` table spans `[0, flength]`, and the statistics of the last step
+  are recorded a fraction of a step past the end of the fibre, where the table holds its
+  end value. That is a scale factor on a diagnostic, and the propagation uses a table built
+  over the full span, so nothing propagated is clamped.
 - Tabulating a multimode or free-space operator is allowed and correct but expensive: the
   table is `2·nnodes` times the size of the operator, which for those geometries is the
-  size of the whole state. Documented on the user page; no guard in the code beyond
-  `maxnodes`.
+  size of the whole state. The constructor now reports the size and warns above
+  `LinearOps.TABLE_WARN_BYTES` (256 MB), naming `linop_tol` and the shape of the operator.
 - The value tables (`β`, `Aeff`) are linear interpolants because no derivative is available
   from the mode interface. A quadratic through the bisection's own midpoint would cost
   nothing extra in evaluations and would cut the node count for a smooth quantity by an
-  order of magnitude; not done here.
+  order of magnitude; not done here. It is why a linear taper's `Aeff` takes 257 nodes at
+  `linop_tol=1e-6` — 257 `Float64`s, but also 257 cubatures at setup for a mode whose
+  `Aeff` is not analytic.
+- The relative tolerance of a value table is taken against its two endpoints, which is
+  right for `β` and `Aeff` (monotonic in z over any fibre Luna describes) and would not be
+  for a quantity small at both ends and large in between. Commented, not guarded.
 - `linop_tol` is one knob for two different things (radians for the operator, relative for
   the values). Splitting it would be easy if anyone needs it.
 

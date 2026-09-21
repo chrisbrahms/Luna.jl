@@ -1224,6 +1224,39 @@ tapercase(spec; kwargs...) = zcase(spec; kind=:taper, kwargs...)
                                          constβ=true) isa NonlinearRHS.NormModeAvg
 end
 
+#= A caller-supplied normalisation (`Luna.setup`'s `norm!` keyword) is not one of Luna's
+   own and need not have an `aeff` field at all, so `tabulate` has to pass it through
+   rather than inspect it. Before this was guarded, `tabulate_linop=true` aborted such a
+   run with a `FieldError` before the first step. =#
+struct WrapperNorm{N}
+    n::N
+end
+(w::WrapperNorm)(nl, z) = w.n(nl, z)
+
+@testset "a caller-supplied normalisation is passed through" begin
+    flength = 1e-2
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    coren, densityfun = Capillary.gradient(:Ar, flength, 1.0, 0.0)
+    m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),)
+    linop, βfun! = LinearOps.make_linop(grid, m, 800e-9)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
+    norm! = WrapperNorm(NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
+    Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff; norm!)
+    # the unknown normalisation comes back untouched, and `β` is still evaluated per call
+    tab = NonlinearRHS.tabulate(transform, 0.0, flength, 1e-6, Eω)
+    @test tab.norm! === norm!
+    @test tab.aeff isa LinearOps.TabulatedScalar
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    dz = flength/20
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz,
+             tabulate_linop=true)
+    @test all(isfinite, out["Eω"])
+    @test maximum(abs, out["Eω"]) > 0
+end
+
 # --- The device path proper, skipped without JLArrays -------------------------
 have_jlarrays = try
     @eval import JLArrays

@@ -1,5 +1,5 @@
 import Luna: PhysData, Grid, LinearOps, Modes, Capillary, RK45
-import Test: @testset, @test
+import Test: @testset, @test, @test_logs
 import Luna.PhysData: wlfreq
 
 R = 5e-3
@@ -392,6 +392,58 @@ end
         @test maximum(abs, y .- yref) < 1e-10
     end
 
+    #= The shape of the operator is not special-cased anywhere -- `_stack`, `selectdim`
+       and `phase!` work on any number of axes -- so a multimode operator tabulates the
+       same way. Four `MarcatiliMode`s on the same gradient, checked against a midpoint
+       quadrature fine enough that its own error is well below the tolerance. =#
+    @testset "a multimode operator" begin
+        coren, _ = Capillary.gradient(:Ar, L, 0.0, 1.0)
+        ms = [Capillary.MarcatiliMode(75e-6, coren, n=1, m=m, kind=:HE, loss=false)
+              for m = 1:4]
+        linop! = LinearOps.make_linop(grid, ms, 800e-9)
+        mproto = zeros(ComplexF64, nω, length(ms))
+        tab = LinearOps.TabulatedLinop(linop!, mproto, 0.0, zend; tol=1e-6, quiet=true)
+        @test size(tab.Φ) == (nω, length(ms), length(tab.z))
+        @test size(tab.secant) == (nω, length(ms))
+        @test tab.err <= 1e-6
+        out = similar(mproto)
+        buf = similar(mproto)
+        npanel = 20000
+        for z in (L/3, L)
+            LinearOps.integrated!(out, tab, z)
+            #= Midpoint over `npanel` panels. The integrand has a √z cusp at 0, whose
+               contribution to the midpoint error is O(h^{3/2}); at this panel count that
+               is below the tolerance being checked. =#
+            ref = zeros(ComplexF64, size(mproto))
+            h = z/npanel
+            for i = 1:npanel
+                linop!(buf, (i - 0.5)*h)
+                ref .+= buf .* h
+            end
+            @test maximum(abs, out .- ref) < 1e-4
+        end
+        y = ones(ComplexF64, size(mproto))
+        RK45.make_prop!(tab, mproto)(y, 0.3L, 0.31L)
+        @test all(isfinite, y)
+    end
+
+    #= Read outside the table, the value at the nearest end is used -- and the operator
+       readback says so, because the propagator adds the secant term whatever it returns,
+       so a step outside the table would propagate with the mean operator over the whole
+       of it. `Luna.run` builds the table over every z the stepper can reach, so this
+       cannot happen from there. =#
+    @testset "reading outside the table" begin
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, L; tol=1e-6, quiet=true)
+        out = similar(proto)
+        ref = similar(proto)
+        @test_logs (:warn, r"outside") LinearOps.phase!(out, tab, 1.5L)
+        LinearOps.phase!(ref, tab, L)
+        @test out == ref
+        # ... and the value tables hold their end value silently, which is deliberate
+        atab = LinearOps.TabulatedScalar(z -> 1 + z^2, 0.0, L; tol=1e-6)
+        @test atab(1.5L) == atab(L)
+    end
+
     #= The value tables: β and Aeff are interpolated rather than integrated, to a
        tolerance relative to the largest value in the table. =#
     @testset "value tables" begin
@@ -418,5 +470,11 @@ end
         flat = LinearOps.TabulatedScalar(z -> Modes.Aeff(m, z=z), 0.0, L; tol=1e-6)
         @test length(flat.z) == 2
         @test flat(0.5L) ≈ Modes.Aeff(m)
+        #= The callable the table was built from is kept, so a table can be rebuilt over a
+           wider span without going through its own interpolant. =#
+        @test atab.src === aeff
+        wider = LinearOps.TabulatedScalar(atab.src, 0.0, 1.5zend; tol=1e-6)
+        @test wider.z[end] == 1.5zend
+        @test isapprox(wider(L/3), aeff(L/3); rtol=1e-5)
     end
 end

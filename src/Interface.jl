@@ -370,8 +370,10 @@ If `raman` is `true`, then the following options apply:
     of evaluating them on the host at every stage. This is what makes such a propagation
     run entirely on a device. It changes the discretisation of the linear step (the
     propagator becomes the exact `exp(∫linop dz)` rather than a one-point rule), so it is
-    opt-in; see [`Luna.run`](@ref). Ignored, apart from a two-node table of `Aeff`, when
-    the fibre is uniform and the operator is already constant.
+    opt-in; see [`Luna.run`](@ref). A uniform fibre keeps its constant operator, which is
+    already exact in the propagator, and gets a two-node table of `Aeff`; reading a
+    constant off a two-node table is not bit-identical to calling `Modes.Aeff` (it is
+    `(1-s)f + sf`), so even there the keyword is not a no-op.
 - `linop_tol::Real`: the tolerance the tabulation's adaptive nodes are placed to satisfy.
     See [`Luna.run`](@ref).
 - `device`: where to run: `:cpu`, `:auto`, `:metal`, `:cuda` or a [`Luna.DeviceSpec`](@ref).
@@ -546,9 +548,19 @@ function prop_capillary_args(radius, flength, gas, pressure;
     else
         Luna.HostSpec()
     end
+    #= `aefftol`/`aeffspan`: with `tabulate_linop=true` the effective area is tabulated
+       here, before `Stats.default` closes over it (below), rather than only inside
+       `Luna.run`. `Luna.run` rebinds its own `transform` and leaves this one alone, so a
+       statistics function built from `transform.aeff` would otherwise keep calling
+       `Modes.Aeff` -- memoised on `(mode, z)`, so once per accepted step forever -- for a
+       tapered fibre. The span is the fibre; the propagation needs `Aeff` up to one step
+       past the end, and `NonlinearRHS.tabulate` rebuilds a wider table for that from this
+       one's source callable. =#
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
-                                     noise_field, thg, device=devicereq, precision)
+                                     noise_field, thg, device=devicereq, precision,
+                                     aefftol=(tabulate_linop ? linop_tol : nothing),
+                                     aeffspan=(0.0, float(flength)))
     #= Stats.jl is host-only code (out of this branch's scope beyond the host-copy
        warning and PeriodicStats): `Stats.default`/`collect_stats` use their `Eω`
        argument only to size and type their internal buffers at construction, but for an
@@ -990,9 +1002,23 @@ the response), so no keyword is passed.
 linopkw(grid::Grid.RealGrid, thg) = NamedTuple()
 linopkw(grid::Grid.EnvGrid, thg) = (; thg)
 
+#= The effective-area callable `Luna.setup` is given: `Modes.Aeff` directly, or a table
+   over `aeffspan` when `aefftol` is a tolerance rather than `nothing`. Tabulating here
+   rather than only in `Luna.run` is what stops the memoised `Modes.Aeff` `Dict` growing
+   once per accepted step for a tapered fibre when the statistics are on -- see the call
+   site in `prop_capillary_args`. =#
+function makeaeff(mode, aefftol::Nothing, aeffspan)
+    z -> Modes.Aeff(mode, z=z)
+end
+
+function makeaeff(mode, aefftol, aeffspan)
+    LinearOps.TabulatedScalar(z -> Modes.Aeff(mode, z=z), aeffspan...; tol=aefftol)
+end
+
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
                c::Val{true}; noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.device_request(), precision=nothing)
+               device=Luna.device_request(), precision=nothing,
+               aefftol=nothing, aeffspan=(0.0, 1.0))
     @info("Using mode-averaged propagation.")
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ;
                                                     linopkw(grid, thg)...)
@@ -1002,21 +1028,22 @@ function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, 
        caller's request (`prop_capillary`'s own keywords, default `Luna.device_request()`
        so an untouched call reproduces today's behaviour); `Luna.setup` resolves them. =#
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z);
+                                   βfun!, makeaeff(mode, aefftol, aeffspan);
                                    noise_field, constβ=true, device, precision)
     linop, Eω, transform, FT
 end
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
                c::Val{false}; noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.device_request(), precision=nothing)
+               device=Luna.device_request(), precision=nothing,
+               aefftol=nothing, aeffspan=(0.0, 1.0))
     @info("Using mode-averaged propagation.")
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ;
                                         linopkw(grid, thg)...)
 
     # `device`/`precision`: see the constant-operator branch above
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z);
+                                   βfun!, makeaeff(mode, aefftol, aeffspan);
                                    noise_field, device, precision)
     linop, Eω, transform, FT
 end
@@ -1040,9 +1067,12 @@ function _cpu_only!(device, precision, what)
     nothing
 end
 
+#= `aefftol`/`aeffspan` are accepted and ignored: multimode propagation has no single
+   effective area, and `norm_modal` does not use one. =#
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
                noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.HostSpec(), precision=nothing)
+               device=Luna.HostSpec(), precision=nothing,
+               aefftol=nothing, aeffspan=(0.0, 1.0))
     _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
@@ -1054,7 +1084,8 @@ end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
                noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.HostSpec(), precision=nothing)
+               device=Luna.HostSpec(), precision=nothing,
+               aefftol=nothing, aeffspan=(0.0, 1.0))
     _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")

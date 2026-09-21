@@ -111,15 +111,26 @@ junction in a multi-section fill — without refining anywhere else. The design 
 
 `TabulatedLinop` stores not `Φ` but its deviation from the secant through the ends of the
 table, and the propagator adds `L̄·(t2 − t1)` back in the same broadcast. In exact
-arithmetic that is the same number; in `Float32` it is the difference between storing the
-operator's *variation* along `z` (a few radians) and its accumulated phase (thousands),
-whose `Float32` spacing would exceed the phase difference over a step.
+arithmetic that is the same number; in `Float32` it stores the operator's *variation* along
+`z` rather than its accumulated phase. `make_linop` already subtracts the frame, so `max|Φ|`
+is tens to hundreds of radians (34 rad over 0.1 m of gradient, 359 rad over 1 m) and the
+deviation is 11.3 times smaller over the same span. Rounding `ΔΦ` to `Float32` both ways,
+the subtraction buys a factor of 4 to 11 in its error — 2.1e-7 rad against 1.3e-6 at 0.1 m,
+2.7e-5 against 1.0e-4 at 10 m. It is a reduction of the rounding error, not the difference
+between working and not working, and it costs nothing: a cubic Hermite is exact on a linear
+function, so the node placement and the interpolation error are unchanged, and a
+z-independent operator ends up storing nothing at all.
 
-Two things this does not cover. `Luna.run` tabulates into a transform of its own and leaves
-the caller's object alone, so a statistics function built from `transform.aeff` before the
-run keeps calling the untabulated one — once per accepted step, on the host, where the
-statistics already are. And a `linop!` which is genuinely discontinuous in `z` cannot be
-tabulated to tolerance: the bisection stops at its depth or node limit and warns.
+`Luna.run` tabulates into a transform of its own and leaves the caller's object alone, so a
+statistics function built from `transform.aeff` before the run would keep calling the
+untabulated one. `prop_capillary` therefore tabulates `Aeff` itself, over `[0, flength]`,
+before `Stats.default` closes over it; `NonlinearRHS._aefftab` rebuilds a wider table from
+that one's `src` for the propagation, which needs `Aeff` up to one step past the end of the
+fibre. A low-level caller who builds statistics by hand and wants the same has to pass a
+`LinearOps.TabulatedScalar` to `Luna.setup` as `aeff`, which is all `prop_capillary` does.
+
+What this does not cover: a `linop!` which is genuinely discontinuous in `z` cannot be
+tabulated to tolerance, and the bisection stops at its depth or node limit and warns.
 
 ## Unit scaling
 

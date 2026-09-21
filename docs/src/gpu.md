@@ -252,9 +252,13 @@ mode-averaged nonlinear normalisation needs. Six host evaluations and six copies
 serialise a device run against the host and are the slowest thing in it.
 
 `tabulate_linop=true` evaluates all three at setup instead, on `z` nodes placed by adaptive
-bisection, and stores the tables where the state lives. Nothing on the host is touched
-inside the propagation after that. It works for every mode type and for a uniform fibre
-too, where the operator is already constant and only a two-node table of `Aeff` is built.
+bisection, and stores the tables where the state lives. What is left inside the propagation
+is an interval lookup and four interpolation weights per readback — scalar host arithmetic,
+no mode evaluation and no copy between host and device. It works for every mode type
+(mode-averaged, multimode, radial and free space; the operator is tabulated whatever its
+shape, and `β` and `Aeff` exist only for the mode-averaged transform) and for a uniform
+fibre too, where the operator is already constant and only a two-node table of `Aeff` is
+built.
 
 **It changes the discretisation of the linear step, which is why it is not the default.**
 What is tabulated is the *integrated* operator `Φ(z) = ∫ linop dz'`, and the propagator
