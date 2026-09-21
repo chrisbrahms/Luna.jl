@@ -127,8 +127,10 @@ All twelve examples build the statistics with `Stats.default(grid, Eω, transfor
 and pass them to `Output.MemoryOutput`, in place of the commented-out
 `Stats.collect_stats(grid, Eω, Stats.ω0(grid))` line which would have thrown. Each was run
 with its grids and lengths shrunk so a run takes seconds; all twelve complete and record
-11 to 13 statistics -- 13 for the 3-D χ⁽²⁾ case, which has two polarisation components and
-two transverse widths.
+11 to 13 statistics. The 13 of the 3-D χ⁽²⁾ case are the 11 of a one-component radial run,
+plus `fwhm_y` (a Cartesian grid has a width per transverse axis), plus the
+`fwhm_t_min_allpol`/`fwhm_t_max_allpol` pair that two polarisation components add, minus
+`pressure` (a crystal, not a gas).
 
 ### `docs/`
 
@@ -298,6 +300,14 @@ nothing between them and the final commit changes what they exercise (two docstr
   `energy` and the on-axis peak intensity are.
 - **`electrondensity` is field-resolved only**, as it already was: the constructors are
   typed on `Grid.RealGrid`.
+- **For `gpu/int-E2` or later: give the gate's radial cases the new statistics.** The
+  free-space geometries are now the only ones whose statistics the gate does not cover at
+  all, and this branch adds a large amount of per-step reduction code which only runs
+  there. The reviewer's cheapest version, which I agree with: add `Stats.default` to the
+  two `radial_*` cases only — rank 3, one polarisation, the same reduction code the 3-D
+  ones take — and leave `free3d_env_kerr` and `free2d_*_chi2` on `freestats`. It needs a
+  fresh one-ulp sensitivity study for the statistics tolerance of those two cases and a
+  regenerated baseline, which is why it is not here. (Review round 1, finding 9.)
 
 ## Deviations from GPU_PLAN.md and the brief
 
@@ -315,3 +325,113 @@ nothing between them and the final commit changes what they exercise (two docstr
    Luna has always done"; that is now false, deliberately, because the free-space set is the
    first one which reads no time-domain field and the buffer is four times the state.
 5. **`src/Plotting.jl` is a scope extension** — three lines, so that the new keys plot.
+6. **`collar_energy_fraction` is recorded whether or not an absorber is active there.**
+   The brief says the dataset is recorded "when `:rate` boundaries are on; otherwise
+   skipped". `Stats.default` is built before `Luna.run` is called and cannot see
+   `boundary` or `rcollar`, so what it records is the fluence fraction in the **nominal**
+   collar region — the region `Boundaries.rprofile(spacegrid, collar)` describes —
+   whatever the run then does with it. With `boundary=:none` or `:legacy` nothing is
+   absorbing there; with `boundary=:rate` and a changed `rcollar` the region is not the one
+   the run uses. `collar=nothing` skips the dataset. The `beam_profile` docstring says all
+   of this. (Review round 1, finding 3.)
+7. **`Stats.squeeze` is removed, not deprecated.** Both of its methods are gone and the
+   name no longer exists in `Stats`. It was undocumented and unexported and nothing outside
+   `Stats.CentreOfMass` called it, but it was reachable as `Stats.squeeze`. (Review round 1,
+   finding 5.)
+
+## Changes after review round 1
+
+Review: `scratchpad/reviews/gpu-25-modal-error-stat-1.md`, verdict **approve with minor
+fixes**, on `a253526c`. The reviewer reproduced every number this PR claims for the gate,
+`test_stats.jl`, `test_device.jl`, `test_metal.jl` and the docs build, and checked the two
+pieces of new physics independently — the Cartesian on-axis weights against an explicit
+inverse FFT on random data, the energy weights against the functionals and against foreign
+and wrong-grid ones, and the recorded beam widths against the analytic fluence FWHM. None
+of the findings was a correctness bug on a path Luna takes.
+
+### 2 (minor) — the energy probe was the size of the state, on every path
+
+`_devenergy`'s probe is `(nω, 1, nk...)`, and the functional materialises `abs2` of it: on
+a 512 x 128 x 128 grid that is two transient host arrays of 134 MB and 67 MB, built at
+construction. They were built even when `ctx.ondevice` was false — which for the free-space
+default set is always, since `beam_profile` makes it host-only — and the weights were then
+never used.
+
+The probe now runs only when the device path is the one being taken. The bare
+`ctx.ondevice || return f` the review suggests would also have made every energy statistic
+report "no device form", which is what `Luna.ScaledOutput`'s warning and `collect_stats`'s
+`@info` line read: every device run taking the host path by size (all of them, at today's
+`STATS_DEVICE_MINLEN`) would have announced that the energies have no device form. So the
+two halves of the trait are separated instead:
+
+- `_hasform(ctx, spacegrid)` answers the structural half from the grids alone, which is what
+  `device_capable` is documented to mean ("it does not depend on the array type a statistic
+  was prepared for"). That is what a host-built statistic reports.
+- the probe still answers the other half — that the functional the caller passed *is* the
+  one those grids describe — wherever the weights will actually be used.
+
+`SpectralEnergy` and `SpectralEnergyWindow` carry the answer in a `hasform` field. The one
+consequence: a host-built statistic reports a device form for a foreign functional, which
+the probe would have refused. Nothing reads it there — a host-built set never evaluates the
+weights (`_onstate` refuses), and a device run which would take the device path builds the
+probe and gets the checked answer.
+
+### 4 (minor) — a free-space set recorded two mode-named datasets
+
+`fwhm_t` takes a `combined` keyword for the name of the dataset which adds the columns
+together (default `allmodes`, as before), and the free-space `Stats.default` passes
+`allpol`. A two-polarisation free-space state therefore records
+`fwhm_t_min_allpol`/`fwhm_t_max_allpol` instead of `..._allmodes`. `Stats.default`'s
+docstring says what a two-component state records, and the 13-dataset count of the 3-D
+χ⁽²⁾ example is broken down above.
+
+### 6 (nit) — the Cartesian energy weights carried a vector of ones
+
+`_energy_weights` returns an empty weight tuple for the Cartesian transverse grids and
+`_ekernel(::Tuple{})` is `abs2`, so the reduction is `sum(abs2, Eω; dims)` rather than a
+multiply by 1.0 per element per reduction on the largest states Luna makes. A spectral
+window, which no longer has a frequency weight vector to fold into there, creates one.
+
+### 1 (minor) — `_axisweights`'s docstring
+
+It said an axis which does not contain `x = 0` gives "the correct interpolation to the
+axis". It gives the **nearest sample**, half a cell off the axis; the band-limited
+interpolation to `x = 0` would be the all-`1/N` weights, a different vector. Corrected, with
+the note that no transverse grid Luna builds is of that kind.
+
+### 3 (minor) and 7 (nit) — `beam_profile`'s docstring
+
+It now says that `collar_energy_fraction` is the fluence fraction in the nominal collar
+region whether or not an absorber is active there, that it uses the `collar` given to it
+rather than `Luna.run`'s `rcollar` (it is built before `Luna.run` is called), and that
+`Maths.fwhm` returns `NaN`, silently, on a transverse grid with a handful of samples across
+the beam — `w0 = 100 µm` on a `Grid.FreeGrid(400e-6, 8, 400e-6, 6)` records
+`fwhm_x = fwhm_y = NaN`. Deviation 6 above records the first of these against the brief.
+
+### 5 and 8 (nits) — recorded rather than changed
+
+`Stats.squeeze`'s removal is deviation 7 above. The per-step host allocations of the
+free-space energy path — one `(nω, nk...)` copy per polarisation component per call for
+`energy` and for each energy window, because the functionals reshape what they are given —
+are in `Stats.default`'s docstring, with `stats_period` and `Output.nostats` named as the
+levers, next to the beam profile's own buffer.
+
+### 9 (note) — the gate's free-space cases
+
+Not changed here, as the reviewer agrees. Added to the open items above as work for
+`gpu/int-E2` or later, with the reviewer's cheapest version (the two `radial_*` cases only).
+
+### Re-run after the changes
+
+| what | result |
+| --- | --- |
+| `test/test_regression.jl` vs `b641025b` | **466 pass, 0 fail**, `0.000e+00` on all 44 rows, both classes, both modes |
+| `test/test_device.jl` (JLArrays) | **1383 pass, 0 fail, 71 testsets** |
+| `test/test_stats.jl` | **167 pass, 0 fail, 10 testsets** |
+
+`test_metal.jl` was not re-run: the changes after the review are two docstrings, a dataset
+name which the Metal testset does not assert on (it compares the two runs' key sets to each
+other), and two construction-time paths -- the probe guard, which only skips work on the
+host path, and the Cartesian weight tuple, which the Metal cases exercise through the same
+`_weightedenergy` the JLArray ones do. The gate, `test_device.jl` and `test_stats.jl` were
+re-run in full.
