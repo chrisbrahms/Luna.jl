@@ -443,7 +443,7 @@ Half-widths and length of the rectangular guide of [`setup_rect_modal`](@ref). `
 deliberately: a rectangular guide is the only geometry in Luna with a Cartesian
 `Modes.dimlimits`, and `a > b` is the case the Cartesian in-domain test of the adaptive
 transverse integral (`NonlinearRHS._points!`) got wrong before `gpu/26-rectmode-fix`. The
-aspect ratio 2.5 makes the dropped strip a quarter of the `x` extent.
+aspect ratio 2.5 makes the dropped strip 30 % of the guide's area.
 """
 const A_RECT = 100e-6
 
@@ -462,8 +462,8 @@ guide is wide in, which is the one the in-domain test is applied to -- with the 
 index and the same polarisation, so that the Kerr product of the fundamental projects
 onto the second mode. At 5 µJ over 3 cm the second mode reaches 7 % of the fundamental's
 peak `|Eω|`, and the 20-step fixed run agrees with the adaptive one to 3e-4, so the case
-is resolved at the fixed step size. The intensity stays two orders of magnitude below
-ionisation, so Kerr is the only response.
+is resolved at the fixed step size. There is no plasma response: the matrix already has
+four ionising cases, and this one is here for the transverse integral.
 
 This is the matrix's only Cartesian transverse domain, and so the only case which reaches
 the `:cartesian` branch of `NonlinearRHS._points!`; every other multimode case is polar,
