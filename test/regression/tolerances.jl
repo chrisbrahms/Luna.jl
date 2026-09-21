@@ -61,6 +61,15 @@
      in the `:adaptive` one, in line with the two radial Kerr cases. Its baseline does not
      exist in any pre-`gpu/20` baseline directory, so the older baselines are run with
      `LUNA_REGRESSION_SKIP=radial_field_raman`.
+   - `rect_modal_field` (added in `gpu/26-rectmode-fix` as the matrix's only Cartesian
+     transverse domain) is the tightest multimode case: 1.8e-15 `Eω` in the `:fixed` mode
+     and 2.1e-14 in the `:adaptive` one, both at the 1e-12 floor after the 100x. Unlike
+     `multimode_field_plasma` there is no ionisation to feed a one-ulp change back into
+     the step-size controller, and the adaptive step count (73) is reproducible. Its
+     `:fixed` `:stats` 2.6e-12 is `stats/transverse_integral_error_rel`, the cubature's
+     own error estimate, for the same reason as the other two adaptive-quadrature cases.
+     Its baseline does not exist in any pre-`gpu/26` baseline directory, so the older
+     baselines are run with `LUNA_REGRESSION_SKIP=rect_modal_field`.
 =#
 module RegressionTolerances
 
@@ -115,6 +124,9 @@ const TOLERANCES = Dict{String, Dict{Symbol, Dict{Symbol, Float64}}}(
     "multimode_field_plasma" => Dict(
         :fixed     => Dict(:Eω => 6.7e-12, :stats => 5.8e-11),
         :adaptive  => Dict(:Eω => 7.3e-05, :stats => 7.3e-02)),
+    "rect_modal_field" => Dict(
+        :fixed     => Dict(:Eω => 1.0e-12, :stats => 2.6e-12),
+        :adaptive  => Dict(:Eω => 2.1e-12, :stats => 7.3e-09)),
     "radial_field_kerr" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
         :adaptive  => Dict(:Eω => 1.2e-08, :stats => 1.0e-12)),

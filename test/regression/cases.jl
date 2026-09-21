@@ -19,7 +19,7 @@ module RegressionCases
 
 using Luna
 import Luna: Boundaries, Capillary, Fields, Grid, Interface, LinearOps, Modes,
-             Nonlinear, NonlinearRHS, Output, PhysData, Stats
+             Nonlinear, NonlinearRHS, Output, PhysData, RectModes, Stats
 #= Hankel is a direct dependency of Luna, so import it directly rather than as `Luna.Hankel`:
    `src/Luna.jl` keeps an `import Hankel` only so that existing scripts still resolve
    `Luna.Hankel`, and a later branch removing that dead import must not break the gate. =#
@@ -434,6 +434,62 @@ setup_gnlse_raman_shock() = setup_gnlse(raman=true, shock=true)
 taper(z) = A_CAP + (0.75A_CAP - A_CAP)*z/L_CAP
 
 # ---------------------------------------------------------------------------------------
+# Rectangular multimode case
+# ---------------------------------------------------------------------------------------
+"""
+    A_RECT, B_RECT, L_RECT
+
+Half-widths and length of the rectangular guide of [`setup_rect_modal`](@ref). `a > b`
+deliberately: a rectangular guide is the only geometry in Luna with a Cartesian
+`Modes.dimlimits`, and `a > b` is the case the Cartesian in-domain test of the adaptive
+transverse integral (`NonlinearRHS._points!`) got wrong before `gpu/26-rectmode-fix`. The
+aspect ratio 2.5 makes the dropped strip a quarter of the `x` extent.
+"""
+const A_RECT = 100e-6
+
+@doc (@doc A_RECT)
+const B_RECT = 40e-6
+
+@doc (@doc A_RECT)
+const L_RECT = 0.03
+
+"""
+Multimode field propagation in a rectangular guide (`RectModes.RectMode`, argon at 5 bar,
+silver cladding) with `a > b`, Kerr only.
+
+The two modes are the `m = 1` and `m = 3` modes of the `x` index -- the coordinate the
+guide is wide in, which is the one the in-domain test is applied to -- with the same `y`
+index and the same polarisation, so that the Kerr product of the fundamental projects
+onto the second mode. At 5 µJ over 3 cm the second mode reaches 7 % of the fundamental's
+peak `|Eω|`, and the 20-step fixed run agrees with the adaptive one to 3e-4, so the case
+is resolved at the fixed step size. The intensity stays two orders of magnitude below
+ionisation, so Kerr is the only response.
+
+This is the matrix's only Cartesian transverse domain, and so the only case which reaches
+the `:cartesian` branch of `NonlinearRHS._points!`; every other multimode case is polar,
+where the test is unchanged.
+"""
+function setup_rect_modal()
+    gas = :Ar
+    pres = 5.0
+    grid = makegrid(Grid.RealGrid, L_RECT, Λ0, ΛLIMS, TRANGE)
+    modes = Tuple(RectModes.RectMode(A_RECT, B_RECT, gas, pres, :Ag; n=1, m=mx, pol=:x)
+                  for mx in (1, 3))
+    dens0 = PhysData.density(gas, pres)
+    densityfun = let dens0=dens0
+        z -> dens0
+    end
+    responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    inputs = Fields.GaussField(λ0=Λ0, τfwhm=ΤFWHM, energy=5e-6)
+    linop = LinearOps.make_const_linop(grid, modes, Λ0)
+    Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, modes, :x;
+                                   full=true)
+    statsfun = Stats.default(grid, Eω, modes, linop, transform; gas=gas)
+    output = Output.MemoryOutput(0, L_RECT, SAVEN, statsfun)
+    Eω, grid, linop, transform, FT, output
+end
+
+# ---------------------------------------------------------------------------------------
 # The case matrix
 # ---------------------------------------------------------------------------------------
 """
@@ -516,6 +572,8 @@ const CASES = Case[
     capillary_case("multimode_field_plasma", A_CAP, L_CAP, :Ar, 0.1;
                    λ0=Λ0, λlims=ΛLIMS, trange=TRANGE, τfwhm=ΤFWHM, energy=150e-6,
                    modes=4, plasma=true, PPT_options=NOCACHE),
+
+    lowlevel_case("rect_modal_field", L_RECT, setup_rect_modal),
 
     lowlevel_case("radial_field_kerr", L_FREE, setup_radial_field),
     lowlevel_case("radial_env_kerr", L_FREE, setup_radial_env),

@@ -120,9 +120,9 @@ or a version — and the cases call `makegrid`, `runkw`, `radialgrid` and `absor
 instead of the API directly. On `evanescent` each of those reduces to exactly the call the
 pre-Group-A `cases.jl` made: regenerating the `fdf8dbe3` baseline with the shimmed file
 reproduces the original one bit for bit, over the 21 cases which existed then, both modes
-and 502 datasets. `radial_field_raman`, added in `gpu/20-radial-device`, is the 22nd; it
-runs on `evanescent` through the same shim, but no baseline generated before that branch
-contains it.
+and 502 datasets. `radial_field_raman`, added in `gpu/20-radial-device`, is the 22nd and
+`rect_modal_field`, added in `gpu/26-rectmode-fix`, the 23rd; both run on `evanescent`
+through the same shim, but no baseline generated before their branches contains them.
 
 The block is marked in the file and should be deleted, with its call sites, once no baseline
 in use predates `gpu/int-A`.
