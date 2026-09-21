@@ -1265,4 +1265,50 @@ end
         modes=4, device=MetalSpec)
 end
 
+#= ------------------------------------------------- the Cartesian free-space transforms =#
+
+#= The multi-axis FFT plans `TransFree`/`TransFree2D` need, against FFTW on the same random
+   data. `(1, 3)` and `(1, 3, 4)` -- the time axis and the one or two transverse axes, with
+   the polarisation axis skipped -- are what Luna plans; Metal.jl's own tests cover `(1, 3)`
+   and `(1, 4)` but not `(1, 3, 4)` (GPU_PLAN.md section 2), so the three-axis real and
+   complex regions are checked here before anything is built on them. Forward and inverse,
+   one and two polarisation components, powers of two and not.
+
+   This runs first in the free-space part of the file: if a region were unsupported or
+   wrong, the transforms below would have to be built out of two plans instead of one. =#
+@testset "multi-axis FFT plans on Metal" begin
+    shapes = (((64, 1, 16, 8), (1, 3, 4)),
+              ((64, 2, 16, 8), (1, 3, 4)),
+              ((96, 2, 15, 7), (1, 3, 4)), # transverse axes not powers of two
+              ((64, 1, 32), (1, 3)),
+              ((64, 2, 32), (1, 3)),
+              ((385, 1, 24), (1, 3)))      # odd time axis: real output length matters
+    for (sz, region) in shapes, TT in (Float32, ComplexF32)
+        A = TT <: Complex ? complex.(randn(Float32, sz), randn(Float32, sz)) :
+                            randn(Float32, sz)
+        Ah = convert(Array{TT <: Complex ? ComplexF64 : Float64}, A)
+        # the host plan Luna would make for the same buffer, in double precision
+        FTh = Utils.plan_ft(Ah, region)
+        href = FTh * Ah
+
+        dA = MtlArray(A)
+        FT = Utils.plan_ft(dA, region)
+        dout = similar(dA, ComplexF32, size(href))
+        LinearAlgebra.mul!(dout, FT, dA) # plain arrays, exactly the planned shape
+        @test size(dout) == size(href)
+        @test maximum(abs, ComplexF64.(Array(dout)) .- href)/maximum(abs, href) < 1e-5
+
+        #= The inverse plan Luna holds explicitly: an `AbstractFFTs.ScaledPlan` whose
+           `scale` is 1/N over the *output* lengths, which for a real transform is not the
+           input's. `to_time!` folds that scale into the oversampling copy and applies
+           `Utils.iplan(IFT)`, so both halves are checked separately here. =#
+        IFT = Utils.plan_ift(FT)
+        @test Utils.iscale(IFT) ≈ 1/prod(sz[i] for i in region)
+        back = similar(dA)
+        LinearAlgebra.mul!(back, Utils.iplan(IFT), copy(dout))
+        B = Array(back) .* Float32(Utils.iscale(IFT))
+        @test maximum(abs, convert(Array{eltype(Ah)}, B) .- Ah)/maximum(abs, Ah) < 1e-5
+    end
+end
+
 end # have_metal
