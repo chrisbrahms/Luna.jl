@@ -21,7 +21,7 @@ which the brief expected to move.
 | `c8d360c9` | `test_metal.jl`: the Cartesian free-space transforms on hardware |
 | `9b09ac45` | `benchmark/free.jl`, memory accounting, docs and this file |
 | `73b6365c` | PR fix: `test_boundaries.jl` row and the last commit hash |
-| `744c0406` | Review round 1 fixes |
+| `a39604f4` | Review round 1 fixes (this row corrected in the commit after it) |
 
 ## The plan test, first
 
