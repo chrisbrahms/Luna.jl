@@ -1,6 +1,6 @@
 # `gpu/22-modal`: the batched column evaluator and the fixed transverse quadrature
 
-Base: `gpu/int-D` at `90826dc4`. Eight commits.
+Base: `gpu/int-D` at `90826dc4`. Ten commits.
 
 ## Motivation
 
@@ -86,8 +86,8 @@ refuses `:adaptive` for anything but a host `Float64` run with a message naming
 
 ### `src/Interface.jl`
 
-`prop_capillary` takes `modal_integral`, `nr`, `nθ` and `kronrod`, records them in the
-output file, and ignores them for mode-averaged propagation (which has no transverse
+`prop_capillary` takes `modal_integral`, `modal_nr`, `modal_nθ` and `modal_kronrod`,
+records them in the output file, and ignores them for mode-averaged propagation (which has no transverse
 integral), as it already ignored `radial_integral_rtol`. The device sentinel resolves to
 `Luna.settings["device"]` for a multimode call as well, but only with
 `modal_integral=:fixed` and only when every response has a device kernel; an explicit
@@ -320,8 +320,9 @@ worst case above): `multimode_field_plasma` rhs 45.4 → 43.9 ms, prop 14.30 →
 
 Batching the points of a round, with the modal transform already hoisted out of the loop,
 is worth about 9 %: one right-hand side, Kerr, 4 modes, 1600 fs — `nb=1` 4.53 ms, `nb=4`
-4.12 ms, `nb=16` 4.12 ms, `nb=32` 4.11 ms. 16 is the default; the rule asks for 3, 2, 4 and
-8 points per round at the default tolerance, so nothing is split there.
+4.12 ms, `nb=16` 4.12 ms, `nb=32` 4.11 ms. 16 is the default; for this case the driver
+asks for rounds of 3, 2, 4, 8 **and 16** points, so nothing is split at the default and
+the dictionary of blocks is `[1, 2, 3, 4, 8, 16]`.
 
 ### The two rules, and the device (`benchmark/modal.jl`)
 
@@ -380,8 +381,23 @@ ms (`Float32` fixed `nr=64`), **106 ms** (Metal, same rule).
    are not known in advance. `Utils.saveFFTwisdom()` is called when a width is added, so it
    is paid once per shape per machine, but with `:patient` planning the first step of a run
    is slower than the rest.
-6. **`x1 >= ul[2]`** in the Cartesian branch of the point rule (deviation 5 above) looks
-   like a bug. It is preserved, not fixed.
+6. **`x1 >= ul[2]` in the Cartesian branch of the point rule** (deviation 5 above) is a
+   pre-existing bug, deliberately not fixed here. Review round 1 worked out what it
+   costs. The condition is reached only for a Cartesian domain with `full=true`, i.e.
+   `RectModes.RectMode`, whose `dimlimits` is `(:cartesian, (-a, -b), (a, b))`:
+
+   - for `a > b` — a wide, shallow guide — every cubature point with `b <= x1 < a` is
+     treated as outside and contributes zero, so a strip of the guide is silently dropped
+     from the transverse integral and the nonlinearity is underestimated. That is a real
+     physics bug, and it predates this branch;
+   - for `a <= b` the wrong test never fires (`x1 < a <= b` always), and the missing
+     `x2 >= ul[2]` test is harmless because the h-adaptive rule samples the open interior
+     only. Square guides — what `test_rect_modes.jl` and the examples use — are
+     unaffected, which is why it has never been caught.
+
+   The correct condition is `inside &= !(x2 <= ll[2] || x2 >= ul[2])`. Fixing it changes
+   the answer of every `a > b` rectangular multimode run, so it wants its own commit with
+   a regression case and an entry in the gate's tolerance table, not this one.
 7. `prop_capillary` has no `maxbatch` keyword; it is on `Luna.setup` and on the transform.
    Nothing in the interface needs it, but a user with a very tight
    `radial_integral_rtol` cannot lower it from there.
@@ -391,8 +407,81 @@ ms (`Float32` fixed `nr=64`), **106 ms** (Metal, same rule).
 | file | this branch | likely against |
 | --- | --- | --- |
 | `src/NonlinearRHS.jl` | the whole modal section replaced (base 404–623), `AbstractTransModal`/`ModalBlock`/`ModalRound` inserted before it | `gpu/20-radial-device` rewrites `TransRadial` and `FreeSpaceNorm`, which are *after* it; adjacent-hunk only |
-| `src/Luna.jl` | the two modal `setup` methods replaced by `setup_modal`; `runscaling`, `save_modeinfo_maybe`, one comment in `run` | `gpu/23` and `gpu/24` both edit `Luna.run`; `gpu/20` edits the radial `setup` methods |
+| `src/Luna.jl` | the two modal `setup` methods replaced by `setup_modal`; `runscaling`, `save_modeinfo_maybe`, and (since review round 1) the stale comment in `run` at 689–695 | `gpu/23` and `gpu/24` both edit `Luna.run`; `gpu/20` edits the radial `setup` methods |
 | `src/Interface.jl` | `prop_capillary_args` keywords and the device sentinel, the multimode `setup` methods, `_statskwargs` | `gpu/24` will touch the `Stats.default` call next to `_statskwargs` |
 | `src/Stats.jl` | **not touched** | — |
 | `test/test_device.jl`, `test/test_metal.jl` | new testsets appended before the last two | every Group E branch appends there |
 | `docs/src/gpu.md`, `docs/src/developer/device_model.md` | the admonition, "What runs where", "Performance", and one new section each | every Group E branch edits the same three sentences |
+
+## Changes after review round 1
+
+`reviews/gpu-22-modal-1.md` — "approve with minor fixes", every load-bearing claim
+reproduced independently. All ten findings are addressed here; one commit (`eacee07d`)
+plus this file.
+
+**Finding 1 (fix before `int-E`) — `has_error_estimate` for a Cartesian rule.** The θ
+clause fired for any `full=true` rule, but a Cartesian domain's second coordinate is
+Gauss–Legendre in y and has no embedded rule, so `Wd` was identically zero and
+`integral_error!` reported a quadrature error of exactly zero. The clause is now
+polar-only, and the error-estimate testset has a Cartesian case (two `RectMode`s) with
+`kronrod=false` (no estimate, `Wd == 0`, `NaN`) and with `kronrod=true` (a finite,
+non-zero estimate).
+
+**Finding 3 (fix before `int-E`) — the wisdom write inside the right-hand side.**
+`modalround!` no longer calls `Utils.saveFFTwisdom()`: that took the shared FFTW pid lock,
+deleted the cache file and re-exported all wisdom from inside an RK45 step, which is the
+lock several processes of a `Scans.runscan` share. The round widths are predictable —
+`Cubature.pcubature_v` doubles a Clenshaw–Curtis rule and `hcubature_v` works in multiples
+of 17, neither depending on the integrand, its dimension or the tolerance — so
+`NonlinearRHS.modal_round_widths` computes them and the constructor builds them all,
+inside `Luna.setup` where the wisdom is loaded and saved. At `maxbatch = 16` that is
+`[1, 2, 3, 4, 8, 16]` for the radial integral and `[1, 2, 4, 6, 16]` for the full 2-D one.
+A width which was not predicted is still built on demand, without writing wisdom. A new
+testset checks the predicted list for both drivers and that a whole right-hand side adds
+none of them. The memory is the same as before — the reviewer measured 33 MiB of round
+buffers as the steady state, which is what is now allocated up front — except for a run
+which converges in two rounds, which now allocates blocks it does not use.
+
+**Finding 9 — keyword names.** `prop_capillary`'s `nr`, `nθ` and `kronrod` are now
+`modal_nr`, `modal_nθ` and `modal_kronrod`: they are top-level keywords of a flat
+interface, meaningful only for a mode collection with `modal_integral=:fixed`, and the
+radial and free-space device branches will want the generic names. `Luna.setup` keeps
+`nr`/`nθ`/`kronrod`, where the context leaves no room for confusion. `saveargs`, the
+tests and both documentation pages follow.
+
+**Finding 2 — the low-level `MethodError`.** `Stats.mode_reconstruction_error` is typed on
+`TransModal`, so `Stats.default(..., modes, ...)` on a fixed transform raises a
+`MethodError` unless `mode_error=false` is passed; only `prop_capillary` is protected.
+`Stats.jl` is `gpu/24`'s, so the fix stays out of this branch, but the `TransModalFixed`
+docstring, the `Luna.setup` modal docstring and the user page now say so.
+
+**Findings 4, 5 — stale comments and two PR inaccuracies.** Fixed: `Luna.run`'s list of
+which transforms can produce a device `Eω` (the PR's conflict table said this branch
+already changed it — it did not, and now it does); three comments in `test_metal.jl`,
+including a block that had been left 157 lines from its testset; and
+`Nonlinear.PLASMA_THREAD_MINLEN`'s "a block with a single column — every mode-averaged and
+modal transform", which this branch's own 8-thread numbers depend on being false. The
+`maxbatch` paragraph above now says the driver asks for 16-point rounds too.
+
+**Findings 6, 7, 8 — nits.** `Interface._statskwargs` accepts a `NamedTuple` as well as a
+`Dict`. There is a comment on why the mode matrices are held in the field's element type
+(complex with a zero imaginary part on an envelope grid: `mul!` needs matching element
+types to reach a BLAS `gemm` on the host and the accelerated path on a device). Two of the
+three coverage gaps are closed: the modified shot-noise model through `TransModalFixed` on
+JLArray against the host (the noise buffer, `Emt_nl` and the `1/Eref` division), and the
+multimode `:auto` sentinel on Metal hardware (`modes=4, modal_integral=:fixed` with no
+`device` keyword resolves to the GPU, while the `:adaptive` default stays on the host and
+`device=:cpu` opts out). The third — a multimode *envelope* propagation on a device — is
+still one right-hand side on JLArray only.
+
+**Finding 10** — the `x1 >= ul[2]` typo — is deliberately not fixed; the reviewer's
+analysis of what it costs is in known gap 6 above.
+
+### Tests after the fixes
+
+| what | result |
+| --- | --- |
+| gate, `LUNA_REGRESSION_BASE=fa556e6f` | **460 pass, 0 fail**, the same two modal rows to every digit (1.452e-15 / 3.086e-11 and 6.913e-14 / 3.146e-07) |
+| `test_device.jl` | **738 pass, 0 fail, 41 testsets** (was 715/39) |
+| `test_metal.jl` | **452 pass, 0 fail, 18 testsets** (was 448; the four new assertions are the `:auto` sentinel ones in "Luna.set_device(:cpu) opts out") |
+| `test_modes.jl`, `test_multimode.jl`, `test_interface.jl` | 724 + 6 + 349 pass, 0 fail |
