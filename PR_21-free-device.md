@@ -20,6 +20,8 @@ which the brief expected to move.
 | `e2f3baa2` | The Cartesian collar on the device, and `test_device.jl` |
 | `c8d360c9` | `test_metal.jl`: the Cartesian free-space transforms on hardware |
 | `9b09ac45` | `benchmark/free.jl`, memory accounting, docs and this file |
+| `73b6365c` | PR fix: `test_boundaries.jl` row and the last commit hash |
+| `744c0406` | Review round 1 fixes |
 
 ## The plan test, first
 
@@ -194,7 +196,7 @@ temporary stacked ones with `Hankel` pinned to the worktree's 0.5.9.
 | what | result | before |
 | --- | --- | --- |
 | `test/test_regression.jl` × 2 | 460/0 and 460/0 — the record above | |
-| `test/test_device.jl` (JLArrays) | **775 pass, 0 fail**, 43 testsets | 687 / 38 |
+| `test/test_device.jl` (JLArrays) | **783 pass, 0 fail**, 44 testsets | 687 / 38 |
 | `test/test_metal.jl` (Metal 1.11.1, hardware) | **567 pass, 0 fail**, 25 testsets | 452 / 20 |
 | `test/test_freespace.jl` | **77 pass, 0 fail** | 77 pass |
 | `test/test_chi2.jl` | **42 pass, 0 fail** | 42 pass |
@@ -242,6 +244,7 @@ Measured, per save, normalised by the largest `|Eω|` in that save (the gate's m
 | 2-D free-space envelope χ⁽²⁾ (BBO) | **0.000e+00** |
 | 3-D free-space envelope Kerr | **0.000e+00** |
 | 2-D free-space field χ⁽²⁾ with a shot-noise field | **0.000e+00** |
+| 3-D free-space envelope Kerr with a shot-noise field | **0.000e+00** |
 
 Exactly zero, where the radial cases are at 1e-16. There is no GEMM in a Cartesian
 right-hand side, and the JLArray FFT shims wrap host plans, so every operation is the same
@@ -321,6 +324,16 @@ so the response block is **not** chunked. Two reasons beyond the headroom:
 
 A `Float64` host run is exactly twice these numbers (1.75 GB for the plasma case).
 
+**Setup costs a little more than the propagation holds** (review 1, findings 4 and 5), all
+of it collectable once `Luna.setup` returns: on the host, the `Float64` prototypes the
+input-field plans are made against (`(nt, npol, Nk...)` and `(nt, 2, Nk...)`, 64 MB and
+128 MB at this grid) and the initial state before it is uploaded (64 MB); on the device,
+one state-shaped time-domain block for the state's own plan (32 MB). The *oversampled*
+block is no longer among them: `setup_free` hands the array it planned `FTo` against to
+the transform as its `Eto` rather than leaving it to the garbage collector, which is 64 MB
+less peak memory at setup on this grid. `setup_radial` still allocates its planning
+prototype and drops it — that is `TransRadial`, out of scope here.
+
 ## Benchmark
 
 `benchmark/free.jl` (new, modelled on `benchmark/radial.jl`). M1 Pro, Julia 1.13.0,
@@ -330,27 +343,41 @@ of argon at 1 bar, a 100 fs / 400–2000 nm **envelope** grid (`nω = 128`), `R 
 
 | transverse grid | | CPU `Float64` | CPU `Float32` | Metal `Float32` |
 | ---: | --- | ---: | ---: | ---: |
-| 32 × 32 | joint inverse FFT | 1.149 ms | 916.5 µs | 297.3 µs |
-| | right-hand side | 3.689 ms | 2.750 ms | 463.3 µs |
-| | one step | 46.16 ms | 39.69 ms | 3.344 ms |
-| | propagation | 477.7 ms | 411.7 ms | 61.1 ms |
-| 64 × 64 | joint inverse FFT | 5.271 ms | 3.889 ms | 422.7 µs |
-| | right-hand side | 16.23 ms | 11.54 ms | 870.9 µs |
-| | one step | 195.1 ms | 163.8 ms | 7.406 ms |
-| | propagation | 2.052 s | 1.689 s | 137.6 ms |
-| 128 × 128 | joint inverse FFT | 39.72 ms | 18.15 ms | 1.063 ms |
-| | right-hand side | 100.8 ms | 51.26 ms | 2.684 ms |
-| | one step | 1.060 s | 704.5 ms | 26.04 ms |
-| | propagation | 10.96 s | 7.278 s | 521.0 ms |
+| 32 × 32 | joint inverse FFT | 1.148 ms | 916.5 µs | 313.4 µs |
+| | right-hand side | 3.680 ms | 2.747 ms | 465.6 µs |
+| | one step | 46.15 ms | 39.77 ms | 3.297 ms |
+| | propagation | 477 ms | 412 ms | 56.0 ms |
+| 64 × 64 | joint inverse FFT | 5.246 ms | 3.887 ms | 424.3 µs |
+| | right-hand side | 16.21 ms | 11.52 ms | 851.8 µs |
+| | one step | 195.0 ms | 164.1 ms | 7.413 ms |
+| | propagation | 2.03 s | 1.69 s | 109 ms |
+| 128 × 128 | joint inverse FFT | 36.05 ms | 17.52 ms | 1.057 ms |
+| | right-hand side | 93.23 ms | 50.47 ms | 2.688 ms |
+| | one step | 1.004 s | 700.3 ms | 25.93 ms |
+| | propagation | 10.56 s | 7.27 s | 352 ms |
 
 **There is no crossover to report.** The smallest grid in the sweep already has 1024
-transverse columns — past where the radial transform crosses over — and Metal is 7.8× the
-`Float64` host there, 14.9× at 64 × 64 and 21.0× at 128 × 128. The gap is the FFT: at
-128 × 128 the joint inverse transform alone is 37× faster on the GPU. This is the
-geometry the GPU work was for.
+transverse columns — past where the radial transform crosses over.
 
-As with `benchmark/radial.jl`, the Metal numbers on the small grid are partly launch-bound
-and scatter run to run on a shared machine; the CPU columns reproduce to under 1 %.
+The figure to quote is the **per-step** one, which `BenchmarkTools` repeats many times and
+which reproduces to about 3 %: Metal is **14×** the `Float64` host at 32 × 32, 26× at
+64 × 64 and **39×** at 128 × 128. End to end the propagation is 8.5×, 18.7× and 30.0×
+faster — lower because a propagation also does its setup, its output and, on a device, the
+host copy of each saved field, none of which the GPU helps with. The gap is the FFT: at
+128 × 128 the joint inverse transform alone is 34× faster on the GPU. This is the geometry
+the GPU work was for.
+
+**On the scatter of the `prop` column** (review 1, finding 3). It is a single `@elapsed`
+per sample, not a `BenchmarkTools` loop, so it pays for compilation on the first run of a
+process, for the device's first-touch graph and kernel caching, and for whatever the
+garbage collector does among the fresh field-sized buffers each sample allocates. Review 1
+measured a factor of **2.2** between two runs of the 64 × 64 Metal row with the original
+`samples=2` and no warm-up. `proptime` now discards a warm-up run and takes the minimum of
+five (`LUNA_BENCH_PROPSAMPLES` overrides it). Re-measured: two full sweeps and an
+independent `LUNA_BENCH_NFREE=64` run agree to within 10 % on every row — Metal at
+64 × 64 is 108.8 ms, 108.8 ms and 121.8 ms; CPU `Float64` 2.03 s, 2.05 s and 2.23 s — so
+the column is worth two figures and no more. The table above is the second full sweep;
+the `fft`, `rhs` and `step` columns agree between all runs to a few per cent.
 
 ## Documentation
 
@@ -395,9 +422,42 @@ and scatter run to run on a shared machine; the CPU columns reproduce to under 1
 - **No `npol = 2` Cartesian gate case.** The two χ⁽²⁾ gate cases are two-component 2-D
   runs, so the shape is covered there; there is no two-component *3-D* case anywhere
   except `test_freespace.jl`'s host-only `pol = true` sweep.
-- **`TransFree2D`'s new `noise_field` keyword is tested on `JLArray` but not on Metal**,
-  and `TransFree`'s (3-D) is not tested at all beyond the shape check — the 2-D test
-  covers the same code, `freenoise` being shared.
+- **The new `noise_field` keywords are tested on `JLArray` but not on Metal.** Both
+  dimensionalities are covered there (2-D and, since review round 1, 3-D, which is the one
+  the branch repaired); the gate runs with `shotnoise=false` by construction.
+
+## Review round 1
+
+`scratchpad/reviews/gpu-21-free-device-1.md`, verdict **approve with minor fixes**. Every
+load-bearing claim was independently reproduced — both gates (460/0, `0.000e+00` on every
+row against the base; the `evanescent` record to every digit), `test_device` 775,
+`test_metal` 567, `test_freespace` 77, `test_chi2` 42, `test_boundaries` 184, the
+Metal-vs-CPU agreements to every digit, and the memory arithmetic — **except the
+benchmark's `prop` column**, which scattered by 2.2× between two of the reviewer's own
+runs. The eight findings are addressed in one follow-up commit:
+
+| # | finding | fix |
+| --- | --- | --- |
+| 1 | the 3-D shot-noise path, the one this branch repaired, had no test (the noise testsets and the wrong-shape check were all 2-D) | `free3dcase` gains `noise_field`; new testset `the 3-D free-space noise field on JLArray` — `Et_noise` resident, `(nto, 1, 8, 6)`, bit-identical to the host's, one device right-hand side finite, the propagation at 0.000e+00, and a noise field without the polarisation axis refused |
+| 2 | `Luna.run`'s comment still named two of the four transforms that carry a scaling (stale twice over: review 20's finding 4 was the other half of the same sentence) | names all four, and `TransModal` as the exception |
+| 3 | the `prop` column does not reproduce, and three speed-up figures in the PR and both docs pages rest on it | `proptime` discards a warm-up run and takes the minimum of five (`LUNA_BENCH_PROPSAMPLES`); re-measured over two sweeps and a single-size run, now within 10 %; the quoted ratios come from `step`, which reproduces to 3 %, with the end-to-end ones given alongside and a paragraph on the scatter in the PR, in `benchmark/free.jl`'s docstring and in `device_model.md` |
+| 4 | `setup_free` allocated two field-sized blocks only to plan against them | the oversampled one is handed to the transform as its `Eto` (`freebuffers` takes it over, checks its shape and zero-fills it); the state-shaped one is documented |
+| 5 | the memory table was device-side only | a paragraph on what setup allocates on the host and on the device, in the PR and both docs pages |
+| 6 | `freeprefac` duplicated the expression `TransRadial` inlined | one `fsprefac`, documented, next to `fsnorm!`, used by all three free-space transforms |
+| 7 | the `gpu.md` sentence introducing the radial table had been edited to describe the Cartesian one, and was over-width | rewritten to introduce the radial table; the two over-width lines this branch added are wrapped |
+| 8 | `test_device.jl`'s "backend trait" testset errors if a GPUArrays-backed package is loaded before the file (pre-existing) | the device wrapper instances are constructed directly (`SubArray`, `Base.ReshapedArray`) instead of through `Base.view`/`Base.reshape`, which `GPUArrays` takes over for `AbstractGPUArray`; verified both ways round — 783/0 with `using JLArrays` first and with it loaded by the file |
+
+Re-run after the fixes: gate against `fa556e6f` (21 cases) **460 pass, 0 fail,
+`0.000e+00` on every row**; `test_device.jl` **783 pass, 0 fail, 44 testsets** (and the
+same with `JLArrays` loaded first, which used to be 773 / 2 errored);
+`test_freespace.jl` **77 pass, 0 fail**; `test_chi2.jl` **42 pass, 0 fail**;
+`test_boundaries.jl` **184 pass, 0 fail**; `benchmark/free.jl` re-measured (the table
+above is the new run).
+
+The reviewer's two carried-forward notes stand: `TransRadial` still holds six field-sized
+buffers and does not alias `Pωo` with `Eωo` (out of scope here, two lines on `gpu/int-E`),
+and the `Boundaries.clampdecay`/`addloss`/`addloss_k` `Float64` promotion is still
+`gpu/23`'s.
 
 ## Deviations from GPU_PLAN.md
 

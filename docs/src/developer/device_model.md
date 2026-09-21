@@ -822,6 +822,15 @@ Three things follow.
   more of a transform-dominated one.
 - A `Float64` host run is exactly twice these numbers.
 
+The table is what the propagation holds. `Luna.setup` allocates a little more, all of it
+collectable once it returns: on the **host**, the `Float64` prototypes the input-field
+plans are made against (`(nt, npol, Nk...)` and `(nt, 2, Nk...)`, 64 MB and 128 MB at this
+grid) and the initial state before it is uploaded (64 MB), and on the **device** one
+state-shaped time-domain block for the state's own plan (32 MB). The *oversampled* block
+is not among them: `setup_free` hands the array it planned `FTo` against to the transform
+as its `Eto` ([`NonlinearRHS.freebuffers`](@ref Luna.NonlinearRHS.freebuffers)) instead of
+leaving it to the garbage collector.
+
 ### The transverse collar
 
 [`Boundaries.CartesianCollar`](@ref Luna.Boundaries.CartesianCollar) needed no change to
@@ -840,23 +849,35 @@ thread, `:estimate`, no wisdom; 10 fixed steps over 1 cm of argon at 1 bar on a 
 
 | transverse grid | | CPU `Float64` | CPU `Float32` | Metal `Float32` |
 | ---: | --- | ---: | ---: | ---: |
-| 32 x 32 | joint inverse FFT | 1.149 ms | 916.5 µs | 297.3 µs |
-| | right-hand side | 3.689 ms | 2.750 ms | 463.3 µs |
-| | one step | 46.16 ms | 39.69 ms | 3.344 ms |
-| | propagation | 477.7 ms | 411.7 ms | 61.1 ms |
-| 64 x 64 | joint inverse FFT | 5.271 ms | 3.889 ms | 422.7 µs |
-| | right-hand side | 16.23 ms | 11.54 ms | 870.9 µs |
-| | one step | 195.1 ms | 163.8 ms | 7.406 ms |
-| | propagation | 2.052 s | 1.689 s | 137.6 ms |
-| 128 x 128 | joint inverse FFT | 39.72 ms | 18.15 ms | 1.063 ms |
-| | right-hand side | 100.8 ms | 51.26 ms | 2.684 ms |
-| | one step | 1.060 s | 704.5 ms | 26.04 ms |
-| | propagation | 10.96 s | 7.278 s | 521.0 ms |
+| 32 x 32 | joint inverse FFT | 1.148 ms | 916.5 µs | 313.4 µs |
+| | right-hand side | 3.680 ms | 2.747 ms | 465.6 µs |
+| | one step | 46.15 ms | 39.77 ms | 3.297 ms |
+| | propagation | 477 ms | 412 ms | 56.0 ms |
+| 64 x 64 | joint inverse FFT | 5.246 ms | 3.887 ms | 424.3 µs |
+| | right-hand side | 16.21 ms | 11.52 ms | 851.8 µs |
+| | one step | 195.0 ms | 164.1 ms | 7.413 ms |
+| | propagation | 2.03 s | 1.69 s | 109 ms |
+| 128 x 128 | joint inverse FFT | 36.05 ms | 17.52 ms | 1.057 ms |
+| | right-hand side | 93.23 ms | 50.47 ms | 2.688 ms |
+| | one step | 1.004 s | 700.3 ms | 25.93 ms |
+| | propagation | 10.56 s | 7.27 s | 352 ms |
 
 There is no crossover to report: the smallest grid in the sweep already has 1024
-transverse columns, and Metal is 7.8 times the `Float64` host there and 21 times at
-128 x 128. The gap is the FFT -- at 128 x 128 the joint inverse transform alone is 37
-times faster on the GPU.
+transverse columns. Per step -- the figure to quote, since `BenchmarkTools` repeats it
+many times and it reproduces to about 3 % -- Metal is **14 times** the `Float64` host at
+32 x 32, 26 times at 64 x 64 and **39 times** at 128 x 128. End to end the propagation is
+8.5, 18.7 and 30.0 times faster; it is lower because a propagation also does its setup,
+its output and, on a device, the host copy of each saved field, none of which the GPU
+helps with. The gap is the FFT: at 128 x 128 the joint inverse transform alone is 34 times
+faster on the GPU.
+
+The `fft`, `rhs` and `step` columns reproduce to a few per cent between runs. The
+`propagation` column is a single `@elapsed` per sample and scatters more: across two full
+sweeps and an independent single-size run the same rows came out within 10 % of each other
+(Metal at 64 x 64: 108.8, 108.8 and 121.8 ms), so read it to two figures. `proptime`
+discards a warm-up run and takes the minimum of five, which is what makes even that much
+reproducible -- with two samples and no warm-up, review 1 of `gpu/21-free-device` measured
+a factor of 2.2 on the same row.
 
 ## The output and statistics boundary
 

@@ -164,11 +164,18 @@ makechi2(::Type{ComplexF64}, θ, ϕ, nt) = Nonlinear.Chi2Env(
     @test Utils.backend(typeof(host)) isa Utils.CPUBackend
     @test Utils.backend(typeof(dev)) isa Utils.DeviceBackend
 
-    # Wrappers report their parent's backend
+    #= Wrappers report their parent's backend. The device wrappers are constructed
+       directly rather than through `Base.view`/`Base.reshape`: once `GPUArrays` is
+       loaded (which `Pkg.test()` ordering, or any file which loads a GPU package before
+       this one, can do) its methods for `AbstractGPUArray` take over and call
+       `GPUArrays.derive`, which `DummyGPUArray` does not implement. What is under test
+       is `Utils.backend` on a wrapper type, not which method builds the wrapper. =#
+    devview = SubArray(dev, (Base.Slice(Base.OneTo(4)), 1, 1))
+    devreshape = Base.ReshapedArray(dev, (24,), ())
     @test Utils.backend(view(host, :, 1, 1)) isa Utils.CPUBackend
-    @test Utils.backend(view(dev, :, 1, 1)) isa Utils.DeviceBackend
+    @test Utils.backend(devview) isa Utils.DeviceBackend
     @test Utils.backend(reshape(host, 24)) isa Utils.CPUBackend
-    @test Utils.backend(reshape(dev, 24)) isa Utils.DeviceBackend
+    @test Utils.backend(devreshape) isa Utils.DeviceBackend
     @test Utils.backend(PermutedDimsArray(host, (3, 2, 1))) isa Utils.CPUBackend
     @test Utils.backend(PermutedDimsArray(dev, (3, 2, 1))) isa Utils.DeviceBackend
 
@@ -2122,7 +2129,8 @@ freechi2(grid::Grid.EnvGrid) = Nonlinear.Chi2Env(BBO_θ, BBO_ϕ, PhysData.χ2(:B
    fixed steps. The block is `(nto, npol, Nx, Ny)` and the transform is one region-(1,3,4)
    FFT each way. =#
 function free3dcase(spec; gas=:Ar, pres=1.0, λ0=800e-9, energy=1e-9, flength=2e-3,
-                    R=1e-3, Nx=8, Ny=6, w0=200e-6, precision=nothing, boundary=:rate)
+                    R=1e-3, Nx=8, Ny=6, w0=200e-6, noise_field=nothing,
+                    precision=nothing, boundary=:rate)
     grid = Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
     xygrid = Grid.FreeGrid(R, Nx, R, Ny)
     nfunλ = PhysData.ref_index_fun(gas, pres)
@@ -2134,7 +2142,7 @@ function free3dcase(spec; gas=:Ar, pres=1.0, λ0=800e-9, energy=1e-9, flength=2e
     normfun = NonlinearRHS.const_norm_free(grid, xygrid, nfun)
     inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
     Eω, transform, FT = Luna.setup(grid, xygrid, dens, normfun, resp, inputs;
-                                   device=spec, precision)
+                                   noise_field, device=spec, precision)
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
     h = flength/8
     Luna.run(Eω, grid, linop, transform, FT, out;
@@ -2290,4 +2298,36 @@ end
     # a noise field of the wrong shape is refused, not silently broadcast
     @test_throws ErrorException free2dcase(Grid.RealGrid, HostSpec();
                                            Nx, noise_field=nf[:, 1:1, :])
+end
+
+#= The 3-D shot-noise path in its own right. This is the dimensionality whose buffers were
+   built without the polarisation axis before this branch, so that `ldiv!` against the
+   region-(1,3,4) plan could not run at all; a 2-D test does not cover it, `freenoise`
+   getting its shapes from the transform. =#
+@testset "the 3-D free-space noise field on JLArray" begin
+    grid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 100e-15)
+    Nx, Ny = 8, 6
+    nfω = Fields.generate_noise_field(grid)
+    nf = zeros(ComplexF64, (length(grid.ω), 1, Nx, Ny))
+    nf[grid.sidx, 1, :, :] .= nfω[grid.sidx] .* ones(1, Nx, Ny)
+
+    href, htr = free3dcase(HostSpec(); Nx, Ny, noise_field=nf)
+    dref, dtr = free3dcase(JLSpec; Nx, Ny, noise_field=nf)
+
+    @test dtr.Et_noise isa JLArray{ComplexF64, 4}
+    @test dtr.Et_nl isa JLArray{ComplexF64, 4}
+    @test size(dtr.Et_noise) == size(dtr.Eto) == (length(grid.to), 1, Nx, Ny)
+    @test maximum(abs, Array(dtr.Et_noise)) > 0
+    @test maximum(abs, Array(dtr.Et_noise) .- htr.Et_noise)/
+          maximum(abs, htr.Et_noise) < 1e-14
+    # one right-hand side on the device, with the noise in it, is finite
+    nl = similar(dref["Eω"][:, :, :, :, 1])
+    dnl = Luna.todevice(JLSpec, nl)
+    dEω = Luna.todevice(JLSpec, href["Eω"][:, :, :, :, 1])
+    dtr(dnl, dEω, 0.0)
+    @test all(isfinite, Array(dnl))
+    @test radialdiff(href, dref) < 1e-10
+    # a noise field without the polarisation axis is refused, not silently broadcast
+    @test_throws ErrorException free3dcase(HostSpec();
+                                           Nx, Ny, noise_field=nf[:, 1, :, :])
 end

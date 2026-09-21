@@ -177,10 +177,13 @@ The same applies to the two Cartesian free-space geometries: build the transvers
 way. The time and transverse axes are transformed together by one multi-axis FFT plan --
 region `(1, 3)` in 2-D and `(1, 3, 4)` in 3-D -- on every backend.
 
-This is the geometry where a GPU is worth using. A mode-averaged run has one transverse
-column and is launch-bound; a free-space run has one per transverse grid point. Measured on an M1 Pro
-(`benchmark/radial.jl`, 20 fixed steps over 1 cm of argon at 1 bar, a 100 fs / 400-2000 nm
-grid, `boundary=:none`), wall time for the whole propagation:
+Free space is the geometry where a GPU is worth using. A mode-averaged run has one
+transverse column and is launch-bound; a radial run has one per radial point, and a
+Cartesian one has `Nx` or `Nx*Ny` of them.
+
+The radial transform, measured on an M1 Pro (`benchmark/radial.jl`, 20 fixed steps over
+1 cm of argon at 1 bar, a 100 fs / 400-2000 nm grid, `boundary=:none`), wall time for the
+whole propagation:
 
 | radial points | CPU `Float64` | CPU `Float32` | Metal `Float32` |
 | ---: | ---: | ---: | ---: |
@@ -200,11 +203,13 @@ argon at 1 bar, a 100 fs / 400-2000 nm envelope grid, `boundary=:none`):
 
 | transverse grid | columns | CPU `Float64` | CPU `Float32` | Metal `Float32` |
 | ---: | ---: | ---: | ---: | ---: |
-| 32 x 32 | 1024 | 478 ms | 412 ms | 61.1 ms |
-| 64 x 64 | 4096 | 2.05 s | 1.69 s | 138 ms |
-| 128 x 128 | 16384 | 10.96 s | 7.28 s | 521 ms |
+| 32 x 32 | 1024 | 477 ms | 412 ms | 56.0 ms |
+| 64 x 64 | 4096 | 2.03 s | 1.69 s | 109 ms |
+| 128 x 128 | 16384 | 10.56 s | 7.27 s | 352 ms |
 
-Metal is 7.8 times the `Float64` host at 32 x 32 and 21 times at 128 x 128.
+Metal is 8.5 times the `Float64` host at 32 x 32 and 30 times at 128 x 128 end to end;
+measured per step, which reproduces to a few per cent where the propagation column
+scatters by up to 10 %, it is 14 times and 39 times. Read the table to two figures.
 
 ### Memory
 
@@ -228,6 +233,11 @@ For the 3-D example (`examples/low_level_interface/freespace/full3D.jl`: a field
 so that run fits a 16 GB device with room to spare; the total scales as `Nx*Ny`, and
 128 x 128 Kerr + plasma at 0.88 GB extrapolates to 3.5 GB at 256 x 256 and 14 GB at
 512 x 512. `Float64` on the host is twice these numbers.
+
+Setting up costs a little more than the propagation holds, all of it collectable once
+`Luna.setup` returns: the `Float64` prototypes its input-field plans are made against and
+the initial state before it is uploaded (about 256 MB on the host at that grid), and one
+state-shaped time-domain block on the device.
 
 The absorbing boundaries (`boundary=:rate`, `:legacy` and `:none`) and the default
 statistics *do* run with a device state:

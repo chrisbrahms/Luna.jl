@@ -39,6 +39,13 @@ const BUDGET = 2.0
 const NSTEPS = 10
 
 """
+Timed runs of the whole propagation per row, after one discarded warm-up run; the column
+reports the minimum. `LUNA_BENCH_PROPSAMPLES` overrides it. See [`proptime`](@ref) for why
+this is not 1.
+"""
+const PROPSAMPLES = parse(Int, get(ENV, "LUNA_BENCH_PROPSAMPLES", "5"))
+
+"""
 Transverse grid sizes to sweep; each is used for both `Nx` and `Ny`.
 `LUNA_BENCH_NFREE` (comma-separated) overrides it.
 """
@@ -126,20 +133,37 @@ function steptime(spec, N)
     bminimum(brun(b)).time/1e9
 end
 
-function proptime(spec, N; samples=2)
-    minimum(1:samples) do _
+"""
+    proptime(spec, N; samples=PROPSAMPLES)
+
+Wall time of the whole fixed-step propagation, as the minimum of `samples` runs after one
+discarded warm-up run.
+
+The warm-up and the sample count matter. A propagation is timed with `@elapsed` rather
+than by `BenchmarkTools`, so the first one in a process pays for compiling the stepper for
+this combination of types, and on a device for building and caching the FFT graphs and
+kernels; each run also allocates a fresh set of field-sized buffers, so the garbage
+collector can land in the middle of one. Review 1 of `gpu/21-free-device` measured a
+factor of 2.2 between two runs of this column at 64 x 64 with `samples=2` and no warm-up,
+while the `fft`, `rhs` and `step` columns -- which `BenchmarkTools` runs many times --
+reproduced to under 2 %. With the warm-up and `samples = $(PROPSAMPLES)` the column is
+stable, but the ratios worth quoting are still the ones from `step`.
+"""
+function proptime(spec, N; samples=PROPSAMPLES)
+    runonce() = begin
         Eω, linop, _, transform, grid, FT = prepare(spec, N)
         out = Output.MemoryOutput(0, FLENGTH, 3, Output.nostats)
         output = Utils.isdevice(Eω) ? ToHost(out) : out
         dz = FLENGTH/NSTEPS
-        t = @elapsed quiet() do
+        @elapsed quiet() do
             Luna.run(Eω, grid, linop, transform, FT, output;
                      zmax=FLENGTH, boundary=:none,
                      init_dz=dz, min_dz=dz, max_dz=dz)
             sync(spec)
         end
-        t
     end
+    runonce() # warm-up: compilation, device graph caching, first-touch allocation
+    minimum(_ -> runonce(), 1:samples)
 end
 
 fmttime(t) = t >= 1    ? @sprintf("%7.3f s ", t)    :
@@ -154,8 +178,8 @@ for name in Luna.devicenames()
         push!(specs, (string(name)*" "*string(Luna.realtype(spec)), spec))
 end
 
-@printf("3-D free-space envelope Kerr: %s at %g bar, R = %g m, %g m, %d fixed steps, boundary=:none\n",
-        GAS, PRES, R, FLENGTH, NSTEPS)
+@printf("3-D free-space envelope Kerr: %s at %g bar, R = %g m, %g m, %d fixed steps, \
+         boundary=:none\n", GAS, PRES, R, FLENGTH, NSTEPS)
 @printf("%d Julia threads, 1 FFTW thread, 1 BLAS thread, :estimate, no wisdom\n",
         Threads.nthreads())
 @printf("\n%-14s %10s %12s %12s %12s %12s %12s\n",

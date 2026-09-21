@@ -1045,11 +1045,7 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
        `todevice` performs. =#
     Tfwd = todevice(spec, convert(Matrix{TT}, rgrid.Tfwd))
     Tbwd = todevice(spec, convert(Matrix{TT}, rgrid.Tbwd))
-    #= The z-independent part of the frequency-domain normalisation, precombined on the
-       host in Float64 as one vector (GPU_PLAN.md 4.1). `Pref` converts the polarisation
-       buffer's units back to physical ones and is 1 on every Float64 run, so this is
-       exactly the vector the per-step expression used to rebuild every call. =#
-    prefac = todevice(spec, @. grid.ωwin * (-im*grid.ω) * scaling.Pref)
+    prefac = fsprefac(grid, spec, scaling)
     #= Precompute time-domain noise in real space: ω→t via to_time!, then k→r. This is
        Grid.to_rspace! done with our own Tbwd, so that the noise passes through exactly
        the same matrix as the field does on every step. The noise is a state-unit
@@ -1125,15 +1121,39 @@ function (t::TransRadial)(nl, Eω, z)
     fsnorm!(nl, t.prefac, t.normfun(z))
 end
 
-#= The frequency-domain normalisation of the free-space transforms, as one fused
-   broadcast over the precombined `pre` (which carries `ωwin`, `-iω` and `Pref`) and the
-   normalisation array. Written with the same association as the expression it replaces,
-   `pre ./ (2 .* norm)`, so the Float64 path is unchanged; the `2` goes through
-   `Luna.scalar` so that nothing reachable from a kernel is a `Float64` or an `Int`. =#
+"""
+    fsnorm!(nl, pre, nrm)
+
+Apply the frequency-domain normalisation of a free-space transform to `nl` in place, as
+one fused broadcast over the precombined prefactor `pre` ([`fsprefac`](@ref), which
+carries `ωwin`, `-iω` and `Pref`) and the normalisation array `nrm`
+([`FreeSpaceNorm`](@ref)).
+
+Written with the same association as the expression it replaces, `pre ./ (2 .* norm)`, so
+the `Float64` path is unchanged; the `2` goes through [`Luna.scalar`](@ref) so that
+nothing reachable from a kernel is a `Float64` or an `Int`. Shared by
+[`TransRadial`](@ref), [`TransFree`](@ref) and [`TransFree2D`](@ref).
+"""
 function fsnorm!(nl, pre, nrm)
     two = scalar(nl, 2.0)
     @. nl *= pre/(two*nrm)
 end
+
+"""
+    fsprefac(grid, spec, scaling)
+
+The z-independent part of the frequency-domain normalisation of a free-space transform,
+`ωwin·(-iω)·Pref`, precombined on the host in `Float64` as one vector (GPU_PLAN.md §4.1)
+and mirrored to `spec`. Shared by [`TransRadial`](@ref), [`TransFree`](@ref) and
+[`TransFree2D`](@ref), which all multiply by it once per right-hand side in
+[`fsnorm!`](@ref).
+
+`Pref` converts the polarisation buffer's units back to physical ones and is `1` on every
+`Float64` run, so this is exactly the vector the per-step expression it replaces used to
+rebuild on every call.
+"""
+fsprefac(grid, spec, scaling) =
+    todevice(spec, @. grid.ωwin * (-im*grid.ω) * scaling.Pref)
 
 #=================================================#
 #==========  FREE-SPACE NORMALISATION  ===========#
@@ -1495,7 +1515,7 @@ end
    region differs; everything else below is written once for both. =#
 
 """
-    freebuffers(spec, TT, ωshape, tshape)
+    freebuffers(spec, TT, ωshape, tshape, Eto)
 
 The buffers a Cartesian free-space transform holds: `(Eωo, Eto, Pto)`, on `spec`'s array
 type and precision.
@@ -1506,11 +1526,26 @@ is the only reader of the field's copy and it has finished with it before `to_fr
 writes the polarisation's, so aliasing them removes one field-sized allocation per
 transform (GPU_PLAN.md §4.4). The two never appear as the input and the output of the
 same FFT call, which a device plan would reject.
+
+`Eto`, if given, is **taken over** as the oversampled time-domain buffer rather than
+allocated here: `Luna.setup` has to allocate one block of exactly that shape and type to
+plan the forward transform against, and handing it to the transform instead of leaving it
+to the garbage collector is one oversampled block less peak memory at setup (64 MB on the
+3-D example's grid). It is zero-filled here because FFTW's planning modes other than
+`:estimate` write into the array they plan against; nothing reads it before `to_time!`
+overwrites it, so this is only for reproducibility with the allocated path.
 """
-function freebuffers(spec, ::Type{TT}, ωshape, tshape) where {TT}
+function freebuffers(spec, ::Type{TT}, ωshape, tshape, Eto) where {TT}
     CT = Complex{realtype(spec)}
     Eωo = alloc(spec, CT, ωshape)
-    Eto = alloc(spec, TT, tshape)
+    if isnothing(Eto)
+        Eto = alloc(spec, TT, tshape)
+    else
+        (eltype(Eto) === TT && size(Eto) == tshape) || error(
+            "the time-domain buffer handed to this transform is a $(typeof(Eto)) of "*
+            "size $(size(Eto)), but it needs a $TT array of size $tshape.")
+        fill!(Eto, zero(TT))
+    end
     Pto = similar(Eto)
     Eωo, Eto, Pto
 end
@@ -1609,17 +1644,23 @@ free-space propagation. `TT` is the time-domain element type (`Float64`/`Float32
   polarisation are expressed in. The responses are converted to it with
   [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale), the noise field is divided by `Eref`
   and `Pref` is folded into `prefac`.
+- `Eto=nothing`: an oversampled time-domain block of exactly the transform's shape and
+  element type, **taken over** as its `Eto` rather than allocated ([`freebuffers`](@ref)).
+  `Luna.setup` passes the array it planned `FT` against, so that block is not left to the
+  garbage collector; the caller must not use it for anything else afterwards.
 """
 function TransFree(TT, grid, xygrid::Grid.FreeGrid, FT, responses, densityfun, normfun,
-                   pol=false; noise_field=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
+                   pol=false; noise_field=nothing, spec=HostSpec(), scaling=UNIT_SCALING,
+                   Eto=nothing)
     np = pol ? 2 : 1
     Nx, Ny = length(xygrid.x), length(xygrid.y)
     ωshape = (length(grid.ω), np, Nx, Ny)
     tshape = (length(grid.to), np, Nx, Ny)
     IFT = Utils.plan_ift(FT)
-    Eωo, Eto, Pto = freebuffers(spec, TT, ωshape_oversampled(grid, ωshape), tshape)
+    Eωo, Eto, Pto = freebuffers(spec, TT, ωshape_oversampled(grid, ωshape), tshape,
+                                Eto)
     gv = gridvectors(grid, spec)
-    prefac = freeprefac(grid, spec, scaling)
+    prefac = fsprefac(grid, spec, scaling)
     Et_noise, Et_nl = freenoise(spec, TT, noise_field, grid, ωshape, tshape, IFT, scaling)
     responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto)
     check_norm(normfun, spec, scaling)
@@ -1694,15 +1735,16 @@ the oversampled `(t, x) -> (ω, kx)` plan and `noise_field` of shape `(nω, npol
 """
 function TransFree2D(TT, grid, xgrid::Grid.Free2DGrid, FT, responses, densityfun, normfun,
                      pol=false; noise_field=nothing, spec=HostSpec(),
-                     scaling=UNIT_SCALING)
+                     scaling=UNIT_SCALING, Eto=nothing)
     np = pol ? 2 : 1
     Nx = length(xgrid.x)
     ωshape = (length(grid.ω), np, Nx)
     tshape = (length(grid.to), np, Nx)
     IFT = Utils.plan_ift(FT)
-    Eωo, Eto, Pto = freebuffers(spec, TT, ωshape_oversampled(grid, ωshape), tshape)
+    Eωo, Eto, Pto = freebuffers(spec, TT, ωshape_oversampled(grid, ωshape), tshape,
+                                Eto)
     gv = gridvectors(grid, spec)
-    prefac = freeprefac(grid, spec, scaling)
+    prefac = fsprefac(grid, spec, scaling)
     Et_noise, Et_nl = freenoise(spec, TT, noise_field, grid, ωshape, tshape, IFT, scaling)
     responses = Nonlinear.rescale_responses(Tuple(responses), spec, scaling, Eto)
     check_norm(normfun, spec, scaling)
@@ -1728,13 +1770,6 @@ Calculate the reciprocal-domain (ω-kx-space) nonlinear response due to the fiel
 and place the result in `nl`.
 """
 (t::TransFree2D)(nl, Eωk, z) = freetransform!(t, nl, Eωk, z)
-
-#= The z-independent part of the frequency-domain normalisation, precombined on the host
-   in Float64 as one vector (GPU_PLAN.md 4.1), as `TransRadial` does. `Pref` converts the
-   polarisation buffer's units back to physical ones and is 1 on every Float64 run, so
-   this is exactly the vector the per-step expression used to rebuild every call. =#
-freeprefac(grid, spec, scaling) =
-    todevice(spec, @. grid.ωwin * (-im*grid.ω) * scaling.Pref)
 
 """
     freetransform!(t, nl, Eωk, z)

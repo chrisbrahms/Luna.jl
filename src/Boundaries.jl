@@ -539,7 +539,8 @@ apply_realspace!(c, Et, Δz) = nothing
 The transverse absorber functor for `spacegrid`, given the power rate `αr` over its real
 space. `grid` and `Et` size the buffer the radial collar needs, and `Et`'s array type and
 real precision are what that buffer (and hence `RadialCollar`'s
-`Tfwd`/`Tbwd`/`αr`/`weight`, or [`CartesianCollar`](@ref)'s rate and scratch) is built in -- `similar(Et, Complex{real(eltype(Et))}, ...)`
+`Tfwd`/`Tbwd`/`αr`/`weight`, or [`CartesianCollar`](@ref)'s rate and scratch) is built in
+-- `similar(Et, Complex{real(eltype(Et))}, ...)`
 rather than a host `ComplexF64` array, so a radial run on a device or in `Float32` is not
 handed host `Float64` matrices to multiply its state against. The buffer allocated here
 *is* the collar's work buffer ([`RadialCollar`](@ref) takes it over), so a radial run pays

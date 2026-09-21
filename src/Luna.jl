@@ -522,8 +522,11 @@ function setup_free(::Type{TH}, grid, spacegrid, densityfun, normfun, responses,
     Utils.plan_ift(FT) # create inverse FT plans now, so wisdom is saved
     Utils.plan_ift(FTh)
     Utils.plan_ift(FTo)
+    #= `xo` is handed to the transform rather than left to the garbage collector: it is
+       an oversampled block of exactly the shape and type the transform's own `Eto` has,
+       and it has served its purpose once `FTo` is planned. =#
     transform = freetransform(grid, spacegrid, FTo, responses, densityfun, normfun, np > 1;
-                              noise_field, spec, scaling)
+                              noise_field, spec, scaling, Eto=xo)
     Eωk = todevice(spec, isunity(scaling) ? Eωk : Eωk ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
@@ -665,8 +668,9 @@ function run(Eω, grid,
 
     #= The unit scaling the state and the polarisation are expressed in (`Luna.jl`'s
        `unitscaling`, GPU_PLAN.md 4.1): the identity for every transform which does not
-       carry one (`NonlinearRHS.TransModeAvg` and `NonlinearRHS.TransRadial` do). Needed
-       here only to decide whether the output needs unscaling. =#
+       carry one. `NonlinearRHS.TransModeAvg`, `TransRadial`, `TransFree2D` and
+       `TransFree` all do; `TransModal` does not. Needed here only to decide whether the
+       output needs unscaling. =#
     scaling = runscaling(transform)
 
     #= `Output.jl` stays device-unaware (`ScaledOutput`'s docstring): wrap whenever the
