@@ -186,8 +186,15 @@ gives a vector. `Stats._weightedenergy` now `vec`s it.
   whole set as a user gets it (`beam_profile=true`), which is host-only, against the same
   host reference.
 
-  Two things about that comparison, both measured on the CPU (`Float32` against `Float64`
-  on the same code path, 2 mm propagation, fixed steps):
+  The 3-D case's transverse grid is deliberately tiny — 24 x 6 points over ±1 mm for a
+  200 µm waist, as the existing `metalfree3dcase`'s is, so that a hardware test is quick.
+  It does not resolve the beam: the set records 0.83 of the input energy and 2.8 % of the
+  beam reaches the transverse absorber. The two radial cases record the input energy to
+  better than 5 %, which is the independent check that the numbers are physical rather
+  than merely equal on the two paths.
+
+  Two more things about that comparison, both measured on the CPU (`Float32` against
+  `Float64` on the same code path, 2 mm propagation, fixed steps):
 
   - the whole set differs between the two precisions by 1e-7 to 1e-6 relative, so the 1e-3
     the Metal comparison uses is comparing the device arithmetic and not the precision;
@@ -234,7 +241,7 @@ a stacked environment with `JLArrays` for `test_device.jl`, one with `Metal` for
 | `test/test_regression.jl` vs `b641025b` | **466 pass, 0 fail**, `0.000e+00` everywhere |
 | `test/test_regression.jl` vs `fdf8dbe3` | **466 pass, 0 fail**, the `gpu/int-E` record to every digit |
 | `test/test_device.jl` (JLArrays) | **1383 pass, 0 fail, 71 testsets** (1148/68 on the base) |
-| `test/test_metal.jl` (Metal, hardware) | METALRES |
+| `test/test_metal.jl` (Metal 1.11, hardware) | **785 pass, 0 fail, 31 testsets** (721/30 on the base) |
 | `test/test_stats.jl` | **167 pass, 0 fail, 10 testsets** (1/1 on the base) |
 | `test/test_multimode.jl` | 5 pass, 0 fail, 4 testsets |
 | `test/test_freespace.jl` | 77 pass, 0 fail, 43 testsets |

@@ -1913,4 +1913,110 @@ end
     @test metalradialdiff(h3, d3) < 1e-4
 end
 
+#= The radial and free-space default statistics on real hardware. As with the
+   mode-averaged set, the reference is the *same* propagation on the CPU in Float32, so
+   what is compared is the device arithmetic and the device branches against the host
+   branches -- not Float32 against Float64. Fixed steps on both sides, so the two runs
+   differ only in their arithmetic. =#
+function metalstatscase(spec; geom=:radial, GT=Grid.RealGrid, gas=:Ar, pres=1.0,
+                        energy=1e-6, flength=2e-3, λ0=800e-9, R=1e-3, N=24, Ny=6,
+                        w0=200e-6, beam_profile=false, stats_device=:auto)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (400e-9, 2000e-9), 100e-15) :
+        Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
+    sg = geom === :radial ? Grid.RadialGrid(R, N) : Grid.FreeGrid(R, N, R, Ny)
+    nfunλ = PhysData.ref_index_fun(gas, pres)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    linop = LinearOps.make_const_linop(grid, sg, nfun)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = GT === Grid.RealGrid ?
+        (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),) :
+        (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
+    normfun = geom === :radial ? NonlinearRHS.const_norm_radial(grid, sg, nfun) :
+                                 NonlinearRHS.const_norm_free(grid, sg, nfun)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
+    Eω, transform, FT = Luna.setup(grid, sg, dens, normfun, resp, inputs; device=spec)
+    sf = Stats.default(grid, Eω, transform, linop; gas, beam_profile, stats_device)
+    out = Output.MemoryOutput(0, flength, 3, sf)
+    h = flength/8
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary=:rate, boundary_N=4, min_dz=h, max_dz=h, init_dz=h)
+    out, transform, sf
+end
+
+@testset "radial and free-space statistics on Metal" begin
+    #= `stats_device=:device`: these states are below `Stats.STATS_DEVICE_MINLEN`, so
+       `:auto` takes the host copy (which the last part of this testset checks), and the
+       device branches would otherwise not run on hardware at all. =#
+    for (nm, kw) in (("radial, field-resolved", (;)),
+                     ("radial, envelope", (; GT=Grid.EnvGrid)),
+                     ("3-D free space", (; geom=:free3d, GT=Grid.EnvGrid)))
+        h32, htr, hsf = metalstatscase(DeviceSpec(Array, Float32);
+                                       kw..., stats_device=:device)
+        dm, dtr, dsf = metalstatscase(MetalSpec; kw..., stats_device=:device)
+        @test (nm, Stats.device_capable(dsf)) == (nm, true)
+        @test (nm, Stats.device_capable(hsf)) == (nm, false) # a host array, host branches
+        @test eltype(dm["Eω"]) === ComplexF32
+        @test length(dm["stats"]["z"]) == length(h32["stats"]["z"])
+        @test sort(collect(keys(dm["stats"]))) == sort(collect(keys(h32["stats"])))
+        for key in sort(collect(keys(h32["stats"])))
+            h = h32["stats"][key]
+            d = dm["stats"][key]
+            scale = maximum(abs, h)
+            err = scale > 0 ? maximum(abs, d .- h)/scale : maximum(abs, d .- h)
+            @test (nm, key, err <= 1e-3) == (nm, key, true)
+        end
+        #= The comparison has content. The propagation is short -- 2 mm, well inside the
+           Rayleigh range of a 200 µm waist -- so the peak intensity moves by only 1.3e-4
+           over it on the radial grids and by 7.2e-2 on the 3-D one; what is asserted is
+           that the statistics are not three identical numbers, and, independently of the
+           two runs agreeing with each other, that the recorded energy is the energy that
+           went in. Measured on the CPU, the whole set differs between `Float32` and
+           `Float64` on the same path by 1e-7 to 1e-6 relative, so the 1e-3 above is
+           comparing the device arithmetic and not the precision. =#
+        pk = h32["stats"]["peakintensity"]
+        @test (nm, maximum(pk) > minimum(pk)) == (nm, true)
+        #= The recorded energy is the energy that went in, on the two grids which resolve
+           the beam. The 3-D case's transverse grid is deliberately tiny -- 24 x 6 points
+           over +-1 mm for a 200 µm waist, as `metalfree3dcase`'s is, so that a hardware
+           test is quick -- and neither samples the beam well enough for the sampled
+           energy to be the analytic one nor keeps it off the transverse absorber: it
+           records 0.83 of the input energy and loses 2.8 % of the beam to the collar. =#
+        if get(kw, :geom, :radial) === :radial
+            @test (nm, isapprox(first(dm["stats"]["energy"]), 1e-6, rtol=0.05)) ==
+                  (nm, true)
+        else
+            @test (nm, isapprox(first(dm["stats"]["energy"]), 0.832e-6, rtol=0.05)) ==
+                  (nm, true)
+        end
+    end
+
+    #= The whole set, as a user gets it: `Stats.beam_profile` has no device form, so the
+       set is host-only, the state is copied down every step, and the warning names it.
+       The reference is the same run on the CPU in Float32. =#
+    h32, _, _ = metalstatscase(DeviceSpec(Array, Float32); beam_profile=true)
+    dm, _, dsf = metalstatscase(MetalSpec; beam_profile=true)
+    @test !Stats.device_capable(dsf)
+    @test Stats.host_statistics(dsf) == ["BeamProfile"]
+    @test sort(collect(keys(dm["stats"]))) == sort(collect(keys(h32["stats"])))
+    for key in sort(collect(keys(h32["stats"])))
+        #= `collar_energy_fraction` is compared absolutely, not relatively. It is the
+           ratio of the fluence in the collar to the total, and on this grid the beam is
+           so far inside the aperture that the numerator is at the rounding level: the
+           same run records 1.6e-18 in `Float64` and 1.1e-15 to 1.3e-14 in `Float32`, so
+           a relative comparison of two `Float32` runs is a comparison of rounding noise.
+           What the dataset says here is "nothing has reached the collar", and that is
+           what is checked. =#
+        h = h32["stats"][key]
+        d = dm["stats"][key]
+        scale = maximum(abs, h)
+        err = key == "collar_energy_fraction" ? maximum(abs, d .- h) :
+              scale > 0 ? maximum(abs, d .- h)/scale : maximum(abs, d .- h)
+        @test (key, err <= 1e-3) == (key, true)
+    end
+    @test all(isfinite, dm["stats"]["fwhm_r"])
+    @test all(0 .<= dm["stats"]["collar_energy_fraction"] .< 1e-10)
+end
+
 end # have_metal
