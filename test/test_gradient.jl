@@ -75,8 +75,20 @@ statsfun = Stats.collect_stats(grid, Eω,
 output_grad_array = Output.MemoryOutput(0, L, 201, statsfun)
 Luna.run(Eω, grid, linop, transform, FT, output_grad_array, status_period=10, zmax=L)
 
-@test all(output_grad.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])
-@test all(output_grad_array.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])
+#= The pressure is the same at both ends, so the z-dependent operator is a constant one
+   written as a closure and these three runs are the same propagation. They are compared
+   per save on the largest `|Eω|` in that save rather than elementwise: since gpu/27 the
+   z-dependent path propagates with the integral of the operator, whose two-node table
+   holds the constant to within the rounding of a Simpson sum rather than bitwise, so the
+   adaptive controller can take a slightly different step and the spectral tails -- thirty
+   orders below the peak -- have no relative accuracy to compare. Measured: 7.1e-15. =#
+savediff(a, b) = maximum(axes(a, 2)) do i
+    maximum(abs, a[:, i] .- b[:, i])/maximum(abs, b[:, i])
+end
+@test savediff(output_grad.data["Eω"][grid.sidx, :],
+               output_const.data["Eω"][grid.sidx, :]) < 1e-12
+@test savediff(output_grad_array.data["Eω"][grid.sidx, :],
+               output_const.data["Eω"][grid.sidx, :]) < 1e-12
 end
 
 @testset "envelope" begin
@@ -134,6 +146,18 @@ statsfun = Stats.collect_stats(grid, Eω,
 output_grad_array = Output.MemoryOutput(0, L, 201, statsfun)
 Luna.run(Eω, grid, linop, transform, FT, output_grad_array, status_period=10, zmax=L)
 
-@test all(output_grad.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])
-@test all(output_grad_array.data["Eω"][grid.sidx, :] .≈ output_const.data["Eω"][grid.sidx, :])
+#= The pressure is the same at both ends, so the z-dependent operator is a constant one
+   written as a closure and these three runs are the same propagation. They are compared
+   per save on the largest `|Eω|` in that save rather than elementwise: since gpu/27 the
+   z-dependent path propagates with the integral of the operator, whose two-node table
+   holds the constant to within the rounding of a Simpson sum rather than bitwise, so the
+   adaptive controller can take a slightly different step and the spectral tails -- thirty
+   orders below the peak -- have no relative accuracy to compare. Measured: 7.1e-15. =#
+savediff(a, b) = maximum(axes(a, 2)) do i
+    maximum(abs, a[:, i] .- b[:, i])/maximum(abs, b[:, i])
+end
+@test savediff(output_grad.data["Eω"][grid.sidx, :],
+               output_const.data["Eω"][grid.sidx, :]) < 1e-12
+@test savediff(output_grad_array.data["Eω"][grid.sidx, :],
+               output_const.data["Eω"][grid.sidx, :]) < 1e-12
 end

@@ -1187,7 +1187,7 @@ struct OnePointLinop{F, hT} <: LinearOps.AbstractIntegratedLinop
     host::hT
 end
 
-OnePointLinop(linop!, proto::AbstractArray) =
+onepoint_linop(linop!, proto::AbstractArray) =
     OnePointLinop(linop!, Array{eltype(proto)}(undef, size(proto)))
 
 LinearOps.PhaseStyle(::OnePointLinop) = LinearOps.IncrementalPhase()
@@ -1243,7 +1243,7 @@ function zcase(spec; kind=:gradient, gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, �
        table. =#
     dz = flength/nsteps
     mdz = isnothing(maxdz) ? dz : maxdz
-    lop = onepoint ? OnePointLinop(linop, Eω) : linop
+    lop = onepoint ? onepoint_linop(linop, Eω) : linop
     Luna.run(Eω, grid, lop, transform, FT, out;
              zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=mdz, rtol,
              linop_integral, linop_tol)
