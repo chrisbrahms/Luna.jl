@@ -1,6 +1,6 @@
 # `gpu/22-modal`: the batched column evaluator and the fixed transverse quadrature
 
-Base: `gpu/int-D` at `90826dc4`. Five commits.
+Base: `gpu/int-D` at `90826dc4`. Eight commits.
 
 ## Motivation
 
@@ -205,6 +205,16 @@ recorded, unchanged by this one.
 | `test/test_device.jl` | 715 pass, 0 fail, 39 testsets | `julia --project=<jlenv> -t 1 -e 'using Luna; include("test/test_device.jl")'` |
 | `test/test_metal.jl` | 448 pass, 0 fail, 18 testsets | `julia --project=<metalenv> -t 1 -e 'using Luna, Metal; include("test/test_metal.jl")'` |
 | `test_multimode`, `test_modes`, `test_polarisation_field`, `test_vectorplasma`, `test_stats`, `test_noise`, `test_interface`, `test_capillary`, `test_antiresonant` | 1336 pass, 0 fail, 47 testsets | `using Luna; Luna.set_fftw_mode(:estimate); Luna.set_fftw_threads(1); Luna.set_fftw_wisdom(false); include(...)` |
+| `test_rect_modes`, `test_polarisation`, `test_polarisation_env`, `test_tapers`, `test_gradient`, `test_mixtures`, `test_processing`, `test_output`, `test_linops` | 2563 pass, 0 fail, 28 testsets | as above |
+
+The eight modal examples in `examples/low_level_interface` run (the propagation part of
+each, up to the first plotting call): `basic_modal`, `basic_modal_env`,
+`full_modal/basic_modal_full`, `full_modal/basic_modal_full_bothpolarisations`,
+`rectangular/rectangular_modal`, `tapers/taper_modal`. Two do not, and neither is this
+branch's doing — both fail identically on the base commit:
+`polarisation/modal_nonvector_plasma.jl` uses `linop` two lines before it is defined, and
+`polarisation/elliptical_env.jl` calls `Luna.setup` with a `normfun` positional argument
+the signature has not had for a long time.
 
 New coverage:
 
