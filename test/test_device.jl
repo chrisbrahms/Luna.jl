@@ -1174,6 +1174,172 @@ function gradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9
     out, transform
 end
 
+#= A multimode propagation. `modal_integral=:fixed` (`NonlinearRHS.TransModalFixed`) is
+   the transverse integral which runs on a device: the adaptive cubature driver is host
+   scalar code and returns `Vector{Float64}`. `run=false` returns the pieces instead of
+   propagating, for tests which compare one right-hand side.
+
+   Fixed steps when it does propagate, so that two runs differ only in their arithmetic.
+   `nr=32` rather than the default 64 keeps the block small; the HE1m fields are smooth
+   enough that the rule is far more accurate than the adaptive one either way (the
+   "fixed and adaptive" testset measures that). =#
+function modalcase(GT, spec; nmodes=4, components=:y, gas=:Ar, pres=0.1, energy=50e-6,
+                   flength=2e-3, λ0=800e-9, plasma=false, modal_integral=:fixed,
+                   nr=32, nθ=16, full=false, kronrod=false, precision=nothing, run=true,
+                   taper=false)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (200e-9, 3000e-9), 400e-15) :
+        Grid.EnvGrid(λ0, (200e-9, 3000e-9), 400e-15)
+    a = taper ? (z -> 75e-6*(1 - 0.2z/flength)) : 75e-6
+    modes = Tuple(Capillary.MarcatiliMode(a, gas, pres; n=1, m=mi, loss=false)
+                  for mi in 1:nmodes)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = GT === Grid.RealGrid ?
+        (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),) :
+        (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
+    if plasma
+        resp = (resp...,
+                Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)), tablerate(),
+                                         PhysData.ionisation_potential(gas)))
+    end
+    linop = taper ? LinearOps.make_linop(grid, modes, λ0) :
+                    LinearOps.make_const_linop(grid, modes, λ0)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, modes, components;
+                                   modal_integral, full, nr, nθ, kronrod,
+                                   device=spec, precision)
+    run || return Eω, transform, FT, linop, grid
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/10
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary=:none, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= One right-hand side of a modal transform, for comparing two of them. =#
+function modalrhs(GT, spec; z=0.0, kwargs...)
+    Eω, transform, _, _, _ = modalcase(GT, spec; run=false, kwargs...)
+    nl = similar(Eω)
+    transform(nl, Eω, z)
+    Eω, nl, transform
+end
+
+#= The fixed quadrature rule against the adaptive cubature, on the host. They are
+   different discretisations of the same integral, so they agree to the accuracy of the
+   quadrature and not to rounding: the HE1m fields are smooth, so a 64-node Gauss rule
+   is far better than the adaptive rule at its default 1e-3 tolerance and what is
+   measured here is the *adaptive* rule's error. =#
+@testset "the fixed and the adaptive transverse integral agree" begin
+    #= The tolerance is looser for the plasma case: the ionisation rate is a spline of
+       log(rate) evaluated at the local field, so the integrand it contributes is
+       piecewise cubic in the field rather than smooth, and neither rule converges on it
+       as fast as on the Kerr term. Both are still far inside what the quadrature is
+       worth. =#
+    @testset "$GT plasma=$plasma" for (GT, plasma, tol) in
+            ((Grid.RealGrid, false, 1e-12), (Grid.RealGrid, true, 1e-10),
+             (Grid.EnvGrid, false, 1e-12))
+        aEω, anl, atr = modalrhs(GT, HostSpec(); plasma, modal_integral=:adaptive)
+        fEω, fnl, ftr = modalrhs(GT, HostSpec(); plasma, modal_integral=:fixed, nr=64)
+        @test atr isa NonlinearRHS.TransModal
+        @test ftr isa NonlinearRHS.TransModalFixed
+        @test aEω == fEω # the same input field
+        @test maximum(abs, anl .- fnl)/maximum(abs, anl) < tol
+    end
+
+    #= The full 2-D rule. Here it is the adaptive rule which is the less accurate of the
+       two: `hcubature` in two dimensions stops at its 1e-3 tolerance long before a
+       product Gauss/trapezoid rule on a smooth integrand does. =#
+    aEω, anl, _ = modalrhs(Grid.RealGrid, HostSpec(); nmodes=2, components=:xy, full=true,
+                           modal_integral=:adaptive)
+    fEω, fnl, _ = modalrhs(Grid.RealGrid, HostSpec(); nmodes=2, components=:xy, full=true,
+                           modal_integral=:fixed, nr=64, nθ=16)
+    @test maximum(abs, anl .- fnl)/maximum(abs, anl) < 1e-6
+end
+
+#= The mode matrices of a `z`-dependent mode collection are rebuilt whenever `z` moves;
+   `Modes.zconstant` is what says whether they have to be. =#
+@testset "a tapered mode collection rebuilds its matrices" begin
+    Eω, tr, _, _, _ = modalcase(Grid.RealGrid, HostSpec(); taper=true, run=false)
+    @test !tr.zconstant
+    S0 = copy(tr.S)
+    nl = similar(Eω)
+    tr(nl, Eω, 0.0)
+    @test tr.S == S0 # z = 0 is where they were built
+    tr(nl, Eω, 1e-3)
+    @test tr.S != S0
+    @test tr.zmat == 1e-3
+    #= ... and the result is the one the adaptive rule gives at the same position, which
+       is the check that the rebuild is the right rebuild. =#
+    aEω, atr, _, _, _ = modalcase(Grid.RealGrid, HostSpec(); taper=true, run=false,
+                                  modal_integral=:adaptive)
+    anl = similar(aEω)
+    atr(anl, aEω, 1e-3)
+    @test maximum(abs, anl .- nl)/maximum(abs, anl) < 1e-12
+
+    # a fixed core radius is z-independent, and then nothing is rebuilt
+    _, ctr, _, _, _ = modalcase(Grid.RealGrid, HostSpec(); run=false)
+    @test ctr.zconstant
+    Sc = copy(ctr.S)
+    ctr(nl, Eω, 1e-3)
+    @test ctr.S == Sc
+end
+
+#= The embedded error estimate of the fixed rule: the Gauss subset of a Kronrod rule in
+   r, projected with the difference of the two weight sets. Nothing evaluates it per
+   step -- it becomes a statistic in a later branch of the GPU work -- so this is what
+   checks that it works at all. =#
+@testset "the embedded quadrature error estimate" begin
+    Eω, nl, tr = modalrhs(Grid.RealGrid, HostSpec(); nr=33, kronrod=true)
+    @test NonlinearRHS.has_error_estimate(tr)
+    err = NonlinearRHS.integral_error!(tr)
+    @test all(isfinite, err)
+    #= A 33-point Kronrod rule on the smooth HE1m fields: the coarse (16-point Gauss)
+       rule differs from it by very little, and the estimate is nowhere near the
+       integral itself. =#
+    @test 0 < maximum(abs, err)/maximum(abs, nl) < 1e-6
+    # the full 2-D rule has one in θ as well, for an even number of nodes
+    _, _, trf = modalrhs(Grid.RealGrid, HostSpec(); nmodes=2, components=:xy, full=true,
+                         nr=16, nθ=8)
+    @test NonlinearRHS.has_error_estimate(trf)
+    @test all(isfinite, NonlinearRHS.integral_error!(trf))
+    # without an embedded rule there is nothing to compare against
+    _, _, trn = modalrhs(Grid.RealGrid, HostSpec(); nr=32, kronrod=false)
+    @test !NonlinearRHS.has_error_estimate(trn)
+    @test all(isnan, NonlinearRHS.integral_error!(trn))
+end
+
+#= The adaptive transverse integral is host scalar code driven by `Cubature`, which
+   returns `Vector{Float64}`: it is refused for anything else, naming the fixed rule. =#
+@testset "the adaptive transverse integral is host Float64 only" begin
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    ms = (Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false),)
+    ts = Modes.ToSpace(ms; components=:y)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)
+    nrm = NonlinearRHS.norm_modal(grid)
+    for (spec, scaling) in ((DeviceSpec(Array, Float32), UNIT_SCALING),
+                            (HostSpec(), UnitScaling(1024.0, PhysData.ε_0)))
+        err = try
+            NonlinearRHS.TransModal(grid, ts, resp, z -> 1.0, nrm; spec, scaling)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("modal_integral=:fixed", err.msg)
+    end
+    # ... and `Luna.setup` says the same thing before it builds anything
+    err = try
+        modalcase(Grid.RealGrid, DeviceSpec(Array, Float32); modal_integral=:adaptive,
+                  run=false)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("modal_integral=:fixed", err.msg)
+end
+
 @testset "constβ is checked, not trusted" begin
     grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
     coren, densityfun = Capillary.gradient(:Ar, 1e-2, 1.0, 0.0)
@@ -1641,6 +1807,86 @@ end
     plain, _ = kerrcase(Grid.RealGrid, HostSpec())
     @test maximum(abs, href["Eω"][:, end] .- plain["Eω"][:, end])/
           maximum(abs, plain["Eω"][:, end]) > 1e-6
+end
+
+#= The batched column evaluator on a device array: the mode matrices, the block and the
+   responses all live there, and the answer is the host's. =#
+@testset "the batched modal evaluator on JLArray" begin
+    @testset "$GT plasma=$plasma" for (GT, plasma) in
+            ((Grid.RealGrid, false), (Grid.RealGrid, true), (Grid.EnvGrid, false))
+        hEω, hnl, htr = modalrhs(GT, HostSpec(); plasma)
+        dEω, dnl, dtr = modalrhs(GT, JLSpec; plasma)
+
+        # the transform really is resident on the device
+        @test dEω isa JLArray
+        @test dtr.S isa JLArray
+        @test dtr.Wp isa JLArray
+        @test dtr.Wd isa JLArray
+        @test dtr.Emt isa JLArray
+        @test dtr.Emωo isa JLArray
+        @test dtr.Pmt isa JLArray
+        @test dtr.err isa JLArray
+        @test dtr.block.Et isa JLArray
+        @test dtr.block.Pt isa JLArray
+        @test dtr.block.Et2 isa JLArray # the reshape a GEMM needs, not a wrapper
+        @test dtr.gv.ω isa JLArray
+        @test dtr.gv.sidx isa JLArray{Bool}
+        @test dtr.norm!.pre isa JLArray
+        plasma && @test dtr.block.resp[2].J isa JLArray
+        # ... and the host one still aliases the grid's own vectors
+        @test htr.gv.ω === htr.grid.ω
+
+        @test Array(dEω) == hEω
+        h = hnl; d = Array(dnl)
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+    end
+end
+
+#= The exit condition of this branch on JLArray: a multimode propagation with the
+   default physics of a field-resolved `prop_capillary` call in a non-Raman gas (Kerr,
+   and Kerr plus plasma), end to end on a device array. =#
+@testset "multimode propagation on JLArray" begin
+    @testset "plasma=$plasma" for plasma in (false, true)
+        href, _ = modalcase(Grid.RealGrid, HostSpec(); plasma)
+        dref, dtr = modalcase(Grid.RealGrid, JLSpec; plasma)
+        @test dtr isa NonlinearRHS.TransModalFixed
+        @test size(dref["Eω"]) == size(href["Eω"])
+        @test dref["z"] ≈ href["z"]
+        #= Normalised to the strongest mode rather than per mode: the fourth mode carries
+           1e-10 of the energy of the first, so its own relative difference measures the
+           first mode's rounding against the fourth mode's amplitude. =#
+        nrm = maximum(abs, href["Eω"][:, :, end])
+        for idx in axes(href["Eω"], 2)
+            h = href["Eω"][:, idx, end]
+            d = dref["Eω"][:, idx, end]
+            @test maximum(abs, d .- h)/nrm < 1e-10
+        end
+    end
+end
+
+#= The embedded error estimate is two matrix products and a transform like everything
+   else, so it runs where the transform does. =#
+@testset "the quadrature error estimate on JLArray" begin
+    _, hnl, htr = modalrhs(Grid.RealGrid, HostSpec(); nr=33, kronrod=true)
+    _, dnl, dtr = modalrhs(Grid.RealGrid, JLSpec; nr=33, kronrod=true)
+    @test NonlinearRHS.has_error_estimate(dtr)
+    herr = NonlinearRHS.integral_error!(htr)
+    derr = Array(NonlinearRHS.integral_error!(dtr))
+    @test all(isfinite, derr)
+    @test maximum(abs, derr .- herr)/maximum(abs, herr) < 1e-10
+end
+
+#= The adaptive transverse integral cannot run on a device array at all, and says so with
+   the fixed rule named. =#
+@testset "a device multimode run needs the fixed rule" begin
+    err = try
+        modalcase(Grid.RealGrid, JLSpec; modal_integral=:adaptive, run=false)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("modal_integral=:fixed", err.msg)
 end
 
 @testset "boundaries and default statistics on JLArray" begin

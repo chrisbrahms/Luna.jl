@@ -432,3 +432,128 @@ end # testset "makemodes"
         @test Etthis ≈ Etxy_grid[:, :, x1idx, x2idx]
     end
 end # testset "spatial field and fluence"
+
+#= The fixed transverse quadrature rule and the batched mode matrix, which
+   `NonlinearRHS.TransModalFixed` and the batched column evaluator are built on. =#
+@testset "transverse quadrature" begin
+    a = 125e-6
+    dl = (:polar, (0.0, 0.0), (a, 2π))
+    @testset "polar radial nr=$nr kronrod=$kr" for nr in (8, 33, 64), kr in (false, true)
+        q = Modes.transverse_quadrature(:polar, false; nr, kronrod=kr)
+        @test q.kind == :polar
+        @test !q.full
+        @test q.nθ == 1
+        @test q.kronrod == kr
+        # the fine and the embedded coarse rule both integrate 1 over the core exactly
+        w = Modes.quadrature_weights(q, dl)
+        wc = Modes.quadrature_weights(q, dl; coarse=true)
+        @test sum(w) ≈ π*a^2
+        @test sum(wc) ≈ π*a^2
+        @test length(q) == length(w) == nr + (kr ? isodd(nr) ? 0 : 1 : 0)
+        nodes = Modes.quadrature_nodes(q, dl)
+        @test length(nodes) == length(q)
+        # Gauss and Kronrod nodes are strictly inside, and the rule is radial
+        @test all(0 .< first.(nodes) .< a)
+        @test all(iszero, last.(nodes))
+        #= A Gauss rule of n nodes is exact for polynomials of degree 2n-1, and the
+           polar weights carry one power of r, so r^k is exact for k+1 <= 2nr-1. =#
+        for k in (1, 3)
+            @test sum(w .* [r^k for (r, _) in nodes]) ≈ 2π*a^(k+2)/(k+2)
+        end
+        #= A smooth non-polynomial integrand: 2π∫r exp(-(r/w)²) dr over (0, a) is
+           πw²(1 - exp(-(a/w)²)). A handful of nodes is not enough for it, which is why
+           the default is 64. =#
+        w0 = a/3
+        val = sum(w .* [exp(-(r/w0)^2) for (r, _) in nodes])
+        @test val ≈ π*w0^2*(1 - exp(-(a/w0)^2)) rtol=(nr < 16 ? 1e-2 : 1e-9)
+    end
+
+    @testset "polar full 2-D" begin
+        q = Modes.transverse_quadrature(:polar, true; nr=16, nθ=8)
+        @test length(q) == 16*8
+        @test sum(Modes.quadrature_weights(q, dl)) ≈ π*a^2
+        @test sum(Modes.quadrature_weights(q, dl; coarse=true)) ≈ π*a^2
+        nodes = Modes.quadrature_nodes(q, dl)
+        @test all(0 .< first.(nodes) .< a)
+        @test all(0 .<= last.(nodes) .< 2π)
+        #= The periodic trapezoid is exact for every azimuthal harmonic below nθ and
+           wrong for nθ itself, which is the reason for the nθ ≥ 4h+1 rule. =#
+        for h in (1, 3, 7)
+            @test sum(Modes.quadrature_weights(q, dl) .*
+                      [cos(h*θ)^2 for (_, θ) in nodes]) ≈ π*a^2/2
+        end
+        @test !isapprox(sum(Modes.quadrature_weights(q, dl) .*
+                            [cos(8*θ)^2 for (_, θ) in nodes]), π*a^2/2, rtol=1e-6)
+        # an odd nθ, or nθ = 2, has no embedded coarse rule: the two are equal
+        q3 = Modes.transverse_quadrature(:polar, true; nr=8, nθ=5)
+        @test Modes.quadrature_weights(q3, dl; coarse=true) == Modes.quadrature_weights(q3, dl)
+    end
+
+    @testset "cartesian" begin
+        dlc = (:cartesian, (-1.0, -2.0), (3.0, 4.0))
+        q = Modes.transverse_quadrature(:cartesian, true; nr=8, nθ=6)
+        @test length(q) == 48
+        @test sum(Modes.quadrature_weights(q, dlc)) ≈ 4*6
+        nodes = Modes.quadrature_nodes(q, dlc)
+        @test all(-1 .< first.(nodes) .< 3)
+        @test all(-2 .< last.(nodes) .< 4)
+        # a rectangular domain has no radial rule, and the kinds have to match
+        @test_throws ErrorException Modes.transverse_quadrature(:cartesian, false; nr=8)
+        @test_throws ErrorException Modes.quadrature_weights(q, dl)
+        @test_throws ErrorException Modes.quadrature_nodes(q, dl)
+    end
+
+    @test_throws ErrorException Modes.transverse_quadrature(:spiral, true; nr=8)
+    @test_throws DomainError Modes.transverse_quadrature(:polar, false; nr=1)
+    @test_throws DomainError Modes.transverse_quadrature(:polar, true; nr=8, nθ=0)
+end
+
+@testset "mode matrix" begin
+    a = 125e-6
+    ms = Tuple(Capillary.MarcatiliMode(a, :He, 1.0; n=1, m=mi) for mi in 1:3)
+    xs = [(a*r, θ) for (r, θ) in zip(range(0.05, 0.95, 7), range(0, 1.7π, 7))]
+    for (comp, indices) in ((:xy, 1:2), (:x, 1), (:y, 2))
+        M = Modes.mode_matrix(ms, indices, xs)
+        @test size(M) == (3, length(indices), length(xs))
+        #= The same numbers `to_space!` evaluates one point at a time -- it leaves them
+           in the `ToSpace`'s own matrix -- so this is an exact comparison, not a
+           tolerance. =#
+        ts = Modes.ToSpace(ms; components=comp)
+        for (ip, x) in enumerate(xs)
+            Modes.to_space!(zeros(ComplexF64, 2, ts.npol), zeros(ComplexF64, 2, 3), x, ts)
+            @test M[:, :, ip] == ts.Ems
+        end
+    end
+    # outside the mode's dimlimits (including a negative radius) the matrix is zero
+    @test all(iszero, Modes.mode_matrix(ms, 1:2, [(1.5a, 0.0), (-a/2, 0.0), (a, 0.0)]))
+    # the quadrature form is the coordinate form at the rule's nodes
+    q = Modes.transverse_quadrature(:polar, false; nr=8)
+    @test Modes.mode_matrix(ms, 1, q) ==
+          Modes.mode_matrix(ms, 1, Modes.quadrature_nodes(q, Modes.dimlimits(ms[1])))
+    # mode_matrix! fills only as many points as the output has room for
+    out = Array{Float64, 3}(undef, 3, 2, 2)
+    @test Modes.mode_matrix!(out, ms, 1:2, xs) == Modes.mode_matrix(ms, 1:2, xs[1:2])
+    @test_throws DimensionMismatch Modes.mode_matrix!(out, ms, 1:2, xs[1:1])
+    @test_throws DimensionMismatch Modes.mode_matrix!(
+        Array{Float64, 3}(undef, 2, 2, 2), ms, 1:2, xs)
+
+    @testset "traits" begin
+        # a fixed core radius makes the transverse profile z-independent
+        @test Modes.zconstant(ms[1])
+        @test !Modes.zconstant(Capillary.MarcatiliMode(z -> a, :He, 1.0))
+        @test Modes.zconstant(
+            Antiresonant.ZeisbergerMode(a, :He, 1.0; wallthickness=300e-9))
+        @test !Modes.zconstant(
+            Antiresonant.ZeisbergerMode(z -> a, :He, 1.0; wallthickness=300e-9))
+        # the Cartesian components of HE_nm carry the azimuthal harmonic |n-1|
+        @test Modes.azimuthal_order(ms[1]) == 0
+        @test Modes.azimuthal_order(Capillary.MarcatiliMode(a, :He, 1.0; n=3, m=1)) == 2
+        @test Modes.azimuthal_order(
+            Capillary.MarcatiliMode(a, :He, 1.0; n=0, m=1, kind=:TE)) == 1
+        @test Modes.azimuthal_order(
+            Antiresonant.ZeisbergerMode(a, :He, 1.0; n=3, wallthickness=300e-9)) == 2
+        # anything which has not said stays unknown, and the check is then skipped
+        @test isnothing(Modes.azimuthal_order(Modes.delegated(ms[1])))
+        @test !Modes.zconstant(Modes.delegated(ms[1]))
+    end
+end
