@@ -1311,4 +1311,191 @@ end
     end
 end
 
+#= The χ⁽²⁾ response matching the grid, built from the grid's own carrier frequency and
+   oversampled time axis (which `Chi2Env` needs for the carrier phase). =#
+metalchi2(::Grid.RealGrid, θ, ϕ) = Nonlinear.Chi2Field(θ, ϕ, PhysData.χ2(:BBO))
+metalchi2(grid::Grid.EnvGrid, θ, ϕ) = Nonlinear.Chi2Env(θ, ϕ, PhysData.χ2(:BBO),
+                                                        grid.ω0, grid.to)
+
+#= Type I SHG in BBO on a `Grid.Free2DGrid`, field-resolved or envelope: the 2-D Cartesian
+   transform with the two-component χ⁽²⁾ response and the crystal-optics normalisation
+   (whose fill is host root-finding, staged through `ohost` and uploaded). `boundary=:rate`
+   so the k-space absorber, the evanescent source taper and `Boundaries.CartesianCollar`
+   run too; fixed steps, so two runs differ only in their arithmetic. =#
+const METAL_BBO_θ = deg2rad(29.2)
+const METAL_BBO_ϕ = deg2rad(30)
+
+function metalfree2dcase(GT, spec; λ0=800e-9, τfwhm=30e-15, w0=20e-6, energy=10e-9,
+                         thickness=30e-6, Nx=2^5, precision=nothing, boundary=:rate)
+    grid = GT === Grid.RealGrid ?
+        Grid.RealGrid(λ0, (250e-9, 2e-6), 120e-15) :
+        Grid.EnvGrid(λ0, (250e-9, 2e-6), 120e-15; thg=true)
+    xgrid = Grid.Free2DGrid(4w0, Nx)
+    nfuns = PhysData.ref_index_fun_xy(:BBO, METAL_BBO_θ)
+    linop = LinearOps.make_const_linop(grid, xgrid, nfuns)
+    normfun = NonlinearRHS.const_norm_free2D(grid, xgrid, nfuns)
+    densityfun = z -> 1 # unity density: this is a solid
+    resp = (metalchi2(grid, METAL_BBO_θ, METAL_BBO_ϕ),)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm, energy=energy/(sqrt(π/2)*w0), w0)
+    Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, resp, inputs;
+                                   device=spec, precision)
+    out = Output.MemoryOutput(0, thickness, 3, Output.nostats)
+    h = thickness/8
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=thickness, boundary, boundary_N=4, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= A small 3-D free-space envelope Kerr propagation on a `Grid.FreeGrid`: the block is
+   `(nto, npol, Nx, Ny)` and the transform is one region-(1,3,4) FFT each way. =#
+function metalfree3dcase(spec; gas=:Ar, pres=1.0, λ0=800e-9, energy=1e-9, flength=2e-3,
+                         R=1e-3, Nx=8, Ny=6, w0=200e-6, precision=nothing, boundary=:rate)
+    grid = Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
+    xygrid = Grid.FreeGrid(R, Nx, R, Ny)
+    nfunλ = PhysData.ref_index_fun(gas, pres)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    linop = LinearOps.make_const_linop(grid, xygrid, nfun)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
+    normfun = NonlinearRHS.const_norm_free(grid, xygrid, nfun)
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
+    Eω, transform, FT = Luna.setup(grid, xygrid, dens, normfun, resp, inputs;
+                                   device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/8
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, boundary_N=4, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= The stray-Float64 smoke test for the Cartesian free-space pieces: the transform's own
+   buffers and mirrors, both normalisation fills (the isotropic broadcast and the
+   crystal-optics host fill with its `ohost` staging buffer) and the transverse collar.
+   Metal refuses a Float64 array and its kernel compiler rejects any `double` which
+   survives optimisation, so an element type here which is not Float32/ComplexF32/Bool is
+   the failure this file exists for. =#
+@testset "no stray Float64 in the Cartesian free-space kernels" begin
+    #= A fine transverse grid over a small box, so that the largest k⊥ on the grid exceeds
+       k(ω) at the long-wavelength end and the evanescent branch of the kernel -- the one
+       which takes the taper -- is actually reached. =#
+    grid = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 100e-15)
+    xygrid = Grid.FreeGrid(10e-6, 32, 10e-6, 16)
+    nfunλ = PhysData.ref_index_fun(:Ar, 1.0)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    nrm = NonlinearRHS.const_norm_free(grid, xygrid, nfun; spec=MetalSpec)
+    @test nrm.out isa MtlArray{ComplexF32, 4}
+    @test nrm.kperp2m isa MtlArray{Float32, 4}
+    @test nrm.kwinm isa MtlArray{Float32, 4}
+    @test nrm.sidxm isa MtlArray{Bool}
+    @test nrm.ωm isa MtlArray{Float32}
+    @test nrm.nm.dev isa MtlArray{Float32, 1}
+    out = nrm(0.0) # compiles and runs the fill kernel on the GPU
+    @test all(isfinite, Array(out))
+    hnrm = NonlinearRHS.const_norm_free(grid, xygrid, nfun)
+    hout = hnrm(0.0)
+    @test maximum(abs, ComplexF64.(Array(out)) .- hout)/maximum(abs, hout) < 1e-5
+    @test any(x -> imag(x) != 0, hout) # there really are evanescent channels here
+
+    #= The taper branch: `reflength!` sets ℓ, κmax and the k-window and invalidates the
+       mirror. The window is clamped at its floor exactly as `Boundaries.setup` clamps it
+       -- the raw profile is exactly zero at the Nyquist wavevector of an FFT grid, and
+       the normalisation divides by it. =#
+    kwin = max.(Boundaries.kprofile(xygrid, 0.1), exp(-Boundaries.MAX_αℓ/2))
+    before = copy(Array(out))
+    NonlinearRHS.reflength!(nrm, 1e-3; κmax=1e4, kwin)
+    NonlinearRHS.reflength!(hnrm, 1e-3; κmax=1e4, kwin)
+    @test !nrm.mirrored
+    out2 = nrm(0.0)
+    @test nrm.mirrored
+    hout2 = hnrm(0.0)
+    @test maximum(abs, ComplexF64.(Array(out2)) .- hout2)/maximum(abs, hout2) < 1e-5
+    @test maximum(abs, Array(out2) .- before) > 0 # the taper did something
+
+    #= The crystal-optics fill: host root-finding per (ω, kx), staged through `ohost` and
+       uploaded. `ohost` is a host ComplexF64 buffer by design -- it is never broadcast
+       against the state -- and what reaches the device is `out`. =#
+    bgrid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
+    xgrid = Grid.Free2DGrid(80e-6, 2^5)
+    nfuns = PhysData.ref_index_fun_xy(:BBO, METAL_BBO_θ)
+    cnrm = NonlinearRHS.const_norm_free2D(bgrid, xgrid, nfuns; spec=MetalSpec)
+    @test cnrm.ohost isa Array{ComplexF64, 3}
+    cout = cnrm(0.0)
+    @test cout isa MtlArray{ComplexF32, 3}
+    @test size(cout, 2) == 2 # crystal optics is a two-polarisation normalisation
+    hcnrm = NonlinearRHS.const_norm_free2D(bgrid, xgrid, nfuns)
+    hcout = hcnrm(0.0)
+    @test maximum(abs, ComplexF64.(Array(cout)) .- hcout)/maximum(abs, hcout) < 1e-5
+
+    # the transverse collar, built the way `Boundaries.setup` builds it, in both shapes
+    for sg in (xgrid, xygrid)
+        xyshape = sg isa Grid.Free2DGrid ? (length(sg.x),) : (length(sg.x), length(sg.y))
+        Et = Luna.alloc(MetalSpec, Float32, (length(grid.t), 2, xyshape...))
+        αr = Boundaries.rate(Boundaries.rprofile(sg, 0.1), 1e-3)
+        collar = Boundaries.spatialcollar(sg, αr, grid, Et)
+        @test collar isa Boundaries.CartesianCollar
+        @test collar.αxy isa MtlArray{Float32}
+        @test collar.fac isa MtlArray{Float32}
+        @test size(collar.αxy) == xyshape
+        copyto!(Et, randn(Float32, size(Et)))
+        Boundaries.apply_realspace!(collar, Et, 1e-4)
+        @test all(isfinite, Array(Et))
+        @test collar.reference[] > 0
+        @test collar.removed[] > 0
+    end
+end
+
+#= The exit test of the branch on hardware: 2-D and 3-D Cartesian free space, Kerr and
+   χ⁽²⁾, `boundary=:rate`, through the low-level interface. Metal against the CPU at the
+   *same* precision and the same scaling -- an explicit `DeviceSpec(Array, Float32)`, not
+   the sentinel, which with Metal loaded would resolve to the GPU and compare Metal with
+   itself. =#
+@testset "2-D free-space χ⁽²⁾ on Metal" begin
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        href, htr = metalfree2dcase(GT, DeviceSpec(Array, Float32))
+        dref, dtr = metalfree2dcase(GT, MetalSpec)
+
+        @test dtr isa NonlinearRHS.TransFree2D
+        @test dtr.Eto isa MtlArray
+        @test dtr.Eωo isa MtlArray{ComplexF32, 3}
+        @test dtr.Pωo === dtr.Eωo # one field-sized buffer fewer
+        @test dtr.prefac isa MtlArray{ComplexF32, 1}
+        @test dtr.gv.towin isa MtlArray{Float32}
+        @test dtr.normfun.out isa MtlArray{ComplexF32, 3}
+        @test dtr.scaling.Eref == htr.scaling.Eref
+        @test eltype(dref["Eω"]) === ComplexF32
+
+        # both polarisation components carry field: the second harmonic is on x
+        for ip in 1:2
+            @test maximum(abs, href["Eω"][:, ip, :, end]) > 0
+        end
+        @test size(dref["Eω"]) == size(href["Eω"])
+        @test metalradialdiff(href, dref) < 1e-4
+    end
+end
+
+@testset "3-D free-space Kerr on Metal" begin
+    href, htr = metalfree3dcase(DeviceSpec(Array, Float32))
+    dref, dtr = metalfree3dcase(MetalSpec)
+
+    @test dtr isa NonlinearRHS.TransFree
+    @test dtr.Eto isa MtlArray{ComplexF32, 4}
+    @test dtr.Eωo isa MtlArray{ComplexF32, 4}
+    @test dtr.Pωo === dtr.Eωo
+    @test dtr.normfun.out isa MtlArray{ComplexF32, 4}
+    @test ndims(dref["Eω"]) == 5 # (ω, pol, kx, ky, z)
+    @test size(dref["Eω"]) == size(href["Eω"])
+    @test metalradialdiff(href, dref) < 1e-4
+end
+
+@testset "free space on Metal against the Float64 CPU path" begin
+    href, _ = metalfree2dcase(Grid.RealGrid, HostSpec())
+    dref, _ = metalfree2dcase(Grid.RealGrid, MetalSpec)
+    @test metalradialdiff(href, dref) < 1e-4
+
+    h3, _ = metalfree3dcase(HostSpec())
+    d3, _ = metalfree3dcase(MetalSpec)
+    @test metalradialdiff(h3, d3) < 1e-4
+end
+
 end # have_metal
