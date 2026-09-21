@@ -92,8 +92,11 @@ tabulation as the default that would move every uniform case at rounding level f
 
 `linop_integral` on `prop_capillary_args`, forwarded by `boundary_kwargs` and recorded by
 `saveargs` in place of `tabulate_linop`, which stays as an accepted (deprecated) keyword.
-`Aeff` is pre-tabulated for the statistics only when the operator is z-dependent
-*and* `linop_integral === :tabulated`.
+It is validated in the first line of the function, so a misspelled symbol fails before the
+grid, the FFT plans, the input field and `Stats.default` are built rather than after.
+`Aeff` is pre-tabulated for the statistics only when the operator is z-dependent *and*
+`linop_integral !== :quadrature`. `prop_gnlse` rejects the keyword outright, as it did
+`tabulate_linop`; its operator is always constant, and the docstring now says so.
 
 ### `src/Boundaries.jl`
 
@@ -103,7 +106,11 @@ supplied already integrated, which they could not before (`addloss` would have c
 like a closure). `clampdecay` is not linear in the operator, cannot be pushed through an
 integral, and raises with a message naming the fix. `Luna.run` integrates *after*
 `Boundaries.setup`, so an operator Luna built itself is always clamped first; only a
-caller-supplied integrated operator in free space can reach that error.
+caller-supplied integrated operator in free space can reach that error. That also means
+`addloss`'s method is the one `Luna.run` can reach — for a waveguide geometry — while
+`addloss_k`'s is only reachable by a direct call, since every free-space branch of
+`Boundaries.setup` calls `clampdecay` first. It is there so that the pair stays complete
+and for the day the clamp can be expressed on an integrated operator.
 
 ### `src/LinearOps.jl` — one behaviour change outside the interface
 
@@ -206,10 +213,10 @@ M1 Pro, Julia 1.13.0.
 
 | file | result | how to run |
 | --- | --- | --- |
-| `test/test_linops.jl` | **338 pass, 0 fail** (68 of them new) | `julia --project=$PWD -t 1 -e 'using Luna; include("test/test_linops.jl")'` |
-| `test/test_device.jl` | **1183 pass, 0 fail** (35 of them new) | as above, from an environment with `JLArrays` |
+| `test/test_linops.jl` | **354 pass, 0 fail** (84 of them new) | `julia --project=$PWD -t 1 -e 'using Luna; include("test/test_linops.jl")'` |
+| `test/test_device.jl` | **1197 pass, 0 fail** (49 of them new) | as above, from an environment with `JLArrays` |
 | `test/test_metal.jl` | **726 pass, 0 fail** | from an environment with `Metal`, `using Luna, Metal` first |
-| `test/test_interface.jl` | **362 pass, 0 fail** | as `test_linops.jl` |
+| `test/test_interface.jl` | **363 pass, 0 fail** | as `test_linops.jl` |
 | `test/test_rk45.jl`, `test_gradient.jl`, `test_tapers.jl`, `test_boundaries.jl` | **all pass** | as `test_linops.jl` |
 | `test/test_freespace.jl`, `test/test_radialgrid.jl` | **236 pass, 0 fail** between them | as `test_linops.jl` |
 
@@ -245,32 +252,21 @@ it is also the per-stage-host-work side of the call-counting check) and through
 
 ### Tests whose expectations changed
 
-Three, all for the same reason: they compared a z-dependent operator which happens to be
-**constant in z** against the constant-operator path elementwise, and were bit-identical
-because the one-point rule evaluated the closure and used the result as it stood. A
-two-node table holds that constant to within the rounding of a Simpson sum divided by the
-span, which is enough for the adaptive controller to accept a slightly different step
-somewhere.
+**One.** Three others changed in the first round of this branch and are back to their
+original assertions, because `constant_linop` (review round 1, finding 2) makes them hold
+again: `test_gradient.jl`'s `field` and `envelope` comparisons of an equal-pressure
+"gradient" against the constant-operator path, `test_tapers.jl`'s constant `afun`, and
+`test_rk45.jl`'s `Linfunc`, all of which are z-independent closures and are now recognised
+as such. `test_rk45.jl` is back to `all(abs2.(Aarrp) .== abs2.(Aarrpf))` and additionally
+asserts that `constant_linop(Linfunc, Aω, …) == Lin` bitwise; it also gained
+`@test_throws ArgumentError RK45.make_prop!(Linfunc, Aω)`.
 
-- `test_gradient.jl` (`field` and `envelope`): `all(Eω_grad .≈ Eω_const)` elementwise
-  becomes the normalised maximum difference per save, `< 1e-12`. **Measured: 7.1e-15.**
-  The elementwise form was comparing spectral tails thirty orders below the peak.
-- `test_tapers.jl` (`const vs afun`): the same change, same threshold.
-- `test_rk45.jl`: `all(abs2.(Aarrp) .== abs2.(Aarrpf))` becomes `isapprox(..., rtol=1e-4)`.
-  `Linfunc` is a constant operator written as a closure, now wrapped in a `TabulatedLinop`;
-  ~1e-12 rad of phase difference over two soliton periods of an N = 5 soliton at
-  `rtol=1e-8` moves the answer by of order `rtol`. The same test also gained
-  `@test_throws ArgumentError RK45.make_prop!(Linfunc, Aω)`.
-
-No test's *tolerance* was loosened to accommodate the new propagator; these three changed
-the *metric* from elementwise to normalised-per-save, which is what the regression gate
-uses.
-
-One more, for the `TabulatedScalar` change: `test_interface.jl`'s memoised-cache test
-asserted `t20 == t5` (the cache holds the tables' nodes and nothing the propagation added).
-It is now `t20 <= t5 + 1`, because the statistics recorded past the end of the fibre call
-`Modes.Aeff` at one `z` per run and the two runs end at different ones. Measured: 33 and
-34, against 30-odd growing to 60-odd without a table.
+The one that remains is `test_interface.jl`'s memoised-cache test, for the
+`TabulatedScalar` change: it asserted `t20 == t5` (the cache holds the tables' nodes and
+nothing the propagation added) and is now `t20 <= t5 + 1`, because the statistics recorded
+past the end of the fibre call `Modes.Aeff` at one `z` per run and the two runs end at
+different ones. Measured: 33 and 34, against 30-odd growing to 60-odd without a table. A
+systematically short table still fails it, because that would add an entry per stage.
 
 ## Metal
 
@@ -343,13 +339,19 @@ branch and is fixed: `Stats.zdw_linop`, which does not resolve from inside
 
 ## Known gaps and risks
 
-- **A free-space or multimode run with a z-dependent operator now builds a table by
-  default.** The table is `2·nnodes` copies of an operator which, for those geometries, is
-  the size of the whole state. `TabulatedLinop` reports its size and warns above 256 MB
-  (`LinearOps.TABLE_WARN_BYTES`), and `linop_integral=:quadrature` holds no table at all —
-  but a 3-D free-space script which used to allocate nothing extra can now allocate a lot,
-  and the warning is the only thing standing in front of that. Worth a decision at
-  integration: whether the default should depend on the size of the operator.
+- **`:auto`'s fallback branch has no coverage outside its own test.** Nothing in the gate,
+  the test suite or `examples/` is big enough to take it: every z-dependent operator in
+  them is mode-averaged or four-mode, and every free-space example uses `make_const_linop`.
+  The test forces it with a four-node budget. So the branch is exercised, but only
+  synthetically, and the `@info`'s advice (raise `linop_tol`) has not been measured against
+  a real case that needs it.
+- `linop_budget` is a `Luna.run` keyword only; `prop_capillary` does not expose it, and a
+  caller who wants a bigger budget there has to say `linop_integral=:tabulated`, which
+  removes the bound rather than raising it. Nothing `prop_capillary` builds comes near the
+  default.
+- The `:auto` fallback builds the capped table and then throws it away. That wastes at most
+  `linop_budget` bytes and the evaluations that went into it. Deciding without building
+  would mean predicting an adaptive node count.
 - A caller-supplied `AbstractIntegratedLinop` cannot be used for a free-space propagation
   with any `boundary` mode, because the evanescent clamp is not linear in the operator.
   It raises rather than propagating something wrong. The callable path is unaffected.
@@ -365,6 +367,80 @@ branch and is fixed: `Stats.zdw_linop`, which does not resolve from inside
   converted once by `_seclike` when the propagator is built. That is right for a
   caller-written operator and for `OffsetLinop`; `TabulatedLinop` already returns one on
   the state.
+
+## Changes after review round 1
+
+The review (`scratchpad/reviews/gpu-27-linop-integral-1.md`, "approve with minor fixes")
+reproduced the gate, the convergence table and the three test counts exactly, and verified
+independently — by running the same tabulated gradient on the base worktree and on this
+branch and comparing the serialised `Eω` — that the `AbsolutePhase` propagator is gpu/23's
+bit for bit (`max|Δ| = 0.0`). Nine findings, all addressed.
+
+1. **A z-independent closure is now recognised instead of tabulated** (finding 2, the
+   largest change). `LinearOps.constant_linop(linop!, proto, z0, z1)` evaluates the
+   operator at the five z values the tabulation's own first refinement uses — the two ends,
+   the midpoint and the two quarter points — and returns the constant array if they are
+   identical, `nothing` otherwise. `Luna.run` calls it before it looks at
+   `linop_integral`, so it applies to all three settings. A uniform fibre reached through
+   `make_linop` rather than `make_const_linop`, a `Capillary.gradient` with the same
+   pressure at both ends, a constant taper function and `test_freespace.jl`'s
+   `runprop_grad` are all propagated exactly by `make_prop!(::AbstractArray, y0)` — which
+   is what the removed one-point rule computed for them, bit for bit — instead of through
+   a two-node table whose secant is a Simpson sum. That **restores the three expectation
+   changes** the first round made, removes `2·nnodes` state-sized copies from a constant
+   free-space closure, and removes part of the motivation for `:auto`.
+2. **`test_rk45.jl` is back to exact equality** (finding 1). The review measured 1.08e-10
+   behind the `rtol=1e-4` the first round put there; with finding 2 the two runs are the
+   same arithmetic again and `all(abs2.(Aarrp) .== abs2.(Aarrpf))` holds. The PR's claim
+   that "no test's tolerance was loosened" was wrong about that one and the section is
+   rewritten.
+3. **`linop_integral=:auto` is the new default** (finding 4), implemented as the review
+   recommended rather than as the PR had sketched it. `LinearOps.bytes_per_node(proto)`
+   counts the *peak* — four host `ComplexF64` copies of the operator per node, held
+   simultaneously while the table is built, plus the two kept on the state —
+   `LinearOps.node_budget(proto, budget)` turns a byte budget (`linop_budget`, default
+   `LinearOps.TABLE_BUDGET_BYTES` = 256 MB) into a node cap clamped to
+   `[2, DEFAULT_MAXNODES]`, and `LinearOps.capped(tab, maxnodes)` says whether the cap
+   bound. The size of a table is not knowable before it is built, so this is a cap and not
+   a post-hoc size test. When it binds, `Luna.run` logs an `@info` which states the memory
+   saved **and** that the quadrature costs about 90 host evaluations of the operator per
+   step against one table readback, that for the operators which trigger the fallback those
+   are state-sized host work inside every step, and that raising `linop_tol` so the table
+   fits is usually the better answer. `:tabulated` and `:quadrature` remain explicit and
+   ignore the budget.
+4. **The table's size warning is issued before the build** (finding 3), from
+   `maxnodes·bytes_per_node(proto)`, and names the host peak; the post-build warning is
+   gone and the `@info` summary now reports both what was kept and what the build peaked
+   at. The old warning counted only the two device copies and fired after the host had
+   already allocated about four times that.
+5. **The value tables say something when they are read outside their span** (finding 5),
+   `@warn maxlog=1`, as `phase!` does for the operator table. `TabulatedScalar`'s
+   source-callable fallback is right for the one diagnostic it was written for, but if it
+   ever fired per stage the host work the table exists to remove would be back, silently.
+   That one expected out-of-span read — `prop_capillary`'s statistics table, which spans
+   the fibre while the last step's statistics are recorded past the end of it — is
+   `quiet=true`, a new keyword on `TabulatedScalar`; the table the *propagation* uses is a
+   different object, rebuilt over the whole of what the stepper can reach, and it is not
+   quiet. Without that, every tapered `prop_capillary` run would warn once about behaviour
+   that is by design.
+6. **`addloss_k`'s reachability** (finding 6) is stated above: every free-space branch of
+   `Boundaries.setup` calls `clampdecay` first, which refuses an integrated operator, so
+   `addloss`'s method is the one `Luna.run` reaches and `addloss_k`'s is for a direct call.
+7. **`OffsetLinop`'s `δ` cache and `Boundaries._cachedlike` are keyed on the array type**
+   (finding 7), `(array type, real element type)`, so inspecting an operator with a host
+   buffer before a device propagation no longer poisons the cache.
+8. **`linop_integral` is validated in the first line of `prop_capillary_args`** (finding
+   8), not only inside `Luna.run`. `prop_gnlse`'s refusal of the keyword is documented.
+9. **Docstrings** (finding 9): `maxevals` is in `QuadratureLinop`'s signature line;
+   `derivative!` says that it holds the end value *silently*, unlike `phase!`; and
+   `QuadratureLinop` counts the integrals that stopped at `maxevals` (`ncapped`) so that
+   `LinearOps.report_integral`, which `Luna.run` calls after the stepper returns, can
+   report the total once instead of the per-call warning's `maxlog=1` reporting the first
+   and going quiet.
+
+Everything was rerun after the fixes: the gate (below), `test_linops.jl` (354),
+`test_device.jl` (1197), `test_interface.jl` (363), `test_rk45.jl`, `test_gradient.jl`,
+`test_tapers.jl`.
 
 ## Deviations from GPU_PLAN.md and the brief
 
@@ -398,6 +474,14 @@ branch and is fixed: `Stats.zdw_linop`, which does not resolve from inside
   `gpu/25`. `Fields.PropagatedField`'s `propagator!` is a user-supplied function with no
   relation to `linop`. What both would need if they did use the operator —
   `derivative!(out, op, z)` — is part of the interface and is tested.
+- **The default is `:auto`, not `:tabulated`.** GPU_PLAN.md §6 Group E2 specifies
+  `:tabulated` (default) and `:quadrature`. `:auto` was added after review round 1 as the
+  bound on the memory the new default can ask for; it *is* `:tabulated` for everything in
+  the gate, the test suite and `examples/`.
+- **`constant_linop` is not in the plan.** It restores the pre-branch behaviour of a
+  z-independent closure exactly, which is what makes the plan's "uniform fibres and all
+  other cases exactly unchanged" true of a closure as well as of an array.
+
 - **The staging of the commits.** The brief asks for a commit per stage (interface,
   quadrature, keyword, tests, docs). The first three touch the same three functions in the
   same three files and were written together; they are one commit, with tests and docs

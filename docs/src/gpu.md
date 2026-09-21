@@ -438,7 +438,7 @@ audit; there is nothing to set.
 ### Tapers and pressure gradients (`linop_integral`)
 
 ```julia
-out = prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); ...)                            # tabulated
+out = prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); ...)                             # :auto
 out = prop_capillary(125e-6, 0.1, :He, (1.0, 0.0); ..., linop_integral=:quadrature) # or this
 ```
 
@@ -452,6 +452,11 @@ exp(Φ(t2) − Φ(t1)),   Φ(z) = ∫ L dz',
 which is exact, so what it needs is not the operator but its integral. `linop_integral`
 says how that integral is obtained, and there are two built-in answers plus the option of
 writing your own.
+
+A `linop!` which ignores `z` is recognised first and used as the constant operator it is,
+whichever setting you pick — a `Capillary.gradient` with the same pressure at both ends, a
+taper function which returns a constant, `LinearOps.make_linop` given a refractive index
+which does not depend on `z`. Such a run is unaffected by anything on this page.
 
 **What changed.** Until this release Luna propagated a z-dependent operator with
 `exp(L(t2)·(t2 − t1))`, a one-point rule. It is first order in the step size, and — this is
@@ -477,7 +482,7 @@ larger than any tolerance — the regression gate records 8.0e-3 for its gradien
 9.2e-2 for its taper case. A uniform fibre has a constant operator, which was always exact
 in the propagator, and is bit-for-bit unchanged.
 
-**`:tabulated` (the default)** evaluates `Φ` at setup on `z` nodes placed by adaptive
+**`:tabulated`** evaluates `Φ` at setup on `z` nodes placed by adaptive
 bisection and stores the table where the state lives, together with the propagation
 constant `β(z)` and effective area `Aeff(z)` the mode-averaged nonlinear normalisation
 needs. What is left inside the propagation is an interval lookup and four interpolation
@@ -494,10 +499,11 @@ multi-section fill — costs a handful of extra intervals where it is rather tha
 grid everywhere. A 0.1 m gradient takes about 60 nodes at the default tolerance and a taper
 about 30.
 
-The table costs `2·length(Eω)·nnodes` numbers in the state's precision. For a mode-averaged
-run that is a few megabytes. For a multimode, radial or free-space operator, whose `linop`
-is the size of the whole state, it is `2·nnodes` times the state, and Luna warns above 256
-MB; that is the case for `:quadrature`.
+The table costs `2·length(Eω)·nnodes` numbers in the state's precision, and about twice
+that again on the host while it is being built. For a mode-averaged run that is a few
+megabytes. For a multimode, radial or free-space operator, whose `linop` is the size of the
+whole state, it is several times `nnodes` times the state; Luna warns before it starts
+building if that could exceed 256 MB, and `:auto` bounds it instead of warning.
 
 **`:quadrature`** integrates the operator over each step instead, by adaptive
 Gauss–Kronrod quadrature on the host, and uploads the result. It holds no table, needs no
@@ -506,6 +512,18 @@ about fifteen host evaluations of the operator per stage against one table readb
 `β` and `Aeff` are evaluated per stage as well. It computes the same integral as the table
 does — the two agree to 1e-7 of each other on the cases above — so it is the thing to check
 a tabulated result against, and the thing to use when the table would be too large.
+
+**`:auto` is the default**, and it is `:tabulated` with a memory bound: the node count is
+capped so that the table's peak cost stays inside `linop_budget` (256 MB, counted at the
+peak, which is dominated by the host copies held while the table is built), and if that cap
+binds before `linop_tol` is met the run falls back to `:quadrature` and logs a line saying
+so. A mode-averaged capillary never comes close — the gate's gradient and taper cases
+tabulate to about 1 MB — so in practice `:auto` is `:tabulated` for everything
+`prop_capillary` builds. It exists for a multimode, radial or free-space operator, which is
+the size of the whole state, where the table is `2·nnodes` copies of it; if you see that
+message, raising `linop_tol` so that the table fits is usually a better answer than the
+fallback, because the fallback's ninety host evaluations of a state-sized operator per step
+cost more than the memory did.
 
 **Your own `Φ`.** If you know the integral in closed form, define a subtype of
 `LinearOps.AbstractIntegratedLinop` and pass it to `Luna.run` in place of the callable; it

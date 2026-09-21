@@ -147,11 +147,34 @@ caller-supplied integrated operator exactly and, for an `AbsolutePhase` operator
 free — it is the secant. `Boundaries.clampdecay` is not linear in the operator, cannot be
 pushed through the integral, and raises.
 
+### Choosing between them
+
+`Luna.run` converts a callable in three steps.
+[`LinearOps.constant_linop`](@ref Luna.LinearOps.constant_linop) first: a closure which
+ignores `z` — `make_linop` with a z-independent index, a `Capillary.gradient` with equal
+end pressures, a constant taper function — is materialised and propagated exactly by the
+array method, which is what such a run did before gpu/27, bit for bit. The test is the five
+z values the tabulation's own first refinement evaluates, compared for equality, so it
+cannot be wrong in a way the two-node table it replaces is not already wrong.
+
+Then `linop_integral`. `:tabulated` and `:quadrature` say which; `:auto`, the default,
+tabulates with the node count capped by [`LinearOps.node_budget`](@ref
+Luna.LinearOps.node_budget) — a byte budget (`linop_budget`, 256 MB) divided by
+[`LinearOps.bytes_per_node`](@ref Luna.LinearOps.bytes_per_node) — and falls back to the
+quadrature, with an `@info`, when the cap binds before the tolerance is met. The size of a
+table is not knowable before it is built, since the nodes are placed adaptively, which is
+why the bound is a node cap rather than a post-hoc size test. `bytes_per_node` counts the
+*peak*, four host `ComplexF64` copies of the operator per node plus the two kept on the
+state; the host term dominates a `Float32` device run, and it is what the pre-build size
+warning states. Nothing in Luna's tests or examples reaches the fallback: every z-dependent
+operator in them is mode-averaged or four-mode, and every free-space example uses
+`make_const_linop`.
+
 ## Tabulated z-dependent quantities
 
-`linop_integral=:tabulated` — the default — replaces every host quantity the step would
-otherwise evaluate with a table over `z`, built at setup and held on the state's array
-type:
+`linop_integral=:tabulated`, and `:auto` when the table fits, replace every host quantity
+the step would otherwise evaluate with a table over `z`, built at setup and held on the
+state's array type:
 
 - [`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop): the integrated operator
   `Φ(z) = ∫ linop dz'`, read back with a cubic Hermite interpolant. This is the
@@ -199,7 +222,8 @@ fibre. A low-level caller who builds statistics by hand and wants the same has t
 
 The statistics of the last accepted step are recorded a fraction of a step past the end of
 the fibre, i.e. outside the `[0, flength]` table `prop_capillary` built for them. A value
-table read outside its span calls its source callable rather than holding its end value,
+table read outside its span warns once and calls its source callable rather than holding
+its end value,
 so that point is the same number the untabulated path gave; holding it is worth 2.8e-2 on
 the peak intensity of the regression gate's taper case. Nothing inside a propagation can
 reach that branch, since `Luna.run` rebuilds the table over everything the stepper can
@@ -210,9 +234,10 @@ operator over the whole table.
 What this does not cover: a `linop!` which is genuinely discontinuous in `z` cannot be
 tabulated to tolerance, and the bisection stops at its depth or node limit and warns.
 Nor is the table free for a geometry whose operator is the size of the whole state — a
-multimode, radial or free-space one — where it is `2·nnodes` copies of it; the constructor
-reports its size and warns above `LinearOps.TABLE_WARN_BYTES` (256 MB), and
-`linop_integral=:quadrature` is the way out.
+multimode, radial or free-space one — where its peak is several `nnodes` copies of it; the
+constructor warns above `LinearOps.TABLE_WARN_BYTES` (256 MB) *before* it allocates
+anything, from the node cap it was given, and reports what it actually cost afterwards.
+`:auto` bounds it instead.
 
 ## Unit scaling
 
