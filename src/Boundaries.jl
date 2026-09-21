@@ -417,10 +417,16 @@ Transverse absorbing boundary for radially symmetric propagation: the power rate
 it first. It is applied to `Eω` directly (the collar is diagonal in ω) with one inverse and
 one forward Hankel transform along the last axis, into the buffer `buf` sized like `Eω`.
 
-`Tfwd` and `Tbwd` are copies of `rgrid`'s transform matrices in the element type of `Eω`,
+`buf` is the collar's own work buffer, shaped and typed like the `Eω` it will be applied
+to; the constructor **takes it over** rather than copying it, so the caller must not use
+it for anything else. `Boundaries.spatialcollar` allocates it, which is why this takes a
+buffer rather than a prototype: two field-sized arrays where one will do is not free on a
+device.
+
+`Tfwd` and `Tbwd` are copies of `rgrid`'s transform matrices in the element type of `buf`,
 so that both operands of the matrix multiplication have the same element type (which a
 device's accelerated matrix multiply requires); `weight` is a copy of its real-space
-integration weights, in the real precision of `Eω`. Nothing else of the grid is needed per
+integration weights, in the real precision of `buf`. Nothing else of the grid is needed per
 step, so the grid itself is not kept.
 
 Every array is `convert`ed to `Eω`'s precision on the host and then moved with
@@ -439,17 +445,16 @@ struct RadialCollar{mT, vT, bT}
     warned::Base.RefValue{Bool}
 end
 
-function RadialCollar(rgrid::Grid.RadialGrid, αr, Eω)
-    spec = _specof(Eω)
-    TT = eltype(Eω)
+function RadialCollar(rgrid::Grid.RadialGrid, αr, buf)
+    spec = _specof(buf)
+    TT = eltype(buf)
     RT = real(TT)
     Tfwd = todevice(spec, convert(Matrix{TT}, rgrid.Tfwd))
     Tbwd = todevice(spec, convert(Matrix{TT}, rgrid.Tbwd))
     αrc = todevice(spec, convert(Vector{RT}, αr))
     weight = todevice(spec, convert(Vector{RT}, rgrid.wr))
     fac = similar(αrc)
-    buf = similar(Eω)
-    assert_resident(spec, Eω, Tfwd, Tbwd, αrc, weight, fac, buf)
+    assert_resident(spec, Tfwd, Tbwd, αrc, weight, fac, buf)
     RadialCollar(Tfwd, Tbwd, αrc, weight, fac, buf, Ref(0.0), Ref(0.0), Ref(false))
 end
 
@@ -530,7 +535,9 @@ space. `grid` and `Et` size the buffer the radial collar needs, and `Et`'s array
 real precision are what that buffer (and hence `RadialCollar`'s
 `Tfwd`/`Tbwd`/`αr`/`weight`) is built in -- `similar(Et, Complex{real(eltype(Et))}, ...)`
 rather than a host `ComplexF64` array, so a radial run on a device or in `Float32` is not
-handed host `Float64` matrices to multiply its state against.
+handed host `Float64` matrices to multiply its state against. The buffer allocated here
+*is* the collar's work buffer ([`RadialCollar`](@ref) takes it over), so a radial run pays
+for one field-sized array, not two.
 """
 spatialcollar(rg::Grid.RadialGrid, αr, grid, Et) = RadialCollar(
     rg, αr, similar(Et, Complex{real(eltype(Et))}, (length(grid.ω), size(Et)[2:end]...)))

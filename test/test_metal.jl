@@ -1105,8 +1105,10 @@ function metalradialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3,
 end
 
 #= Per save, normalised by the largest `|Eω|` in that save: an elementwise relative
-   difference is meaningless in the k-channels the evanescent taper has emptied. =#
-function radialdiff(a, b)
+   difference is meaningless in the k-channels the evanescent taper has emptied. Named
+   apart from `test_device.jl`'s `radialdiff`, which is the same idea without the
+   `ComplexF64` conversion a `ComplexF32` saved field needs. =#
+function metalradialdiff(a, b)
     A, B = a["Eω"], b["Eω"]
     size(A) == size(B) || return Inf
     worst = 0.0
@@ -1229,14 +1231,14 @@ end
         @test eltype(dref["Eω"]) === ComplexF32
 
         @test size(dref["Eω"]) == size(href["Eω"])
-        @test radialdiff(href, dref) < 1e-4
+        @test metalradialdiff(href, dref) < 1e-4
     end
 end
 
 @testset "radial Kerr on Metal against the Float64 CPU path" begin
     href, _ = metalradialcase(Grid.RealGrid, HostSpec())
     dref, _ = metalradialcase(Grid.RealGrid, MetalSpec)
-    @test radialdiff(href, dref) < 1e-4
+    @test metalradialdiff(href, dref) < 1e-4
 end
 
 @testset "Metal refuses what it cannot run" begin

@@ -57,19 +57,22 @@ function basecommit()
 end
 
 """
-    selected()
+    selected() -> (cases, description)
 
 The cases to run, as a `Vector{RegressionCases.Case}`: `ENV["LUNA_REGRESSION_ONLY"]` (a
-comma-separated list of case names) if set, minus `ENV["LUNA_REGRESSION_SKIP"]`.
+comma-separated list of case names) if set, minus `ENV["LUNA_REGRESSION_SKIP"]`, together
+with a one-line description of the selection for the header.
 
 Both default to empty, i.e. the whole matrix. They exist because a baseline generated
 before a case was added has no file for it, so the gate would report it as a failure to
 load rather than as the missing baseline it is: a branch which adds a case runs the older
 baselines with that case skipped, and the new case against a baseline of its own. Neither
-variable is a way to make a failing case pass -- a skipped case is named in the header.
+variable is a way to make a failing case pass: the header names the lists exactly as they
+were given (`only: ...`, `skipped: ...`), an unknown name is an error, and the filtering
+happens before the comparison, so nothing a case does can change it.
 """
 function selected()
-    names(k) = haskey(ENV, k) ? split(ENV[k], ',') : String[]
+    names(k) = haskey(ENV, k) ? String.(split(ENV[k], ',')) : String[]
     only, skip = names("LUNA_REGRESSION_ONLY"), names("LUNA_REGRESSION_SKIP")
     for n in vcat(only, skip)
         any(c -> c.name == n, RegressionCases.CASES) ||
@@ -77,11 +80,17 @@ function selected()
     end
     cases = isempty(only) ? RegressionCases.CASES :
             filter(c -> c.name in only, RegressionCases.CASES)
-    filter(c -> !(c.name in skip), cases)
+    cases = filter(c -> !(c.name in skip), cases)
+    #= What the header says is what the *user asked for*, not the 21 names which survived
+       it: a list of everything which ran leaves the reader to spot what is missing. =#
+    parts = String[]
+    isempty(only) || push!(parts, "only: " * join(only, ", "))
+    isempty(skip) || push!(parts, "skipped: " * join(skip, ", "))
+    (cases, isempty(parts) ? "" : "  (" * join(parts, "; ") * ")")
 end
 
 const BASE = basecommit()
-const CASES = selected()
+const CASES, SELECTION = selected()
 const BASEDIR = get(ENV, "LUNA_REGRESSION_DIR",
                     joinpath(Luna.Utils.cachedir(), "regression", BASE))
 
@@ -94,8 +103,7 @@ isdir(BASEDIR) || error(
 @printf("  baseline commit: %s\n", BASE)
 @printf("  baseline dir:    %s\n", BASEDIR)
 @printf("  cases:           %d of %d%s\n", length(CASES), length(RegressionCases.CASES),
-        length(CASES) == length(RegressionCases.CASES) ? "" :
-        " (" * join([c.name for c in CASES], ", ") * ")")
+        SELECTION)
 @printf("\n%-24s %-9s %11s %10s %11s %10s  %s\n",
         "case", "mode", "Eω diff", "Eω tol", "stats diff", "stats tol", "worst quantity")
 @printf("%s\n", "-"^112)

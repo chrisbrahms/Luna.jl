@@ -20,7 +20,7 @@
 =#
 using Luna
 import Luna: RK45, Grid, Modes, Fields, LinearOps, Nonlinear, NonlinearRHS, Output,
-             PhysData, Utils, DeviceSpec, HostSpec
+             PhysData, Utils, Boundaries, DeviceSpec, HostSpec
 import LinearAlgebra
 import BenchmarkTools: @benchmarkable, run as brun, minimum as bminimum
 import Printf: @printf, @sprintf
@@ -80,8 +80,16 @@ function prepare(spec, N)
         #= Both forms of the operator. `Luna.run` needs the host `Float64` one, because
            `Boundaries.setup` wraps it there (the evanescent clamp and the two absorbers
            are host scalar code) and `Luna.run` uploads the result itself; a stepper built
-           by hand, as `steptime` does, needs it already on the device. =#
-        (Eω, linop, Luna.upload_like(Eω, linop), transform, grid, FT)
+           by hand, as `steptime` does, needs it already on the device.
+
+           The device copy is made from the *clamped* operator, not the raw one:
+           `boundary=:none` still puts the free-space operator through
+           `Boundaries.evanescent`, and without it the evanescent `κ` on this grid makes
+           the interaction picture's `exp(κ Δz)` overflow, so a hand-built stepper would
+           be timed on `Inf`/`NaN` data. `evanescent` also tapers the transform's
+           normalisation to match, which is what `Luna.run` does. =#
+        clamped = Boundaries.evanescent(linop, transform, FLENGTH/NSTEPS)
+        (Eω, linop, Luna.upload_like(Eω, clamped), transform, grid, FT)
     end
 end
 

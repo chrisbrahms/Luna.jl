@@ -1200,14 +1200,16 @@ end
    only in their arithmetic; `boundary_N` is small enough that the absorber's reference
    length does not cap `max_dz` and undo that. =#
 function radialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3, λ0=800e-9,
-                    R=1e-3, N=24, w0=200e-6, plasma=false, raman=false,
-                    precision=nothing, boundary=:rate)
+                    R=1e-3, N=24, w0=200e-6, plasma=false, raman=false, npol=1,
+                    noise_field=nothing, precision=nothing, boundary=:rate)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (400e-9, 2000e-9), 100e-15) :
         Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
     rg = Grid.RadialGrid(R, N)
     nfunλ = PhysData.ref_index_fun(gas, pres)
-    nfun = (λ; z=0.0) -> nfunλ(λ)
+    #= The number of polarisation components is decided by what `nfun` returns, which is
+       what `Luna.setup` reads off the normalisation (`size(normfun(0), 2)`). =#
+    nfun = npol == 2 ? ((λ; z=0.0) -> (nfunλ(λ), nfunλ(λ))) : ((λ; z=0.0) -> nfunλ(λ))
     linop = LinearOps.make_const_linop(grid, rg, nfun)
     ρ = PhysData.density(gas, pres)
     dens = z -> ρ
@@ -1224,9 +1226,13 @@ function radialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3, λ0=
                                            Nonlinear.RamanPolarEnv(grid.to, rr))
     end
     normfun = NonlinearRHS.const_norm_radial(grid, rg, nfun)
-    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
+    #= θ ≠ 0 puts field in *both* polarisation components (the input is rotated by θ, the
+       second component carrying cos θ), so a two-component run is not one with an empty
+       first component. =#
+    inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength,
+                                     θ=npol == 2 ? π/6 : 0.0)
     Eω, transform, FT = Luna.setup(grid, rg, dens, normfun, Tuple(resp), inputs;
-                                   device=spec, precision)
+                                   noise_field, device=spec, precision)
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
     h = flength/8
     Luna.run(Eω, grid, linop, transform, FT, out;
@@ -1716,6 +1722,48 @@ end
     # the Raman response contributes: this is not a comparison of two Kerr-only runs
     plain, _ = radialcase(Grid.RealGrid, HostSpec(); gas=:N2, energy=50e-6, raman=false)
     @test maximum(abs, hr["Eω"] .- plain["Eω"])/maximum(abs, plain["Eω"]) > 1e-6
+end
+
+#= Two polarisation components. This is the only shape in which the reshaped Hankel GEMM
+   can differ at all from the per-view loop it replaces -- `m` goes from `nto` to `2nto` --
+   and "the Hankel step as one GEMM" measures that on a bare product; here it is a whole
+   propagation, so the interleaved `(it, ip)` row order is exercised through the response
+   protocol, the boundaries and the stepper as well. =#
+@testset "two polarisation components on JLArray" begin
+    href, htr = radialcase(Grid.RealGrid, HostSpec(); npol=2)
+    dref, dtr = radialcase(Grid.RealGrid, JLSpec; npol=2)
+    @test size(dtr.Eto_r, 2) == 2
+    @test size(href["Eω"], 2) == 2
+    # both components carry field, so this is not a one-component run in disguise
+    for ip in 1:2
+        @test maximum(abs, href["Eω"][:, ip, :, :]) > 0
+    end
+    @test radialdiff(href, dref) < 1e-10
+end
+
+#= The modified shot-noise path: the noise field is uploaded, taken to the time domain
+   with the device inverse plan and then k -> r with the device `Tbwd`, and a second
+   block-sized buffer holds field+noise. The same host noise field goes into both runs, so
+   they are comparable. =#
+@testset "the radial noise field on JLArray" begin
+    grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 100e-15)
+    N = 24
+    nfω = Fields.generate_noise_field(grid)
+    nf = zeros(ComplexF64, (length(grid.ω), 1, N))
+    nf[grid.sidx, 1, :] .= nfω[grid.sidx] .* ones(1, N)
+
+    href, htr = radialcase(Grid.RealGrid, HostSpec(); N, noise_field=nf)
+    dref, dtr = radialcase(Grid.RealGrid, JLSpec; N, noise_field=nf)
+
+    @test dtr.Et_noise isa JLArray{Float64, 3}
+    @test dtr.Et_nl isa JLArray{Float64, 3}
+    @test size(dtr.Et_noise) == size(dtr.Eto_r)
+    @test Luna.all_resident(JLSpec, dtr.Et_noise, dtr.Et_nl)
+    # the noise really is there, and it is the same field on both array types
+    @test maximum(abs, Array(dtr.Et_noise)) > 0
+    @test maximum(abs, Array(dtr.Et_noise) .- htr.Et_noise)/
+          maximum(abs, htr.Et_noise) < 1e-14
+    @test radialdiff(href, dref) < 1e-10
 end
 
 @testset "radial envelope Raman on JLArray" begin

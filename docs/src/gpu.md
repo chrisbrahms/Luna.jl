@@ -165,9 +165,14 @@ output = Output.MemoryOutput(0, 1e-2, 11)
 Luna.run(Eω, grid, linop, transform, FT, output; zmax=1e-2)
 ```
 
-The `normfun` is built before the device is known, so `Luna.setup` moves it for you; you
-can also build it on the device directly with the `spec` keyword of `norm_radial` /
-`const_norm_radial`.
+The `normfun` is built before the device is known, so `Luna.setup` moves it for you. On a
+device or `Float32` run that means **replacing** it: `NonlinearRHS.retarget` builds a new
+`FreeSpaceNorm` on the run's array type, the transform holds that one, and the object your
+script still refers to is no longer part of the propagation — calling `reflength!` on it,
+or reading its `out`, afterwards does nothing useful. Reach it through the transform
+(`transform.normfun`), or build it on the device in the first place with the `spec` keyword
+of `norm_radial` / `const_norm_radial`, in which case `retarget` returns it unchanged. On
+the default host `Float64` path nothing is replaced.
 
 This is the geometry where a GPU is worth using. A mode-averaged run has one transverse
 column and is launch-bound; a radial run has one per radial point. Measured on an M1 Pro

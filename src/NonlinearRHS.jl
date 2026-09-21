@@ -1057,7 +1057,8 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
     if !isnothing(noise_field)
         Eωo_noise = alloc(spec, CT, (length(grid.ωo), np, N))
         Et_noise = alloc(spec, TT, (length(grid.to), np, N))
-        to_time!(Et_noise, todevice(spec, noise_field ./ scaling.Eref), Eωo_noise, IFT)
+        nf = isunity(scaling) ? noise_field : noise_field ./ scaling.Eref
+        to_time!(Et_noise, todevice(spec, nf), Eωo_noise, IFT)
         Grid.radial_matmul!(Et_noise, Et_noise, Tbwd)
         Et_nl = alloc(spec, TT, (length(grid.to), np, N))
     else

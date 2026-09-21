@@ -147,7 +147,7 @@ Against the base, **every row of every case in both modes is exactly `0.000e+00`
 moved, no step count moved.
 
 Against `evanescent` the record is the `gpu/int-D` one reproduced to every digit, with no
-new rows — the same twelve non-zero rows, the same values:
+new rows — the same sixteen non-zero rows (eight cases in two modes), the same values:
 
 | case | mode | `Eω` | `stats` |
 | --- | --- | ---: | ---: |
@@ -220,10 +220,10 @@ off, through the timing wrapper.
 | what | result | before |
 | --- | --- | --- |
 | `test/test_regression.jl` × 3 | 460/0, 460/0, 6/0 — the record above | |
-| `test/test_device.jl` (JLArrays) | **675 pass, 0 fail**, 36 testsets | 611 / 31 |
+| `test/test_device.jl` (JLArrays) | **687 pass, 0 fail**, 38 testsets | 611 / 31 |
 | `test/test_metal.jl` (Metal 1.11, hardware) | **452 pass, 0 fail**, 20 testsets | 386 / 16 |
 | `test/test_freespace.jl` | **77 pass, 0 fail** | 77 pass |
-| `test/test_boundaries.jl` | **182 pass, 0 fail** | 182 pass |
+| `test/test_boundaries.jl` (with JLArrays in the environment) | **184 pass, 0 fail** | 184 pass |
 | `include("docs/make.jl")` | the 9 pre-existing unresolved `@ref`s, none new | |
 | the five radial examples | all run | |
 
@@ -242,6 +242,13 @@ off, through the timing wrapper.
   Kerr / Kerr+plasma / Kerr+Raman, `boundary=:rate`, fixed steps) run on the host and on
   `JLArray`, plus residency assertions on the transform, its mirrors, its Hankel matrices
   and the retargeted normalisation.
+- `two polarisation components on JLArray` (review round 1): the same propagation with
+  `npol = 2`, which is the only shape in which the reshaped GEMM can differ from the
+  per-view loop at all. The input is rotated by `θ = π/6` so that both components carry
+  field, and the test asserts that.
+- `the radial noise field on JLArray` (review round 1): a transform built with a
+  `noise_field`, so that the upload, the device `IFT` and `Tbwd` at setup, the `Et_nl`
+  buffer and their residency are covered. The same host noise field goes into both runs.
 
 Measured differences (per save, normalised by the largest `|Eω|` in that save — the gate's
 metric; an elementwise relative difference is meaningless in the k-channels the evanescent
@@ -254,6 +261,8 @@ taper has emptied):
 | radial field Kerr+plasma | 9.844e-16 |
 | radial field Kerr+Raman | 6.223e-16 |
 | radial envelope Kerr+Raman | 8.383e-16 |
+| radial field Kerr, two polarisation components | 8.481e-16 |
+| radial field Kerr with a shot-noise field | 1.095e-15 |
 
 The plasma case runs on a tighter grid at a smaller waist than the Kerr ones so that argon
 actually ionises, and the test asserts the ionised fraction is non-zero — otherwise it would
@@ -294,42 +303,46 @@ same size as the `Float32`-vs-`Float64` one, i.e. it is single precision and not
 
 | N | | CPU `Float64` | CPU `Float32` | Metal `Float32` |
 | ---: | --- | ---: | ---: | ---: |
-| 64 | Hankel GEMM | 95.7 µs | 48.2 µs | 170.7 µs |
-| | right-hand side | 365.9 µs | 208.8 µs | 494.0 µs |
-| | one step | 3.460 ms | 2.499 ms | 3.545 ms |
-| | propagation | 72.1 ms | 51.6 ms | 93.6 ms |
-| 256 | Hankel GEMM | 1.395 ms | 703.6 µs | 287.1 µs |
-| | right-hand side | 3.480 ms | 1.858 ms | 773.3 µs |
-| | one step | 26.96 ms | 16.79 ms | 5.439 ms |
-| | propagation | 556.0 ms | 341.8 ms | 114.6 ms |
-| 1024 | Hankel GEMM | 22.23 ms | 11.12 ms | 592.6 µs |
-| | right-hand side | 47.68 ms | 24.09 ms | 1.215 ms |
-| | one step | 313.8 ms | 169.4 ms | 8.404 ms |
-| | propagation | 6.51 s | 3.47 s | 210.6 ms |
+| 64 | Hankel GEMM | 95.7 µs | 48.2 µs | 173.3 µs |
+| | right-hand side | 363.0 µs | 210.4 µs | 562.1 µs |
+| | one step | 3.499 ms | 2.528 ms | 3.930 ms |
+| | propagation | 72.0 ms | 52.3 ms | 77.3 ms |
+| 256 | Hankel GEMM | 1.399 ms | 706.9 µs | 291.2 µs |
+| | right-hand side | 3.542 ms | 1.859 ms | 885.1 µs |
+| | one step | 27.41 ms | 16.83 ms | 5.579 ms |
+| | propagation | 568.0 ms | 346.7 ms | 121.2 ms |
+| 1024 | Hankel GEMM | 22.39 ms | 11.25 ms | 1.126 ms |
+| | right-hand side | 48.62 ms | 24.85 ms | 1.255 ms |
+| | one step | 319.4 ms | 174.7 ms | 8.517 ms |
+| | propagation | 6.53 s | 3.50 s | 201.1 ms |
 
 Crossover, from the narrowing sweep (`LUNA_BENCH_NRADIAL=96,128,192`), propagation wall
 time:
 
 | N | CPU `Float64` | CPU `Float32` | Metal `Float32` |
 | ---: | ---: | ---: | ---: |
-| 64 | 72.1 ms | 51.6 ms | 93.6 ms |
-| 96 | 125.9 ms | 86.4 ms | 83.5 ms |
-| 128 | 192.0 ms | 126.8 ms | 102.8 ms |
-| 192 | 348.3 ms | 221.4 ms | 89.7 ms |
-| 256 | 556.0 ms | 341.8 ms | 114.6 ms |
-| 1024 | 6.51 s | 3.47 s | 210.6 ms |
+| 64 | 72.0 ms | 52.3 ms | 77.3 ms |
+| 96 | 125.7 ms | 86.7 ms | 100.9 ms |
+| 128 | 188.9 ms | 126.9 ms | 104.9 ms |
+| 192 | 357.6 ms | 221.1 ms | 120.3 ms |
+| 256 | 568.0 ms | 346.7 ms | 121.2 ms |
+| 1024 | 6.53 s | 3.50 s | 201.1 ms |
 
 **Metal passes the `Float64` host between 64 and 96 radial points, and the `Float32` host
-between 96 and 128.** At 1024 points it is 31× the `Float64` host and 16× the `Float32` one,
-and the Hankel GEMM alone is 38× faster. This is the first geometry in the project where a
+between 96 and 128.** At 1024 points it is 32× the `Float64` host and 17× the `Float32` one,
+and the Hankel GEMM alone is 20× faster. This is the first geometry in the project where a
 GPU is worth using: the mode-averaged transform has one transverse column and is
 launch-bound (`benchmark/device.jl`), and a radial run has one per radial point.
 
-The Metal propagation time is not monotonic in `N` between 96 and 256 (83.5 ms at 96,
-102.8 ms at 128, 89.7 ms at 192, 114.6 ms at 256). In that range the run is dominated by
-per-step launch and synchronisation overhead, which does not grow with `N`, so the variation
-is noise on a roughly constant floor; the trend is clean from 256 up, where the kernels
-dominate.
+Below about 256 radial points the Metal run is dominated by per-step launch and
+synchronisation overhead, which does not grow with `N`, so its times are a roughly constant
+floor with substantial run-to-run scatter: the same `N = 64` propagation measured 93.6 ms,
+91.4 ms (review round 1, independent run) and 77.3 ms across three runs on this shared
+machine, and the `N = 1024` Hankel GEMM 593 µs and 1.13 ms. The CPU columns reproduce to
+under 1 %. The crossover claim survives the scatter — at `N = 64` Metal is slower than the
+`Float64` host in all three runs and at `N = 256` it is 4.7× faster — but the Metal numbers
+below 256 should be read as "a few tens of ms, flat in `N`" rather than as the digits
+printed.
 
 ## Known gaps and open questions
 
@@ -343,9 +356,18 @@ dominate.
   because `ratemax` is a `Float64`). Found while writing `benchmark/radial.jl`, which did
   exactly that (copied from `benchmark/device.jl`, where it is harmless because a modal
   transform has no evanescent channels and `evanescent` returns the operator unchanged). The
-  benchmark now keeps both forms of the operator. Not fixed here — it is a one-line
-  conversion in three functions, but it is outside this brief and `gpu/23-tabulated-linop`
-  is rewriting how the operator reaches the device anyway.
+  benchmark now builds its hand-made stepper from the *clamped* host operator and uploads
+  that. Not fixed here — it is outside this brief and `gpu/23-tabulated-linop` is rewriting
+  how the operator reaches the device anyway.
+
+  **Recorded for `gpu/23-tabulated-linop` / `gpu/int-E`** (review round 1 confirmed the
+  analysis by reading the order in `src/Luna.jl`: `Boundaries.setup` at ~line 695,
+  `upload_like` at ~line 720, so the three functions only ever see the host `Float64`
+  operator today). What a fix needs:
+  `Boundaries.clampdecay` (`src/Boundaries.jl:359`) must convert `ratemax` to
+  `real(eltype(linop))`; `Boundaries.addloss` must do the same for `α`;
+  `Boundaries.addloss_k` (`:333`) must do the same *and* put its host `α` on the operator's
+  array type with `Luna.upload_like`. All three are exact no-ops at `Float64`.
 - **The refractive index is uploaded on every `fillnorm!` call.** For a constant index
   (`const_norm_radial`, which is what every radial example and the gate cases use) that is
   once per propagation. For a z-dependent one it is one `(Nω, Npol)` host evaluation and one
@@ -357,17 +379,55 @@ dominate.
   once, since the argument (the inverse transform consumes `Eωo` and nothing reads it again)
   has to be checked against each transform's own call sequence.
 - **No two-component radial gate case.** The reshaped GEMM's only possible rounding
-  difference is for two polarisation components, and it is measured directly in
-  `test_device.jl` (< 1e-14) rather than end to end. `test_freespace.jl` does run
-  two-component radial propagations, and they pass.
+  difference is for two polarisation components. It is measured directly in
+  `test_device.jl` as a bare product (< 1e-14) and, since review round 1, end to end as a
+  JLArray propagation against the host (`two polarisation components on JLArray`,
+  8.481e-16); `test_freespace.jl` runs two-component radial propagations on the host. The
+  *gate* still has none, which is the gap: a case would have to be added to `cases.jl` and
+  baselined, and no case in the matrix is a two-component free-space run.
 - **The `Float32` radial path is not exercised on the regression gate**, only in the tests:
   the gate is a `Float64` contract by construction.
+- **The modified shot-noise path is tested on `JLArray` but not on Metal** (review round 1,
+  finding 5). `the radial noise field on JLArray` covers the upload, the device `IFT` and
+  `Tbwd` at setup, `Et_nl`, residency and the propagation; the gate runs with
+  `shotnoise=false` by construction.
 - **Plasma and Raman are not in the Metal radial testset**, only in the `JLArray` one. Their
   kernels are already covered on Metal by `gpu/13`/`gpu/14`'s own testsets (on device blocks
   and through mode-averaged propagations), and what this branch adds is the transform around
   them; a radial Metal plasma run takes about 40 s, which is more than the file's budget
   justifies for a third copy of the same kernel coverage. `metalradialcase` takes `plasma`
   and `raman` keywords, so adding them is a two-line change if a reviewer wants them.
+
+## Review round 1
+
+`scratchpad/reviews/gpu-20-radial-device-1.md`, verdict **approve with minor fixes**. Every
+load-bearing claim was independently reproduced (both gates, `test_device` 675,
+`test_metal` 452, the Metal agreement numbers, the Raman case's contribution and
+sensitivities, the benchmark and the crossover). The ten findings are addressed in one
+follow-up commit:
+
+| # | finding | fix |
+| --- | --- | --- |
+| 1 | `test_boundaries.jl` count was 182, not 184 | the file's last testset is skipped without `JLArrays` in the environment; the table now says 184 and says so |
+| 2 | "twelve non-zero rows" above a sixteen-row table | now "sixteen (eight cases in two modes)" |
+| 3 | the gate header listed the 21 cases which *ran*, not the one skipped | `selected()` returns a description built from the `ONLY`/`SKIP` lists as given; the header prints `21 of 22  (skipped: radial_field_raman)` and the docstring matches |
+| 4 | stale comment in `Luna.run` naming only `TransModeAvg` as carrying a scaling | names `TransRadial` too |
+| 5 | two device paths added but untested: `npol = 2` end to end, and the radial noise field | `radialcase` gains `npol` (with `θ = π/6` so both components carry field) and `noise_field`; two new testsets, `two polarisation components on JLArray` (8.481e-16 vs host) and `the radial noise field on JLArray` (`Et_noise` resident and bit-identical to the host's, propagation 1.095e-15) |
+| 6 | `retarget` silently replaces the caller's normalisation object | `docs/src/gpu.md` now says the transform holds a different object on a device run, that the caller's copy is dead, and how to avoid it (`transform.normfun`, or the `spec` keyword) |
+| 7 | `noise_field ./ Eref` allocated on the default path | guarded with `isunity(scaling)`, as everywhere else |
+| 8 | `spatialcollar` allocated a field-sized prototype used only for `similar` | `RadialCollar` takes the buffer over instead of copying it; one field-sized array per radial run, not two |
+| 9 | `benchmark/radial.jl`'s `step` column timed arithmetic on overflowed evanescent channels | `prepare` uploads the operator `Boundaries.evanescent` has clamped, which is what `boundary=:none` does inside `Luna.run` |
+| 10 | `radialdiff` defined twice with the same signature | the `test_metal.jl` one is `metalradialdiff` |
+
+The reviewer's own two-component JLArray measurement (7.295e-16) and the one now in the
+test file (8.481e-16) agree; the difference is the input rotation, which the test adds so
+that both components carry field.
+
+Re-run after the fixes: gate against `fa556e6f` (21 cases) **460 pass, 0 fail,
+`0.000e+00` on every row**; `test_device.jl` **687 pass, 0 fail, 38 testsets**;
+`test_boundaries.jl` **184 pass, 0 fail**; `test_freespace.jl` **77 pass, 0 fail**;
+`test_metal.jl` **452 pass, 0 fail, 20 testsets**; `benchmark/radial.jl` re-measured (the
+tables above are the new run).
 
 ## Deviations from GPU_PLAN.md
 

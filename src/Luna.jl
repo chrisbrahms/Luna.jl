@@ -661,8 +661,8 @@ function run(Eω, grid,
 
     #= The unit scaling the state and the polarisation are expressed in (`Luna.jl`'s
        `unitscaling`, GPU_PLAN.md 4.1): the identity for every transform which does not
-       carry one (only `NonlinearRHS.TransModeAvg` does, so far). Needed here only to
-       decide whether the output needs unscaling. =#
+       carry one (`NonlinearRHS.TransModeAvg` and `NonlinearRHS.TransRadial` do). Needed
+       here only to decide whether the output needs unscaling. =#
     scaling = runscaling(transform)
 
     #= `Output.jl` stays device-unaware (`ScaledOutput`'s docstring): wrap whenever the

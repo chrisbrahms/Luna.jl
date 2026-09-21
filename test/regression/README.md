@@ -101,9 +101,10 @@ LUNA_REGRESSION_DIR=<dir> LUNA_REGRESSION_ONLY=<new case> LUNA_REGRESSION_BASE=<
 ```
 
 writing it to a directory of its own so that the shared baseline directories, which the
-integration branches regenerate wholesale, are left alone. The header prints which cases
-were selected whenever it is not all of them; neither variable can make a failing case
-pass.
+integration branches regenerate wholesale, are left alone. The header prints the lists as
+they were given (`cases: 21 of 22  (skipped: radial_field_raman)`) whenever the selection
+is not the whole matrix; an unknown case name is an error, and neither variable can make a
+failing case pass.
 
 ### The compatibility shim in `cases.jl`
 
