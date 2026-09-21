@@ -3007,6 +3007,31 @@ end
     @test !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
 end
 
+#= `TransRadial` aliases the same buffer (gpu/int-E; `gpu/21` did it for the two
+   Cartesian transforms and left this one). It has four time-domain buffers rather than
+   two -- the Hankel step is out of place, so the field and the polarisation each need a
+   real-space and a k-space copy -- so five field-sized arrays, not three. =#
+@testset "TransRadial holds five field-sized buffers" begin
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        _, t = radialcase(GT, HostSpec())
+        @test t isa NonlinearRHS.TransRadial
+        @test t.Pωo === t.Eωo
+        @test length(fieldbuffers(t)) == 5
+        # the four time-domain buffers really are four distinct arrays
+        @test length(unique(objectid, Any[t.Eto_r, t.Eto_k, t.Pto_r, t.Pto_k])) == 4
+        @test size(t.Eωo, 1) == length(t.grid.ωo)
+    end
+    # with the modified shot-noise model, two more: the noise and the field+noise buffer
+    grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 100e-15)
+    rg = Grid.RadialGrid(1e-3, 24)
+    nfω = Fields.generate_noise_field(grid)
+    nf = zeros(ComplexF64, (length(grid.ω), 1, rg.N))
+    nf[grid.sidx, :, :] .= nfω[grid.sidx] .* ones(1, 1, rg.N)
+    _, tn = radialcase(Grid.RealGrid, HostSpec(); noise_field=nf)
+    @test length(fieldbuffers(tn)) == 7
+    @test !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
+end
+
 #= 2-D Cartesian free space end to end on a device, field-resolved and envelope, with the
    χ⁽²⁾ responses and `boundary=:rate`. This is the exit test of the branch on the 2-D
    side: the region-(1,3) plans, the two-component response protocol, the crystal-optics

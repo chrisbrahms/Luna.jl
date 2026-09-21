@@ -263,12 +263,35 @@ The array method **allocates a copy** rather than subtracting in place:
 identical fibre, i.e. the same linop is deliberately reused across `Luna.run` calls, and an
 in-place subtraction would compound the absorber on every reuse.
 """
-addloss(linop::AbstractArray, α) = linop .- α./2
+
+#= `Boundaries.setup` is called by `Luna.run` before the operator is uploaded, so in a
+   propagation these three see a host `Float64` operator and the conversions below are
+   identities. A caller who uploads the operator first (or builds it on a device) hands
+   them a `ComplexF32` device array instead, and a `Float64` host `α`/`ratemax` would then
+   promote the result back to `Float64` -- off the device, and in an element type Metal's
+   kernel compiler rejects. `_likeop` puts the absorber's own numbers in the operator's
+   real type and, for an array, on the operator's array type. For the closure forms the
+   operator's type is not known until the closure is called, so the converted array is
+   built on the first call and kept. =#
+_likeop(op::AbstractArray, x::Number) = scalar(op, x)
+_likeop(op::AbstractArray, x::AbstractArray) = upload_like(op, x)
+
+#= The converted `α`, built once and reused. `Ref{Any}` rather than a typed field because
+   the operator's array type is only known when the closure is first called; the branch is
+   perfectly predicted and the broadcast which follows it is field-sized. =#
+function _cachedlike(cache::Ref, op, x)
+    isnothing(cache[]) && (cache[] = _likeop(op, x))
+    cache[]
+end
+
+addloss(linop::AbstractArray, α) = linop .- _likeop(linop, α)./2
 
 function addloss(linop!, α)
+    cache = Ref{Any}(nothing)
+    αh = α./2
     function linop_absorbing!(out, z)
         linop!(out, z)
-        out .-= α./2
+        out .-= _cachedlike(cache, out, αh)
         out
     end
 end
@@ -330,13 +353,15 @@ Like [`addloss`](@ref), for a power absorption coefficient `α` defined over the
 k axes of a free-space operator: the operator has shape `(Nω, Npol, Nk...)` and `α` has
 shape `Nk...`, so it is broadcast along ω and polarisation.
 """
-addloss_k(linop::AbstractArray, α) = linop .- reshape(α, 1, 1, size(α)...)./2
+addloss_k(linop::AbstractArray, α) =
+    linop .- reshape(_likeop(linop, α), 1, 1, size(α)...)./2
 
 function addloss_k(linop!, α)
-    αr = reshape(α, 1, 1, size(α)...)
+    cache = Ref{Any}(nothing)
+    αh = reshape(α./2, 1, 1, size(α)...)
     function linop_kabsorbing!(out, z)
         linop!(out, z)
-        out .-= αr./2
+        out .-= _cachedlike(cache, out, αh)
         out
     end
 end
@@ -355,12 +380,16 @@ transverse grid. Clamping alone would inflate the driven amplitude of those chan
 ([`NonlinearRHS.reflength!`](@ref)), which removes the source from exactly the channels the
 clamp touches. See "Free space" in the module docstring.
 """
-clampdecay(linop::AbstractArray, ratemax) = @. complex(max(real(linop), -ratemax), imag(linop))
+function clampdecay(linop::AbstractArray, ratemax)
+    rm = _likeop(linop, ratemax)
+    @. complex(max(real(linop), -rm), imag(linop))
+end
 
 function clampdecay(linop!, ratemax)
     function linop_clamped!(out, z)
         linop!(out, z)
-        @. out = complex(max(real(out), -ratemax), imag(out))
+        rm = _likeop(out, ratemax)
+        @. out = complex(max(real(out), -rm), imag(out))
         out
     end
 end

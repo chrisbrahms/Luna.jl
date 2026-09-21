@@ -1677,6 +1677,11 @@ a device.
   multiply requires that).
 - `prefac`: the z-independent part of the frequency-domain normalisation,
   `ωwin·(-iω)·Pref`, precombined on the host.
+- `Eωo`, `Pωo`: the oversampled frequency-domain buffer, held under both names because it
+  is the same array: `to_time!` transforms out of it before anything writes `Pωo`, so one
+  buffer serves both passes. The transform therefore holds five field-sized arrays
+  (`Eto_r`, `Eto_k`, `Pto_r`, `Pto_k` and this one), or seven with the modified
+  shot-noise model.
 - `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, nr)`
   for the modified shot-noise model, or `nothing`.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
@@ -1697,7 +1702,7 @@ struct TransRadial{TT, ωT, RGT, FTT, IFTT, nT, rT, gT, gvT, dT, iT, mT, pT, eT,
     Eto_r::TT # Buffer array for field on oversampled time grid
     Eto_k::TT # Buffer array for field on oversampled time grid
     Eωo::ωT # Buffer array for field on oversampled frequency grid
-    Pωo::ωT # Buffer array for NL polarisation on oversampled frequency grid
+    Pωo::ωT # === Eωo: the same buffer under the name the polarisation pass uses
     idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
     Tfwd::mT # forward Hankel transform matrix, in the time-domain element type
     Tbwd::mT # backward Hankel transform matrix, in the time-domain element type
@@ -1749,7 +1754,14 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
     Pto_r = similar(Eto_r)
     Eto_k = similar(Eto_r)
     Pto_k = similar(Eto_r)
-    Pωo = similar(Eωo)
+    #= One field-sized buffer fewer: the oversampled frequency-domain buffer does double
+       duty. `to_time!` writes the field into it and transforms out of it into `Eto_k`,
+       and nothing reads it again -- the two Hankel steps and the responses work on
+       `Eto_k`/`Eto_r`/`Pto_r`/`Pto_k` -- so `to_freq!` can write the nonlinear
+       polarisation into the same array. The two never appear as the input and the output
+       of one FFT call, which a device plan would reject. Same argument and same saving as
+       `TransFree`/`TransFree2D` (`freebuffers`). =#
+    Pωo = Eωo
     idcs = CartesianIndices(size(Pto_r)[3:end])
     gv = gridvectors(grid, spec)
     #= Our own copies of the grid's transform matrices in the type we multiply: a GEMM

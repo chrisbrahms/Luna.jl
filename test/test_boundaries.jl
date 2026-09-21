@@ -560,6 +560,63 @@ GPUArraysCore.allowscalar(false)
     end
 end
 
+#= `Luna.run` calls `Boundaries.setup` before it uploads the operator, so in a propagation
+   `addloss`/`addloss_k`/`clampdecay` always see a host `Float64` operator. A caller who
+   uploads it first -- or builds it on a device, as `benchmark/free.jl` does -- hands them
+   a `ComplexF32` device array, and a `Float64` host `α`/`ratemax` used to promote the
+   result back to `ComplexF64` on the host, which Metal's kernel compiler would reject
+   outright. The three must keep the operator's array type and element type. =#
+@testset "the operator absorbers on an uploaded operator" begin
+    grid = Grid.RealGrid(800e-9, (400e-9, 4000e-9), 0.2e-12)
+    Rs = 50e-6
+    q = Grid.RadialGrid(Rs, 16)
+    nfunλ = PhysData.ref_index_fun(:Ar, 1)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    ℓ = 1e-3/20
+    ratemax = Boundaries.MAX_αℓ/(2ℓ)
+
+    linop_h = LinearOps.make_const_linop(grid, q, nfun, true)
+    proto = Luna.alloc(Luna.DeviceSpec(BJLArray, Float32), ComplexF32, size(linop_h))
+    linop_d = Luna.upload_like(proto, linop_h)
+    @test linop_d isa BJLArray{ComplexF32, 3}
+
+    αk = Boundaries.rate(Boundaries.kprofile(q, 0.1), ℓ)
+    αω = Boundaries.spectral_rate(grid, 1e-3)
+
+    for (fd, fh) in ((Boundaries.clampdecay(linop_d, ratemax),
+                      Boundaries.clampdecay(linop_h, ratemax)),
+                     (Boundaries.addloss(linop_d, αω),
+                      Boundaries.addloss(linop_h, αω)),
+                     (Boundaries.addloss_k(linop_d, αk),
+                      Boundaries.addloss_k(linop_h, αk)))
+        @test fd isa BJLArray{ComplexF32, 3}
+        @test size(fd) == size(linop_h)
+        scale = maximum(abs, fh)
+        @test maximum(abs, Array(fd) .- fh)/scale < 1e-6
+    end
+
+    #= The closure forms convert on their first call and keep the conversion. A closure
+       which writes the device operator stands in for `LinearOps.make_linop`'s, which is
+       host scalar code and cannot write into a device array at all. =#
+    linopf = (out, z) -> (out .= linop_d; out)
+    for (mk, ref) in ((l -> Boundaries.clampdecay(l, ratemax),
+                       Boundaries.clampdecay(linop_h, ratemax)),
+                      (l -> Boundaries.addloss(l, αω),
+                       Boundaries.addloss(linop_h, αω)),
+                      (l -> Boundaries.addloss_k(l, αk),
+                       Boundaries.addloss_k(linop_h, αk)))
+        out = similar(linop_d)
+        f! = mk(linopf)
+        f!(out, 0.0)
+        @test out isa BJLArray{ComplexF32, 3}
+        firstcall = Array(out)
+        f!(out, 0.0) # the cached conversion is reused, not rebuilt
+        @test Array(out) == firstcall
+        scale = maximum(abs, ref)
+        @test maximum(abs, firstcall .- ref)/scale < 1e-6
+    end
+end
+
 isnothing(BOUNDARIES_SCALAR_WAS) ? delete!(task_local_storage(), :ScalarIndexing) :
                                    task_local_storage(:ScalarIndexing, BOUNDARIES_SCALAR_WAS)
 

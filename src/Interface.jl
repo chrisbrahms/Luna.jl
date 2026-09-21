@@ -549,15 +549,16 @@ function prop_capillary_args(radius, flength, gas, pressure;
     #= `device=nothing` means "not specified". It resolves to `Luna.device_request()`,
        i.e. `Luna.settings["device"]` as the user set it -- so an untouched call follows a
        loaded GPU package exactly as the low-level interface does -- only when the
-       propagation is mode-averaged (`mode_s` a single mode, the only geometry with a
-       device path at all) *and* every response it was built with is device-capable
-       (`Nonlinear.device_capable`, true for the Kerr, plasma, Raman and χ⁽²⁾
-       responses). Otherwise it resolves to the CPU regardless of
+       propagation has a device path (`hasdevicepath` below: mode-averaged, or multimode
+       with `modal_integral=:fixed`) *and* every response it was built with is
+       device-capable (`Nonlinear.device_capable`, true for the Kerr, plasma, Raman and
+       χ⁽²⁾ responses). Otherwise it resolves to the CPU regardless of
        `Luna.settings["device"]`, exactly as gpu/10 hardcoded, so that loading a GPU
-       package does not turn a silent, working default call -- multimode, or
-       field-resolved with plasma on by default -- into an error: only an *explicit*
-       `device`/`precision` request reaches `_cpu_only!`'s check (multimode/radial) or
-       `_check_responses_device_capable!`'s (mode-averaged with a non-Kerr response).
+       package does not turn a silent, working default call -- multimode on the adaptive
+       transverse integral, or a user-written response -- into an error: only an
+       *explicit* `device`/`precision` request reaches `Luna.setup_modal`'s check (the
+       adaptive transverse integral) or `_check_responses_device_capable!`'s (a response
+       with no device kernel).
 
        An explicit `precision` counts as an explicit request even with `device` left
        unspecified: `precision=Float32` with a response which has no device kernel is a
