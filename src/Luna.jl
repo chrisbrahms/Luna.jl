@@ -750,7 +750,10 @@ function run(Eω, grid,
        transform's own z-dependent quantities are tabulated either way, which for a
        constant operator is a two-node table and no change to the arithmetic that matters. =#
     if tabulate_linop
-        ztab = zmax + max_dz
+        #= `init_dz` as well as `max_dz`: the first step is taken at `init_dz` before
+           `steplims!` has had a chance to clamp it, and `Boundaries.setup` only reduces
+           it to `max_dz` for `boundary=:rate`. =#
+        ztab = zmax + max(max_dz, init_dz)
         transform = NonlinearRHS.tabulate(transform, z0, ztab, linop_tol, Eω)
         if !(linop isa AbstractArray)
             linop = LinearOps.TabulatedLinop(linop, Eω, z0, ztab; tol=linop_tol)

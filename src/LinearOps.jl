@@ -584,9 +584,11 @@ function _stack(vs::Vector{<:AbstractArray})
 end
 
 #= Locate z in the node vector: the interval index, the normalised position in it and its
-   width. Outside the table the end interval is used, which extrapolates rather than
-   erroring -- the table covers `[z0, zmax + max_dz]`, so this only happens if a caller
-   steps past the end it was built for. =#
+   width. Outside the table the nearest end node is returned exactly (s = 0 or 1), i.e. the
+   quantity is held constant rather than extrapolated: a cubic Hermite run past its interval
+   diverges, and holding the value is the safe thing to do with an argument that should not
+   occur. `Luna.run` builds the table over everything the stepper can ask for -- `zmax` plus
+   the largest step it can take -- so this is a guard, not a working mode. =#
 function _locate(zs::Vector{Float64}, z::Real)
     if z <= zs[1]
         return 1, 0.0, zs[2] - zs[1]

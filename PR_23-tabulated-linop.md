@@ -89,10 +89,12 @@ one so far) is affected.
 
 `run` takes `tabulate_linop=false` and `linop_tol=1e-6` and builds both tables after
 `Boundaries.setup`, so the operator includes the absorber and the evanescent clamp, and
-over `[z0, zmax + max_dz]` with the absorber's `max_dz` — `RK45.solve` runs
+over `[z0, zmax + max(max_dz, init_dz)]` with the absorber's `max_dz` — `RK45.solve` runs
 `while tn <= tmax` and so overshoots `zmax` by up to one step, and that step's stages are
 what the last saved plane is interpolated from (GPU_PLAN.md review finding 9; PR 440's
-fixed 5 % margin is not enough for `boundary=:none`). A constant operator is left alone: it
+fixed 5 % margin is not enough for `boundary=:none`). `init_dz` is in there because the
+first step is taken at `init_dz` before `steplims!` can clamp it, and `Boundaries.setup`
+only reduces it to `max_dz` for `boundary=:rate`. A constant operator is left alone: it
 is already exact in the propagator. `linoptype` reports `"tabulated"` in the output's
 `simulation_type` group.
 
@@ -222,6 +224,30 @@ untabulated one does, and the `Float32` tables cost nothing measurable next to t
 `Float32` state itself — which is what the secant subtraction is for.
 
 
+## Regression gate
+
+21 cases in two run modes, the environment `test/regression/README.md` prescribes
+(`:estimate`, one FFTW thread, one BLAS thread, no wisdom, `julia -t 1`), run on the final
+tree.
+
+| baseline | result | largest difference |
+| --- | --- | --- |
+| `fa556e6f` (source-identical to the base `90826dc4`) | **460 pass, 0 fail** | **0.000e+00**, every case, both modes |
+| `fdf8dbe3` (`evanescent`) | **460 pass, 0 fail** | 7.240e-05 (`multimode_field_plasma` adaptive statistics) |
+
+The first row is the gate for this branch and it is exactly zero, as it has to be:
+tabulation is opt-in and nothing on the default path changed. The second row is the
+project's accumulated distance from `evanescent` and is identical, row for row, to what
+`PR_int-D.md` recorded for the base — this branch adds nothing to it.
+
+```
+LUNA_REGRESSION_BASE=fa556e6f julia --project=$PWD -t 1 test/test_regression.jl
+LUNA_REGRESSION_BASE=fdf8dbe3 julia --project=$PWD -t 1 test/test_regression.jl
+```
+
+The tabulated deltas are documented above ("What it does to the answer") and are
+deliberately *not* gated: they are a different discretisation, not a rounding difference.
+
 ## Tests
 
 All run with `Luna.set_fftw_mode(:estimate)`, `set_fftw_threads(1)`,
@@ -231,7 +257,7 @@ All run with `Luna.set_fftw_mode(:estimate)`, `set_fftw_threads(1)`,
 | --- | --- | --- |
 | `test/test_linops.jl` | **258 pass, 0 fail** (62 of them new) | `julia --project=$PWD -t 1 -e 'using Luna; include("test/test_linops.jl")'` |
 | `test/test_device.jl` | **651 pass, 0 fail** (36 testsets) | as above, from an environment with `JLArrays` |
-| `test/test_metal.jl` | **414 pass, 0 fail** | from an environment with `Metal`, `using Luna, Metal` first |
+| `test/test_metal.jl` | **414 pass, 0 fail** (22 of them new) | from an environment with `Metal`, `using Luna, Metal` first |
 | `test/test_gradient.jl`, `test/test_tapers.jl`, `test/test_interface.jl` | **349 pass, 0 fail** between them | as `test_linops.jl` |
 
 New in `test/test_linops.jl` (`@testset "tabulated linear operator"`, 62 tests): the table
