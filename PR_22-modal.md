@@ -103,12 +103,16 @@ asking for it explicitly through `stats_kwargs` is an error which says why.
 
 ### The three host-hardcodings §4.4 names
 
-- `reset!`'s `::Array{ComplexF64,2}` annotation is gone.
-- The `TransModal` buffer fields are type parameters instead of concrete `Array{...}`.
-- The host `Vector{Float64}` `Cubature` returns is still there, and is now the *stated*
-  reason the adaptive transform is host- and `Float64`-only: the constructor refuses
-  anything else and names the fixed rule, instead of being made parametric for a path it
-  could not take. `TransModalFixed` is the parametric one.
+- `reset!`'s `::Array{ComplexF64,2}` annotation is gone; it takes any array.
+- The host `Vector{Float64}` `Cubature` returns is still there, and it is now the
+  *stated* reason the adaptive transform is host- and `Float64`-only: its constructor
+  refuses any other `spec`/`scaling` and names the fixed rule.
+- The concrete buffer fields of `TransModal` are therefore kept, not made parametric for
+  a path the transform cannot take, and the docstring says why. The transform's own
+  time-domain buffers are parametric in the element type, as they were before; the
+  complex ones stay `Array{ComplexF64}` because the driver's result is reinterpreted into
+  them. `TransModalFixed` is the parametric transform, and it is the one which runs on a
+  device.
 
 ## Deviations from GPU_PLAN.md and from the brief
 
