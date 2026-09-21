@@ -262,18 +262,39 @@ function (f::CentreOfMass)(d, Eω, Et, z, dz)
         if ndims(Eω) > 1
             num = Array(_zipreduce1(_wabs2, +, zero(RT), f.ωd, Eω))
             den = Array(sum(abs2, Eω; dims=1))
-            d["ω0"] = squeeze(Float64.(num) ./ Float64.(den))
+            d["ω0"] = _dropfreq(Float64.(num) ./ Float64.(den))
         else
             num = _zipreduce(_wabs2, +, zero(RT), f.ωd, Eω)
             d["ω0"] = Float64(num)/Float64(sum(abs2, Eω))
         end
     else
-        d["ω0"] = squeeze(Maths.moment(f.ω, abs2.(Eω); dim=1))
+        d["ω0"] = _dropfreq(Maths.moment(f.ω, abs2.(Eω); dim=1))
     end
 end
 
-squeeze(ω0::Array{T, 1}) where T = ω0[1]
-squeeze(ω0::Array{T, 2}) where T = ω0[1, :]
+#= What a reduction along the frequency axis leaves behind depends on the rank of what
+   was reduced, and only on that: a mode-averaged state (nω,) leaves a scalar, a modal or
+   an on-axis state (nω, ncols) one value per column, and a state with transverse axes
+   keeps them. This used to be `Stats.squeeze`, with one method for each of the first two
+   cases and a `MethodError` for anything else -- which is why the default statistics did
+   not run on a radial or free-space state at all, on the host as much as on a device. =#
+_dropfreq(x::AbstractArray{<:Any, 1}) = x[1]
+_dropfreq(x::AbstractArray) = dropdims(x; dims=1)
+
+#= The `i`th column of a state: everything at index `i` of the second axis, which is the
+   mode axis of a modal state and the polarisation axis of a radial or free-space one.
+   `copy` rather than a view, because the energy functionals reshape what they are given.
+   For a state of rank 2 this is `Eω[:, i]`, which is what the statistics below did
+   before they had to cope with transverse axes as well. =#
+_column(Eω, i) = copy(selectdim(Eω, 2, i))
+
+#= A statistic which is one number per column: a scalar for a state with no column axis,
+   otherwise a vector over it, with everything past the second axis integrated or reduced
+   by `f` itself. =#
+function _bycolumn(f, Eω)
+    ndims(Eω) == 1 && return f(Eω)
+    [f(_column(Eω, i)) for i in axes(Eω, 2)]
+end
 
 struct SpectralEnergy{F, W}
     energyfun_ω::F
@@ -310,10 +331,8 @@ statlabel(f::SpectralEnergy) = f.key
 function (f::SpectralEnergy)(d, Eω, Et, z, dz)
     if _onstate(f, Eω)
         d[f.key] = _weightedenergy(f.w, f.prefac*f.Eref2, Eω)
-    elseif ndims(Eω) > 1
-        d[f.key] = [f.energyfun_ω(Eω[:, i]) for i=1:size(Eω, 2)]
     else
-        d[f.key] = f.energyfun_ω(Eω)
+        d[f.key] = _bycolumn(f.energyfun_ω, Eω)
     end
 end
 
@@ -388,10 +407,8 @@ statlabel(f::SpectralEnergyWindow) = f.key
 function (f::SpectralEnergyWindow)(d, Eω, Et, z, dz)
     if _onstate(f, Eω)
         d[f.key] = _weightedenergy(f.w, f.prefac*f.Eref2, Eω)
-    elseif ndims(Eω) > 1
-        d[f.key] = [f.energyfun_ω(Eω[:, i].*f.window) for i=1:size(Eω, 2)]
     else
-        d[f.key] = f.energyfun_ω(Eω.*f.window)
+        d[f.key] = _bycolumn(Eωi -> f.energyfun_ω(Eωi.*f.window), Eω)
     end
 end
 
