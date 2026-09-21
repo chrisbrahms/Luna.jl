@@ -79,12 +79,58 @@ transform holds a [`Luna.GridVectors`](@ref) mirror of the vectors its kernels u
 `DeviceSpec(Array, Float64)` the mirror aliases the grid's own vectors: no copy, no extra
 memory.
 
-Quantities which host scalar code still has to produce on every right-hand side — `β(z)`
+Quantities which host scalar code has to produce on every right-hand side — `β(z)`
 for a taper or a pressure gradient, a user-supplied `linop!` — go through a
 [`Luna.HostMirror`](@ref): a `Float64` host buffer, an optional staging buffer in the
 device precision, and the device array. On the host in double precision the device array
-*is* the host buffer and `upload!` does nothing. This is the interim arrangement until
-`gpu/23` tabulates them.
+*is* the host buffer and `upload!` does nothing. This is the fallback, and the path a
+user-supplied operator takes; `tabulate_linop=true` replaces it with tables (below).
+
+## Tabulated z-dependent quantities
+
+`Luna.run(...; tabulate_linop=true)` replaces every host quantity the step would otherwise
+evaluate with a table over `z`, built at setup and held on the state's array type:
+
+- [`LinearOps.TabulatedLinop`](@ref Luna.LinearOps.TabulatedLinop): the integrated operator
+  `Φ(z) = ∫ linop dz'`, read back with a cubic Hermite interpolant, from which
+  `RK45.make_prop!` builds `exp(Φ(t2) − Φ(t1))` — the exact interaction-picture propagator,
+  where the untabulated path's `exp(linop(t2)·Δz)` is a one-point rule. `Φ(t1)` is read once
+  per step (the six stages share it) and `Φ(t2)` once per distinct `t2`.
+- [`LinearOps.TabulatedVector`](@ref Luna.LinearOps.TabulatedVector) for `β(z)` and
+  [`LinearOps.TabulatedScalar`](@ref Luna.LinearOps.TabulatedScalar) for `Aeff(z)`, put in
+  place by `NonlinearRHS.tabulate`. These are values rather than integrals and no
+  derivative of either is available from the mode interface, so they are interpolated
+  linearly.
+
+The nodes are placed by bisection: an interval is accepted when the interpolant that will
+be read back agrees, at the interval's midpoint, with a directly computed value to the
+tolerance. That measures the error of the thing actually used, and it puts nodes at the
+features Luna's operators have — the `1/√z` cusp of a gradient filled from vacuum, a
+junction in a multi-section fill — without refining anywhere else. The design is PR 440's
+`TabulatedUnitaryPhase` generalised to the full complex operator.
+
+`TabulatedLinop` stores not `Φ` but its deviation from the secant through the ends of the
+table, and the propagator adds `L̄·(t2 − t1)` back in the same broadcast. In exact
+arithmetic that is the same number; in `Float32` it stores the operator's *variation* along
+`z` rather than its accumulated phase. `make_linop` already subtracts the frame, so `max|Φ|`
+is tens to hundreds of radians (34 rad over 0.1 m of gradient, 359 rad over 1 m) and the
+deviation is 11.3 times smaller over the same span. Rounding `ΔΦ` to `Float32` both ways,
+the subtraction buys a factor of 4 to 11 in its error — 2.1e-7 rad against 1.3e-6 at 0.1 m,
+2.7e-5 against 1.0e-4 at 10 m. It is a reduction of the rounding error, not the difference
+between working and not working, and it costs nothing: a cubic Hermite is exact on a linear
+function, so the node placement and the interpolation error are unchanged, and a
+z-independent operator ends up storing nothing at all.
+
+`Luna.run` tabulates into a transform of its own and leaves the caller's object alone, so a
+statistics function built from `transform.aeff` before the run would keep calling the
+untabulated one. `prop_capillary` therefore tabulates `Aeff` itself, over `[0, flength]`,
+before `Stats.default` closes over it; `NonlinearRHS._aefftab` rebuilds a wider table from
+that one's `src` for the propagation, which needs `Aeff` up to one step past the end of the
+fibre. A low-level caller who builds statistics by hand and wants the same has to pass a
+`LinearOps.TabulatedScalar` to `Luna.setup` as `aeff`, which is all `prop_capillary` does.
+
+What this does not cover: a `linop!` which is genuinely discontinuous in `z` cannot be
+tabulated to tolerance, and the bisection stops at its depth or node limit and warns.
 
 ## Unit scaling
 

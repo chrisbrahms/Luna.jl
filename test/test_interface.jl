@@ -618,5 +618,89 @@ end
     @test length(ognlse3["stats"]["z"]) < length(ognlse["stats"]["z"])
 end
 
+#= `tabulate_linop=true` has to take `Modes.Aeff` out of the step for the *statistics* as
+   well as for the propagation. `Luna.run` tabulates into a transform of its own and leaves
+   the caller's alone, so `prop_capillary` tabulates `Aeff` before `Stats.default` closes
+   over it. =#
+@testset "tabulate_linop tabulates Aeff for the statistics" begin
+    afun = z -> 125e-6*(1 - 0.2*z/0.1) # a taper, so Aeff genuinely depends on z
+    kw = (; λ0=800e-9, energy=1e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
+          trange=400e-15, saveN=3, plasma=false, raman=false, shotnoise=false)
+    _, _, _, tr0, _, _ = Luna.Interface.prop_capillary_args(afun, 0.1, :He, 1.0; kw...)
+    _, _, _, trt, _, _ = Luna.Interface.prop_capillary_args(afun, 0.1, :He, 1.0; kw...,
+                                                            tabulate_linop=true)
+    #= The transform `Stats.default` closed over: a table with tabulation on, the bare
+       callable without it. The normalisation shares the one table. =#
+    @test !(tr0.aeff isa Luna.LinearOps.TabulatedScalar)
+    @test trt.aeff isa Luna.LinearOps.TabulatedScalar
+    @test trt.norm!.aeff === trt.aeff
+    @test trt.aeff.z[1] == 0.0 && trt.aeff.z[end] == 0.1 # over the fibre
+    for z in (0.0, 0.037, 0.1)
+        @test isapprox(trt.aeff(z), trt.aeff.src(z); rtol=1e-5)
+    end
+end
+
+#= And that it works: `Modes.Aeff` is memoised on `(mode, z)`, so the size of its cache is
+   the number of distinct `z` it was asked about. A `MarcatiliMode` has an analytic `Aeff`
+   and never reaches the memoised method, so this uses a delegated mode, which is the case
+   GPU_PLAN.md section 4.5 names ("z-dependent non-Marcatili modes"). Low-level interface,
+   because that is where a mode like this can be built. =#
+@testset "tabulate_linop stops the memoised Aeff cache growing" begin
+    cachenames = filter(n -> startswith(string(n), "##Aeff_memoized_cache"),
+                        names(Luna.Modes, all=true))
+    if length(cachenames) != 1
+        @warn "Memoize's cache for Modes.Aeff was not found; skipping the cache-growth test."
+        @test true
+    else
+        cache = getfield(Luna.Modes, only(cachenames))
+        flength = 1e-2
+        grid = Luna.Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+        afun = z -> 75e-6*(1 - 0.2*z/flength)
+        m = Luna.Capillary.MarcatiliMode(afun, :Ar, 1.0, loss=false)
+        #= Overriding `field` stops `delegated` forwarding `Aeff`/`N`, so both go through
+           the memoised generic method -- which is the point. =#
+        dm = Luna.Modes.delegated(
+            m; field=(mm, args...; z=0.0) -> Luna.Modes.field(mm, args...; z=z))
+        ρ = Luna.PhysData.density(:Ar, 1.0)
+        resp = (Luna.Nonlinear.Kerr_field(Luna.PhysData.γ3_gas(:Ar)),)
+        inputs = Luna.Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-7)
+        #= `linop_tol=1e-4` keeps the tables small: this is about whether the cache grows
+           with the step count, not about how many nodes a table has. `max_dz` is the same
+           in both runs so that the tables span the same interval. =#
+        tol = 1e-4
+        maxdz = flength/5
+        #= `rtol=1e-13` on the second run of each pair pins the step size at `min_dz`
+           (`RK45.steplims!` accepts a step it cannot shrink further), so the two runs
+           differ in step count while `max_dz`, and hence the tables, stay the same. =#
+        function cachegrowth(tabulate_linop, nsteps, rtol=1e-6)
+            linop, βfun! = Luna.LinearOps.make_linop(grid, dm, 800e-9)
+            aeff = tabulate_linop ?
+                Luna.LinearOps.TabulatedScalar(z -> Luna.Modes.Aeff(dm, z=z),
+                                               0.0, flength; tol) :
+                (z -> Luna.Modes.Aeff(dm, z=z))
+            Eω, transform, FT = Luna.setup(grid, z -> ρ, resp, inputs, βfun!, aeff)
+            statsfun = Luna.Stats.default(grid, Eω, dm, linop, transform; gas=:Ar)
+            out = Luna.Output.MemoryOutput(0, flength, 3, statsfun)
+            dz = flength/nsteps
+            empty!(cache) # a cache; emptying it only costs recomputation
+            Luna.run(Eω, grid, linop, transform, FT, out;
+                     zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=maxdz,
+                     tabulate_linop, linop_tol=tol, rtol)
+            length(cache), length(out["stats"]["z"])
+        end
+        u5, n5 = cachegrowth(false, 5)
+        u20, n20 = cachegrowth(false, 20, 1e-13)
+        t5, _ = cachegrowth(true, 5)
+        t20, _ = cachegrowth(true, 20, 1e-13)
+        @test n20 > 2*n5 # the second run of each pair really did take more steps
+        # without a table the cache holds at least one entry per accepted step, and grows
+        @test u5 > n5
+        @test u20 > 2*u5
+        # with one, the entries are the tables' nodes: the propagation adds none
+        @test t20 == t5
+        empty!(cache)
+    end
+end
+
 ##
 Logging.global_logger(old_logger)

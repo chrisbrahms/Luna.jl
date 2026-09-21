@@ -1,5 +1,5 @@
-import Luna: PhysData, Grid, LinearOps, Modes, Capillary
-import Test: @testset, @test
+import Luna: PhysData, Grid, LinearOps, Modes, Capillary, RK45
+import Test: @testset, @test, @test_logs
 import Luna.PhysData: wlfreq
 
 R = 5e-3
@@ -218,5 +218,263 @@ end
         out = similar(linop)
         linopf(out, 0.0)
         @test out ≈ linop
+    end
+end
+
+#= Adaptive tabulation of a z-dependent operator (GPU_PLAN.md section 4.5 layer 2). What
+   is checked here is the table and the propagator built from it, against an operator whose
+   integral is known in closed form and against Luna's own z-dependent operators; what
+   tabulation does to a whole propagation is in `test_device.jl` and `test_metal.jl`. =#
+@testset "tabulated linear operator" begin
+    L = 0.1
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    nω = length(grid.ω)
+    proto = zeros(ComplexF64, nω)
+    zend = 1.05L # zmax + max_dz, which is the span Luna.run tabulates over
+
+    #= An operator with the awkwardness Luna's own have and an integral in closed form: a
+       √z term, whose z derivative is infinite at z = 0, exactly as the density of a
+       pressure gradient filled from zero behaves. The constants are of the size a
+       capillary's are -- a propagation constant of ~1e7 rad/m and a loss of ~1/m -- so the
+       absolute tolerance means the same thing here as it does there. =#
+    k0 = @. 1e7*(1 + 0.1*sin(1:nω))
+    k1 = @. 1e4*(1 + 0.5*cos(1:nω))
+    k2 = @. 1.0*(1 + 0.5*sin(2*(1:nω)))
+    cusp!(out, z) = (@. out = -im*(k0 + k1*sqrt(z)) - k2; out)
+    cuspΦ(z) = @. -im*(k0*z + k1*2/3*z^1.5) - k2*z
+
+    @testset "against a known integral, tol = $tol" for tol in (1e-4, 1e-6, 1e-8)
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, zend; tol, quiet=true)
+        @test tab.z[1] == 0.0
+        @test tab.z[end] == zend # the table covers zmax + max_dz
+        @test issorted(tab.z)
+        @test tab.err <= tol # the bisection reached the tolerance it reports
+        @test size(tab.Φ) == (nω, length(tab.z))
+        @test size(tab.dΦ) == size(tab.Φ)
+        out = similar(proto)
+        err = 0.0
+        for z in (0.0, 1e-9, 1e-5, 1e-3, L/7, L/2, 0.83L, L, 1.04L)
+            LinearOps.integrated!(out, tab, z)
+            err = max(err, maximum(abs, out .- cuspΦ(z)))
+        end
+        #= The criterion is on one interval at a time and the differences accumulate over
+           the intervals up to z, so the total is allowed a few of them. =#
+        @test err < 20tol
+    end
+
+    @testset "tighter tolerance, more nodes, smaller error" begin
+        coarse = LinearOps.TabulatedLinop(cusp!, proto, 0.0, zend; tol=1e-4, quiet=true)
+        fine = LinearOps.TabulatedLinop(cusp!, proto, 0.0, zend; tol=1e-8, quiet=true)
+        @test length(fine.z) > 3*length(coarse.z)
+        out = similar(proto)
+        errs = map((coarse, fine)) do tab
+            maximum((1e-5, L/3, 0.71L)) do z
+                LinearOps.integrated!(out, tab, z)
+                maximum(abs, out .- cuspΦ(z))
+            end
+        end
+        @test errs[2] < 1e-3*errs[1]
+    end
+
+    #= What is stored is the deviation from the secant, which the propagator adds back.
+       Both ends of the table are on the secant by construction, and the deviation is what
+       has to fit in Float32 on a device. =#
+    @testset "secant subtraction" begin
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, L; tol=1e-8, quiet=true)
+        out = similar(proto)
+        LinearOps.phase!(out, tab, 0.0)
+        @test all(iszero, out)
+        LinearOps.phase!(out, tab, L)
+        @test maximum(abs, out) < 1e-8
+        LinearOps.integrated!(out, tab, L)
+        @test out ≈ tab.secant .* L
+        full = similar(proto)
+        LinearOps.integrated!(full, tab, L/2)
+        @test tab.scale < 0.1*maximum(abs, full)
+        @test tab.scale ≈ maximum(abs, tab.Φ)
+    end
+
+    #= The propagator: `exp(Φ(t2) - Φ(t1))` against the closed-form integral, the
+       backward propagation as its inverse, and the caches not changing the answer when
+       the arguments repeat (six stages share one `t1`, and `t2` repeats between the
+       forward and backward propagation of each stage). =#
+    @testset "propagator" begin
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, L; tol=1e-10, quiet=true)
+        prop! = RK45.make_prop!(tab, proto)
+        y0 = ones(ComplexF64, nω)
+        t1, t2 = 0.021L, 0.023L
+        y = copy(y0)
+        prop!(y, t1, t2)
+        ref = exp.(cuspΦ(t2) .- cuspΦ(t1))
+        @test maximum(abs, y .- ref)/maximum(abs, ref) < 1e-8
+        prop!(y, t1, t2, true)
+        @test maximum(abs, y .- y0) < 1e-12
+        #= The cached readback is the same number as the fresh one: `prop!` above has
+           already been called at these arguments and now takes the cache, while a
+           propagator built here has not. =#
+        y2 = copy(y0)
+        prop!(y2, t1, t2)
+        y3 = copy(y0)
+        RK45.make_prop!(tab, proto)(y3, t1, t2)
+        @test y2 == y3
+        # ... including after an intervening step at other arguments evicted it
+        prop!(y3, 0.5L, 0.6L)
+        y4 = copy(y0)
+        prop!(y4, t1, t2)
+        @test y4 == y2
+    end
+
+    #= Luna's own z-dependent operators. No closed form, so the table is checked against
+       one built to a much tighter tolerance, and the interesting property -- where the
+       nodes went -- directly. =#
+    function gradient_linop(p0, p1)
+        coren, _ = Capillary.gradient(:Ar, L, p0, p1)
+        m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+        (LinearOps.make_linop(grid, m, 800e-9)..., m)
+    end
+    function taper_linop()
+        afun = z -> 75e-6 + (50e-6 - 75e-6)*z/L
+        m = Capillary.MarcatiliMode(afun, :Ar, 1.0, loss=false, model=:full)
+        (LinearOps.make_linop(grid, m, 800e-9)..., m)
+    end
+
+    @testset "$name" for (name, linop!) in (
+            ("gradient 1 -> 0 bar", gradient_linop(1.0, 0.0)[1]),
+            ("gradient 0 -> 1 bar", gradient_linop(0.0, 1.0)[1]),
+            ("taper", taper_linop()[1]))
+        tol = 1e-6
+        tab = LinearOps.TabulatedLinop(linop!, proto, 0.0, zend; tol, quiet=true)
+        ref = LinearOps.TabulatedLinop(linop!, proto, 0.0, zend; tol=1e-10, quiet=true)
+        @test tab.z[end] == zend
+        @test tab.err <= tol
+        @test length(ref.z) > length(tab.z)
+        out = similar(proto)
+        rout = similar(proto)
+        err = 0.0
+        for z in (1e-7, 1e-4, 1e-3, L/7, L/2, 0.83L, L, 1.04L)
+            LinearOps.integrated!(out, tab, z)
+            LinearOps.integrated!(rout, ref, z)
+            err = max(err, maximum(abs, out .- rout))
+        end
+        @test err < 20tol
+    end
+
+    #= The nodes go where the operator is hard and not where it is not: a p₀ = 0 entrance
+       has a cusp at z = 0 and gets a bisection's worth of nodes there; a linear taper is
+       smooth and gets none. =#
+    @testset "node placement" begin
+        tol = 1e-6
+        cusp = LinearOps.TabulatedLinop(gradient_linop(0.0, 1.0)[1], proto, 0.0, zend;
+                                        tol, quiet=true)
+        smooth = LinearOps.TabulatedLinop(taper_linop()[1], proto, 0.0, zend;
+                                          tol, quiet=true)
+        @test cusp.z[2] - cusp.z[1] < 1e-3*zend
+        @test smooth.z[2] - smooth.z[1] > 1e-2*zend
+        @test count(<(0.01zend), cusp.z) > 5
+        @test count(<(0.01zend), smooth.z) <= 2
+    end
+
+    #= A z-independent operator written as a closure: two nodes, nothing stored beyond the
+       secant, and a propagator which reproduces the constant one. =#
+    @testset "z-independent closure" begin
+        m = Capillary.MarcatiliMode(75e-6, :Ar, 1.0, loss=false)
+        linop!, _ = LinearOps.make_linop(grid, m, 800e-9)
+        tab = LinearOps.TabulatedLinop(linop!, proto, 0.0, L; tol=1e-6, quiet=true)
+        @test length(tab.z) == 2
+        @test tab.scale < 1e-6
+        const_linop = similar(proto)
+        linop!(const_linop, 0.0)
+        @test maximum(abs, Array(tab.secant) .- const_linop) < 1e-6
+        y = ones(ComplexF64, nω)
+        yref = copy(y)
+        RK45.make_prop!(tab, proto)(y, 0.01, 0.013)
+        RK45.make_prop!(const_linop, proto)(yref, 0.01, 0.013)
+        @test maximum(abs, y .- yref) < 1e-10
+    end
+
+    #= The shape of the operator is not special-cased anywhere -- `_stack`, `selectdim`
+       and `phase!` work on any number of axes -- so a multimode operator tabulates the
+       same way. Four `MarcatiliMode`s on the same gradient, checked against a midpoint
+       quadrature fine enough that its own error is well below the tolerance. =#
+    @testset "a multimode operator" begin
+        coren, _ = Capillary.gradient(:Ar, L, 0.0, 1.0)
+        ms = [Capillary.MarcatiliMode(75e-6, coren, n=1, m=m, kind=:HE, loss=false)
+              for m = 1:4]
+        linop! = LinearOps.make_linop(grid, ms, 800e-9)
+        mproto = zeros(ComplexF64, nω, length(ms))
+        tab = LinearOps.TabulatedLinop(linop!, mproto, 0.0, zend; tol=1e-6, quiet=true)
+        @test size(tab.Φ) == (nω, length(ms), length(tab.z))
+        @test size(tab.secant) == (nω, length(ms))
+        @test tab.err <= 1e-6
+        out = similar(mproto)
+        buf = similar(mproto)
+        npanel = 20000
+        for z in (L/3, L)
+            LinearOps.integrated!(out, tab, z)
+            #= Midpoint over `npanel` panels. The integrand has a √z cusp at 0, whose
+               contribution to the midpoint error is O(h^{3/2}); at this panel count that
+               is below the tolerance being checked. =#
+            ref = zeros(ComplexF64, size(mproto))
+            h = z/npanel
+            for i = 1:npanel
+                linop!(buf, (i - 0.5)*h)
+                ref .+= buf .* h
+            end
+            @test maximum(abs, out .- ref) < 1e-4
+        end
+        y = ones(ComplexF64, size(mproto))
+        RK45.make_prop!(tab, mproto)(y, 0.3L, 0.31L)
+        @test all(isfinite, y)
+    end
+
+    #= Read outside the table, the value at the nearest end is used -- and the operator
+       readback says so, because the propagator adds the secant term whatever it returns,
+       so a step outside the table would propagate with the mean operator over the whole
+       of it. `Luna.run` builds the table over every z the stepper can reach, so this
+       cannot happen from there. =#
+    @testset "reading outside the table" begin
+        tab = LinearOps.TabulatedLinop(cusp!, proto, 0.0, L; tol=1e-6, quiet=true)
+        out = similar(proto)
+        ref = similar(proto)
+        @test_logs (:warn, r"outside") LinearOps.phase!(out, tab, 1.5L)
+        LinearOps.phase!(ref, tab, L)
+        @test out == ref
+        # ... and the value tables hold their end value silently, which is deliberate
+        atab = LinearOps.TabulatedScalar(z -> 1 + z^2, 0.0, L; tol=1e-6)
+        @test atab(1.5L) == atab(L)
+    end
+
+    #= The value tables: β and Aeff are interpolated rather than integrated, to a
+       tolerance relative to the largest value in the table. =#
+    @testset "value tables" begin
+        _, βfun!, m = gradient_linop(0.0, 1.0)
+        βtab = LinearOps.TabulatedVector(βfun!, proto, nω, 0.0, zend; tol=1e-8)
+        βref = zeros(Float64, nω)
+        err = 0.0
+        for z in (1e-7, 1e-3, L/3, 0.77L, L, 1.04L)
+            βfun!(βref, z)
+            err = max(err, maximum(abs, βtab(z) .- βref)/maximum(abs, βref))
+        end
+        @test err < 1e-7
+        @test βtab(0.31L) === βtab.buf # the buffer is reused
+        @test size(βtab.f) == (nω, length(βtab.z))
+
+        _, _, mt = taper_linop()
+        aeff = z -> Modes.Aeff(mt, z=z)
+        atab = LinearOps.TabulatedScalar(aeff, 0.0, zend; tol=1e-6)
+        for z in (0.0, 1e-4, L/3, L, 1.04L)
+            @test isapprox(atab(z), aeff(z); rtol=1e-5)
+        end
+        #= Aeff of a fixed-radius mode does not depend on z, so this is the two-node table
+           a uniform fibre gets, which is what makes tabulation one code path. =#
+        flat = LinearOps.TabulatedScalar(z -> Modes.Aeff(m, z=z), 0.0, L; tol=1e-6)
+        @test length(flat.z) == 2
+        @test flat(0.5L) ≈ Modes.Aeff(m)
+        #= The callable the table was built from is kept, so a table can be rebuilt over a
+           wider span without going through its own interpolant. =#
+        @test atab.src === aeff
+        wider = LinearOps.TabulatedScalar(atab.src, 0.0, 1.5zend; tol=1e-6)
+        @test wider.z[end] == 1.5zend
+        @test isapprox(wider(L/3), aeff(L/3); rtol=1e-5)
     end
 end

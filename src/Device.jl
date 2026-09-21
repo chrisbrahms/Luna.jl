@@ -514,9 +514,10 @@ Adapt.adapt_structure(to, g::GridVectors) = GridVectors(
 A length-`n` vector which is filled on the host in `Float64` and then made available on
 `spec`'s array type and precision by [`upload!`](@ref).
 
-This is the interim mechanism for quantities which are still evaluated by host scalar
-code on every right-hand side -- the propagation constant `β` of a tapered or
-pressure-graded waveguide, and a user-supplied `linop!` -- until `gpu/23` tabulates them.
+This is the mechanism for quantities which are evaluated by host scalar code on every
+right-hand side -- the propagation constant `β` of a tapered or pressure-graded waveguide,
+and a user-supplied `linop!`. `Luna.run(...; tabulate_linop=true)` replaces them with
+tables over `z` (`LinearOps.TabulatedVector`) and then no host code runs per stage at all.
 On `DeviceSpec(Array, Float64)` the device array *is* the host buffer and `upload!` does
 nothing, so the CPU path pays neither a copy nor a conversion.
 

@@ -1157,29 +1157,62 @@ function ramancase(spec; gas=:N2, pres=1.0, energy=50e-6, flength=2e-3, λ0=800e
     out, transform
 end
 
-#= A pressure gradient. `LinearOps.make_linop` gives a z-dependent operator closure and
-   `constβ` is left at its default of false, so this is the only case which exercises
-   `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s host-buffer branch -- the
-   two pieces of GPU_PLAN.md section 4.5 layer 1 which upload from the host on every stage
-   until gpu/23 tabulates them. Fixed steps, so that the only difference between the runs
-   is the arithmetic. =#
-function gradientcase(spec; gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9,
-                      precision=nothing)
+#= How many times a piece of host code was called, so that "no host work per stage" can be
+   checked by counting rather than by inspecting types. Wraps a callable of any arity:
+   `linop!(out, z)`, `βfun!(out, z)`, `aeff(z)` and `densityfun(z)`, the last of which is
+   called exactly once per right-hand side and so counts the stages. =#
+mutable struct CountCalls{F}
+    f::F
+    n::Int
+end
+CountCalls(f) = CountCalls(f, 0)
+(c::CountCalls)(args...; kwargs...) = (c.n += 1; c.f(args...; kwargs...))
+
+#= A pressure gradient and a taper. `LinearOps.make_linop` gives a z-dependent operator
+   closure and `constβ` is left at its default of false, so these are the only cases which
+   exercise `NormModeAvg`'s `HostMirror` branch and `RK45.make_prop!`'s host-buffer branch
+   -- the two pieces of GPU_PLAN.md section 4.5 layer 1 which upload from the host on every
+   stage -- and, with `tabulate_linop=true`, the tables which replace them (layer 2).
+   Fixed steps by default, so that the only difference between two runs is the arithmetic.
+
+   The third element of the return value counts the host calls each run made. =#
+function zcase(spec; kind=:gradient, gas=:Ar, pin=1.0, pout=0.0, flength=1e-2, λ0=800e-9,
+               precision=nothing, tabulate_linop=false,
+               linop_tol=LinearOps.DEFAULT_LINOP_TOL, nsteps=20, maxdz=nothing, rtol=1e-6)
     grid = Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15)
-    coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
-    m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
-    aeff(z) = Modes.Aeff(m, z=z)
+    if kind === :gradient
+        coren, densityfun = Capillary.gradient(gas, flength, pin, pout)
+        m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+    else
+        afun = z -> 75e-6 + (50e-6 - 75e-6)*z/flength
+        m = Capillary.MarcatiliMode(afun, gas, pin, loss=false, model=:full)
+        ρ = PhysData.density(gas, pin)
+        densityfun = z -> ρ
+    end
+    aeff = CountCalls(z -> Modes.Aeff(m, z=z))
+    dens = CountCalls(densityfun)
     resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
-    linop, βfun! = LinearOps.make_linop(grid, m, λ0)
+    linop0, βfun0! = LinearOps.make_linop(grid, m, λ0)
+    linop = CountCalls(linop0)
+    βfun! = CountCalls(βfun0!)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=1e-6)
-    Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff;
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
                                    device=spec, precision)
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
-    dz = flength/20
+    #= Fixed steps by default (`max_dz == min_dz == flength/nsteps`). `maxdz` decouples
+       the two, which the counting tests need: the span of the tables is `zmax + max_dz`,
+       so holding `max_dz` fixed makes two runs with different step counts build the same
+       table. =#
+    dz = flength/nsteps
+    mdz = isnothing(maxdz) ? dz : maxdz
     Luna.run(Eω, grid, linop, transform, FT, out;
-             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz)
-    out, transform
+             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=mdz, rtol,
+             tabulate_linop, linop_tol)
+    out, transform, (; linop=linop.n, β=βfun!.n, aeff=aeff.n, rhs=dens.n)
 end
+
+gradientcase(spec; kwargs...) = zcase(spec; kind=:gradient, kwargs...)
+tapercase(spec; kwargs...) = zcase(spec; kind=:taper, kwargs...)
 
 #= The difference between two free-space runs, normalised per save by the largest `|Eω|`
    in that save -- the metric the regression gate uses. An elementwise relative difference
@@ -1287,6 +1320,39 @@ end
     _, βc!, _, _ = LinearOps.make_const_linop(grid, mc, 800e-9)
     @test NonlinearRHS.norm_mode_average(grid, βc!, z -> Modes.Aeff(mc, z=z);
                                          constβ=true) isa NonlinearRHS.NormModeAvg
+end
+
+#= A caller-supplied normalisation (`Luna.setup`'s `norm!` keyword) is not one of Luna's
+   own and need not have an `aeff` field at all, so `tabulate` has to pass it through
+   rather than inspect it. Before this was guarded, `tabulate_linop=true` aborted such a
+   run with a `FieldError` before the first step. =#
+struct WrapperNorm{N}
+    n::N
+end
+(w::WrapperNorm)(nl, z) = w.n(nl, z)
+
+@testset "a caller-supplied normalisation is passed through" begin
+    flength = 1e-2
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    coren, densityfun = Capillary.gradient(:Ar, flength, 1.0, 0.0)
+    m = Capillary.MarcatiliMode(75e-6, coren, loss=false)
+    aeff(z) = Modes.Aeff(m, z=z)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),)
+    linop, βfun! = LinearOps.make_linop(grid, m, 800e-9)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
+    norm! = WrapperNorm(NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
+    Eω, transform, FT = Luna.setup(grid, densityfun, resp, inputs, βfun!, aeff; norm!)
+    # the unknown normalisation comes back untouched, and `β` is still evaluated per call
+    tab = NonlinearRHS.tabulate(transform, 0.0, flength, 1e-6, Eω)
+    @test tab.norm! === norm!
+    @test tab.aeff isa LinearOps.TabulatedScalar
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    dz = flength/20
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary=:none, init_dz=dz, min_dz=dz, max_dz=dz,
+             tabulate_linop=true)
+    @test all(isfinite, out["Eω"])
+    @test maximum(abs, out["Eω"]) > 0
 end
 
 # --- The device path proper, skipped without JLArrays -------------------------
@@ -1461,6 +1527,99 @@ end
         d = dref["Eω"][:, idx]
         @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
     end
+end
+
+#= gpu/23: the tabulated operator (GPU_PLAN.md section 4.5 layer 2) on a device. Three
+   things to establish: that the tables are device-resident and used, that the tabulated
+   run agrees between host and device to the same rounding level as the untabulated one,
+   and that no host code runs inside the propagation -- which is checked by counting the
+   calls, not by reading the types. The difference from the untabulated *discretisation*
+   is not a rounding-level quantity and is measured separately below. =#
+@testset "tabulated operator on JLArray: $kind" for (kind, mk) in (
+        ("gradient", gradientcase), ("taper", tapercase))
+    flength = 1e-2
+    href, htr, _ = mk(HostSpec(); flength, tabulate_linop=true)
+    dref, dtr, _ = mk(JLSpec; flength, tabulate_linop=true)
+
+    #= `Luna.run` tabulates into a transform of its own and does not modify the caller's,
+       so the tables are inspected by building the same thing here. What the propagation
+       above really did is measured by counting host calls, below. =#
+    dtab = NonlinearRHS.tabulate(dtr, 0.0, 1.05flength, 1e-6, dtr.Eωo)
+    htab = NonlinearRHS.tabulate(htr, 0.0, 1.05flength, 1e-6, htr.Eωo)
+    @test dtab.norm!.β isa LinearOps.TabulatedVector
+    @test dtab.norm!.β.f isa JLArray{Float64, 2}
+    @test dtab.norm!.β.buf isa JLArray{Float64, 1}
+    @test dtab.aeff isa LinearOps.TabulatedScalar
+    @test dtab.norm!.aeff isa LinearOps.TabulatedScalar
+    @test dtab.norm!.β(0.3flength) isa JLArray{Float64, 1}
+    # on the host the table is the host array it was built as: nothing is copied
+    @test htab.norm!.β.f isa Array{Float64, 2}
+    # the tabulated β is the one the untabulated path would have staged on the host
+    βh = zeros(Float64, length(htr.grid.ω))
+    htr.norm!.βfun!(βh, 0.37flength)
+    @test maximum(abs, htab.norm!.β(0.37flength) .- βh)/maximum(abs, βh) < 1e-6
+
+    @test dref["z"] ≈ href["z"]
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = dref["Eω"][:, idx]
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+    end
+end
+
+@testset "no host work per stage when tabulated" begin
+    #= Two runs of the same propagation with different step counts. `max_dz` is the same
+       in both, so the tables span the same interval and are built from the same number of
+       evaluations; anything the stepper evaluated on the host would scale with the number
+       of stages, which the right-hand side count shows really did change. =#
+    maxdz = 1e-2/20
+    _, _, coarse = gradientcase(JLSpec; tabulate_linop=true, nsteps=20, maxdz)
+    _, _, fine = gradientcase(JLSpec; tabulate_linop=true, nsteps=80, maxdz, rtol=1e-13)
+    @test fine.rhs > 1.5*coarse.rhs # the second run really did take more steps
+    @test fine.linop == coarse.linop
+    @test fine.β == coarse.β
+    @test fine.aeff == coarse.aeff
+
+    # ... where the untabulated path evaluates all three on the host at every stage
+    _, _, ecoarse = gradientcase(JLSpec; nsteps=20, maxdz)
+    _, _, efine = gradientcase(JLSpec; nsteps=80, maxdz, rtol=1e-13)
+    @test efine.rhs > 1.5*ecoarse.rhs
+    @test efine.linop > 1.5*ecoarse.linop
+    @test efine.β > 1.5*ecoarse.β
+    @test efine.aeff > 1.5*ecoarse.aeff
+    #= The tabulated counts are the cost of building the tables, which is fixed: at 20
+       steps it is comparable with what the untabulated path spends on stepping, and it
+       stops growing while the untabulated path's does not. =#
+    @test coarse.linop < efine.linop
+    @test coarse.β < efine.β
+end
+
+#= What tabulating the operator does to the answer. This is a change of discretisation --
+   the exact interaction-picture propagator instead of a one-point rule -- so it is not a
+   rounding-level difference and is not gated as one. The untabulated path's error is first
+   order in the step and the tabulated one's is not: the two converge to the same solution,
+   and the tabulated run at 20 steps is already closer to the well resolved answer than the
+   untabulated run at 20 times as many. =#
+@testset "tabulated vs untabulated discretisation: $kind" for (kind, mk) in (
+        ("gradient", gradientcase), ("taper", tapercase))
+    flength = 0.1 # a fibre long enough for the step size to matter
+    ref, _, _ = mk(HostSpec(); flength, nsteps=1280)
+    d(a, b) = maximum(map(axes(a["Eω"], 2)) do i
+        maximum(abs, a["Eω"][:, i] .- b["Eω"][:, i])/maximum(abs, b["Eω"][:, i])
+    end)
+    exact = [mk(HostSpec(); flength, nsteps=n)[1] for n in (20, 80, 320)]
+    tab = [mk(HostSpec(); flength, tabulate_linop=true, nsteps=n)[1] for n in (20, 80, 320)]
+    eerr = d.(exact, Ref(ref))
+    terr = d.(tab, Ref(ref))
+    # the untabulated path converges at first order in the step
+    @test eerr[1]/eerr[2] > 3 && eerr[2]/eerr[3] > 3
+    #= The tabulated run at 20 steps is closer to the reference than the untabulated one
+       at 320. The reference is itself a finite-step untabulated run, so what is left of
+       `terr` is largely the reference's own error, which is why this is a comparison
+       against `eerr` rather than an absolute number. =#
+    @test terr[1] < 0.5*eerr[3]
+    # and does not change with the step count, because its linear step is exact
+    @test terr[3] > 0.5*terr[1]
 end
 
 #= gpu/11's exit condition for this test file: RateAbsorber and the default statistics,

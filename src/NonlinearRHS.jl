@@ -20,6 +20,7 @@ import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING, GridVectors, HostM
 import Luna: alloc, todevice, gridvectors, assert_resident, all_resident, scalar,
              upload!, realtype, arraytype, isdevicespec, isunity
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
+import Luna: LinearOps
 import Luna.LinearOps: βz, transverse_k2
 import Logging
 using EllipsisNotation
@@ -794,8 +795,9 @@ ignored, which turns off optical shock formation/self-steepening.
 the linear operator is constant, i.e. for a waveguide of fixed radius at fixed pressure.
 `β` is then evaluated once at construction and divided into `pre`, so that no host code
 runs inside the right-hand side. With `constβ=false` (the default, and what a taper or a
-pressure gradient needs) `βfun!` is called on every evaluation and its result uploaded;
-that is the interim arrangement until `gpu/23` tabulates it.
+pressure gradient needs) `βfun!` is called on every evaluation and its result uploaded,
+unless [`tabulate`](@ref) has replaced the mirror with a table over `z`
+(`tabulate_linop=true` on [`Luna.run`](@ref)).
 """
 function norm_mode_average(grid, βfun!, aeff; shock=true, spec=HostSpec(),
                            scaling=UNIT_SCALING, constβ=false)
@@ -864,9 +866,15 @@ function (n::NormModeAvg{vT, mT, Nothing})(nl, z) where {vT, mT}
     @. nl = ifelse(mask, nl*(pre*sqrtaeff), z0)
 end
 
+#= `β` at `z`, on the array type the kernel broadcasts against. Two sources: a
+   `Luna.HostMirror`, filled by host scalar code and uploaded on every evaluation, or a
+   `LinearOps.TabulatedVector`, which reads it out of a z table and never touches the host
+   (`tabulate_linop=true`; the table ignores `βfun!`, which it was built from). =#
+_βdev(m::HostMirror, βfun!, z) = (βfun!(m.host, z); upload!(m))
+_βdev(tab, βfun!, z) = tab(z)
+
 function (n::NormModeAvg)(nl, z)
-    n.βfun!(n.β.host, z)
-    β = upload!(n.β)
+    β = _βdev(n.β, n.βfun!, z)
     sqrtaeff = scalar(nl, sqrt(n.aeff(z)))
     pre = n.pre
     mask = n.mask
@@ -1799,5 +1807,80 @@ end
    transform type exists. Transforms which are not free-space have nothing to taper. =#
 reflength!(t::Union{TransRadial, TransFree, TransFree2D}, ℓ; kwargs...) = reflength!(t.normfun, ℓ; kwargs...)
 reflength!(t, ℓ; kwargs...) = nothing
+
+
+#=================================================#
+#=========  TABULATION OF THE TRANSFORM  =========#
+#=================================================#
+
+"""
+    tabulate(transform, z0, z1, tol, proto)
+
+The transform with every z-dependent host quantity it evaluates inside the right-hand side
+replaced by a table over `[z0, z1]` built to relative tolerance `tol`, on the array type
+and precision of the propagating field `proto`.
+
+[`Luna.run`](@ref) calls this when `tabulate_linop=true`. The generic method returns the
+transform unchanged: only the mode-averaged transform has such quantities (the propagation
+constant `β(z)` and the effective area `Aeff(z)`), and only it is device-capable so far.
+A transform which is already z-independent gets a two-node table, which costs nothing and
+keeps one code path.
+
+The same generic method covers a caller-supplied normalisation (`Luna.setup`'s `norm!`
+keyword), which is passed through unchanged rather than inspected: only Luna's own
+normalisations are known to have an `aeff` to tabulate. It takes the `aeff` keyword the
+known ones take so that the call site does not have to know which it has.
+"""
+tabulate(t, z0, z1, tol, proto; aeff=nothing) = t
+
+function tabulate(t::TransModeAvg, z0, z1, tol, proto)
+    atab = _aefftab(t.aeff, nothing, z0, z1, tol)
+    #= `Luna.setup` passes the same `aeff` callable to the transform and to the
+       normalisation, so one table serves both and `Modes.Aeff` is called once per node
+       rather than twice. A caller who supplied two different ones, or a normalisation
+       which is not one of Luna's, gets `nothing` and tabulates its own. =#
+    shared = t.aeff === _normaeff(t.norm!) ? atab : nothing
+    TransModeAvg(t.Pto, t.Eto, t.Eωo, t.Pωo, t.FT, t.IFT, t.resp, t.grid, t.gv,
+                 t.densityfun, tabulate(t.norm!, z0, z1, tol, proto; aeff=shared), atab,
+                 t.Et_noise, t.Et_nl, t.scaling)
+end
+
+#= The `Aeff` callable of a normalisation, or `nothing` for one Luna did not build: a
+   caller-supplied `norm!` (`Luna.setup`'s keyword, `NonlinearRHS.check_norm`) need not
+   have the field at all, and reading it would abort the run before dispatch could help. =#
+_normaeff(n::Union{NormModeAvg, NormModeAvgGNLSE}) = n.aeff
+_normaeff(n) = nothing
+
+"""
+    _aefftab(f, shared, z0, z1, tol)
+
+The `Aeff` table to use: `shared` if one has already been built for this transform,
+otherwise a new one over `[z0, z1]`.
+
+A table which already covers the span is kept as it is. One which does not is rebuilt from
+its own source callable rather than from itself: `Luna.prop_capillary` tabulates `Aeff` over
+`[0, flength]` so that the statistics hold a table (see [`Luna.run`](@ref)'s
+`tabulate_linop`), and the propagation needs it up to one step past the end of the fibre.
+Rebuilding through the interpolant instead would place nodes at every kink of the
+interpolant it was reading.
+"""
+_aefftab(f, ::Nothing, z0, z1, tol) = LinearOps.TabulatedScalar(f, z0, z1; tol)
+_aefftab(f, tab, z0, z1, tol) = tab
+_aefftab(f::LinearOps.TabulatedScalar, ::Nothing, z0, z1, tol) =
+    (f.z[1] <= z0 && f.z[end] >= z1) ? f :
+        LinearOps.TabulatedScalar(f.src, z0, z1; tol)
+
+#= With `constβ` the propagation constant is already folded into `pre` and there is no
+   `βfun!` to tabulate; only the effective area is left. =#
+tabulate(n::NormModeAvg{vT, mT, Nothing}, z0, z1, tol, proto; aeff=nothing) where {vT, mT} =
+    NormModeAvg(n.pre, n.mask, n.β, n.βfun!, _aefftab(n.aeff, aeff, z0, z1, tol), n.scaling)
+
+function tabulate(n::NormModeAvg, z0, z1, tol, proto; aeff=nothing)
+    β = LinearOps.TabulatedVector(n.βfun!, proto, length(n.mask), z0, z1; tol)
+    NormModeAvg(n.pre, n.mask, β, n.βfun!, _aefftab(n.aeff, aeff, z0, z1, tol), n.scaling)
+end
+
+tabulate(n::NormModeAvgGNLSE, z0, z1, tol, proto; aeff=nothing) =
+    NormModeAvgGNLSE(n.pre, n.mask, _aefftab(n.aeff, aeff, z0, z1, tol), n.scaling)
 
 end
