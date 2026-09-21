@@ -13,6 +13,8 @@ where ``\hat{\mathbf{e}}_j(\mathbf{r_\perp}, z)`` is the orthonormal transverse 
 ```
 where ``S`` is the cross-sectional area of the waveguide. This transform is implemented in [`NonlinearRHS.TransModal`](@ref) for use within simulations and in [`Modes.overlap`](@ref) for decomposition of existing sampled fields. In both cases, the mode overlap integral is solved explicitly with a p-adaptive or h-adaptive cubature method.
 
+The same integral can instead be evaluated on a fixed Gauss quadrature rule ([`NonlinearRHS.TransModalFixed`](@ref), selected with `modal_integral=:fixed`). The transverse points are then known in advance, so the whole integral is two matrix products and a batched Fourier transform, which is what makes it the multimode transform that runs on a GPU; the cost of a step does not depend on the field, and the accuracy is the accuracy of the rule rather than a tolerance the solver reaches. See [Running on a GPU](@ref).
+
 The linear operator for a mode ``\mathcal{L}_j(\omega, z)`` is given by (see [`LinearOps.make_const_linop`](@ref))
 ```math
 \mathcal{L}_j(\omega, z) = i\left(\beta_j(\omega, z) - \frac{\omega}{v}\right) - \frac{1}{2}\alpha_j(\omega, z)\,,
@@ -45,6 +47,7 @@ The modules and functions that define and implement this decomposition for diffe
 - [RectModes.jl](@ref)
 - [Antiresonant.jl](@ref)
 - [`NonlinearRHS.TransModal`](@ref)
+- [`NonlinearRHS.TransModalFixed`](@ref)
 - [`NonlinearRHS.norm_modal`](@ref)
 - [`LinearOps.make_const_linop`](@ref)
 - [`LinearOps.make_linop`](@ref)

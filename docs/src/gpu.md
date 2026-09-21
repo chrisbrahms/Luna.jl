@@ -4,8 +4,8 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! warning "Work in progress: everything but multimode propagation"
-    This page describes what the device model does as of `gpu/21-free-device`.
+!!! warning "Work in progress"
+    This page describes what the device model does as of `gpu/int-E`.
     `prop_capillary` and `prop_gnlse` take `device` and `precision` keywords (below), and
     for mode-averaged propagation (`modes` a single mode) with the Kerr, plasma and
     Raman responses -- which is everything `prop_capillary` builds by default, in any gas
@@ -13,11 +13,15 @@ dependency of Luna: they are weak dependencies, loaded through package extension
     (`boundary=:rate`, the default) and the default per-step statistics. All three
     free-space geometries -- radially symmetric, 2-D Cartesian and full 3-D, with the
     Kerr, plasma, Raman and χ⁽²⁾ responses -- do too, through the low-level interface,
-    which is the only way to build one.
-    Multimode propagation (`TransModal`) is still host code; `Luna.setup`/`Luna.run`
-    refuse a device or a reduced precision for it rather than running it wrongly (or, for
-    the simple interface, error with a message naming the actual limitation). It follows
-    in `gpu/22-modal`; the page is completed in `gpu/32-docs`.
+    which is the only way to build one, and so does multimode propagation with
+    `modal_integral=:fixed` (below).
+    What is left on the host is `prop_gnlse`, the *adaptive* multimode transverse
+    integral (`modal_integral=:adaptive`, the default, whose cubature driver is host
+    scalar code), the per-step evaluation of the crystal-optics normalisation, and the
+    `fwhm_r` statistic. `Luna.setup`/`Luna.run` refuse a device or a reduced precision
+    for a *transform* which cannot do it rather than running it wrongly, and fall back
+    to the host for a *response* (or, for the simple interface, error with a message
+    naming the actual limitation). The page is completed in `gpu/32-docs`.
 
 ## Enabling it
 
@@ -133,14 +137,19 @@ round 1".)
 ## What runs where
 
 Anything Luna has not yet made device-capable runs on the host. At the moment that means
-the multimode transform (`TransModal`) alone. The mode-averaged transform and all three
-free-space ones -- `TransRadial`, `TransFree2D` and `TransFree` -- are device-capable, and
-so is every nonlinear response Luna ships: the Kerr responses, the χ⁽²⁾ responses, the
-plasma response and the Raman responses. `Luna.setup` refuses a device or a reduced
-precision for a *transform* which cannot do it, through the residency checks each of them
-makes, rather than running it wrongly. A *response* is not refused: it falls back to the
-host copy described under "An ad hoc response on a device" below, which is correct and
-slow.
+the *adaptive* multimode transform (`TransModal`, `modal_integral=:adaptive`, the default
+-- see "Multimode propagation" below) and `prop_gnlse`. The mode-averaged transform, all
+three free-space ones -- `TransRadial`, `TransFree2D` and `TransFree` -- and the
+fixed-quadrature multimode transform (`TransModalFixed`, `modal_integral=:fixed`) are
+device-capable, and so is every nonlinear response Luna ships: the Kerr responses, the
+χ⁽²⁾ responses, the plasma response and the Raman responses. Two pieces of per-step work
+are still host code inside otherwise device-capable runs: the crystal-optics
+normalisation evaluates its refractive indices on the host and stages the result (the
+propagation itself stays on the device), and the `fwhm_r` statistic has no device form.
+`Luna.setup` refuses a device or a reduced precision for a *transform* which cannot do
+it, through the residency checks each of them makes, rather than running it wrongly. A
+*response* is not refused: it falls back to the host copy described under "An ad hoc
+response on a device" below, which is correct and slow.
 
 `prop_capillary` and `prop_gnlse` never build a free-space run, so a free-space
 propagation on a device is set up through the low-level interface:
@@ -240,7 +249,8 @@ the initial state before it is uploaded (about 256 MB on the host at that grid),
 state-shaped time-domain block on the device.
 
 The absorbing boundaries (`boundary=:rate`, `:legacy` and `:none`) and the default
-statistics *do* run with a device state:
+statistics *do* run with a device state, for every device-capable transform -- the
+mode-averaged one, the three free-space ones and the fixed-quadrature multimode one:
 
 - `Boundaries.RateAbsorber`/`LegacyAbsorber` and the transverse collars are broadcasts
   and reductions over mirrored arrays (`Boundaries.jl`), like everything else per-step.
@@ -276,6 +286,55 @@ statistics *do* run with a device state:
   handing it to `Output.MemoryOutput`/`HDF5Output`. A `Float32` run's saved field is
   therefore in physical units already, and is `ComplexF32` -- `eltype(y)` is what the
   output allocates with, not always `ComplexF64`.
+
+### Multimode propagation
+
+A multimode propagation evaluates the nonlinear polarisation at transverse points, then
+integrates it against each mode's transverse field. `modal_integral` chooses how:
+
+- `:adaptive` (the default) drives an adaptive cubature rule, which places transverse
+  points itself until it reaches `radial_integral_rtol`. The driver
+  (`Cubature.pcubature_v`/`hcubature_v`) is host scalar code and hands its results back
+  as `Vector{Float64}`, so this cannot run on a device or in single precision; asking for
+  one is an error naming `modal_integral=:fixed`.
+- `:fixed` uses a fixed Gauss quadrature rule of `modal_nr` nodes along r (and, for the
+  full 2-D integral, `modal_nθ` along θ; they are `nr` and `nθ` on `Luna.setup`). Every
+  right-hand side costs the same, everything it does is a matrix product, a batched
+  transform or a broadcast, and it runs wherever the mode-averaged transform does.
+
+```julia
+using Luna, Metal
+prop_capillary(125e-6, 0.1, :Ar, 0.1;
+               λ0=800e-9, energy=50e-6, τfwhm=20e-15,
+               λlims=(200e-9, 3000e-9), trange=400e-15,
+               modes=4, modal_integral=:fixed, modal_nr=64)
+```
+
+The two are different discretisations of the same integral, so they agree to the accuracy
+of the quadrature rather than to rounding. For a set of HE₁ₘ modes, whose transverse
+fields are smooth, the default 64-node rule is far more accurate than the adaptive rule
+at its default 1e-3 tolerance: the two agree to 3e-16 (Kerr) and 2e-14 (Kerr and plasma)
+on one right-hand side, which is the *adaptive* rule's error, not the fixed rule's.
+
+Two things to check before using it:
+
+- **`modal_nr` has to resolve the transverse structure of the highest mode.** The rule is
+  not adaptive and will not tell you it is under-resolved. 64 is the default; a mode set
+  reaching HE₁₈ or beyond wants more.
+- **`modal_nθ` has to be at least `4h+1`** for modes of azimuthal order up to `h` (`h` is
+  `|n-1|` for an HE\_{nm} mode), because the θ rule is a periodic trapezoid and the
+  integrand of a cubic response projected back onto a mode reaches the harmonic `4h`.
+  Luna warns at setup when it can tell that it is too small. An HE₁ₘ set has `h = 0`, so
+  any number of θ nodes will do, and `full=false` (which `prop_capillary` picks for such a
+  set) uses a single one.
+
+`modal_integral=:fixed` does not collect the `mode_reconstruction_error`,
+`transverse_points` and `transverse_integral_error_*` statistics: those describe the
+adaptive rule's own behaviour. The fixed rule carries an embedded Gauss--Kronrod error
+estimate instead (`modal_kronrod=true`, which rounds `modal_nr` up to an odd number),
+which `NonlinearRHS.integral_error!` evaluates on demand; it becomes a statistic in a
+later branch. At the low level, `Stats.default` needs `mode_error=false` for this
+transform; `prop_capillary` does that for you.
 
 ### An ad hoc response on a device
 
@@ -440,11 +499,31 @@ on the device but the field is large.
 
 A GPU wins on many columns and large time grids; a mode-averaged single-column run is
 launch-bound and will not speed up. `benchmark/device.jl` times the mode-averaged
-propagation on each device and precision, sweeping the grid size, and
-`benchmark/radial.jl` does the same for the radial one, sweeping the number of radial
-points, and `benchmark/free.jl` for the 3-D Cartesian one, sweeping the transverse grid
-(the two tables under "What runs where" are their output). Run any of them from an
-environment which has Luna, BenchmarkTools and the GPU package.
+propagation on each device and precision, sweeping the grid size; `benchmark/radial.jl`
+does the same for the radial one, sweeping the number of radial points;
+`benchmark/free.jl` for the 3-D Cartesian one, sweeping the transverse grid (the two
+tables under "What runs where" are their output); and `benchmark/modal.jl` for a
+four-mode propagation on each transverse integral. Run any of them from an environment
+which has Luna, BenchmarkTools and the GPU package.
+
+Multimode is where a GPU has something to work on: the fixed rule evaluates the
+responses at all `nr` transverse points at once. Measured on an M1 Pro, four HE₁ₘ modes
+of a 75 µm capillary in argon, 10 fixed steps, one FFTW and one BLAS thread, one
+right-hand side:
+
+| | Kerr, 4100-sample state | Kerr, 16388 | Kerr+plasma, 4100 | Kerr+plasma, 16388 |
+| --- | ---: | ---: | ---: | ---: |
+| CPU `Float64` `:adaptive` (the default) | 938 µs | 4.12 ms | 2.96 ms | 11.9 ms |
+| CPU `Float64` `:fixed`, `nr=64` | 306 µs | 1.60 ms | 4.34 ms | 16.7 ms |
+| CPU `Float32` `:fixed`, `nr=64` | 165 µs | 714 µs | 3.82 ms | 15.4 ms |
+| Metal `Float32` `:fixed`, `nr=64` | 410 µs | 733 µs | 956 µs | 1.60 ms |
+
+Two things to read off. The fixed rule is not automatically cheaper on the CPU: the
+adaptive rule needs only about 17 transverse points for a smooth HE₁ₘ set, so a 64-node
+rule does roughly four times the work, which the Kerr rows hide (the transform count does
+not grow with `nr`) and the plasma rows do not. And the GPU's advantage grows with the
+work per node: 1.0× for Kerr at the small grid, 9.6× for Kerr and plasma at the large
+one against the same arithmetic on the CPU, 7.4× against the `Float64` adaptive default.
 
 ## Running the hardware tests
 

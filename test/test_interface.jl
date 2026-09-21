@@ -599,12 +599,45 @@ end
     @test maximum(abs, onothg32["Eω"][:, end] .- onothg["Eω"][:, end])/
           maximum(abs, onothg["Eω"][:, end]) < 1e-4
 
-    # multimode/radial propagation is not device-capable: refused, not silently ignored
+    #= Multimode propagation with the adaptive transverse integral is not
+       device-capable (its cubature driver is host scalar code returning
+       Vector{Float64}): refused, not silently ignored. =#
     @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
                                                device=DeviceSpec(Array, Float32))
     # ... but unaffected at the default device
     om = prop_capillary(args...; kwargs..., modes=4)
     @test size(om["Eω"], 2) == 4
+
+    #= The fixed quadrature rule is the multimode transform which does run in reduced
+       precision (and on a device; that is test_device.jl's and test_metal.jl's). =#
+    omf = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed, modal_nr=32)
+    @test size(omf["Eω"], 2) == 4
+    #= A different discretisation of the same integral, so it agrees with the adaptive
+       rule to the accuracy of the quadrature, not to rounding. The HE1m fields are
+       smooth, so a 32-node Gauss rule is far more accurate than the adaptive rule at
+       its default 1e-3 tolerance; the residual is the *adaptive* rule's error. =#
+    @test maximum(abs, omf["Eω"][:, 1, end] .- om["Eω"][:, 1, end]) /
+          maximum(abs, om["Eω"][:, 1, end]) < 1e-6
+    omf32 = prop_capillary(args...; kwargs..., modes=4, modal_integral=:fixed, modal_nr=32,
+                           device=DeviceSpec(Array, Float32))
+    @test eltype(omf32["Eω"]) === ComplexF32
+    @test maximum(abs, ComplexF64.(omf32["Eω"][:, 1, end]) .- omf["Eω"][:, 1, end]) /
+          maximum(abs, omf["Eω"][:, 1, end]) < 1e-4
+    #= `Stats.mode_reconstruction_error` needs the adaptive transform's single-point
+       machinery and records the cubature's own error estimate; the fixed rule has
+       neither, so `prop_capillary` turns the statistic off for it (the fixed rule's own
+       embedded estimate becomes a statistic in a later branch). =#
+    @test haskey(om["stats"], "mode_reconstruction_error")
+    @test !haskey(omf["stats"], "mode_reconstruction_error")
+    @test haskey(omf["stats"], "energy")
+    # asking for it explicitly is an error which says why
+    @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
+                                            modal_integral=:fixed, modal_nr=32,
+                                            stats_kwargs=Dict{Symbol, Any}(
+                                                :mode_error => true))
+    # an unknown modal_integral is refused
+    @test_throws ErrorException prop_capillary(args...; kwargs..., modes=4,
+                                               modal_integral=:nonsense)
 
     # prop_gnlse: same keywords, but only the CPU/Float64 default is honoured
     gargs = (0.1, 1e-3, [0.0, 0.0, -1e-26])

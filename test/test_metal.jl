@@ -1254,10 +1254,169 @@ end
     end
 end
 
+#= A multimode propagation on the fixed transverse quadrature rule
+   (`NonlinearRHS.TransModalFixed`), which is the transverse integral with a device path:
+   the adaptive cubature driver is host scalar code returning `Vector{Float64}`.
+
+   Fixed steps, so that the only difference between two runs is the arithmetic. `nr=32`
+   rather than the default 64 keeps the block small; the transverse integral of a smooth
+   HE1m set converges long before that (test_device.jl measures it against the adaptive
+   rule). =#
+function metalmodalcase(spec; nmodes=4, components=:y, gas=:Ar, pres=0.1, energy=50e-6,
+                        flength=2e-3, λ0=800e-9, plasma=false, nr=32, nθ=16, full=false,
+                        precision=nothing, boundary=:none)
+    grid = Grid.RealGrid(λ0, (200e-9, 3000e-9), 400e-15)
+    modes = Tuple(Capillary.MarcatiliMode(75e-6, gas, pres; n=1, m=mi, loss=false)
+                  for mi in 1:nmodes)
+    ρ = PhysData.density(gas, pres)
+    dens = z -> ρ
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    if plasma
+        resp = (resp...,
+                Nonlinear.PlasmaCumtrapz(grid.to, zeros(length(grid.to)),
+                                         metal_tablerate(),
+                                         PhysData.ionisation_potential(gas)))
+    end
+    linop = LinearOps.make_const_linop(grid, modes, λ0)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
+    Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, modes, components;
+                                   modal_integral=:fixed, nr, nθ, full,
+                                   device=spec, precision)
+    out = Output.MemoryOutput(0, flength, 3, Output.nostats)
+    h = flength/10
+    Luna.run(Eω, grid, linop, transform, FT, out;
+             zmax=flength, boundary, min_dz=h, max_dz=h, init_dz=h)
+    out, transform
+end
+
+#= Normalised to the strongest mode rather than per mode: in a four-mode capillary run
+   the fourth mode carries ~1e-10 of the energy of the first, so its own relative
+   difference measures the first mode's rounding against the fourth mode's amplitude. =#
+function modaldiff(a, b)
+    nrm = maximum(abs, a[:, :, end])
+    maximum(abs, ComplexF64.(b[:, :, end]) .- ComplexF64.(a[:, :, end]))/nrm
+end
+
+@testset "multimode on Metal" begin
+    @testset "plasma=$plasma" for plasma in (false, true)
+        m32, mtr = metalmodalcase(MetalSpec; plasma)
+        h32, _ = metalmodalcase(DeviceSpec(Array, Float32); plasma)
+        h64, htr = metalmodalcase(HostSpec(); plasma)
+
+        # everything the kernels touch is a Float32 device array
+        @test mtr isa NonlinearRHS.TransModalFixed
+        @test mtr.S isa MtlArray{Float32}
+        @test mtr.Wp isa MtlArray{Float32}
+        @test mtr.Wd isa MtlArray{Float32}
+        @test mtr.Emt isa MtlArray{Float32}
+        @test mtr.Emωo isa MtlArray{ComplexF32}
+        @test mtr.Pmt isa MtlArray{Float32}
+        @test mtr.block.Et isa MtlArray{Float32}
+        @test mtr.block.Et2 isa MtlArray{Float32} # the reshape a GEMM needs
+        @test mtr.block.Pt isa MtlArray{Float32}
+        @test mtr.gv.ω isa MtlArray{Float32}
+        @test mtr.norm!.pre isa MtlArray{ComplexF32}
+        plasma && @test mtr.block.resp[2].J isa MtlArray{Float32}
+        plasma && @test mtr.block.resp[2].ratedev.spline.x isa MtlArray{Float32}
+        # the host Float64 run is unscaled; the Float32 ones are not
+        @test Luna.isunity(htr.scaling)
+        @test !Luna.isunity(mtr.scaling)
+
+        @test size(m32["Eω"]) == size(h64["Eω"])
+        @test eltype(m32["Eω"]) === ComplexF32
+        # Metal against the same arithmetic on the CPU, and against Float64
+        @test modaldiff(h32["Eω"], m32["Eω"]) < 1e-4
+        @test modaldiff(h64["Eω"], m32["Eω"]) < 1e-3
+    end
+
+    #= Two polarisation components and the full 2-D rule: the θ nodes and the vector form
+       of the Kerr response on a device block. =#
+    mxy, mxytr = metalmodalcase(MetalSpec; nmodes=2, components=:xy, full=true, nr=16,
+                                nθ=8)
+    hxy32, _ = metalmodalcase(DeviceSpec(Array, Float32); nmodes=2, components=:xy,
+                              full=true, nr=16, nθ=8)
+    hxy64, _ = metalmodalcase(HostSpec(); nmodes=2, components=:xy, full=true, nr=16,
+                              nθ=8)
+    @test size(mxytr.block.Et) == (length(mxytr.grid.to), 2, 16*8)
+    @test modaldiff(hxy32["Eω"], mxy["Eω"]) < 1e-4
+    @test modaldiff(hxy64["Eω"], mxy["Eω"]) < 1e-3
+
+    #= The absorbing boundaries, which `prop_capillary` turns on by default, on a
+       multimode device state. =#
+    mrate, _ = metalmodalcase(MetalSpec; boundary=:rate)
+    hrate32, _ = metalmodalcase(DeviceSpec(Array, Float32); boundary=:rate)
+    @test modaldiff(hrate32["Eω"], mrate["Eω"]) < 1e-4
+
+    #= `modal_integral=:adaptive` -- the default -- on a device says what to do about it
+       rather than failing somewhere inside Cubature. =#
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    ms = (Capillary.MarcatiliMode(75e-6, :He, 1.0, loss=false),)
+    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(:He)),)
+    inputs = Fields.GaussField(λ0=800e-9, τfwhm=20e-15, energy=1e-6)
+    err = try
+        Luna.setup(grid, z -> 1.0, resp, inputs, ms, :y; device=MetalSpec)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("modal_integral=:fixed", err.msg)
+end
+
+#= The same thing through the simple interface, which is how a user gets it: the default
+   response set of a field-resolved `prop_capillary` call in a non-Raman gas (Kerr, and
+   Kerr plus plasma), four modes, the rate-based absorbing boundaries and the default
+   statistics. `prop_capillary_args` plus `Luna.run` rather than `prop_capillary`, so
+   that the step sequence can be fixed and the comparison is of arithmetic only. =#
+@testset "prop_capillary multimode on Metal" begin
+    args = (125e-6, 2e-3, :Ar, 0.1)
+    kwargs = (λ0=800e-9, energy=50e-6, τfwhm=20e-15, trange=400e-15,
+              λlims=(200e-9, 3000e-9), shotnoise=false, saveN=3, modes=4,
+              modal_integral=:fixed, modal_nr=32)
+    function runfixed(; kw...)
+        Eω, grid, linop, transform, FT, output =
+            Luna.Interface.prop_capillary_args(args...; kwargs..., kw...)
+        h = args[2]/10
+        Luna.run(Eω, grid, linop, transform, FT, output;
+                 zmax=args[2], min_dz=h, max_dz=h, init_dz=h)
+        output, transform
+    end
+    @testset "plasma=$plasma" for plasma in (false, true)
+        m32, mtr = runfixed(; plasma, device=MetalSpec)
+        h32, _ = runfixed(; plasma, device=DeviceSpec(Array, Float32))
+        h64, _ = runfixed(; plasma, device=HostSpec())
+        @test mtr isa NonlinearRHS.TransModalFixed
+        @test mtr.block.Et isa MtlArray{Float32}
+        @test eltype(m32["Eω"]) === ComplexF32
+        @test modaldiff(h32["Eω"], m32["Eω"]) < 1e-4
+        @test modaldiff(h64["Eω"], m32["Eω"]) < 1e-3
+        # the statistics survive the device-to-host boundary
+        @test isapprox(m32["stats"]["energy"][1, end], h32["stats"]["energy"][1, end];
+                       rtol=1e-3)
+        #= `Stats.mode_reconstruction_error` is the adaptive transform's; the fixed rule
+           collects the other default statistics and not that one. =#
+        @test !haskey(m32["stats"], "mode_reconstruction_error")
+        @test haskey(m32["stats"], "fwhm_r")
+    end
+
+    # the adaptive default is refused on a device, naming the fix
+    err = try
+        Luna.Interface.prop_capillary_args(args...; kwargs..., modal_integral=:adaptive,
+                                           device=MetalSpec)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("modal_integral=:fixed", err.msg)
+end
+
 #= `Luna.set_device(:cpu)` opts out, whatever `settings["device"]` is otherwise: this is
-   exit criterion 3. `prop_gnlse` and multimode/radial `prop_capillary` are not
-   device-capable (`_cpu_only!`, `Interface.jl`) and keep giving the CPU, Float64 answer
-   under `:auto` too -- refusing only when the caller explicitly asks for something else. =#
+   exit criterion 3. `prop_gnlse`, radial `prop_capillary` and multimode `prop_capillary`
+   with the *adaptive* transverse integral (the default) are not device-capable, and keep
+   giving the CPU, Float64 answer under `:auto` too -- refusing only when the caller
+   explicitly asks for something else. Multimode with `modal_integral=:fixed` is
+   device-capable and does follow `:auto`, which is checked below. =#
 @testset "Luna.set_device(:cpu) opts out" begin
     old = get(Luna.settings, "device", nothing)
     capargs = (125e-6, 1e-3, :He, 1.0)
@@ -1287,14 +1446,29 @@ end
         dcap = Luna.prop_capillary(capargs...; capkw..., device=:cpu)
         @test dcap["Eω"] == ocap["Eω"]
 
-        #= Multimode propagation is not device-capable and must stay on the CPU by
-           default under :auto too -- it must not turn a working run into an error just
-           because a GPU package happens to be loaded (the bug an earlier version of
-           this branch had: `device`'s default resolved through `:auto` even for paths
-           that can never honour it). =#
+        #= Multimode propagation with the adaptive transverse integral (the default) is
+           not device-capable and must stay on the CPU by default under :auto too -- it
+           must not turn a working run into an error just because a GPU package happens
+           to be loaded (the bug an earlier version of this branch had: `device`'s
+           default resolved through `:auto` even for paths that can never honour it). =#
         om = Luna.prop_capillary(capargs...; capkw..., modes=4)
         @test size(om["Eω"], 2) == 4
-        # ... but an explicit device request for multimode still errors
+        @test eltype(om["Eω"]) === ComplexF64
+
+        #= ... while multimode with `modal_integral=:fixed` *is* device-capable, so the
+           sentinel resolves it to the GPU under :auto with no `device` keyword at all.
+           This is the only hardware test of that branch of `Interface.prop_capillary_args`;
+           everything else passes `device=MetalSpec` explicitly. =#
+        omf = Luna.prop_capillary(capargs...; capkw..., modes=4,
+                                  modal_integral=:fixed, modal_nr=16)
+        @test size(omf["Eω"], 2) == 4
+        @test eltype(omf["Eω"]) === ComplexF32
+        # ... and `device=:cpu` still opts that out
+        omfc = Luna.prop_capillary(capargs...; capkw..., modes=4, modal_integral=:fixed,
+                                   modal_nr=16, device=:cpu)
+        @test eltype(omfc["Eω"]) === ComplexF64
+
+        # ... but an explicit device request for the adaptive rule still errors
         @test_throws ErrorException Luna.prop_capillary(capargs...; capkw..., modes=4,
                                                          device=MetalSpec)
     finally
@@ -1497,7 +1671,9 @@ end
     @test_throws ErrorException NonlinearRHS.Et_to_Pt!(
         Pd, Ed, ((out, E, ρ) -> nothing,), 1.0)
 
-    # multimode propagation is not device-capable through the simple interface either
+    #= multimode propagation with the adaptive transverse integral is not device-capable
+       through the simple interface either (with `modal_integral=:fixed` it is, which the
+       "prop_capillary multimode on Metal" testset above covers) =#
     @test_throws ErrorException Luna.prop_capillary(
         125e-6, 1e-3, :He, 1.0; λ0=800e-9, energy=1e-9, τfwhm=10e-15,
         λlims=(300e-9, 2e-6), trange=400e-15, saveN=3, plasma=false, shotnoise=false,

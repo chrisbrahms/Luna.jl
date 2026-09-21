@@ -1,7 +1,7 @@
 module Interface
 using Luna
 import Luna.PhysData: wlfreq, roomtemp
-import Luna: Grid, Modes, Output, Fields, Boundaries
+import Luna: Grid, Modes, Output, Fields, Boundaries, NonlinearRHS
 import Random: AbstractRNG, GLOBAL_RNG
 import Logging: @info, @debug
 
@@ -311,6 +311,25 @@ In this case, all keyword arguments except for `λ0` are ignored.
     - a `Number` `N` of modes, which simply creates the first `N` `HE` modes.
     Note that when elliptical or circular polarisation is included, each mode is present
     twice in the output, once for `x` and once for `y` polarisation.
+- `modal_integral::Symbol`: how the transverse integral of the nonlinear polarisation is
+    evaluated in a multimode simulation. `:adaptive` (the default) uses an adaptive
+    cubature rule, which chooses its own transverse points to reach
+    `radial_integral_rtol` and runs on the host in double precision. `:fixed` uses a fixed
+    Gauss quadrature rule of `nr` (and, for the full 2-D integral, `nθ`) nodes, which
+    costs the same on every step, is the multimode transform which runs on a device or in
+    reduced precision, and is a different discretisation of the same integral -- it agrees
+    with `:adaptive` to the accuracy of the rule rather than to rounding. Ignored for
+    mode-averaged propagation, which has no transverse integral. See
+    [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed).
+- `radial_integral_rtol::Number`: relative tolerance of the adaptive transverse integral
+    (`modal_integral=:adaptive` only).
+- `modal_nr::Int`, `modal_nθ::Int`, `modal_kronrod::Bool`: the quadrature rule of
+    `modal_integral=:fixed`: the number of nodes along r (or x) and θ (or y), and whether
+    to use a Gauss-Kronrod rule in r so that the rule carries an embedded error estimate.
+    `modal_nr` has to resolve the transverse structure of the highest mode, and
+    `modal_nθ` has to be at least `4h+1` for modes of azimuthal order up to `h` (so at
+    least 5 for an HE₁ₘ set). They are `nr`, `nθ` and `kronrod` on [`Luna.setup`](@ref),
+    where the context leaves no room for confusion.
 - `model::Symbol`: Can be `:full`, which includes the full complex refractive index of the cladding
     in the effective index of the mode, or `:reduced`, which uses the simpler model more
     commonly seen in the literature. See `Luna.Capillary` for more details.
@@ -380,15 +399,16 @@ If `raman` is `true`, then the following options apply:
     `nothing` (the default) means "not specified": it becomes `Luna.device_request()`,
     i.e. `Luna.settings["device"]` as the user set it (`:cpu` if nothing was set and
     nothing loaded, `:auto` once a GPU package has been `using`d), only when the
-    propagation is mode-averaged (`modes` a single mode) *and* every nonlinear response it
+    propagation has a device path -- mode-averaged (`modes` a single mode), or multimode
+    with `modal_integral=:fixed` -- *and* every nonlinear response it
     was built with is device-capable (`Nonlinear.device_capable`; true for the Kerr
     responses including the no-THG one, the plasma, Raman and χ⁽²⁾ responses, false for
     anything user-written). Otherwise it stays on
     the CPU, whatever `Luna.settings["device"]` says, exactly as before this keyword
     existed -- loading a GPU package must never turn a working default call into an
     error. An *explicit* `device` or `precision` request which cannot be honoured
-    (multimode and radial propagation, a response with no device kernel, and
-    [`prop_gnlse`](@ref)) errors naming the fix (`device=:cpu` or
+    (multimode propagation with `modal_integral=:adaptive`, a response with no device
+    kernel, and [`prop_gnlse`](@ref)) errors naming the fix (`device=:cpu` or
     `Luna.set_device(:cpu)`), rather than being silently narrowed to the CPU, run on the
     host through `Nonlinear.HostResponse` at every step, or failing with an unrelated
     `MethodError`. See the "Running on a GPU" page (`docs/src/gpu.md`).
@@ -487,7 +507,9 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         shotnoise=true,
                         rng=GLOBAL_RNG,
                         modes=:HE11, model=:full, loss=true,
-                        radial_integral_rtol=1e-3,
+                        radial_integral_rtol=1e-3, modal_integral=:adaptive,
+                        modal_nr=NonlinearRHS.FIXED_NR,
+                        modal_nθ=NonlinearRHS.FIXED_Nθ, modal_kronrod=false,
                         raman=nothing, kerr=true, plasma=nothing,
                         stats_kwargs=Dict{Symbol, Any}(),
                         PPT_options=Dict{Symbol, Any}(), preionfrac=0.0,
@@ -541,13 +563,17 @@ function prop_capillary_args(radius, flength, gas, pressure;
        unspecified: `precision=Float32` with a response which has no device kernel is a
        scaled run in which that response falls back to the host, which is not what the
        caller asked for, so it is refused with the same message. =#
-    if mode_s isa Modes.AbstractMode && !(isnothing(device) && isnothing(precision))
+    #= Which geometries have a device path at all: mode-averaged, and multimode on the
+       fixed quadrature rule. The adaptive transverse integral is driven by `Cubature`,
+       which is host scalar code returning `Vector{Float64}`. =#
+    hasdevicepath = (mode_s isa Modes.AbstractMode) || (modal_integral === :fixed)
+    if hasdevicepath && !(isnothing(device) && isnothing(precision))
         _check_responses_device_capable!(something(device, Luna.HostSpec()), precision,
                                          resp)
     end
     devicereq = if !isnothing(device)
         device
-    elseif mode_s isa Modes.AbstractMode && all(Nonlinear.device_capable, resp)
+    elseif hasdevicepath && all(Nonlinear.device_capable, resp)
         Luna.device_request()
     else
         Luna.HostSpec()
@@ -564,18 +590,24 @@ function prop_capillary_args(radius, flength, gas, pressure;
                                      radial_integral_rtol, const_linop(radius, pressure);
                                      noise_field, thg, device=devicereq, precision,
                                      aefftol=(tabulate_linop ? linop_tol : nothing),
-                                     aeffspan=(0.0, float(flength)))
+                                     aeffspan=(0.0, float(flength)),
+                                     modal_integral, nr=modal_nr, nθ=modal_nθ,
+                                     kronrod=modal_kronrod)
     #= The state itself, not a host copy of it: `Stats.default` builds its buffers and
        plans its inverse transform for the array type and precision `Eω` has, and takes
        the unit scaling from `transform`, so that the default statistics run on the
-       device with the state left where it is. =#
-    stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
+       device with the state left where it is. `_statskwargs` turns off the mode
+       reconstruction error for `modal_integral=:fixed`, which has no single-point
+       machinery to compute it from. =#
+    stats = Stats.default(grid, Eω, mode_s, linop, transform;
+                          gas=gas, _statskwargs(transform, stats_kwargs)...)
     stats = Output.maybe_periodic(stats, stats_period)
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
 
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
         shotnoise, modes, model, loss, raman, kerr, plasma, PPT_options,
+        modal_integral, modal_nr, modal_nθ, modal_kronrod,
         temperature, saveN, filepath, filename,
         boundary, boundary_N, boundary_length, tcollar, tabulate_linop, linop_tol,
         device, precision, stats_period)
@@ -1012,10 +1044,14 @@ function makeaeff(mode, aefftol, aeffspan)
     LinearOps.TabulatedScalar(z -> Modes.Aeff(mode, z=z), aeffspan...; tol=aefftol)
 end
 
+#= `rtol` and the `modal_integral`/quadrature keywords describe the transverse integral
+   of a multimode propagation, which mode-averaged propagation does not have; they are
+   accepted and ignored here, as `rtol` always was. =#
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
                c::Val{true}; noise_field=nothing, thg=LinearOps.thg_default(grid),
                device=Luna.device_request(), precision=nothing,
-               aefftol=nothing, aeffspan=(0.0, 1.0))
+               aefftol=nothing, aeffspan=(0.0, 1.0), modal_integral=:adaptive,
+               nr=nothing, nθ=nothing, kronrod=nothing)
     @info("Using mode-averaged propagation.")
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ;
                                                     linopkw(grid, thg)...)
@@ -1033,7 +1069,8 @@ end
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
                c::Val{false}; noise_field=nothing, thg=LinearOps.thg_default(grid),
                device=Luna.device_request(), precision=nothing,
-               aefftol=nothing, aeffspan=(0.0, 1.0))
+               aefftol=nothing, aeffspan=(0.0, 1.0), modal_integral=:adaptive,
+               nr=nothing, nθ=nothing, kronrod=nothing)
     @info("Using mode-averaged propagation.")
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ;
                                         linopkw(grid, thg)...)
@@ -1049,50 +1086,95 @@ needfull(modes) = !all(modes) do mode
     (mode.kind == :HE) && (mode.n == 1)
 end
 
-#= Multimode propagation is not device- or reduced-precision-capable yet (`TransModal`,
-   Group E of GPU_PLAN.md): `Luna.setup` for it takes no `device`/`precision` keyword at
-   all. These two methods accept and validate them instead of erroring with an unhelpful
-   "no keyword argument device", so a `device`/`precision` request which does not resolve
-   to the CPU in `Float64` -- the only thing that transform can produce -- gets a message
-   naming the actual limitation. `prop_capillary`/`prop_gnlse` never build a free-space
-   run, so the device paths of `TransRadial` (gpu/20), `TransFree` and `TransFree2D`
-   (gpu/21) are reached through the low-level interface only. =#
+#= `prop_gnlse` is the one thing the simple interface builds which is not device- or
+   reduced-precision-capable (GPU_PLAN.md Group E): its `Luna.setup` call takes no
+   `device`/`precision` keyword at all. This accepts and validates them instead of
+   erroring with an unhelpful "no keyword argument device", so a `device`/`precision`
+   request which does not resolve to the CPU in `Float64` -- the only thing that path can
+   produce -- gets a message naming the actual limitation. Multimode propagation is
+   checked by `Luna.setup` itself, which knows whether the adaptive or the fixed
+   transverse integral was asked for. `prop_capillary`/`prop_gnlse` never build a
+   free-space run, so the device paths of `TransRadial` (gpu/20), `TransFree` and
+   `TransFree2D` (gpu/21) are reached through the low-level interface only. =#
 function _cpu_only!(device, precision, what)
     spec = Luna.withprecision(Luna.resolve_device(device), precision)
     (Luna.arraytype(spec) === Array && Luna.realtype(spec) === Float64) || error(
         "$what does not run on a device or in reduced precision yet (GPU_PLAN.md Group "*
-        "E); got $(spec). Pass modes=<a single mode> for a device-capable mode-averaged "*
-        "run, or device=Luna.HostSpec() (the default) here.")
+        "E); got $(spec). Use prop_capillary for a device-capable mode-averaged or "*
+        "multimode (modal_integral=:fixed) run, or device=Luna.HostSpec() (the default) "*
+        "here.")
     nothing
 end
 
-#= `aefftol`/`aeffspan` are accepted and ignored: multimode propagation has no single
-   effective area, and `norm_modal` does not use one. =#
+#= The `device`/`precision` request is passed straight to `Luna.setup`, which refuses
+   anything but the host in `Float64` for `modal_integral=:adaptive` and names
+   `modal_integral=:fixed` as the fix. `aefftol`/`aeffspan` are accepted and ignored:
+   multimode propagation has no single effective area, and `norm_modal` does not use
+   one. =#
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
                noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.HostSpec(), precision=nothing,
+               device=Luna.HostSpec(), precision=nothing, modal_integral=:adaptive,
+               nr=NonlinearRHS.FIXED_NR, nθ=NonlinearRHS.FIXED_Nθ, kronrod=false,
                aefftol=nothing, aeffspan=(0.0, 1.0))
-    _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_const_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf, rtol, noise_field)
+                                   pol ? :xy : :y; full=nf, rtol, noise_field,
+                                   modal_integral, nr, nθ, kronrod, device, precision)
     linop, Eω, transform, FT
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
                noise_field=nothing, thg=LinearOps.thg_default(grid),
-               device=Luna.HostSpec(), precision=nothing,
+               device=Luna.HostSpec(), precision=nothing, modal_integral=:adaptive,
+               nr=NonlinearRHS.FIXED_NR, nθ=NonlinearRHS.FIXED_Nθ, kronrod=false,
                aefftol=nothing, aeffspan=(0.0, 1.0))
-    _cpu_only!(device, precision, "multimode propagation")
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf, rtol, noise_field)
+                                   pol ? :xy : :y; full=nf, rtol, noise_field,
+                                   modal_integral, nr, nθ, kronrod, device, precision)
     linop, Eω, transform, FT
 end
+
+"""
+    _statskwargs(transform, stats_kwargs)
+
+The keyword arguments for `Stats.default`. `Stats.mode_reconstruction_error` is written
+against [`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal): it re-evaluates
+the transform at one transverse point and compares the result with the modal
+reconstruction, which needs the adaptive transform's single-point machinery, and it
+records the cubature's own error estimate. The fixed quadrature rule has neither. Its own
+embedded error estimate
+([`NonlinearRHS.integral_error!`](@ref Luna.NonlinearRHS.integral_error!)) becomes a
+statistic in a later branch of the GPU work; until then a `modal_integral=:fixed` run
+collects the other default statistics and not this one. An explicit `mode_error` in
+`stats_kwargs` is left alone.
+"""
+_statskwargs(transform, stats_kwargs) = stats_kwargs
+
+function _statskwargs(transform::NonlinearRHS.TransModalFixed, stats_kwargs)
+    if haskey(stats_kwargs, :mode_error)
+        stats_kwargs[:mode_error] && error(
+            "stats_kwargs[:mode_error] = true, but the mode reconstruction error "*
+            "statistic is defined only for the adaptive transverse integral "*
+            "(modal_integral=:adaptive): it re-evaluates the transform at a single "*
+            "transverse point and records the cubature's own error estimate, neither "*
+            "of which the fixed quadrature rule has. Leave `mode_error` out (it is off "*
+            "by default with modal_integral=:fixed) or pass modal_integral=:adaptive.")
+        return stats_kwargs
+    end
+    _mergekw(stats_kwargs)
+end
+
+#= `stats_kwargs` is splatted everywhere else, so a `NamedTuple` works as well as the
+   documented `Dict`; `merge` of a `NamedTuple` with a `Dict` is a `MethodError`. The
+   default goes first in both, so that anything in `stats_kwargs` wins -- there is
+   nothing there to win, by the `haskey` above, but that is the order a reader expects. =#
+_mergekw(kw::AbstractDict) = merge(Dict{Symbol, Any}(:mode_error => false), kw)
+_mergekw(kw) = merge((; mode_error=false), NamedTuple(pairs(kw)))
 
 function makeoutput(flength, saveN, stats, filepath::Nothing, scan::Nothing, scanidx, filename)
     Output.MemoryOutput(0, flength, saveN, stats)
