@@ -19,7 +19,7 @@ which the brief expected to move.
 | `be2bbbf5` | `TransFree` and `TransFree2D` on the device |
 | `e2f3baa2` | The Cartesian collar on the device, and `test_device.jl` |
 | `c8d360c9` | `test_metal.jl`: the Cartesian free-space transforms on hardware |
-| (this) | `benchmark/free.jl`, docs, this file |
+| `9b09ac45` | `benchmark/free.jl`, memory accounting, docs and this file |
 
 ## The plan test, first
 
@@ -198,6 +198,7 @@ temporary stacked ones with `Hankel` pinned to the worktree's 0.5.9.
 | `test/test_metal.jl` (Metal 1.11.1, hardware) | **567 pass, 0 fail**, 25 testsets | 452 / 20 |
 | `test/test_freespace.jl` | **77 pass, 0 fail** | 77 pass |
 | `test/test_chi2.jl` | **42 pass, 0 fail** | 42 pass |
+| `test/test_boundaries.jl` (with JLArrays in the environment) | **184 pass, 0 fail** | 184 pass |
 | `include("docs/make.jl")` | 8 unresolved `@ref`s, one **fewer** than the base's 9 | 9 |
 | the free-space and radial examples | 12 of 13 run (below) | |
 
