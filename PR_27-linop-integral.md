@@ -302,14 +302,34 @@ the `Float32` rounding of the state.
 
 `benchmark/tabulated.jl` now compares `:quadrature` against `:tabulated`, which unlike its
 previous comparison is like for like (the two compute the same integral to 1e-7 of each
-other). The qualitative picture from gpu/23 is unchanged and the quadrature side is
-*slower* than the one-point rule it replaced in the "no table" column, by roughly the ratio
-of 15 operator evaluations to one per stage; `:tabulated` is the default for that reason.
+other). M1 Pro, Julia 1.13.0, 1 Julia thread, 1 FFTW thread, 1 BLAS thread, `:estimate`,
+no wisdom. Ar, 0.1 m, 20 fixed steps, `boundary=:none`, `linop_tol=1e-6`. The `tabulated`
+column *includes* the table build, which is listed separately.
 
-The tabulated propagator costs one extra field-sized broadcast per `(t1, t2)` pair relative
-to nothing, exactly as in gpu/23 — the `AbsolutePhase` propagator is that code with the
-table replaced by the interface, so there is no per-step cost to the generalisation.
-`PhaseStyle` and `isnothing(secant(op))` are resolved when the propagator is built.
+| case | device | trange | state | `:quadrature` | `:tabulated` | speedup | table setup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| gradient | CPU Float64 | 400 fs | 1025 | 68.80 ms | 14.68 ms | 4.69× | 7.78 ms |
+| gradient | CPU Float32 | 400 fs | 1025 | 68.10 ms | 13.44 ms | 5.07× | 7.94 ms |
+| gradient | Metal Float32 | 400 fs | 1025 | 226.04 ms | 80.34 ms | 2.81× | 9.09 ms |
+| gradient | CPU Float64 | 1600 fs | 4097 | 262.02 ms | 58.46 ms | 4.48× | 30.33 ms |
+| gradient | Metal Float32 | 1600 fs | 4097 | 425.10 ms | 112.35 ms | 3.78× | 33.83 ms |
+| taper | CPU Float64 | 400 fs | 1025 | 251.49 ms | 25.91 ms | 9.70× | 20.20 ms |
+| taper | CPU Float32 | 400 fs | 1025 | 252.88 ms | 24.78 ms | 10.21× | 19.27 ms |
+| taper | Metal Float32 | 400 fs | 1025 | 434.88 ms | 87.66 ms | 4.96× | 20.14 ms |
+| taper | CPU Float64 | 1600 fs | 4097 | 985.07 ms | 103.74 ms | 9.50× | 75.10 ms |
+| taper | Metal Float32 | 1600 fs | 4097 | 1.202 s | 148.12 ms | 8.11× | 76.23 ms |
+
+So `:quadrature` costs 3–10× the tabulated run, and against the *removed* one-point rule
+(gpu/23's "prop" column on the same machine and cases: 11.81 ms and 37.08 ms at 400 fs
+Float64) it is 5.8× and 6.8×. That is the price of fifteen operator evaluations per stage
+instead of one, less what the `(t1, t2)` cache saves; the gradient's ratio is the smaller
+one because `Capillary.neff_β_grid` makes its `linop!` cheap. `:tabulated` is the default
+for that reason, and `:quadrature` is a check and a fallback, not a production setting.
+
+The tabulated numbers are gpu/23's (14.53 ms and 25.91 ms for the same two rows) — the
+`AbsolutePhase` propagator is that branch's code with the table replaced by the interface,
+so the generalisation costs nothing per step. `PhaseStyle(op)` and `isnothing(secant(op))`
+are resolved when the propagator is built.
 
 ## Documentation
 
