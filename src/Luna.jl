@@ -305,12 +305,13 @@ collection of [`Modes.AbstractMode`](@ref Luna.Modes.AbstractMode)s and `compone
     `setup` above. A device or a `Float32` run needs `modal_integral=:fixed`.
 
 !!! note "Statistics with `modal_integral=:fixed`"
-    `Stats.default` has to be called with `mode_error=false` for a
-    [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed):
-    `Stats.mode_reconstruction_error` is typed on
-    [`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal) and records the
-    adaptive rule's own behaviour, so leaving it at its default of `true` gives a
-    `MethodError`. `prop_capillary` does this for you.
+    `Stats.default`'s `mode_error=true` records the diagnostic the transform has: the
+    mode reconstruction error and the cubature's error estimate for
+    [`NonlinearRHS.TransModal`](@ref Luna.NonlinearRHS.TransModal), and the embedded
+    Gauss--Kronrod estimate
+    ([`Stats.transverse_integral_error`](@ref Luna.Stats.transverse_integral_error)) for
+    a [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed). The
+    latter is `NaN` unless the rule was built with `kronrod=true`.
 """
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components; kwargs...)
@@ -438,6 +439,12 @@ Set up a radially symmetric free-space propagation: plan the transforms, build t
 The input fields are built on the host in `Float64` (`Fields` is host scalar code), so the
 transform they need is planned on the host whatever the run uses; the returned `FT` is the
 plan on the *state's* array type, which is what the absorbing boundaries apply.
+
+!!! note "Statistics"
+    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, transform, linop)` builds the
+    default statistics set for the returned transform: the total energy, the peak
+    intensity, `ω0` and the duration on the propagation axis, the beam size, the energy
+    in the absorbing collar, and the electron density with plasma.
 """
 function setup(grid::Grid.RealGrid, rg::Grid.RadialGrid,
                densityfun, normfun, responses, inputs; kwargs...)
@@ -515,6 +522,12 @@ The joint time-and-space transform is one multi-axis plan — region `(1, 3, 4)`
 The input fields are built on the host in `Float64` (`Fields` is host scalar code), so the
 transform they need is planned on the host whatever the run uses; the returned `FT` is the
 plan on the *state's* array type, which is what the absorbing boundaries apply.
+
+!!! note "Statistics"
+    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, transform, linop)` builds the
+    default statistics set for the returned transform: the total energy, the peak
+    intensity, `ω0` and the duration on the propagation axis, the beam size, the energy
+    in the absorbing collar, and the electron density with plasma.
 """
 function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
                densityfun, normfun, responses, inputs; kwargs...)

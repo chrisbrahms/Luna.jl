@@ -292,9 +292,16 @@ mode-averaged one, the three free-space ones and the fixed-quadrature multimode 
   override the choice, `stats_kwargs=Dict(:stats_device => :device)` (or `:host`) reaches
   `Stats.collect_stats` through `prop_capillary`.
 
-  `fwhm_r` and the modal reconstruction error have no device form at all and keep their
-  algorithms on the host, so a multimode set is computed on a host copy whichever
-  transverse integral it came from. A statistics function *you* write is host code too:
+  `fwhm_r`, the modal reconstruction error and the transverse quadrature error have no
+  device form at all and keep their algorithms on the host, so a multimode set is computed
+  on a host copy whichever transverse integral it came from. The radial and free-space
+  default sets are in the same position: `Stats.beam_profile`, which records the beam size
+  and the collar energy fraction, applies the inverse transverse transform to the whole
+  state and has no device form, so it makes its set host-only. `beam_profile=false` on
+  `Stats.default` drops it and leaves a set every member of which is device-capable --
+  the energy, and the on-axis `ω0`, peak intensity, duration and electron density, all of
+  which reduce over the transverse axes on the device. A statistics function *you* write
+  is host code too:
   the whole set is then
   computed on a host copy of the field on every step the statistics fire, and `Luna.run`
   warns once, naming it (`userfuns[1]`), when that happens. Use `stats_period` to reduce
@@ -346,13 +353,13 @@ Two things to check before using it:
   any number of θ nodes will do, and `full=false` (which `prop_capillary` picks for such a
   set) uses a single one.
 
-`modal_integral=:fixed` does not collect the `mode_reconstruction_error`,
-`transverse_points` and `transverse_integral_error_*` statistics: those describe the
-adaptive rule's own behaviour. The fixed rule carries an embedded Gauss--Kronrod error
-estimate instead (`modal_kronrod=true`, which rounds `modal_nr` up to an odd number),
-which `NonlinearRHS.integral_error!` evaluates on demand; it becomes a statistic in a
-later branch. At the low level, `Stats.default` needs `mode_error=false` for this
-transform; `prop_capillary` does that for you.
+`modal_integral=:fixed` does not collect `mode_reconstruction_error`, which describes
+the adaptive rule's own behaviour. It does collect `transverse_points` and
+`transverse_integral_error_abs`/`_rel`, from the rule's embedded Gauss--Kronrod error
+estimate (`Stats.transverse_integral_error`, which calls
+`NonlinearRHS.integral_error!` once per accepted step). The estimate exists only with
+`modal_kronrod=true`, which rounds `modal_nr` up to an odd number; without it the two
+error datasets are `NaN` and only the node count is meaningful.
 
 ### An ad hoc response on a device
 

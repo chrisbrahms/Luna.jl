@@ -47,7 +47,8 @@ inputs = Fields.GaussGaussField(;λ0, τfwhm, energy=energy/(sqrt(π/2)*w0), w0)
 Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, responses, inputs)
 
 ##
-output = Output.MemoryOutput(0, thickness, 101)
+statsfun = Stats.default(grid, Eω, transform, linop)
+output = Output.MemoryOutput(0, thickness, 101, statsfun)
 Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6, zmax=thickness)
 
 ##
