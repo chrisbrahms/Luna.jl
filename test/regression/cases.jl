@@ -261,7 +261,15 @@ end
    statistics to a case means re-measuring its tolerance and regenerating every baseline.
    `Stats.collect_stats` with no functions appends `Stats.zdz!`, which is enough for the
    fixed-step check that the step sequence really was imposed, and for the step-count check
-   in the adaptive mode. =#
+   in the adaptive mode.
+
+   `gpu/int-E2` considered adding the default set to the two radial cases only, which
+   `gpu/25`'s review suggested, and did not: this file has to run unchanged on the baseline
+   commits, and none of the three in use (`b641025b`, `782f55d1`, `fdf8dbe3`) has a
+   `Stats.default` for a radial transform. Recording those statistics would make the gate
+   impossible to run against any commit before `gpu/25`, which is the comparison the
+   project's regression record is made of. It becomes possible once the oldest baseline in
+   use is `gpu/int-E2` or later. =#
 "`z` and `dz` only: the statistics a free-space geometry can record."
 freestats(grid, Eω) = Stats.collect_stats(grid, Eω)
 

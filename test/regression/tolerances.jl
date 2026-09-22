@@ -53,9 +53,16 @@
      failure, would become a no-op). The case runs at 175 µJ instead: the most strongly
      ionising energy whose adaptive step count is reproducible, at ±1, ±2 and ±8 ulp and
      at 1e-14. The sweep behind that choice is in `cases.jl` next to the case.
-   - Outside the ionising cases the loosest `:Eω` tolerances are `taper_field_kerr`
-     8.7e-07 and `gradient_field_kerr` 2.6e-07, the two z-dependent cases: the operator is
-     rebuilt at every stage, so where the stepper lands feeds back into the field itself.
+   - The two z-dependent cases, `gradient_field_kerr` and `taper_field_kerr`, used to be
+     the loosest `:Eω` tolerances outside the ionising cases: 2.6e-07 and 8.7e-07 in the
+     `:adaptive` mode, because the old one-point propagator rebuilt the operator at every
+     stage, so where the stepper landed fed back into the field itself. `gpu/27` replaced
+     that with `exp(Φ(t2) − Φ(t1))` over a table built once at setup, and the feedback is
+     gone: re-measured on `gpu/int-E2` the `:adaptive` `:Eω` sensitivities are 2.5e-13
+     and 7.6e-15, giving 2.5e-11 and the 1e-12 floor. The `:stats` numbers are almost
+     unchanged (1.6e-04, 3.5e-05, from `stats/zdw` and `stats/peakintensity`), because
+     they are still recorded once per accepted step. The `:fixed` mode was at the floor
+     before and after.
    - `radial_field_raman` (added in `gpu/20-radial-device` as the matrix's only
      multi-column Raman case) is at the floor in the `:fixed` mode (2.4e-15) and 1.1e-09
      in the `:adaptive` one, in line with the two radial Kerr cases. Its baseline does not
@@ -147,10 +154,10 @@ const TOLERANCES = Dict{String, Dict{Symbol, Dict{Symbol, Float64}}}(
         :adaptive  => Dict(:Eω => 5.0e-12, :stats => 1.0e-12)),
     "gradient_field_kerr" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
-        :adaptive  => Dict(:Eω => 2.6e-07, :stats => 1.6e-04)),
+        :adaptive  => Dict(:Eω => 2.5e-11, :stats => 1.6e-04)),
     "taper_field_kerr" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
-        :adaptive  => Dict(:Eω => 8.7e-07, :stats => 3.1e-05)),
+        :adaptive  => Dict(:Eω => 1.0e-12, :stats => 3.5e-05)),
     "modeavg_field_legacy" => Dict(
         :fixed     => Dict(:Eω => 1.0e-12, :stats => 1.0e-12),
         :adaptive  => Dict(:Eω => 1.3e-11, :stats => 7.8e-08)),
