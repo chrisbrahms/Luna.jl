@@ -1947,7 +1947,7 @@ function metalstatscase(spec; geom=:radial, GT=Grid.RealGrid, gas=:Ar, pres=1.0,
                                  NonlinearRHS.const_norm_free(grid, sg, nfun)
     inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
     Eω, transform, FT = Luna.setup(grid, sg, dens, normfun, resp, inputs; device=spec)
-    sf = Stats.default(grid, Eω, transform, linop; gas, beam_profile, stats_device)
+    sf = Stats.default(grid, Eω, linop, transform; gas, beam_profile, stats_device)
     out = Output.MemoryOutput(0, flength, 3, sf)
     h = flength/8
     Luna.run(Eω, grid, linop, transform, FT, out;

@@ -154,7 +154,7 @@ analytic(grid::Grid.EnvGrid, Eω0) = FFTW.ifft(Eω0)
 @testset "$geom statistics, $GT" for geom in (:radial, :free2d, :free3d),
                                     GT in (Grid.RealGrid, Grid.EnvGrid)
     s = freesetup(; geom, GT)
-    sf = Stats.default(s.grid, s.Eω, s.transform, s.linop;
+    sf = Stats.default(s.grid, s.Eω, s.linop, s.transform;
                        gas=:Ar, windows=((600e-9, 1000e-9),))
     d = sf(s.Eω, 0.0, 1e-4)
 
@@ -199,7 +199,7 @@ analytic(grid::Grid.EnvGrid, Eω0) = FFTW.ifft(Eω0)
     #= The beam profile is the only member with no device form, so it is what makes the
        set host-only; without it every statistic in the set has one. =#
     @test Stats.host_statistics(sf) == ["BeamProfile"]
-    sfd = Stats.default(s.grid, s.Eω, s.transform, s.linop; beam_profile=false)
+    sfd = Stats.default(s.grid, s.Eω, s.linop, s.transform; beam_profile=false)
     @test isempty(Stats.host_statistics(sfd))
     # ... and turning it off changes nothing about the rest
     dd = sfd(s.Eω, 0.0, 1e-4)
@@ -212,7 +212,7 @@ end
    through its quadrature sum. =#
 @testset "on-axis electron density" begin
     s = freesetup(; geom=:radial, N=32, R=200e-6, w0=40e-6, energy=20e-6, plasma=true)
-    sf = Stats.default(s.grid, s.Eω, s.transform, s.linop)
+    sf = Stats.default(s.grid, s.Eω, s.linop, s.transform)
     d = sf(s.Eω, 0.0, 1e-4)
     Eω0 = dropdims(Grid.onaxis(s.sg, s.Eω; dim=3); dims=2)
     Et0 = analytic(s.grid, Eω0)
@@ -231,7 +231,7 @@ end
    nothing is NaN. =#
 @testset "a radial propagation with the default statistics" begin
     s = freesetup(; geom=:radial, N=32, R=1e-3, w0=200e-6, energy=1e-9)
-    sf = Stats.default(s.grid, s.Eω, s.transform, s.linop; gas=:Ar)
+    sf = Stats.default(s.grid, s.Eω, s.linop, s.transform; gas=:Ar)
     out = Output.MemoryOutput(0, 0.02, 5, sf)
     Luna.run(s.Eω, s.grid, s.linop, s.transform, s.FT, out; zmax=0.02,
              status_period=100)

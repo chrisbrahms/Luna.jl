@@ -142,10 +142,15 @@ the *adaptive* multimode transform (`TransModal`, `modal_integral=:adaptive`, th
 three free-space ones -- `TransRadial`, `TransFree2D` and `TransFree` -- and the
 fixed-quadrature multimode transform (`TransModalFixed`, `modal_integral=:fixed`) are
 device-capable, and so is every nonlinear response Luna ships: the Kerr responses, the
-χ⁽²⁾ responses, the plasma response and the Raman responses. Two pieces of per-step work
-are still host code inside otherwise device-capable runs: the crystal-optics
+χ⁽²⁾ responses, the plasma response and the Raman responses. Three pieces of per-step
+work are still host code inside otherwise device-capable runs. The crystal-optics
 normalisation evaluates its refractive indices on the host and stages the result (the
-propagation itself stays on the device), and the `fwhm_r` statistic has no device form.
+propagation itself stays on the device). Some statistics have no device form -- `fwhm_r`
+and the rest of `Stats.beam_profile`, the modal reconstruction error and the transverse
+quadrature error -- and one such member makes its whole set host-only; see "Boundaries
+and statistics" below. And `linop_integral=:quadrature` integrates a z-dependent linear
+operator by evaluating it on the host and uploading the result, which the default `:auto`
+avoids by tabulating the integral at setup; see "Tapers and pressure gradients" below.
 `Luna.setup` refuses a device or a reduced precision for a *transform* which cannot do
 it, through the residency checks each of them makes, rather than running it wrongly. A
 *response* is not refused: it falls back to the host copy described under "An ad hoc
@@ -247,6 +252,8 @@ Setting up costs a little more than the propagation holds, all of it collectable
 `Luna.setup` returns: the `Float64` prototypes its input-field plans are made against and
 the initial state before it is uploaded (about 256 MB on the host at that grid), and one
 state-shaped time-domain block on the device.
+
+### Boundaries and statistics
 
 The absorbing boundaries (`boundary=:rate`, `:legacy` and `:none`) and the default
 statistics *do* run with a device state, for every device-capable transform -- the

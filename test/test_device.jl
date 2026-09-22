@@ -3210,6 +3210,10 @@ end
     @test length(fieldbuffers(tn)) == 7
     @test !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
 end
+#= The remaining device tests, like the block above, need JLArrays. They were added after
+   `end # have_jlarrays` closed that block, so they get their own guard rather than
+   erroring in an environment without JLArrays. =#
+if have_jlarrays
 
 #= 2-D Cartesian free space end to end on a device, field-resolved and envelope, with the
    χ⁽²⁾ responses and `boundary=:rate`. This is the exit test of the branch on the 2-D
@@ -3388,7 +3392,7 @@ function freestatsstate(spec; geom=:radial, GT=Grid.RealGrid, N=8, R=400e-6, gas
                                     θ=npol == 2 ? π/6 : 0.0)
     Eω, transform, FT = Luna.setup(grid, sg, dens, normfun, Tuple(resp), inputs;
                                    device=spec)
-    sf = Stats.default(grid, Eω, transform, linop;
+    sf = Stats.default(grid, Eω, linop, transform;
                        gas, windows, beam_profile, stats_device)
     (grid, Eω, sf)
 end
@@ -3485,3 +3489,5 @@ end
     @test dh["transverse_points"] == 33
     @test 0 < dh["transverse_integral_error_rel"] < 1e-3
 end
+
+end # have_jlarrays

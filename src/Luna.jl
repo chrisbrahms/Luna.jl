@@ -441,7 +441,7 @@ transform they need is planned on the host whatever the run uses; the returned `
 plan on the *state's* array type, which is what the absorbing boundaries apply.
 
 !!! note "Statistics"
-    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, transform, linop)` builds the
+    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, linop, transform)` builds the
     default statistics set for the returned transform: the total energy, the peak
     intensity, `ω0` and the duration on the propagation axis, the beam size, the energy
     in the absorbing collar, and the electron density with plasma.
@@ -524,7 +524,7 @@ transform they need is planned on the host whatever the run uses; the returned `
 plan on the *state's* array type, which is what the absorbing boundaries apply.
 
 !!! note "Statistics"
-    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, transform, linop)` builds the
+    [`Stats.default`](@ref Luna.Stats.default)`(grid, Eωk, linop, transform)` builds the
     default statistics set for the returned transform: the total energy, the peak
     intensity, `ω0` and the duration on the propagation axis, the beam size, the energy
     in the absorbing collar, and the electron density with plasma.

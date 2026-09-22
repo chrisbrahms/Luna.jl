@@ -1964,7 +1964,7 @@ function default(grid, Eω, modes::Modes.ModeCollection, linop, transform;
 end
 
 """
-    default(grid, Eω, transform, linop; kwargs...)
+    default(grid, Eω, linop, transform; kwargs...)
 
 The default statistics set for a radial or free-space propagation, i.e. for a
 [`NonlinearRHS.TransRadial`](@ref Luna.NonlinearRHS.TransRadial),
@@ -1990,8 +1990,10 @@ It records
 - `z` and `dz`.
 
 `Eω` is the propagating state itself, not a host copy of it, as for the modal methods.
-`linop` is accepted for symmetry with those and is not used: a free-space linear operator
-has no mode and so no zero-dispersion wavelength to record.
+The positional arguments are those of the modal methods without the mode, and in the same
+order as [`Luna.run`](@ref Luna.run) takes them. `linop` is accepted for that symmetry and
+is not used: a free-space linear operator has no mode and so no zero-dispersion wavelength
+to record.
 
 # Keyword arguments
 - `windows=nothing`: wavelength regions to record the energy in, as for the modal methods
@@ -2018,7 +2020,7 @@ statistics cost; `Output.PeriodicStats` (`stats_period` on `prop_capillary`, or
 [`Output.maybe_periodic`](@ref Luna.Output.maybe_periodic)) is the lever, and
 `Output.nostats` switches them off.
 """
-function default(grid, Eω, transform::Union{TransRadial, TransFree, TransFree2D}, linop;
+function default(grid, Eω, linop, transform::Union{TransRadial, TransFree, TransFree2D};
                  windows=nothing, gas=nothing, userfuns=Any[],
                  collar=Boundaries.DEFAULT_RCOLLAR, beam_profile=true,
                  stats_device=:auto)
