@@ -863,7 +863,13 @@ function _project_points!(out, Pω, W, pre, ::Val{2})
 end
 
 #= The transverse coordinates, the Jacobian factor and the in-domain flag of one chunk of
-   a round, exactly as the per-point implementation computed them. =#
+   a round.
+
+   For a Cartesian domain the in-domain test is the one `Modes._outside` makes, so the
+   adaptive driver, the mode matrix and the fixed quadrature rule all use the same
+   rectangle. The polar test is deliberately not `Modes._outside`'s: here `r == 0` counts
+   as outside, and the Clenshaw-Curtis rule `Cubature.pcubature_v` uses does sample it.
+   Both give the same integral, because the Jacobian `pre` is zero there. =#
 function _points!(t::TransModal, xs, off, n)
     _, ll, ul = t.dimlimits
     polar = t.dimlimits[1] == :polar
@@ -878,12 +884,11 @@ function _points!(t::TransModal, xs, off, n)
             if polar
                 pre = x1
             else
-                #= NOTE `x1 >= ul[2]` rather than `x2 >= ul[2]`: this reproduces the
-                   condition the per-point implementation used, which looks like a typo
-                   for the upper limit of the second coordinate but is left as it was --
-                   changing it would change the answer of every Cartesian-domain
-                   multimode run. =#
-                inside &= !(x2 <= ll[2] || x1 >= ul[2])
+                #= Until `gpu/26-rectmode-fix` the upper limit here read `x1 >= ul[2]`,
+                   which for a `RectMode` guide with `a > b` treated every point with
+                   `b <= x1 < a` as outside and dropped a strip of the domain from the
+                   transverse integral. =#
+                inside &= !(x2 <= ll[2] || x2 >= ul[2])
                 pre = 1.0
             end
         else

@@ -212,3 +212,64 @@ end
     # LP11 should not couple nonlinearly to HE11
     @test norm(Inl3)/norm(Inl12) < 1e-32
 end
+@testset "Rectangular transverse integral" begin
+    using Luna
+    import Luna: NonlinearRHS, RectModes
+    import Luna.PhysData: ε_0, μ_0
+
+    #= For a single mode the transverse integral of the Kerr polarisation is analytic.
+       The field at a transverse point is Eₘ ê/√N, with ê the mode profile and N its
+       normalisation, so the Kerr polarisation is ρ ε₀ γ₃ (Eₘ ê/√N)³ and its projection
+       back onto the mode is
+
+           ∫ dA (ê/√N) ρ ε₀ γ₃ (Eₘ ê/√N)³ = (∫ê⁴ dA / N²) ρ ε₀ γ₃ Eₘ³ .
+
+       `NonlinearRHS.Erω_to_Prω!` returns the same windowed, transformed and normalised
+       polarisation at a single transverse point, so with `norm!` the identity the ratio
+       of the transform's output to `Erω_to_Prω!` at the centre of the guide, where ê = 1,
+       is ∫ê⁴ dA / N² · N^(3/2) = ∫ê⁴ dA / √N. Everything else -- the time window, the
+       oversampled transforms, the spectral window, the density and γ₃ -- cancels.
+
+       For the fundamental mode of a rectangular guide of half-widths a and b,
+       ∫ê⁴ dA = 9ab/16 and N = ½√(ε₀/μ₀)ab.
+
+       The `a > b` guide is the one this measures. The Cartesian in-domain test of the
+       adaptive driver (`NonlinearRHS._points!`) used to read `x1 >= ul[2]` rather than
+       `x2 >= ul[2]`, which treats every point with b ≤ x < a as outside the guide: for
+       a = 2.5b that drops 8.3 % of ∫ê⁴ dA, so the ratio comes out 8.3 % low. =#
+    "∫ê⁴dA/√N for the fundamental mode of a rectangular guide of half-widths `a`, `b`."
+    kerrfactor(a, b) = (9*a*b/16)/sqrt(0.5*sqrt(ε_0/μ_0)*a*b)
+
+    λ0 = 800e-9
+    gas = :Ar
+    grid = Grid.RealGrid(λ0, (400e-9, 2e-6), 100e-15)
+    densityfun = let dens=PhysData.density(gas, 1.0)
+        z -> dens
+    end
+    responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
+    inputs = Fields.GaussField(λ0=λ0, τfwhm=10e-15, energy=1e-6)
+
+    "The nonlinear polarisation of one `RectMode` at z = 0, and the transform that made it."
+    function rectnl(a, b; kwargs...)
+        modes = (RectModes.RectMode(a, b, gas, 1.0, :Ag),)
+        Eω, transform, FT = Luna.setup(grid, densityfun, responses, inputs, modes, :x;
+                                       full=true, norm! = identity, kwargs...)
+        nl = similar(Eω)
+        transform(nl, Eω, 0.0)
+        nl, transform
+    end
+
+    for (a, b) in ((100e-6, 40e-6), (40e-6, 100e-6), (60e-6, 60e-6))
+        nl, transform = rectnl(a, b; rtol=1e-6, mfcn=20_000)
+        # the same quantity at the centre of the guide, where the mode profile is 1
+        Prω = copy(NonlinearRHS.Erω_to_Prω!(transform, (0.0, 0.0)))
+        # only where the polarisation is not window taper or numerical dust
+        idcs = findall(x -> abs(x) > 1e-3*maximum(abs, Prω), Prω[:, 1])
+        @test length(idcs) > 10
+        @test all(isapprox.(nl[idcs, 1] ./ Prω[idcs, 1], kerrfactor(a, b), rtol=1e-7))
+
+        # the fixed quadrature rule integrates the same domain
+        nlf, _ = rectnl(a, b; modal_integral=:fixed)
+        @test all(isapprox.(nlf[idcs, 1] ./ Prω[idcs, 1], kerrfactor(a, b), rtol=1e-10))
+    end
+end
