@@ -1,3 +1,6 @@
+# Cost of the Capillary `neff_β_grid`/`neff_grid` overloads removed in gpu/30-neff-grid.
+# Meaningful only on the parent commit (gpu/int-E2): it times the overloads, deletes them
+# in-process and times the generic `Modes.neff` path. See PR_30-neff-grid.md.
 import LinearAlgebra
 using Luna, Printf
 import Luna: LinearOps, Capillary, Grid

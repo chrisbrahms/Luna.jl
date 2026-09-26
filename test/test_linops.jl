@@ -131,6 +131,7 @@ for zi in range(0, L, length=10)
     βm!(outm, zi)
     βdm!(outdm, zi)
     @test outm == outdm
+    @test outm[grid.sidx] ≈ [Modes.β(m, ω; z=zi) for ω in grid.ω[grid.sidx]] rtol=1e-14
 end
 
 a = 125e-6

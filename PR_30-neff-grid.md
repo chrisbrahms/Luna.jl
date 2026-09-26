@@ -28,13 +28,26 @@ process, overload methods deleted between the two halves.
 | `prop_capillary`, 4 modes, `:auto` | 6.26 s | 6.16 s |
 
 The operator values and every output `Eω` are bitwise identical with and without the
-overloads (max difference 0). The multimode overload gave no speed-up at all; its
-`AbstractArray` branch could never match a `Vector` of modes (the `where` inside the element
-type makes it invariant), so only tuples ever reached it. On the default path the mode-averaged
-cost is +0.08 s of setup per run, independent of the run length. The one real slowdown is an
-explicit `linop_integral=:quadrature` on a fixed-radius gradient (3.4×); `:auto` falls back to
-quadrature only when a table would exceed the byte budget, which a mode-averaged operator
-does not.
+overloads (max difference 0). The multimode overload gave no speed-up at all, although the
+per-call benchmark passes a `Tuple` and does reach it; its `AbstractArray` branch could never
+match a `Vector` of modes anyway (the `where` inside the element type makes it invariant).
+The per-call timings use the 2049-sample grid above; the `prop_capillary` runs use their own
+4097-sample grid, where the mode-averaged setup cost of the generic path is about +0.08 s per
+run (one timing each, of the order of the run-to-run noise), and it grows with `Nω` but not
+with the fibre length.
+
+The slowdown that does matter is on the `:quadrature` path, where the closure runs at every
+stage (3.4× here, up to the 4.9× per-call ratio). That path is taken when requested
+explicitly, or by `:auto` when the table is capped: the node budget is
+`clamp(256 MiB ÷ (96 B · Nω), 2, 1024)` (`LinearOps.node_budget`), i.e. 682 nodes at
+`Nω = 4097`, and this gradient needed 87 nodes, so a mode-averaged run falls back at
+`Nω ≳ 32k` (picosecond windows with a UV limit), or at any `Nω` when the refinement needs
+more nodes than the cap (tight `linop_tol`, sharp profiles, long fibres). The fallback is
+logged at info level. On those runs a fixed-radius Marcatili gradient is now 3–5× slower per
+operator evaluation than before; tapers, non-Marcatili modes and multimode runs are
+unchanged. The removal is still taken: the overload served one mode type in one geometry,
+duplicated the index formula (without the `real(n) < 1e-3` clamp of the generic one), and
+the default path is now insensitive to it.
 
 ## Changes
 
@@ -43,13 +56,17 @@ does not.
   `LinearOps` import. The comment on `zconstant` no longer mentions `FixedCoreCollection`.
 - `test/test_linops.jl`: the "equivalence for fast z-dependent linops" testset compared the
   overload with the generic path through `Modes.delegated`; it now checks that a delegated
-  mode gives the same operator (renamed, comments updated, the type-inequality assert dropped).
+  mode gives the same operator (renamed, comments updated, the type-inequality assert dropped),
+  and the `RealGrid` block now also checks `βfun!` against an independent `Modes.β` per
+  frequency.
+- `benchmark/neff_overloads.jl`: the measurement script. It is meaningful only on the parent
+  commit (on this branch there is nothing to delete and both halves run the generic path).
 - The generic `LinearOps.neff_grid`/`neff_β_grid` stay as the extension point their docstrings
   describe.
 
 ## Tests
 
-- `test_linops.jl` 354/354, `test_capillary.jl` 181/181, `test_gradient.jl` 7/7,
+- `test_linops.jl` 364/364, `test_capillary.jl` 181/181, `test_gradient.jl` 7/7,
   `test_tapers.jl` 2/2, `test_multimode.jl` 15/15.
 - Regression gate against `gpu/int-E2` ced6b299: 506/506, every case and mode exactly 0 (fixed and adaptive, `Eω` and statistics). Gate run 178 s, baseline generation 253 s.
 
