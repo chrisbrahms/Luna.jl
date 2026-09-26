@@ -112,7 +112,9 @@ is ≈1e14 W/cm², the onset of argon ionisation):
 `Tools.Pcr` = 11.3 GW, so their 0.95 row is ≈2 % lower in energy than the 0.97 probe.)
 
 Timing at 0.8 and 0.95 P_cr (energies from `Tools.Pcr`), FFTW 1 thread, one run each
-(30–550 s, so run-to-run noise is small relative to the differences). Error: final `Eω`
+(30–550 s). The same configuration timed by `modal_accuracy.jl` in another session differs
+by up to 22 % (fixed `nr = 128`: 28.5 vs 34.7 s; adaptive: 73.9 vs 80.9 s), so ratios
+below are good to about that. Error: final `Eω`
 against `:fixed` with `nr = 256`, largest difference over all modes / peak over all modes.
 
 | P/P_cr | rule | error | `-t 1` | `-t 8`, BLAS 1 | `-t 8`, BLAS 8 |
@@ -174,9 +176,12 @@ each metric. Reference mode energy shares: 0.64, 0.34, 1.6e-2, 3.7e-3, 2.8e-4, 3
 - `nr = 64` is **2–3× less accurate than the adaptive default** on the per-mode and energy
   metrics (and 2× on the spectrum), so it is not "as accurate"; the peak-normalised
   metric hid that.
-- `nr = 128` is **more accurate than the adaptive default on all four metrics and 2.3×
-  faster at `-t 8`** (34.7 vs 80.9 s); at `-t 1` the same comparison is 1.24× (108.4 vs
-  133.9 s, `modal_rules.csv`).
+- `nr = 128` is **at least as accurate as the adaptive default on all four metrics
+  (1.3–2.8× smaller error; the energy error, 7e-4, is close to the 5.5e-4 floor) and
+  2.3–2.6× faster at `-t 8`** (34.7 vs 80.9 s here, 28.5 vs 73.9 s in `modal_rules.csv`);
+  at `-t 1` the same comparison is 1.24× (108.4 vs 133.9 s, `modal_rules.csv`).
+- The per-mode metric is set by the weakest modes (energy shares down to 1.9e-6), so a
+  per-mode error of 1e-2 is a 1 % error in a mode carrying a millionth of the energy.
 - Tightening the propagation tolerance does not change `nr = 64`'s error, so the errors
   above are the transverse rule's, not the step controller's. All rules take a similar
   number of steps (741–777), so the time differences are per right-hand side.
@@ -194,6 +199,41 @@ decision: on a multicore CPU, for 8 HE₁ₘ modes at ≤ 0.95 P_cr, `modal_inte
 with `nr = 128` is at least as accurate as the adaptive default on every metric checked
 and 2.3× faster at `-t 8` (1.24× at `-t 1`); the default `nr = 64` is 4.5× faster but
 2–3× less accurate in the weak modes.
+
+## FFTW planning mode (`planmode.jl`, `runs_planmode.csv`; reviewer round 2)
+
+Luna's default planning mode is `:patient`. On this machine PATIENT plans are **slower**
+than ESTIMATE and MEASURE plans for batched and multi-dimensional transforms. Clean
+microbenchmark (plan made on a copy of the input, executed on the original; one FFTW
+thread; min / max over 3 processes):
+
+| transform | estimate | measure | patient |
+|---|---:|---:|---:|
+| complex 1024 × 32 × 32, region (1,2,3) | 13.2 ms | 12.9 ms | 19.1–19.5 ms |
+| real 4096 × 256, region 1 | 1.56 ms | 1.56 ms | 2.10–2.19 ms |
+| real 16384 × 32, region 1 | 0.91 ms | 0.92 ms | 0.98–1.04 ms |
+| real 1-D 131072 | 0.43 ms | 0.33 ms | 0.34 ms |
+| complex 1-D 16384 | 0.106 ms | 0.118 ms | 0.118 ms |
+
+Whole runs, best of 5 (`runs_planmode.csv`):
+
+| case | J / FFTW | estimate | measure | patient |
+|---|---|---:|---:|---:|
+| 3-D 64 × 64 | 4 / 1 | 3.02 | 3.06 | 3.48 |
+| 3-D 64 × 64 | 4 / 4 | 2.06 | 2.06 | 2.61 |
+| 3-D 64 × 64 | 8 / 1 | 2.70 | 2.67 | 3.13 |
+| 3-D 64 × 64 | 8 / 8 | 1.55 | 1.54 | 2.84 |
+| 2-D χ⁽²⁾ | 4 / 1 | 0.42 | 0.44 | 0.44 |
+| 2-D χ⁽²⁾ | 8 / 1 | 0.45 | 0.45 | 0.46 |
+
+The effect is reproducible across processes (so a deterministic plan choice, not noise);
+why FFTW's PATIENT search picks worse plans here (timing disturbed by the efficiency cores
+or by Julia's task scheduler during planning are candidates) is not established.
+`:measure` is as fast as or faster than both other modes in every row, and plans in a
+fraction of PATIENT's time. It also qualifies the thread numbers: the 3-D 64 × 64 gain
+from threads (5.4 → 1.7 s) is under `:estimate`/`:measure`; under the default `:patient`
+the same run takes 2.6–2.9 s. The `:patient` FFT ratio table above is normalised to
+PATIENT's own single-thread plans.
 
 ## Conclusions: what matters for CPU speed
 
@@ -216,7 +256,11 @@ In order of effect, from the measurements above (this machine):
    for small mode-averaged, GNLSE or small free-space runs, which the thresholds leave
    single-threaded. `-t 4` to `-t 8` (at most the performance cores) is the useful range
    here: `-t 4` was as fast as `-t 8` or faster in half the cases, `-t 10` never faster.
-5. **What does not matter**: FFTW threads above `J`; any thread setting for small grids
+5. **FFTW planning mode**: Luna's default `:patient` gives plans up to 1.8× slower in whole
+   3-D runs (1.45× for the transform alone) than `:measure`, which was never slower than
+   either other mode here. Not a thread setting; recorded for a separate decision
+   (`:measure` as the default).
+6. **What does not matter**: FFTW threads above `J`; any thread setting for small grids
    beyond not oversubscribing; host thread settings on a Metal run (≤ 30 %, through
    setup).
 
@@ -248,16 +292,23 @@ Why these forms:
   FFTW's in-memory wisdom reused, so mostly steady state), whereas the 512k case gains
   10–25 % (`J=4`: 3.52 → 2.64 s; `J=8`: 3.15 → 2.85 s) as it does under `:estimate`. The
   cost: under `:estimate` the 128k case loses the 9–20 % it gained with FFTW threads.
-  The threshold is bracketed by one case at 128k (mixed) and one at 512k (gain); a case
-  near 256k was not measured.
-- The `B₀` forms are stated for this machine (`B₀` = 8 performance cores); whether
-  "cores left by the Julia pool" and "half the default" transfer to machines with SMT or
-  uniform cores is untested.
+  The threshold is bracketed by one case at 128k (mixed) and one at 512k (gain), with no
+  case in between, so 2¹⁸ is a conservative choice, not a measured crossover. The worst
+  `:patient` result at 128k (`J=8`, F8 10.3 s) is a single erratic plan (F16 6.0 s, and at
+  `J=4` F16 was the best), not a trend.
+- The `B₀` forms are stated for this machine, where OpenBLAS's default (8) happens to equal
+  the performance-core count. That default is not the physical core count in general (it
+  depends on platform, build and Julia version), so an implementation should derive the
+  core count explicitly or document the dependence; whether "cores left by the Julia pool"
+  and "half the default" transfer to machines with SMT or uniform cores is untested.
 
 Against the best configuration measured (all CSVs, best over repetitions), the revised
-rule is within 10 % in every case at `J = 4, 8` except the 128k mode-averaged case
-(1.20 at `J=4`, 1.09 at `J=8` under `:estimate`; 1.17 and 1.05 under `:patient`), which is
-the threshold trade-off above; noise on 1–3 s runs is ±10 % (6-repetition runs).
+rule is within 10 % in every case at `J = 4, 8` (radial 1024 at `J=4` at the edge, 1.0995)
+except the 128k mode-averaged case (1.20 at `J=4`, 1.09 at `J=8` under `:estimate`; 1.17
+and 1.05 under `:patient`), which is the threshold trade-off above. Repeatability across
+sessions: ≤ 5 % for the recommended (non-oversubscribed) configurations, up to ≈30 % for
+oversubscribed ones (radial `J=4`/F16/B8: 3.33 vs 2.43 s) — oversubscription also makes
+run times unstable.
 
 An explicit `set_fftw_threads(n)` / `BLAS.set_num_threads(n)` by the user wins. With
 per-plan counts the FFTW wisdom cache (today one file per global count,
