@@ -68,8 +68,12 @@ const METALCASES = ("modeavg", "modeavg_long", "modal_fixed", "radial", "radial_
 
 field(out) = out isa Output.MemoryOutput ? out.data["Eω"] : out["Eω"]
 
-fftw_settings() = J == 1 ? (J1_FFTW ? [1, 2, 4, 8] : [1]) : sort(unique([1, J, 2J, 4J]))
-blas_settings(gemm) = gemm ? sort(unique([1, J, 8])) : [1]
+# FFTW_LIST / BLAS_LIST (comma-separated, `J` allowed) override the default grids
+parselist(v) = sort(unique([x == "J" ? J : parse(Int, x) for x in split(v, ",")]))
+fftw_settings() = haskey(ENV, "FFTW_LIST") ? parselist(ENV["FFTW_LIST"]) :
+                  J == 1 ? (J1_FFTW ? [1, 2, 4, 8] : [1]) : sort(unique([1, J, 2J, 4J]))
+blas_settings(gemm) = !gemm ? [1] : haskey(ENV, "BLAS_LIST") ? parselist(ENV["BLAS_LIST"]) :
+                      sort(unique([1, J, 8]))
 
 function main()
     sel = haskey(ENV, "CASES") ? split(ENV["CASES"], ",") :

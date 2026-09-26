@@ -36,8 +36,8 @@ efficiency cores hold back the slowest task). `:patient` planning time grows ste
 the FFTW count: 0.44 s → 6.1 s → 28 s for a 2¹⁸ complex transform at 1, 8, 40 threads —
 paid at every `setup` without wisdom, and once per thread count with it.
 
-GEMM alone: 8 BLAS threads are 5–8× faster than 1 for every Luna shape, even the 4-mode
-`8192×4×16` product (≈2×), independently of `J`.
+GEMM alone: 8 BLAS threads are 5–8× faster than 1 for the radial and 16-mode shapes and
+1.7–5× for the 4-mode ones (`8192×4×16`: ≈2×), independently of `J`.
 
 ## Whole propagations (`runs.jl`)
 
@@ -70,35 +70,44 @@ What drives it:
    BLAS threads even at `J=1`.
 2. **FFTW threads help only large non-GEMM transforms** (8 ps window, 64 × 64 3-D grid) and
    hurt small ones (up to 2× at `J=8`). In the whole runs the threshold is higher than in
-   isolation: the 2-D χ⁽²⁾ case (64k elements per plan) is 5–10 % slower with FFTW threads,
-   the 8 ps case (128k) 16–25 % faster. With GEMMs in the same step (radial), FFTW threads
+   isolation: the 2-D χ⁽²⁾ case (64k elements per plan) is 0–2 % slower with FFTW threads
+   at `J=4` and 11–13 % at `J=8`, the 8 ps case (128k) 20 % faster at `J=4` and 9 % at
+   `J=8`. One case on each side, of different geometry, brackets the threshold between 64k
+   and 128k elements; the 128k case sits on it. With GEMMs in the same step (radial), FFTW threads
    plus BLAS threads oversubscribe (radial 1024 at `J=8`: 6.0 → 10.9 s).
-3. **FFTW's own pthreads at `J=1`** give 4–20 % on the large non-GEMM cases (3-D 64 × 64:
+3. **FFTW's own pthreads at `J=1`** give 7–20 % on the large non-GEMM cases (3-D 64 × 64:
    5.4 → 4.3 s with 8) and cost 30 % on the 1 ps case with 8, which the size threshold avoids.
 4. **`J`**: `-t 4` is as fast as or faster than `-t 8` for mode-averaged, adaptive multimode
    and small radial runs; `-t 8` wins for `:fixed` multimode and the large free-space and
    radial grids. Nothing at `-t 10` was better than `-t 8`.
 
-**Metal** (`runs_metal.csv`): host thread settings barely matter on a device run. FFTW
-threads change nothing; BLAS 8 helps by 10–30 % through host work at setup (building the
-radial matrices).
+**Metal** (`runs_metal.csv`): host thread settings matter little on a device run. FFTW
+threads change little (the exception: radial at `J=8`/BLAS 8, 0.48 → 0.78 s with 16 FFTW
+threads, i.e. more threads only hurt); BLAS 8 helps by 10–30 % through host work at setup
+(building the radial matrices).
 
 ## Multimode: adaptive against fixed transverse integral (`modal_rules.jl`)
 
 The whole-run matrix above used a weakly nonlinear multimode case, and so did the README
-example: there the adaptive rule never refines (31 points at every step, its initial
-rule) and HE₁₁ keeps > 99 % of the energy, so the transverse integral is easy and any
-rule is exact. For a meaningful comparison the peak power has to approach the critical
+example: there the adaptive rule stops at the same level at every step (31 points: the
+33-point Clenshaw–Curtis level of `pcubature` with the two end points excluded; it starts
+from 3) and HE₁₁ keeps > 99 % of the energy, so the transverse integral is easy and any
+reasonable rule is accurate. For a meaningful comparison the peak power has to approach the critical
 power for self-focusing, `Tools.Pcr` (Fibich–Gaeta, with `Tools.getN0n0n2`): 11.3 GW for
 argon at 1 bar and 800 nm, 271 GW for helium (so the README case, 11 GW in helium, is at
 0.04 P_cr). Probe (8 HE₁ₘ modes, 125 µm, Ar 1 bar, 30 fs, 30 cm, adaptive rule at the
-default `radial_integral_rtol = 1e-3`; ratios with `Tools.Pcr`):
+default `radial_integral_rtol = 1e-3`; ratios with `Tools.Pcr`; 125 µm is the core
+radius, the first argument of `prop_capillary`; at 0.95 P_cr the initial peak intensity
+is ≈1e14 W/cm², the onset of argon ionisation):
 
 | P/P_cr | energy | adaptive points median / 90 % / max | HE₁₁ energy share at the end |
 |---|---:|---|---:|
 | 0.51 | 184 µJ | 31 / 63 / 63 | 0.987 |
 | 0.81 | 294 µJ | 63 / 127 / 255 | 0.730 (HE₁₂ 0.259) |
 | 0.97 | 350 µJ | 127 / 127 / 255 | 0.634 (HE₁₂ 0.343) |
+
+(The probe used P_cr = 11.5 GW, Marburger's constant; the timings below use
+`Tools.Pcr` = 11.3 GW, so their 0.95 row is ≈2 % lower in energy than the 0.97 probe.)
 
 Timing at 0.8 and 0.95 P_cr (energies from `Tools.Pcr`), FFTW 1 thread, one run each
 (30–550 s, so run-to-run noise is small relative to the differences). Error: final `Eω`
@@ -125,8 +134,9 @@ overhead is the same on both sides.
 Readings:
 - At matched accuracy the fixed rule at its default `nr = 64` (5.4e-5, 1.6e-4) is as
   accurate as the adaptive default (6.6e-5, 1.5e-4) and **1.9–2.3× faster at `-t 1`,
-  3.6–4.2× faster at `-t 8`**. The adaptive rule refines to 127–1023 points where the
-  integrand is hardest, and each refinement round hands the threads only a few points.
+  3.6–4.2× faster at `-t 8`**. At its default tolerance the adaptive rule refines to
+  63–255 points (1023 at rtol 1e-4) where the integrand is hardest, and each refinement
+  round hands the threads only a few points.
 - Threads: `nr = 64` goes 53.7 → 16.3 s from `-t 1` to `-t 8` (3.3×); adaptive 100.6 →
   58.0 s (1.7×).
 - BLAS: 8 BLAS threads at `-t 8` make the fixed rule 2.1–2.6× slower and the adaptive
@@ -139,17 +149,24 @@ Readings:
 - In the weak case (adaptive stays at 31 points) the two rules cost about the same (4-mode,
   `-t 1`: adaptive 3.9 s, fixed `nr = 32` 3.3 s).
 
+**Found on the way (reviewer):** with the fixed rule's default `modal_kronrod = false`,
+the default statistic `Stats.transverse_integral_error` still evaluates the whole
+right-hand side once per accepted step (`Stats.jl`, `TransverseIntegralError`) and then
+records NaN: about one evaluation in seven is wasted. Skipping it when there is no error
+estimate would make the fixed rule faster still; not changed here.
+
 This concerns the numerical method, not only threads, and is recorded for a separate
-decision: on a multicore CPU, `modal_integral = :fixed` with the default `nr = 64` is the
+decision (narrowed pending the accuracy check below): on a multicore CPU, `modal_integral = :fixed` with the default `nr = 64` is the
 faster multimode rule at the default accuracy in the strongly nonlinear regime measured
 here.
 
 ## Conclusions: what matters for CPU speed
 
 In order of effect, from the measurements above (this machine):
-1. **The transverse rule of multimode runs** (up to 4.2× at matched accuracy, with
-   threads; 1.9–2.3× single-threaded), in the regime where the transverse integral is
-   hard. Not a thread setting, but the largest single factor measured.
+1. **The transverse rule of multimode runs** (up to 4.2× at matched peak-normalised
+   accuracy, with threads; 1.9–2.3× single-threaded), for 8 HE₁ₘ modes at ≤ 0.95 P_cr.
+   Not a thread setting, but the largest single factor measured; see the accuracy check
+   for how far it holds.
 2. **BLAS threads against Julia threads**: with `J > 1`, BLAS = 1 for multimode (up to
    2.8× in the whole-run matrix, 2.6× above); BLAS = `J` for radial (radial 256 at `-t 4`:
    0.95 s against 1.28 s with 8 and 1.68 s with 1); at `J = 1` OpenBLAS's default (8) is right
@@ -180,9 +197,11 @@ FFT plan:
 | CPU, radial (large GEMM) | 1 | `J > 1` ? `J` : unchanged (OpenBLAS default) |
 | CPU, multimode (small GEMMs) | 1 | 1 |
 
-An explicit `set_fftw_threads(n)` / `BLAS.set_num_threads(n)` by the user wins. The 4×
+An explicit `set_fftw_threads(n)` / `BLAS.set_num_threads(n)` by the user wins. With
+per-plan counts the FFTW wisdom cache (today one file per global count,
+`FFTWcache_<n>threads`, `Utils.jl`) has to hold plans for two counts (1 and `J`). The 4×
 multiplier goes. At `J = 1` FFTW stays single-threaded, as today (decided with the user:
-FFTW's own pthreads would gain 5–17 % on the two large non-GEMM cases at `-t 1`, but a run
+FFTW's own pthreads would gain 7–20 % on the two large non-GEMM cases at `-t 1`, but a run
 started without `-t` should stay single-threaded, and the evidence is four cases; the gain
 remains available through an explicit `set_fftw_threads(n)`, which is to be documented;
 today `Utils.FFTWthreads` returns 1 whenever `nthreads() == 1`, so the implementation has
