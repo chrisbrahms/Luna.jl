@@ -55,4 +55,6 @@ version was prepared separately.
   `docs/src/modules/Ionisation.md`, deployment skipped.
 - `test_device.jl` on its own, after the change: all pass (the two testsets 4/4 and 9/9). Docs
   build re-run after the text fixes: exit 0, no errors.
-- Full `Pkg.test()` on this branch: PKGTEST_RESULT.
+- Full `Pkg.test()` on this branch (started at 6ea1d342, so with the first version of the
+  test_device change; the final version was re-run on its own, above): 7071 pass, 0 fail,
+  12 broken (pre-existing, PhysData), 35 min.
