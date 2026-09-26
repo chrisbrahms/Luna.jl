@@ -507,7 +507,7 @@ function ionrate!(out, ir, E, Eref=1; check=true)
     if device_capable(ir)
         check && check_field_range(ir, E, Eref)
         f = ratekernel(ir, Luna.scalar(out, Eref))
-        out .= f.(E)
+        @. $(Utils.threaded(out; minlen=Utils.THREAD_MINLEN_HEAVY)) = f(E)
     else
         (Eref == 1 && !Utils.isdevice(E)) || error(
             "the ionisation rate $(nameof(typeof(ir))) has no device kernel, so it can "*

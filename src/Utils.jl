@@ -220,9 +220,10 @@ Trait distinguishing host arrays ([`CPUBackend`](@ref)) from device (GPU) arrays
 needs no GPU package.
 
 It is used only where the two genuinely differ: FFT planning (FFTW flags and wisdom
-against the generic `AbstractFFTs` planners), the host-copy fallbacks, and residency
-checks. It is never used to select a kernel -- there is one implementation of every
-per-step operation and it runs on both.
+against the generic `AbstractFFTs` planners), the host-copy fallbacks, residency checks,
+and whether [`threaded`](@ref) may share a broadcast out over threads. It is never used to
+select a kernel -- there is one implementation of every per-step operation and it runs on
+both.
 
 Query it with [`backend`](@ref).
 """
@@ -254,6 +255,154 @@ backend(::Type{<:PermutedDimsArray{T, N, A, B, P}}) where {T, N, A, B, P} = back
 
 "Whether `x` lives on a device (GPU). See [`backend`](@ref)."
 isdevice(x) = backend(x) isa DeviceBackend
+
+#=================================================#
+#============  THREADED BROADCASTS   =============#
+#=================================================#
+
+#= Per-step elementwise work (the propagator, the ionisation rate, the plasma terms, the
+   fused pointwise responses, the stage combines) is written as broadcasts, which Base
+   runs on one thread. `threaded(dest)` marks a destination so that the same broadcast
+   expression is shared out over Julia's threads on the host; on a device, or when it
+   would not pay, it is exactly the plain broadcast. Each element is computed by the same
+   scalar code whichever task runs it, so the result is bit-identical to the serial
+   broadcast for any number of threads. A kernel-launch framework (KernelAbstractions)
+   was measured for this and was no faster than `Threads.@spawn` over contiguous chunks,
+   so Luna takes no extra dependency for it. =#
+
+"""
+    THREAD_MINLEN
+
+Default length below which [`threaded`](@ref) runs a broadcast serially. Spawning and
+joining the tasks costs ≈15–25 µs on an M1 Pro, and more with 8 threads, where equal
+chunks also wait for the slowest (efficiency) core; a cheap broadcast (a few arithmetic
+operations per element) only recovers that above ≈2¹⁷ elements.
+"""
+const THREAD_MINLEN = 1 << 17
+
+"""
+    THREAD_MINLEN_HEAVY
+
+[`threaded`](@ref) length threshold for broadcasts dominated by a transcendental function
+(`exp` of a complex number, a spline evaluation), which pay from ≈2¹⁵ elements. A
+mode-averaged state (a few thousand frequency samples) stays below both thresholds, where
+threading was measured to slow a run down.
+"""
+const THREAD_MINLEN_HEAVY = 1 << 15
+
+"""
+    Threaded(dest, minlen)
+
+A broadcast destination wrapper; see [`threaded`](@ref).
+"""
+struct Threaded{A}
+    dest::A
+    minlen::Int
+end
+
+"""
+    threaded(dest; minlen=THREAD_MINLEN)
+
+Mark `dest` as the destination of a broadcast to be shared out over threads:
+
+```julia
+@. \$(Utils.threaded(y; minlen=Utils.THREAD_MINLEN_HEAVY)) = y * exp(linop*dt)
+```
+
+(the `\$` keeps `@.` from dotting the call). The broadcast runs on up to
+`Threads.nthreads()` tasks, each a slab of `dest` along its last non-singleton dimension (at
+least `minlen ÷ 4` elements each) when all of these hold, and as the ordinary
+broadcast otherwise:
+
+- `dest` is a host array ([`backend`](@ref)),
+- `length(dest) >= minlen`,
+- Julia was started with more than one thread,
+- `Luna.settings["threaded_broadcasts"]` is `true` (the default; see
+  [`Luna.set_threaded_broadcasts`](@ref)),
+- the caller is not already inside a threaded region (see [`serial_region`](@ref)).
+
+The results do not depend on which path is taken. The expression must be elementwise,
+which a broadcast is; an argument which aliases `dest` without being `dest` itself is
+copied first, as Base does.
+"""
+threaded(dest; minlen=THREAD_MINLEN) = Threaded(dest, minlen)
+
+#= Nesting guard: a caller which already shares its work out over threads (the plasma
+   response's column loop) runs its inner broadcasts serially. A process-wide counter
+   rather than a task-local flag, because tasks spawned inside the region do not inherit
+   task-local storage; two unrelated concurrent runs in one process at worst make each
+   other's broadcasts serial, which changes the speed and not the result. =#
+const _THREADED_DEPTH = Threads.Atomic{Int}(0)
+
+"""
+    serial_region(f)
+
+Call `f()` with [`threaded`](@ref) broadcasts turned into plain ones, for code which is
+itself running on several threads.
+"""
+function serial_region(f)
+    Threads.atomic_add!(_THREADED_DEPTH, 1)
+    try
+        return f()
+    finally
+        Threads.atomic_sub!(_THREADED_DEPTH, 1)
+    end
+end
+
+_threadable(dest, minlen) =
+    (length(dest) >= minlen) && (Threads.nthreads() > 1) && !isdevice(dest) &&
+    (_THREADED_DEPTH[] == 0) && (settings["threaded_broadcasts"] === true)
+
+@inline Base.Broadcast.materialize!(t::Threaded, x) = Base.Broadcast.materialize!(
+    t, Base.Broadcast.instantiate(
+        Base.Broadcast.Broadcasted(identity, (x,), axes(t.dest))))
+
+function Base.Broadcast.materialize!(t::Threaded, bc::Base.Broadcast.Broadcasted)
+    dest = t.dest
+    _threadable(dest, t.minlen) || return Base.Broadcast.materialize!(dest, bc)
+    #= What Base's `materialize!`/`copyto!` do before their loop: fix the axes to
+       `dest`'s (checking that the arguments broadcast to them), drop the style, and
+       unalias/extrude the arguments. =#
+    bc′ = Base.Broadcast.preprocess(
+        dest, Base.Broadcast.instantiate(_nostyle(bc, axes(dest))))
+    #= Chunks are slabs along the last non-singleton dimension, each iterated as a
+       `CartesianIndices` block the way Base iterates the whole array: a linear index
+       per element would cost an integer division per dimension, which is more than a
+       cheap broadcast's arithmetic. =#
+    ax = axes(bc′)
+    d = something(findlast(a -> length(a) > 1, ax), 1)
+    r = ax[d]
+    # at least minlen/4 elements per task, so a short array does not pay for idle tasks
+    nt = clamp(length(dest) ÷ max(t.minlen ÷ 4, 1), 1, min(Threads.nthreads(), length(r)))
+    chunk = cld(length(r), nt)
+    Threads.atomic_add!(_THREADED_DEPTH, 1)
+    try
+        @sync for k in 1:nt
+            lo = first(r) + (k - 1)*chunk
+            hi = min(lo + chunk - 1, last(r))
+            lo <= hi || continue
+            R = CartesianIndices(ntuple(i -> i == d ? (lo:hi) : ax[i], length(ax)))
+            Threads.@spawn _bcchunk!(dest, bc′, R)
+        end
+    finally
+        Threads.atomic_sub!(_THREADED_DEPTH, 1)
+    end
+    dest
+end
+
+# The style-free `Broadcasted` Base's `copyto!` loops over, with the axes of `dest`.
+@static if VERSION >= v"1.10"
+    _nostyle(bc, ax) = Base.Broadcast.Broadcasted(nothing, bc.f, bc.args, ax)
+else
+    _nostyle(bc, ax) = Base.Broadcast.Broadcasted{Nothing}(bc.f, bc.args, ax)
+end
+
+@noinline function _bcchunk!(dest, bc, R)
+    @inbounds @simd for I in R
+        dest[I] = bc[I]
+    end
+    nothing
+end
 
 #=================================================#
 #===============  FFT PLANNING   =================#

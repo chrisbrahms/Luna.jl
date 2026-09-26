@@ -2,6 +2,7 @@ module LinearOps
 import FFTW
 import Luna: Modes, Grid, PhysData, Maths, RK45
 import Luna: upload_like, scalar, isdevice
+import Luna.Utils: threaded, THREAD_MINLEN_HEAVY
 import QuadGK
 import Printf: @sprintf
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
@@ -839,9 +840,9 @@ function _make_prop!(::AbsolutePhase, op, y0)
             end
             if isnothing(sec)
                 if bwd
-                    @. y *= exp(Φ1 - Φ2)
+                    @. $(threaded(y; minlen=THREAD_MINLEN_HEAVY)) = y * exp(Φ1 - Φ2)
                 else
-                    @. y *= exp(Φ2 - Φ1)
+                    @. $(threaded(y; minlen=THREAD_MINLEN_HEAVY)) = y * exp(Φ2 - Φ1)
                 end
             else
                 #= The secant term is put back here rather than in the readback: it is the
@@ -849,9 +850,9 @@ function _make_prop!(::AbsolutePhase, op, y0)
                    constant propagator forms it, from the step length. =#
                 dt = scalar(y, bwd ? (t1 - t2) : (t2 - t1))
                 if bwd
-                    @. y *= exp(Φ1 - Φ2 + sec*dt)
+                    @. $(threaded(y; minlen=THREAD_MINLEN_HEAVY)) = y * exp(Φ1 - Φ2 + sec*dt)
                 else
-                    @. y *= exp(Φ2 - Φ1 + sec*dt)
+                    @. $(threaded(y; minlen=THREAD_MINLEN_HEAVY)) = y * exp(Φ2 - Φ1 + sec*dt)
                 end
             end
         end
@@ -869,9 +870,9 @@ function _make_prop!(::IncrementalPhase, op, y0)
                 lastt[] = (t1, t2)
             end
             if bwd
-                @. y *= exp(-ΔΦ)
+                @. $(threaded(y; minlen=THREAD_MINLEN_HEAVY)) = y * exp(-ΔΦ)
             else
-                @. y *= exp(ΔΦ)
+                @. $(threaded(y; minlen=THREAD_MINLEN_HEAVY)) = y * exp(ΔΦ)
             end
         end
     end

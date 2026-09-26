@@ -1280,10 +1280,14 @@ function _plasma_run!(p::PlasmaCumtrapz, out, Et, c)
            same as it would be in one call over the whole block. =#
         o3, E3, rate3, frac3, Em3, J3, P3 =
             map(x -> _as3d(x, nc), (out, Et, p.rate, p.fraction, p.Em, p.J, p.P))
-        Threads.@threads :dynamic for i in 1:nc
-            _plasma_block!(_col(o3, i), _col(E3, i), _col(rate3, i), _col(frac3, i),
-                           _col(Em3, i), _col(J3, i), _col(P3, i),
-                           p.ratedev, p.δt, p.preionfrac, c)
+        #= The columns are the threads' work, so the broadcasts inside each column
+           stay serial (`Utils.serial_region`) rather than spawning tasks of their own. =#
+        Utils.serial_region() do
+            Threads.@threads :dynamic for i in 1:nc
+                _plasma_block!(_col(o3, i), _col(E3, i), _col(rate3, i), _col(frac3, i),
+                               _col(Em3, i), _col(J3, i), _col(P3, i),
+                               p.ratedev, p.δt, p.preionfrac, c)
+            end
         end
     else
         _plasma_block!(out, Et, p.rate, p.fraction, p.Em, p.J, p.P,
@@ -1312,14 +1316,14 @@ function _plasma_block!(out, E, rate, fraction, Em, J, P, ratefunc, δt, preionf
     Luna.Ionisation.ionrate!(rate, ratefunc, _ratearg(E, Em), Eref; check=false)
     Maths.cumtrapz_scan!(fraction, rate, δt)
     pf = Luna.scalar(E, preionfrac)
-    @. fraction = pf + 1 - exp(-fraction)
+    @. $(Utils.threaded(fraction; minlen=Utils.THREAD_MINLEN_HEAVY)) = pf + 1 - exp(-fraction)
     cp = Luna.scalar(E, cphase)
-    @. P = fraction * cp * E
+    @. $(Utils.threaded(P)) = fraction * cp * E
     Maths.cumtrapz_scan!(J, P, δt)
     _plasma_loss!(J, E, Em, rate, fraction, Luna.scalar(E, closs))
     Maths.cumtrapz_scan!(P, J, δt)
     co = Luna.scalar(E, cout)
-    @. out += co * P
+    @. $(Utils.threaded(out)) = out + co * P
     out
 end
 
@@ -1349,10 +1353,10 @@ end
    `0/0`, one NaN of which poisons the whole column through the scans which follow. In
    Float64 the two conditions differ only below 1e-162 V/m, which is not a field. =#
 _plasma_loss!(J, E, ::Nothing, rate, fraction, closs) =
-    @. J += ifelse(abs(E) > 0, closs*rate*(1-fraction)/E, zero(E))
+    @. $(Utils.threaded(J)) = J + ifelse(abs(E) > 0, closs*rate*(1-fraction)/E, zero(E))
 
 function _plasma_loss!(J, E, Em, rate, fraction, closs)
-    @. J += ifelse(Em^2 > 0, closs*rate*(1-fraction)/Em^2*E, zero(E))
+    @. $(Utils.threaded(J)) = J + ifelse(Em^2 > 0, closs*rate*(1-fraction)/Em^2*E, zero(E))
 end
 
 #=================================================#

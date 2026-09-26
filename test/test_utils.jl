@@ -118,4 +118,16 @@ end
     @test Luna.settings["fftw_wisdom"] == was
 end
 
+#= The threaded path needs several Julia threads; with one, the same checks run in a child
+   process started with two, so the suite exercises it either way. =#
+if Threads.nthreads() > 1
+    include(joinpath(@__DIR__, "threaded_checks.jl"))
+else
+    @testset "threaded broadcasts (child process, 2 threads)" begin
+        cmd = `$(Base.julia_cmd()) --startup-file=no -t 2 --project=$(Base.active_project())
+               $(joinpath(@__DIR__, "threaded_checks.jl"))`
+        @test success(pipeline(cmd; stdout=devnull, stderr=stderr))
+    end
+end
+
 end

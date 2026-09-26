@@ -2,7 +2,7 @@ module RK45
 import Dates
 import Logging
 import Printf: @sprintf
-import Luna.Utils: format_elapsed
+import Luna.Utils: format_elapsed, threaded, THREAD_MINLEN_HEAVY
 
 #Get Butcher tableau etc from separate file (for convenience of changing if wanted)
 include("dopri.jl")
@@ -242,33 +242,33 @@ function combine!(yn, y, ks, dt, b, n=7)
     k1, k2, k3, k4, k5, k6, k7 = ks
     if n == 1
         c1 = convert(R, dt*b[1])
-        @. yn = y + c1*k1
+        @. $(threaded(yn)) = y + c1*k1
     elseif n == 2
         c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2])
-        @. yn = y + c1*k1 + c2*k2
+        @. $(threaded(yn)) = y + c1*k1 + c2*k2
     elseif n == 3
         c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2]); c3 = convert(R, dt*b[3])
-        @. yn = y + c1*k1 + c2*k2 + c3*k3
+        @. $(threaded(yn)) = y + c1*k1 + c2*k2 + c3*k3
     elseif n == 4
         c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2]); c3 = convert(R, dt*b[3])
         c4 = convert(R, dt*b[4])
-        @. yn = y + c1*k1 + c2*k2 + c3*k3 + c4*k4
+        @. $(threaded(yn)) = y + c1*k1 + c2*k2 + c3*k3 + c4*k4
     elseif n == 5
         c1 = convert(R, dt*b[1]); c2 = convert(R, dt*b[2]); c3 = convert(R, dt*b[3])
         c4 = convert(R, dt*b[4]); c5 = convert(R, dt*b[5])
-        @. yn = y + c1*k1 + c2*k2 + c3*k3 + c4*k4 + c5*k5
+        @. $(threaded(yn)) = y + c1*k1 + c2*k2 + c3*k3 + c4*k4 + c5*k5
     elseif n == 6
         c1 = convert(R, dt*b[1]); c3 = convert(R, dt*b[3]); c4 = convert(R, dt*b[4])
         c5 = convert(R, dt*b[5]); c6 = convert(R, dt*b[6])
-        @. yn = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6
+        @. $(threaded(yn)) = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6
     else
         c1 = convert(R, dt*b[1]); c3 = convert(R, dt*b[3]); c4 = convert(R, dt*b[4])
         c5 = convert(R, dt*b[5]); c6 = convert(R, dt*b[6])
         if iszero(b[7]) # b5 is FSAL and does not use k7; b4 does
-            @. yn = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6
+            @. $(threaded(yn)) = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6
         else
             c7 = convert(R, dt*b[7])
-            @. yn = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6 + c7*k7
+            @. $(threaded(yn)) = y + c1*k1 + c3*k3 + c4*k4 + c5*k5 + c6*k6 + c7*k7
         end
     end
     yn
@@ -292,7 +292,7 @@ function errorestimate!(yerr, ks, dt)
     k1, k2, k3, k4, k5, k6, k7 = ks
     e1 = convert(R, errest[1]); e3 = convert(R, errest[3]); e4 = convert(R, errest[4])
     e5 = convert(R, errest[5]); e6 = convert(R, errest[6]); e7 = convert(R, errest[7])
-    @. yerr = 0 + d*k1*e1 + d*k3*e3 + d*k4*e4 + d*k5*e5 + d*k6*e6 + d*k7*e7
+    @. $(threaded(yerr)) = 0 + d*k1*e1 + d*k3*e3 + d*k4*e4 + d*k5*e5 + d*k6*e6 + d*k7*e7
     yerr
 end
 
@@ -405,7 +405,7 @@ function make_prop!(linop::AbstractArray, y0)
     prop! = let linop=linop
         function prop!(y, t1, t2, bwd=false)
             dt = convert(real(eltype(y)), bwd ? (t1-t2) : (t2-t1))
-            @. y *= exp(linop*dt)
+            @. $(threaded(y; minlen=THREAD_MINLEN_HEAVY)) = y * exp(linop*dt)
         end
     end
 end

@@ -362,7 +362,7 @@ _sumexprs(e::Tuple) = Base.broadcasted(+, _sumexprs(Base.front(e)), e[end])
    one the per-response loop produced. Summing the group first and adding `dest` to the
    total would associate differently and move the result at rounding level. =#
 _materialise!(dest, exprs::Tuple, firstgroup) =
-    Base.materialize!(dest, _sumexprs(firstgroup ? exprs : (dest, exprs...)))
+    Base.materialize!(Utils.threaded(dest), _sumexprs(firstgroup ? exprs : (dest, exprs...)))
 
 _apply_unfused!(Pt, Et, ::Nonlinear.Batched, r, ρ, scaling) =
     Nonlinear.batched!(r, Pt, Et, ρ, scaling)
@@ -1867,7 +1867,7 @@ nothing reachable from a kernel is a `Float64` or an `Int`. Shared by
 """
 function fsnorm!(nl, pre, nrm)
     two = scalar(nl, 2.0)
-    @. nl *= pre/(two*nrm)
+    @. $(Utils.threaded(nl)) = nl * (pre/(two*nrm))
 end
 
 """

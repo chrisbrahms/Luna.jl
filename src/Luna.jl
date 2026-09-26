@@ -13,7 +13,8 @@ Dictionary of global settings for `Luna`.
 """
 settings = Dict{String, Any}("fftw_flag" => FFTW.PATIENT,
                              "fftw_threads" => 0,
-                             "fftw_wisdom" => true)
+                             "fftw_wisdom" => true,
+                             "threaded_broadcasts" => true)
 
 """
     set_fftw_mode(mode)
@@ -33,6 +34,20 @@ function set_fftw_mode(mode)
     s = uppercase(string(mode))
     flag = getfield(FFTW, Symbol(s))
     settings["fftw_flag"] = flag
+end
+
+"""
+    set_threaded_broadcasts(on=true)
+
+Share Luna's per-step elementwise work (the propagator, ionisation rates, the plasma
+response, pointwise nonlinear responses, the Runge-Kutta stage combines) out over Julia's
+threads on the CPU (`on=true`, the default) or run it on one thread. It has an effect only
+when Julia is started with several threads (`julia -t N`), and it does not change any
+result: each element is computed by the same code either way. See
+[`Utils.threaded`](@ref).
+"""
+function set_threaded_broadcasts(on::Bool=true)
+    settings["threaded_broadcasts"] = on
 end
 
 """

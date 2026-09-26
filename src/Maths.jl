@@ -372,7 +372,7 @@ function cumtrapz_scan!(out, y, δt)
     accumulate!(+, out, y; dims=1)
     y1 = _firstalong1(y)
     h = convert(real(eltype(out)), δt)
-    @. out = h*(out - (y + y1)/2)
+    @. $(Luna.Utils.threaded(out)) = h*(out - (y + y1)/2)
 end
 
 "A view of the first slice of `y` along dimension 1, keeping that dimension (size 1)."
