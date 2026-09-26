@@ -42,7 +42,9 @@ GEMM alone: 8 BLAS threads are 5–8× faster than 1 for the radial and 16-mode 
 ## Whole propagations (`runs.jl`)
 
 Wall time (s), best of ≥ 2, `:estimate`, wisdom off. "Old" is today's default (FFTW `4J`,
-BLAS 8), "proposed" the rule below, "best" the fastest configuration measured.
+BLAS 8), "proposed" the **first version** of the rule (FFTW threshold 2¹⁷, BLAS `J` for
+radial, 1 for multimode), "best" the fastest configuration in `runs.csv`. The revised rule
+and its comparison against all data are under "Proposed rule" below.
 
 | case (per-plan FFT elements) | J | old | proposed | best |
 |---|---|---:|---:|---:|
@@ -132,9 +134,10 @@ reconstruction error for adaptive, the transverse-integral statistic for fixed),
 overhead is the same on both sides.
 
 Readings:
-- At matched accuracy the fixed rule at its default `nr = 64` (5.4e-5, 1.6e-4) is as
-  accurate as the adaptive default (6.6e-5, 1.5e-4) and **1.9–2.3× faster at `-t 1`,
-  3.6–4.2× faster at `-t 8`**. At its default tolerance the adaptive rule refines to
+- On the peak-normalised metric the fixed rule at its default `nr = 64` (5.4e-5, 1.6e-4)
+  matches the adaptive default (6.6e-5, 1.5e-4) and is 1.9–2.3× faster at `-t 1`,
+  3.6–4.2× at `-t 8`; **but that metric does not see weak modes or spectral wings** —
+  see the accuracy check below, which changes this conclusion. At its default tolerance the adaptive rule refines to
   63–255 points (1023 at rtol 1e-4) where the integrand is hardest, and each refinement
   round hands the threads only a few points.
 - Threads: `nr = 64` goes 53.7 → 16.3 s from `-t 1` to `-t 8` (3.3×); adaptive 100.6 →
@@ -149,6 +152,37 @@ Readings:
 - In the weak case (adaptive stays at 31 points) the two rules cost about the same (4-mode,
   `-t 1`: adaptive 3.9 s, fixed `nr = 32` 3.3 s).
 
+### Accuracy check with mode- and spectrum-resolved metrics (`modal_accuracy.jl`)
+
+0.95 P_cr, `-t 8`, BLAS 1. Two independent references at a 10× tighter propagation
+tolerance (`rtol = 1e-7`): `:fixed nr = 256` (refF) and `:adaptive` with
+`radial_integral_rtol = 1e-5` (refA, 892 s). They agree to 9e-6 (global), 2.5e-3
+(per mode), 5.5e-4 (mode energy), 1.1e-3 dB (spectrum above −40 dB), which is the floor of
+each metric. Reference mode energy shares: 0.64, 0.34, 1.6e-2, 3.7e-3, 2.8e-4, 3.2e-5,
+5.4e-6, 1.9e-6. Error against refF / refA:
+
+| rule | steps | time | global | per mode | mode energy | spectrum (dB) |
+|---|---:|---:|---|---|---|---|
+| adaptive 1e-3 (default) | 754 | 80.9 s | 1.3e-4 | 1.2–1.3e-2 | 1.3e-3 | 0.0065–0.0068 |
+| adaptive 1e-4 | 741 | 274.6 s | 2.8–3.2e-5 | 2.5–3.8e-3 | 0.6–1.1e-3 | 0.0010–0.0015 |
+| fixed nr 32 | 777 | 12.8 s | 1.1e-3 | 8.3e-2 | 1.3e-2 | 0.050 |
+| fixed nr 64 (default) | 758 | 18.0 s | 1.6–1.7e-4 | 2.3e-2 | 3.6–4.1e-3 | 0.013 |
+| fixed nr 128 | 748 | 34.7 s | 4.5–4.7e-5 | 0.9–1.0e-2 | 6.8–7.0e-4 | 0.0025–0.0028 |
+| fixed nr 256 (default rtol) | 742 | 59.0 s | 2.1–2.4e-5 | 2.2–3.2e-3 | 1.6–4.3e-4 | 0.0007–0.0012 |
+| fixed nr 64, rtol 1e-7 | 1448 | 37.4 s | 1.7–1.8e-4 | 2.4–2.5e-2 | 3.5e-3 | 0.012 |
+
+- `nr = 64` is **2–3× less accurate than the adaptive default** on the per-mode and energy
+  metrics (and 2× on the spectrum), so it is not "as accurate"; the peak-normalised
+  metric hid that.
+- `nr = 128` is **more accurate than the adaptive default on all four metrics and 2.3×
+  faster at `-t 8`** (34.7 vs 80.9 s); at `-t 1` the same comparison is 1.24× (108.4 vs
+  133.9 s, `modal_rules.csv`).
+- Tightening the propagation tolerance does not change `nr = 64`'s error, so the errors
+  above are the transverse rule's, not the step controller's. All rules take a similar
+  number of steps (741–777), so the time differences are per right-hand side.
+- In absolute terms every rule except `nr = 32` is within 0.013 dB on the spectrum and
+  ≤ 0.4 % on mode energies; whether that matters is the user's call.
+
 **Found on the way (reviewer):** with the fixed rule's default `modal_kronrod = false`,
 the default statistic `Stats.transverse_integral_error` still evaluates the whole
 right-hand side once per accepted step (`Stats.jl`, `TransverseIntegralError`) and then
@@ -156,22 +190,23 @@ records NaN: about one evaluation in seven is wasted. Skipping it when there is 
 estimate would make the fixed rule faster still; not changed here.
 
 This concerns the numerical method, not only threads, and is recorded for a separate
-decision (narrowed pending the accuracy check below): on a multicore CPU, `modal_integral = :fixed` with the default `nr = 64` is the
-faster multimode rule at the default accuracy in the strongly nonlinear regime measured
-here.
+decision: on a multicore CPU, for 8 HE₁ₘ modes at ≤ 0.95 P_cr, `modal_integral = :fixed`
+with `nr = 128` is at least as accurate as the adaptive default on every metric checked
+and 2.3× faster at `-t 8` (1.24× at `-t 1`); the default `nr = 64` is 4.5× faster but
+2–3× less accurate in the weak modes.
 
 ## Conclusions: what matters for CPU speed
 
 In order of effect, from the measurements above (this machine):
-1. **The transverse rule of multimode runs** (up to 4.2× at matched peak-normalised
-   accuracy, with threads; 1.9–2.3× single-threaded), for 8 HE₁ₘ modes at ≤ 0.95 P_cr.
-   Not a thread setting, but the largest single factor measured; see the accuracy check
-   for how far it holds.
-2. **BLAS threads against Julia threads**: with `J > 1`, BLAS = 1 for multimode (up to
-   2.8× in the whole-run matrix, 2.6× above); BLAS = `J` for radial (radial 256 at `-t 4`:
-   0.95 s against 1.28 s with 8 and 1.68 s with 1); at `J = 1` OpenBLAS's default (8) is right
-   (radial 1024: 7.1 s against 20.2 s).
-3. **FFTW threads**: only for large plans without GEMMs (≥ 2¹⁷ elements); otherwise 1.
+1. **The transverse rule of multimode runs**: at equal or better accuracy on every metric
+   (fixed `nr = 128` against the adaptive default), 2.3× with 8 threads and 1.24× with one,
+   for 8 HE₁ₘ modes at 0.95 P_cr; the fixed rule also gains 3.3× from threads against the
+   adaptive rule's 1.7×. Not a thread setting, and measured for one case only.
+2. **BLAS threads against Julia threads**: multimode wants the cores the Julia pool leaves
+   (`max(1, 8 − J)`; 8 BLAS threads cost up to 2.8×); radial wants 4 at `J = 4, 8` (8 costs
+   up to 55 %, 1 up to 3×); at `J = 1` OpenBLAS's default (8) is right (radial 1024: 7.1 s
+   against 20.2 s).
+3. **FFTW threads**: only for large plans without GEMMs (≥ 2¹⁸ elements); otherwise 1.
    The current default (`4J` for every plan) costs up to 2× on small grids and up to 3.5×
    on radial runs together with BLAS 8, and `:patient` planning time grows with the FFTW
    count (25–64× that of one thread at 40 threads, i.e. `4J` for `J = 10`).
@@ -187,15 +222,42 @@ In order of effect, from the measurements above (this machine):
 
 ## Proposed rule ("auto", `fftw_threads = 0` and a new `blas_threads = 0`)
 
-Per transform, at `Luna.setup`, with `J = Threads.nthreads()` and `N` the elements of each
-FFT plan:
+Revised after review round 1 (BLAS grid `runs_blasgrid.csv`, `:patient` runs
+`runs_patient.csv`, 6-repetition noise runs `runs_noise.csv`). Per transform, at
+`Luna.setup`, with `J = Threads.nthreads()`, `N` the elements of each FFT plan and `B₀`
+OpenBLAS's own default count (8 here, whatever `J`):
 
 | state | FFTW threads per plan | BLAS threads |
 |---|---|---|
-| device (Metal/CUDA) | 1 | unchanged (OpenBLAS default) |
-| CPU, transform without GEMMs (mode-averaged, GNLSE, Cartesian free space) | `N ≥ 2¹⁷` ? `J` : 1 | unchanged |
-| CPU, radial (large GEMM) | 1 | `J > 1` ? `J` : unchanged (OpenBLAS default) |
-| CPU, multimode (small GEMMs) | 1 | 1 |
+| device (Metal/CUDA) | 1 | unchanged |
+| CPU, no GEMMs (mode-averaged, GNLSE, Cartesian free space) | `N ≥ 2¹⁸` ? `J` : 1 | unchanged |
+| CPU, radial (large GEMMs) | 1 | `J = 1` ? unchanged : `B₀ ÷ 2` |
+| CPU, multimode (small GEMMs next to the threaded plasma loop) | 1 | `J = 1` ? unchanged : `max(1, B₀ − J)` |
+
+Why these forms:
+- **Multimode BLAS `max(1, B₀ − J)`**: the BLAS pool gets the cores the Julia pool leaves.
+  `modal_fixed` at `J=4`: BLAS 1/2/4/8 = 2.32/2.20/2.15/4.42 s (best 4); at `J=8`:
+  1.74/2.05/2.16/4.14 s (best 1). At `J=1` BLAS makes no difference (≤ 1 %).
+- **Radial BLAS `B₀ ÷ 2`**: radial 256 at `J=4`/`J=8`: BLAS 1/2/4/8 = 1.72/1.24/0.98/1.33
+  and 1.66/1.23/0.97/1.50 s (best 4 at both); radial 1024: 17.8/10.2/6.44/5.86 and
+  17.8/10.2/6.45/6.11 s (4 is within 10 % of the best). `B₀ − J` would give 1 at `J=8`
+  (1.66 s, 71 % slower). At `J=1` the default 8 is right (7.1 vs 20.2 s).
+- **FFTW threshold 2¹⁸ (raised from 2¹⁷)**: under Luna's default `:patient` planning the
+  128k-element case (8 ps window) is not reliably faster with FFTW threads (`J=4`: F1 5.97,
+  F4 6.16, F8 5.79, F16 5.10 s; `J=8`: F1 6.34, F8 10.31, F16 6.01 s; best of 3 with
+  FFTW's in-memory wisdom reused, so mostly steady state), whereas the 512k case gains
+  10–25 % (`J=4`: 3.52 → 2.64 s; `J=8`: 3.15 → 2.85 s) as it does under `:estimate`. The
+  cost: under `:estimate` the 128k case loses the 9–20 % it gained with FFTW threads.
+  The threshold is bracketed by one case at 128k (mixed) and one at 512k (gain); a case
+  near 256k was not measured.
+- The `B₀` forms are stated for this machine (`B₀` = 8 performance cores); whether
+  "cores left by the Julia pool" and "half the default" transfer to machines with SMT or
+  uniform cores is untested.
+
+Against the best configuration measured (all CSVs, best over repetitions), the revised
+rule is within 10 % in every case at `J = 4, 8` except the 128k mode-averaged case
+(1.20 at `J=4`, 1.09 at `J=8` under `:estimate`; 1.17 and 1.05 under `:patient`), which is
+the threshold trade-off above; noise on 1–3 s runs is ±10 % (6-repetition runs).
 
 An explicit `set_fftw_threads(n)` / `BLAS.set_num_threads(n)` by the user wins. With
 per-plan counts the FFTW wisdom cache (today one file per global count,
@@ -209,8 +271,8 @@ to honour an explicit `n` there).
 
 ## Decisions for the user
 
-1. The rule and its thresholds as above (FFT threshold 2¹⁷ elements; multimode BLAS = 1
-   even though `J=4`/BLAS 4 was 9 % faster once). Decided: no FFTW threads at `J = 1`.
+1. The revised rule and its thresholds (FFT threshold 2¹⁸ elements; BLAS by geometry).
+   Decided: no FFTW threads at `J = 1`.
 2. Setting BLAS threads from Luna changes global state that other code in the session sees.
    Options: set it at `setup` and log once (proposed), or only recommend it in the docs.
 3. `Luna.tune_threads()` (fit the two thresholds per machine, stored in the scratch cache):
