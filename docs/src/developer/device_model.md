@@ -108,7 +108,7 @@ Sampling profile at one thread (Kerr + PPT plasma in argon, `benchmark/threaded/
 broadcasts take 52 % of a mode-averaged step, 69 % of a four-mode `:fixed` step and 35 %
 of a 256-point radial step (where GEMM takes 46 %). The speed-ups from threading them are
 modest (`benchmark/threaded/speed.jl`, off/on at `-t 8`): 1.00 for a 1 ps mode-averaged
-window (below the thresholds), 1.18–1.30 for an 8 ps one, 1.11–1.40 for a 256-point
+window (below the thresholds), 1.18–1.24 for an 8 ps one, 1.11–1.40 for a 256-point
 radial grid, 1.05–1.23 for a 1024-point one, unchanged for the four-mode case (its plasma
 columns were already threaded). KernelAbstractions' CPU backend was measured for the same
 job and is no faster than `Threads.@spawn` over chunks
@@ -228,8 +228,9 @@ generic `Modes.neff` path costs 3.1e-4 s per mode-averaged call against 6.4e-5 s
 adds ≈0.08 s to a default run's setup and nothing per step; the multimode overload gave no
 speed-up at all. The one path where it shows is `:quadrature`, which evaluates the closure
 at every stage (3.4× slower for that case) -- taken when requested, or by `:auto` when the
-table would exceed the node budget, which for a mode-averaged operator means `Nω ≳ 32k`
-or a refinement needing more than the node cap. The results are bitwise identical.
+table would exceed the node budget, `clamp(256 MiB ÷ (96 B · Nω), 2, 1024)` nodes -- for the
+87 nodes the benchmark gradient needed that is `Nω ≳ 32k`, and proportionally smaller
+`Nω` for a profile that needs more nodes -- or a refinement needing more than the node cap. The results are bitwise identical.
 
 ## Tabulated z-dependent quantities
 
@@ -1181,7 +1182,7 @@ errors if it is asked for explicitly.
 
 Replacing a per-point loop with a matrix product and a batched transform changes the
 order of the arithmetic, which is what the regression gate allows and measures. Against
-`gpu/int-D`, the two cases which go through a modal transform moved by 1.5e-15
+the per-point loop, the two cases which go through a modal transform moved by 1.5e-15
 (`modeavg_field_vector`, two modes and two polarisation components) and 6.9e-14
 (`multimode_field_plasma`, four modes) in `Eω` in the fixed-step mode; every other case
 is exactly zero, and the adaptive step counts did not change.
@@ -1377,7 +1378,7 @@ costs ~400 µs regardless of the size of the state, and the default set makes si
 plus one MPSGraph inverse FFT — 2.7–3.6 ms for 1025 to 16385 elements, against 0.34–1.31 ms
 for one transfer plus the host branches. On the mode-averaged Kerr case that is a 1.99×
 slower accepted step, so the size test restores the host path there, which is what
-`gpu/int-D` did. Luna logs which path a device run took, once, at construction.
+the statistics did before they had a device form. Luna logs which path a device run took, once, at construction.
 
 The rule is the size of the state and nothing else. An earlier version also took the device
 path for any state with more than one column; the column sweep in `benchmark/stats.jl` does
@@ -1385,10 +1386,9 @@ not support that — on Metal the device path is still slower at 16 and 128 colu
 `fwhm_t` copies the time-domain intensity to the host on either path and its per-column
 root-finding is host work either way, so extra columns alone do not make it pay. The
 threshold is where the transfer of the state reaches the fixed cost of the round trips,
-which is a few million elements. Every device state Luna produces today is one
-mode-averaged column, far below it. `gpu/int-E` should re-measure on real radial and
-free-space device states, where the transfer is much larger relative to the round trips,
-and may well lower the threshold.
+which is a few million elements. It was re-measured on radial and 3-D Metal states (see
+"Boundaries and statistics" on the user page), where the transfer is much larger relative
+to the round trips, and the threshold stayed: no state Luna produces is above it.
 
 The fix that would make the device path win on a single column is to stop making six round
 trips: a two-phase protocol in which each statistic writes its scalar reductions into one

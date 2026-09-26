@@ -16,7 +16,8 @@ multimode transverse integral (`modal_integral=:adaptive`, the default), the per
 evaluation of the crystal-optics normalisation, and a few statistics (`fwhm_r` among
 them). `Luna.setup`/`Luna.run` refuse a device or a reduced precision for a *transform*
 which cannot do it rather than running it wrongly, and fall back to the host for a
-*response*.
+*response* (the simple interface, given an explicit device it cannot honour, errors with a
+message naming the limitation instead).
 
 !!! note "CUDA"
     The CUDA extension is written and registered the same way as the Metal one, and the
@@ -132,8 +133,7 @@ explained it as the nonlinear right-hand side rounding to zero below `Float32`'s
 floor. That claim was wrong:
 the comparison it was based on had no host reference at all -- both sides were resolving
 to the GPU through `Luna.settings["device"] = :auto` -- so it was comparing Metal with
-itself. Fixed in review round 1; see `PR_11-boundaries-output.md`'s "Changes after review
-round 1".)
+itself.)
 
 ## What runs where
 
@@ -277,7 +277,7 @@ mode-averaged one, the three free-space ones and the fixed-quadrature multimode 
     step.
 
   In practice the host path is taken for everything Luna produces today. The threshold
-  was re-measured on `gpu/int-E` on real radial and 3-D Metal states (M1 Pro, Metal 1.11,
+  was re-measured on real radial and 3-D Metal states (M1 Pro, Metal 1.11,
   one call of a set of `ω0`, `energy`, `peakpower`, `fwhm_t` and `density`, against one
   RK45 step of the same propagation):
 
@@ -654,9 +654,9 @@ the whole propagation (`benchmark/threaded/speed.jl`):
 | --- | ---: | ---: | ---: |
 | mode-averaged, 1 ps window, 0.5 m | 2.2 s | 2.2 s | 3.3 s |
 | mode-averaged, 8 ps window (nt ≈ 2¹⁶), 0.2 m | 8.0 s | 6.7 s | 6.0 s |
-| four modes, `modal_integral=:fixed` | 6.2 s | 1.8 s | 5.5 s |
+| four modes, `modal_integral=:fixed` | 6.3 s | 1.8 s | 5.5 s |
 | radial, 256 points | 2.2 s | 1.7 s | 2.6 s |
-| radial, 1024 points | 20.3 s | 17.6 s | 9.4 s |
+| radial, 1024 points | 20.4 s | 17.6 s | 9.4 s |
 
 So: start Julia with several threads, keep FFTW (and BLAS) at one thread for
 mode-averaged and small multimode runs, and give them several threads only for large

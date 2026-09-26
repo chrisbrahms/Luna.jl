@@ -2533,18 +2533,19 @@ end
 
 #= The embedded error estimate is two matrix products and a transform like everything
    else, so it runs where the transform does. =#
+#= `nr=17`, not 33: with 33 nodes this case is resolved to rounding level (the estimate is
+   2.5e-16 of the integral), so its own relative difference measures only operation order
+   -- it moved by 5 % under `Pkg.test()` -- and an estimate of zero would pass too. At 17
+   the estimate is 1.3e-4 of the integral. =#
 @testset "the quadrature error estimate on JLArray" begin
-    _, hnl, htr = modalrhs(Grid.RealGrid, HostSpec(); nr=33, kronrod=true)
-    _, dnl, dtr = modalrhs(Grid.RealGrid, JLSpec; nr=33, kronrod=true)
+    _, hnl, htr = modalrhs(Grid.RealGrid, HostSpec(); nr=17, kronrod=true)
+    _, dnl, dtr = modalrhs(Grid.RealGrid, JLSpec; nr=17, kronrod=true)
     @test NonlinearRHS.has_error_estimate(dtr)
     herr = NonlinearRHS.integral_error!(htr)
     derr = Array(NonlinearRHS.integral_error!(dtr))
     @test all(isfinite, derr)
-    #= The estimate is the difference of two quadratures of the same integrand, so for a
-       well-resolved case it is itself close to rounding level and its own relative
-       difference measures only operation order (which moved it by 5 % under
-       `Pkg.test()`). It is compared relative to the integral it estimates the error of. =#
-    @test maximum(abs, derr .- herr)/maximum(abs, hnl) < 1e-10
+    @test maximum(abs, herr)/maximum(abs, hnl) > 1e-8 # resolved, not rounding noise
+    @test maximum(abs, derr .- herr)/maximum(abs, herr) < 1e-10
 end
 
 #= The adaptive transverse integral cannot run on a device array at all, and says so with
@@ -3477,8 +3478,9 @@ end
    on a device: the statistic stages the host state into the transform's units and array
    type and scales the absolute error back. =#
 @testset "the transverse integral error on a device transform" begin
-    hEω, _, htr = modalrhs(Grid.RealGrid, HostSpec(); nr=33, kronrod=true)
-    dEω, _, dtr = modalrhs(Grid.RealGrid, JLSpec; nr=33, kronrod=true)
+    # nr=17 so that the error is resolved; see "the quadrature error estimate on JLArray"
+    hEω, _, htr = modalrhs(Grid.RealGrid, HostSpec(); nr=17, kronrod=true)
+    dEω, _, dtr = modalrhs(Grid.RealGrid, JLSpec; nr=17, kronrod=true)
     @test dtr.err isa JLArray{ComplexF64, 2}
     hs = Stats.collect_stats(Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15), hEω,
                              Stats.transverse_integral_error(htr))
@@ -3487,17 +3489,10 @@ end
     @test !Stats.device_capable(ds) # the statistic, and so the set, is host-only
     dh = hs(hEω, 0.1, 1e-4)
     dd = ds(hEω, 0.1, 1e-4) # a host state, with a device transform behind it
-    #= The error statistics are compared relative to the scale of the integral, not to
-       themselves: see "the quadrature error estimate on JLArray" above. `_rel` is already
-       normalised by it; `_abs` is divided by the integral's RMS, which is `_abs/_rel`. =#
-    nlrms = dh["transverse_integral_error_abs"]/dh["transverse_integral_error_rel"]
     for key in sort(collect(keys(dh)))
-        err = key == "transverse_integral_error_abs" ? abs(dd[key] - dh[key])/nlrms :
-              key == "transverse_integral_error_rel" ? abs(dd[key] - dh[key]) :
-              statserr(dd[key], dh[key])
-        @test (key, err <= 1e-10) == (key, true)
+        @test (key, statserr(dd[key], dh[key]) <= 1e-10) == (key, true)
     end
-    @test dh["transverse_points"] == 33
+    @test dh["transverse_points"] == 17
     @test 0 < dh["transverse_integral_error_rel"] < 1e-3
 end
 
