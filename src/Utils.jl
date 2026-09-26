@@ -419,7 +419,7 @@ real-to-complex transform if `x` is real (field-resolved grids) and a complex-to
 one if it is complex (envelope grids).
 
 On the host this is FFTW with Luna's configured planning flags, so the wisdom logic of
-[`loadFFTwisdom`](@ref)/[`saveFFTwisdom`](@ref) applies. On a device it is the generic
+`Utils.loadFFTwisdom`/`Utils.saveFFTwisdom` applies. On a device it is the generic
 `AbstractFFTs` planner, which device FFT libraries implement and which takes no flags.
 
 Device plans work on plain arrays of exactly the planned shape -- Metal's in particular

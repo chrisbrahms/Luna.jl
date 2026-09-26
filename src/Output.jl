@@ -146,7 +146,7 @@ end
 Whether the output `o` already holds a top-level entry named `key`.
 
 An output can be any callable, so this cannot always be answered. For an
-[`AbstractOutput`](@ref) which defines `haskey` -- [`MemoryOutput`](@ref) and
+`AbstractOutput` which defines `haskey` -- [`MemoryOutput`](@ref) and
 [`HDF5Output`](@ref) both do -- the answer comes from `haskey`. For anything else, including
 a bare function and a wrapper which forwards the call but not `haskey`, the answer is
 `false`: nothing can be read back out of it. A caller which uses `hasdata` to avoid writing

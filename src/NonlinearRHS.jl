@@ -1937,7 +1937,7 @@ taper: the factor is the pure physics, which is only usable with steps `Δz ≲ 
 - `grid`, `spacegrid`: the temporal and transverse grids
 - `nfun`: refractive index, either `nfun(ω; z)` returning one index or a tuple (one per
   polarisation), or a tuple `(nfunx, nfuny)` of crystal-optics functions
-  `nfunx(λ, δθ; z)`, `nfuny(λ; z)` (see [`Luna.PhysData.crystal_internal_angle`](@ref))
+  `nfunx(λ, δθ; z)`, `nfuny(λ; z)` (see `Luna.PhysData.crystal_internal_angle`)
 - `kperp2`, `kidcs`: squared transverse wavevector and the indices of the k axes, on the
   host (the crystal-optics fill is host scalar code)
 - `out`: the normalisation array (complex, since ``\\beta_z`` is complex below cutoff), on
