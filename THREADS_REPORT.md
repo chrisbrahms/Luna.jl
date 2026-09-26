@@ -58,9 +58,10 @@ BLAS 8), "proposed" the rule below, "best" the fastest configuration measured.
 | 3-D free 64 × 64 (512k) | 1 / 4 / 8 | 5.40 / 2.07 / 1.67 | 5.40 / 2.06 / 1.67 | 4.31 / 2.06 / 1.67 |
 
 The proposed rule is within 10 % of the best measured configuration in every case at
-`J > 1` (worst: 4-mode `:fixed` at `J=4`, 2.34 vs 2.13 s); at `J = 1` the two large non-GEMM
-cases are 5 % and 25 % above the best, which needed FFTW pthreads (see below), and never slower than the old default beyond
-noise; the old default is up to 3.5× slower (radial 256 at `J=4`).
+`J > 1` (worst: 4-mode `:fixed` at `J=4`, 2.34 vs 2.13 s) and never slower than the old
+default beyond noise; the old default is up to 3.5× slower (radial 256 at `J=4`). At `J = 1`
+the two large non-GEMM cases are 7 % and 25 % above the best, which needed FFTW pthreads
+(see below).
 
 What drives it:
 1. **BLAS against the Julia pool.** In the 4-mode `:fixed` run the GEMMs are small and
@@ -98,7 +99,9 @@ An explicit `set_fftw_threads(n)` / `BLAS.set_num_threads(n)` by the user wins. 
 multiplier goes. At `J = 1` FFTW stays single-threaded, as today (decided with the user:
 FFTW's own pthreads would gain 5–17 % on the two large non-GEMM cases at `-t 1`, but a run
 started without `-t` should stay single-threaded, and the evidence is four cases; the gain
-remains available through an explicit `set_fftw_threads(n)`, which is to be documented).
+remains available through an explicit `set_fftw_threads(n)`, which is to be documented;
+today `Utils.FFTWthreads` returns 1 whenever `nthreads() == 1`, so the implementation has
+to honour an explicit `n` there).
 
 ## Decisions for the user
 
