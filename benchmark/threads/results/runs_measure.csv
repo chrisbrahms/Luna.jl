@@ -1,0 +1,13 @@
+device,flag,julia_threads,fftw_threads,blas_threads,case,time_s,maxreldiff
+cpu,measure,4,1,1,modeavg,2.1189,0.00e+00
+cpu,measure,4,4,1,modeavg,2.6105,0.00e+00
+cpu,measure,4,1,1,modeavg_long,5.9197,0.00e+00
+cpu,measure,4,4,1,modeavg_long,4.8703,0.00e+00
+cpu,measure,4,1,1,free2d_chi2,0.4354,0.00e+00
+cpu,measure,4,4,1,free2d_chi2,0.4346,0.00e+00
+cpu,measure,8,1,1,modeavg,2.1340,0.00e+00
+cpu,measure,8,8,1,modeavg,3.1618,0.00e+00
+cpu,measure,8,1,1,modeavg_long,6.3804,0.00e+00
+cpu,measure,8,8,1,modeavg_long,5.7942,0.00e+00
+cpu,measure,8,1,1,free2d_chi2,0.4515,0.00e+00
+cpu,measure,8,8,1,free2d_chi2,0.5049,0.00e+00

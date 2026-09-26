@@ -229,8 +229,9 @@ Whole runs, best of 5 (`runs_planmode.csv`):
 The effect is reproducible across processes (so a deterministic plan choice, not noise);
 why FFTW's PATIENT search picks worse plans here (timing disturbed by the efficiency cores
 or by Julia's task scheduler during planning are candidates) is not established.
-`:measure` is as fast as or faster than both other modes in every row, and plans in a
-fraction of PATIENT's time. It also qualifies the thread numbers: the 3-D 64 × 64 gain
+`:measure` is within 5 % of the best mode in every whole run and up to 1.8× faster than
+`:patient`; for the transforms alone it ranges from 23 % faster (real 131072) to 11 %
+slower (complex 16384) than `:estimate`, and it plans 10–80× faster than PATIENT. It also qualifies the thread numbers: the 3-D 64 × 64 gain
 from threads (5.4 → 1.7 s) is under `:estimate`/`:measure`; under the default `:patient`
 the same run takes 2.6–2.9 s. The `:patient` FFT ratio table above is normalised to
 PATIENT's own single-thread plans.
@@ -251,15 +252,16 @@ In order of effect, from the measurements above (this machine):
    on radial runs together with BLAS 8, and `:patient` planning time grows with the FFTW
    count (25–64× that of one thread at 40 threads, i.e. `4J` for `J = 10`).
 4. **Julia threads**: large gains for fixed-rule multimode (3.3×) and large free-space
-   grids (3-D 64 × 64: 5.4 → 1.7 s, 3.2×); moderate for radial (1.2–1.5×, the GEMM already
+   grids (3-D 64 × 64: 5.4 → 1.7 s, 3.2×, under `:estimate`/`:measure`; 2.6–2.9 s threaded
+   under the default `:patient`); moderate for radial (1.2–1.5×, the GEMM already
    uses BLAS threads at `-t 1`) and long mode-averaged windows (8 ps: 7.9 → 5.1 s); none
    for small mode-averaged, GNLSE or small free-space runs, which the thresholds leave
    single-threaded. `-t 4` to `-t 8` (at most the performance cores) is the useful range
    here: `-t 4` was as fast as `-t 8` or faster in half the cases, `-t 10` never faster.
 5. **FFTW planning mode**: Luna's default `:patient` gives plans up to 1.8× slower in whole
-   3-D runs (1.45× for the transform alone) than `:measure`, which was never slower than
-   either other mode here. Not a thread setting; recorded for a separate decision
-   (`:measure` as the default).
+   3-D runs (1.45× for the transform alone) than `:measure`, which was within 5 % of the
+   best mode in every whole run here. Not a thread setting; recorded for a separate decision
+   (`:measure` as the default; the FFTW threshold follows it, see Decisions).
 6. **What does not matter**: FFTW threads above `J`; any thread setting for small grids
    beyond not oversubscribing; host thread settings on a Metal run (≤ 30 %, through
    setup).
@@ -324,9 +326,15 @@ to honour an explicit `n` there).
 
 1. The revised rule and its thresholds (FFT threshold 2¹⁸ elements; BLAS by geometry).
    Decided: no FFTW threads at `J = 1`.
-2. Setting BLAS threads from Luna changes global state that other code in the session sees.
+2. The FFTW planning mode, which the FFT threshold depends on. Under `:measure`
+   (`runs_measure.csv`, best of 5) the 128k case gains 18 % at `J=4` (5.92 → 4.87 s) and
+   9 % at `J=8` (6.38 → 5.79 s) from FFTW threads, the 64k case is flat at `J=4` and 12 %
+   slower at `J=8`, the 16k case 23–48 % slower: so **2¹⁷ with `:measure` as the default,
+   2¹⁸ if `:patient` stays**. `:measure` is also the faster mode for multi-dimensional
+   grids (previous section).
+3. Setting BLAS threads from Luna changes global state that other code in the session sees.
    Options: set it at `setup` and log once (proposed), or only recommend it in the docs.
-3. `Luna.tune_threads()` (fit the two thresholds per machine, stored in the scratch cache):
+4. `Luna.tune_threads()` (fit the two thresholds per machine, stored in the scratch cache):
    implement now, or leave for later.
-4. The docs could recommend `-t 4` to `-t 8` (not `-t auto`, which includes efficiency cores)
+5. The docs could recommend `-t 4` to `-t 8` (not `-t auto`, which includes efficiency cores)
    for laptops; Luna cannot choose `J` itself.
