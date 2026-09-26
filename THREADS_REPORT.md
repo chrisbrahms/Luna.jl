@@ -156,12 +156,14 @@ In order of effect, from the measurements above (this machine):
    (radial 1024: 7.1 s against 20.2 s).
 3. **FFTW threads**: only for large plans without GEMMs (≥ 2¹⁷ elements); otherwise 1.
    The current default (`4J` for every plan) costs up to 2× on small grids and up to 3.5×
-   on radial runs together with BLAS 8, and its `:patient` planning time is 10–60× that of
-   one thread.
-4. **Julia threads**: large gains for fixed-rule multimode (3.3×), radial and large
-   free-space grids (2–3×); none for small mode-averaged, GNLSE or small free-space runs,
-   which the thresholds leave single-threaded. `-t 8` (the performance cores) is the
-   useful maximum here; `-t 10` was never faster.
+   on radial runs together with BLAS 8, and `:patient` planning time grows with the FFTW
+   count (25–64× that of one thread at 40 threads, i.e. `4J` for `J = 10`).
+4. **Julia threads**: large gains for fixed-rule multimode (3.3×) and large free-space
+   grids (3-D 64 × 64: 5.4 → 1.7 s, 3.2×); moderate for radial (1.2–1.5×, the GEMM already
+   uses BLAS threads at `-t 1`) and long mode-averaged windows (8 ps: 7.9 → 5.1 s); none
+   for small mode-averaged, GNLSE or small free-space runs, which the thresholds leave
+   single-threaded. `-t 4` to `-t 8` (at most the performance cores) is the useful range
+   here: `-t 4` was as fast as `-t 8` or faster in half the cases, `-t 10` never faster.
 5. **What does not matter**: FFTW threads above `J`; any thread setting for small grids
    beyond not oversubscribing; host thread settings on a Metal run (≤ 30 %, through
    setup).
