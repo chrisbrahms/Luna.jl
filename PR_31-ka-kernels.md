@@ -94,8 +94,10 @@ window (nt ≈ 2¹⁶); `radial_big` 1024 points. All Kerr + PPT plasma in argon
 
 Speed-up = off/on (on-time in brackets). The gains are modest: the threaded broadcasts are
 only part of the step, a mode-averaged state is mostly below the thresholds, and the
-multimode case already threads its plasma columns. Nothing measured is slower beyond noise
-(the `modal` 0.96 is within the run-to-run spread of that case).
+multimode case already threads its plasma columns. The one measured slowdown is `modal` at
+`-t 8` (×0.96, one run; ×0.99 at `-t 4`). Log: `scratchpad/F31/speed_final.log`, one run
+per configuration after the chunking change (each speed-up is the ratio of the best of two
+timings per setting).
 
 **Aside, pre-existing, not changed here:** FFTW's default thread count (`fftw_threads = 0`
 means 4 × `Threads.nthreads()`) is harmful for these grid sizes: `modal` takes 5.4 s with
@@ -109,13 +111,18 @@ page in `gpu/32-docs`.
   broadcast along other axes, a scalar right-hand side, a view destination, an aliasing
   shifted view, the nesting guard, the setting); run in process when Julia has several
   threads, otherwise in a child process with `-t 2`, so `Pkg.test()` exercises it.
-  8/8 at 4 threads, 1/1 (child) at 1 thread.
+  8/8 at 4 threads (re-run after the chunking change: 8/8), 1/1 (child) at 1 thread.
 - CPU, 1 thread: `test_rk45` 51, `test_linops` 364, `test_ionisation` 37, `test_multimode`
   15, `test_vectorplasma` 2, `test_freespace` 77 — all pass.
 - CPU, 4 threads: `test_rk45`, `test_ionisation`, `test_multimode`, `test_vectorplasma`,
-  `test_freespace`, `test_kerr` — all pass.
+  `test_freespace`, `test_kerr` — all pass (before the chunking change, and re-run after
+  it: all pass; `test_utils.jl` 40/41 with the runner artifact below).
 - `test_device.jl` at 4 threads: 1432/1432. `test_metal.jl`: all pass.
-- Regression gate against ced6b299: 506/506, largest difference 0.000e+00 at `-t 1` and at
+- Regression gate against ced6b299. Most of its 23 cases are mode-averaged or GNLSE with
+  arrays below both thresholds, so at `-t 4` it mostly exercises the serial path; the
+  stronger bit-identity evidence is the off/on comparison of `speed.jl` on the five larger
+  cases above (identical outputs in every configuration) and `threaded_checks.jl`
+  (`minlen=16`). Result: 506/506, largest difference 0.000e+00 at `-t 1` and at
   `-t 4` (FFTW/BLAS pinned to 1 thread by the gate); re-run at `-t 4` after the chunking
   change: 506/506, 0.000e+00 (177 s). `test_device.jl` (4 threads, 370 s) and `test_metal.jl`
   (394 s) re-run after it: all pass.

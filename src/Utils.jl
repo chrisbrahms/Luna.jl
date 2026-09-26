@@ -221,7 +221,7 @@ needs no GPU package.
 
 It is used only where the two genuinely differ: FFT planning (FFTW flags and wisdom
 against the generic `AbstractFFTs` planners), the host-copy fallbacks, residency checks,
-and whether [`threaded`](@ref) may share a broadcast out over threads. It is never used to
+and whether `threaded` may share a broadcast out over threads. It is never used to
 select a kernel -- there is one implementation of every per-step operation and it runs on
 both.
 
@@ -273,7 +273,7 @@ isdevice(x) = backend(x) isa DeviceBackend
 """
     THREAD_MINLEN
 
-Default length below which [`threaded`](@ref) runs a broadcast serially. Spawning and
+Default length below which `threaded` runs a broadcast serially. Spawning and
 joining the tasks costs ≈15–25 µs on an M1 Pro, and more with 8 threads, where equal
 chunks also wait for the slowest (efficiency) core; a cheap broadcast (a few arithmetic
 operations per element) only recovers that above ≈2¹⁷ elements.
@@ -283,7 +283,7 @@ const THREAD_MINLEN = 1 << 17
 """
     THREAD_MINLEN_HEAVY
 
-[`threaded`](@ref) length threshold for broadcasts dominated by a transcendental function
+`threaded` length threshold for broadcasts dominated by a transcendental function
 (`exp` of a complex number, a spline evaluation), which pay from ≈2¹⁵ elements. A
 mode-averaged state (a few thousand frequency samples) stays below both thresholds, where
 threading was measured to slow a run down.
@@ -293,7 +293,7 @@ const THREAD_MINLEN_HEAVY = 1 << 15
 """
     Threaded(dest, minlen)
 
-A broadcast destination wrapper; see [`threaded`](@ref).
+A broadcast destination wrapper; see `threaded`.
 """
 struct Threaded{A}
     dest::A
@@ -319,7 +319,7 @@ broadcast otherwise:
 - Julia was started with more than one thread,
 - `Luna.settings["threaded_broadcasts"]` is `true` (the default; see
   [`Luna.set_threaded_broadcasts`](@ref)),
-- the caller is not already inside a threaded region (see [`serial_region`](@ref)).
+- the caller is not already inside a threaded region (see `serial_region`).
 
 The results do not depend on which path is taken. The expression must be elementwise,
 which a broadcast is; an argument which aliases `dest` without being `dest` itself is
@@ -337,7 +337,7 @@ const _THREADED_DEPTH = Threads.Atomic{Int}(0)
 """
     serial_region(f)
 
-Call `f()` with [`threaded`](@ref) broadcasts turned into plain ones, for code which is
+Call `f()` with `threaded` broadcasts turned into plain ones, for code which is
 itself running on several threads.
 """
 function serial_region(f)
@@ -370,6 +370,9 @@ function Base.Broadcast.materialize!(t::Threaded, bc::Base.Broadcast.Broadcasted
        per element would cost an integer division per dimension, which is more than a
        cheap broadcast's arithmetic. =#
     ax = axes(bc′)
+    #= Only one dimension is split, so the task count is capped by its length: a
+       (2^17, 2) array gets two tasks. Luna's multi-column blocks have their columns (or
+       polarisation, mode or transverse axes) last and long enough for this. =#
     d = something(findlast(a -> length(a) > 1, ax), 1)
     r = ax[d]
     # at least minlen/4 elements per task, so a short array does not pay for idle tasks
