@@ -47,7 +47,7 @@ BLAS 8), "proposed" the rule below, "best" the fastest configuration measured.
 | case (per-plan FFT elements) | J | old | proposed | best |
 |---|---|---:|---:|---:|
 | mode-averaged 1 ps (16k) | 1 / 4 / 8 | 2.17 / 2.64 / 4.25 | 2.17 / 2.14 / 2.16 | 2.17 / 2.14 / 2.16 |
-| mode-averaged 8 ps (128k) | 1 / 4 / 8 | 7.94 / 5.12 / 6.30 | 7.54 / 5.14 / 6.00 | 7.41 / 5.12 / 6.00 |
+| mode-averaged 8 ps (128k) | 1 / 4 / 8 | 7.94 / 5.12 / 6.30 | 7.94 / 5.14 / 6.00 | 7.41 / 5.12 / 6.00 |
 | envelope Raman (2k), GNLSE (2k) | 1–8 | up to 2.2× slower at `J=8` | = best | |
 | 4 modes `:fixed` | 1 / 4 / 8 | 6.32 / 4.84 / 4.86 | 6.26 / 2.34 / 1.72 | 6.26 / 2.13 / 1.72 |
 | 4 modes `:adaptive` | 1 / 4 / 8 | 17.6 / 15.4 / 18.0 | 17.6 / 15.4 / 17.2 | 17.6 / 15.1 / 17.0 |
@@ -55,10 +55,11 @@ BLAS 8), "proposed" the rule below, "best" the fastest configuration measured.
 | radial 1024 | 1 / 4 / 8 | 7.07 / 11.8 / 7.92 | 7.07 / 6.43 / 6.02 | 7.07 / 6.22 / 6.02 |
 | 2-D free χ⁽²⁾ (64k) | 1 / 4 / 8 | 0.43 / 0.48 / 0.53 | 0.43 / 0.48 / 0.47 | 0.43 / 0.48 / 0.47 |
 | 3-D free 16 × 8 (16k) | 1 / 4 / 8 | 0.15 / 0.17 / 0.21 | 0.15 | 0.15 |
-| 3-D free 64 × 64 (512k) | 1 / 4 / 8 | 5.40 / 2.07 / 1.67 | 4.47 / 2.06 / 1.67 | 4.31 / 2.06 / 1.67 |
+| 3-D free 64 × 64 (512k) | 1 / 4 / 8 | 5.40 / 2.07 / 1.67 | 5.40 / 2.06 / 1.67 | 4.31 / 2.06 / 1.67 |
 
-The proposed rule is within 10 % of the best measured configuration in every case (worst:
-4-mode `:fixed` at `J=4`, 2.34 vs 2.13 s) and never slower than the old default beyond
+The proposed rule is within 10 % of the best measured configuration in every case at
+`J > 1` (worst: 4-mode `:fixed` at `J=4`, 2.34 vs 2.13 s); at `J = 1` the two large non-GEMM
+cases are 5 % and 25 % above the best, which needed FFTW pthreads (see below), and never slower than the old default beyond
 noise; the old default is up to 3.5× slower (radial 256 at `J=4`).
 
 What drives it:
@@ -89,18 +90,20 @@ FFT plan:
 | state | FFTW threads per plan | BLAS threads |
 |---|---|---|
 | device (Metal/CUDA) | 1 | unchanged (OpenBLAS default) |
-| CPU, transform without GEMMs (mode-averaged, GNLSE, Cartesian free space) | `N ≥ 2¹⁷` ? (`J > 1` ? `J` : 4) : 1 | unchanged |
+| CPU, transform without GEMMs (mode-averaged, GNLSE, Cartesian free space) | `N ≥ 2¹⁷` ? `J` : 1 | unchanged |
 | CPU, radial (large GEMM) | 1 | `J > 1` ? `J` : unchanged (OpenBLAS default) |
 | CPU, multimode (small GEMMs) | 1 | 1 |
 
 An explicit `set_fftw_threads(n)` / `BLAS.set_num_threads(n)` by the user wins. The 4×
-multiplier goes. At `J = 1` Luna would, for the first time, let FFTW use pthreads (4) for
-large plans.
+multiplier goes. At `J = 1` FFTW stays single-threaded, as today (decided with the user:
+FFTW's own pthreads would gain 5–17 % on the two large non-GEMM cases at `-t 1`, but a run
+started without `-t` should stay single-threaded, and the evidence is four cases; the gain
+remains available through an explicit `set_fftw_threads(n)`, which is to be documented).
 
 ## Decisions for the user
 
-1. The rule and its thresholds as above (FFT threshold 2¹⁷ elements; `J=1` large plans get 4
-   FFTW pthreads; multimode BLAS = 1 even though `J=4`/BLAS 4 was 9 % faster once).
+1. The rule and its thresholds as above (FFT threshold 2¹⁷ elements; multimode BLAS = 1
+   even though `J=4`/BLAS 4 was 9 % faster once). Decided: no FFTW threads at `J = 1`.
 2. Setting BLAS threads from Luna changes global state that other code in the session sees.
    Options: set it at `setup` and log once (proposed), or only recommend it in the docs.
 3. `Luna.tune_threads()` (fit the two thresholds per machine, stored in the scratch cache):
