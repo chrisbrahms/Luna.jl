@@ -83,6 +83,89 @@ What drives it:
 threads change nothing; BLAS 8 helps by 10–30 % through host work at setup (building the
 radial matrices).
 
+## Multimode: adaptive against fixed transverse integral (`modal_rules.jl`)
+
+The whole-run matrix above used a weakly nonlinear multimode case, and so did the README
+example: there the adaptive rule never refines (31 points at every step, its initial
+rule) and HE₁₁ keeps > 99 % of the energy, so the transverse integral is easy and any
+rule is exact. For a meaningful comparison the peak power has to approach the critical
+power for self-focusing, `Tools.Pcr` (Fibich–Gaeta, with `Tools.getN0n0n2`): 11.3 GW for
+argon at 1 bar and 800 nm, 271 GW for helium (so the README case, 11 GW in helium, is at
+0.04 P_cr). Probe (8 HE₁ₘ modes, 125 µm, Ar 1 bar, 30 fs, 30 cm, adaptive rule at the
+default `radial_integral_rtol = 1e-3`; ratios with `Tools.Pcr`):
+
+| P/P_cr | energy | adaptive points median / 90 % / max | HE₁₁ energy share at the end |
+|---|---:|---|---:|
+| 0.51 | 184 µJ | 31 / 63 / 63 | 0.987 |
+| 0.81 | 294 µJ | 63 / 127 / 255 | 0.730 (HE₁₂ 0.259) |
+| 0.97 | 350 µJ | 127 / 127 / 255 | 0.634 (HE₁₂ 0.343) |
+
+Timing at 0.8 and 0.95 P_cr (energies from `Tools.Pcr`), FFTW 1 thread, one run each
+(30–550 s, so run-to-run noise is small relative to the differences). Error: final `Eω`
+against `:fixed` with `nr = 256`, largest difference over all modes / peak over all modes.
+
+| P/P_cr | rule | error | `-t 1` | `-t 8`, BLAS 1 | `-t 8`, BLAS 8 |
+|---|---|---:|---:|---:|---:|
+| 0.8 | adaptive, rtol 1e-3 (default) | 6.6e-5 | 100.6 s | 58.0 s | 63.4 s |
+| 0.8 | adaptive, rtol 1e-4 | 2.0e-5 | 369.8 s | 189.3 s | 214.8 s |
+| 0.8 | fixed, nr 32 | 4.7e-4 | 29.4 s | 11.6 s | 24.2 s |
+| 0.8 | fixed, nr 64 (default) | 5.4e-5 | 53.7 s | 16.3 s | 38.1 s |
+| 0.8 | fixed, nr 128 | 2.3e-5 | 101.6 s | 26.7 s | 63.4 s |
+| 0.95 | adaptive, rtol 1e-3 (default) | 1.5e-4 | 133.9 s | 73.9 s | 82.6 s |
+| 0.95 | adaptive, rtol 1e-4 | 5.2e-5 | 543.8 s | 277.3 s | 343.3 s |
+| 0.95 | fixed, nr 32 | 1.1e-3 | 33.9 s | 12.6 s | 25.9 s |
+| 0.95 | fixed, nr 64 (default) | 1.6e-4 | 57.7 s | 17.5 s | 41.5 s |
+| 0.95 | fixed, nr 128 | 5.1e-5 | 108.4 s | 28.5 s | 74.7 s |
+
+(`-t 1` column: BLAS 1; BLAS 8 at `-t 1` is within 3 % of it in every row.) Both rules'
+default statistics evaluate the right-hand side once more per accepted step (the
+reconstruction error for adaptive, the transverse-integral statistic for fixed), so that
+overhead is the same on both sides.
+
+Readings:
+- At matched accuracy the fixed rule at its default `nr = 64` (5.4e-5, 1.6e-4) is as
+  accurate as the adaptive default (6.6e-5, 1.5e-4) and **1.9–2.3× faster at `-t 1`,
+  3.6–4.2× faster at `-t 8`**. The adaptive rule refines to 127–1023 points where the
+  integrand is hardest, and each refinement round hands the threads only a few points.
+- Threads: `nr = 64` goes 53.7 → 16.3 s from `-t 1` to `-t 8` (3.3×); adaptive 100.6 →
+  58.0 s (1.7×).
+- BLAS: 8 BLAS threads at `-t 8` make the fixed rule 2.1–2.6× slower and the adaptive
+  rule 9–24 % slower; no effect at `-t 1`. This is the multimode BLAS = 1 rule.
+- Error floor: adaptive at 1e-4 and fixed at `nr = 128` agree with each other and with
+  the reference to 2–5e-5; below that the metric is limited by something common to all
+  runs (the propagation's own step-size tolerance, or the reference itself), so the
+  accuracy of the finer rules is not resolved here. The conclusions use only the rules
+  above that floor.
+- In the weak case (adaptive stays at 31 points) the two rules cost about the same (4-mode,
+  `-t 1`: adaptive 3.9 s, fixed `nr = 32` 3.3 s).
+
+This concerns the numerical method, not only threads, and is recorded for a separate
+decision: on a multicore CPU, `modal_integral = :fixed` with the default `nr = 64` is the
+faster multimode rule at the default accuracy in the strongly nonlinear regime measured
+here.
+
+## Conclusions: what matters for CPU speed
+
+In order of effect, from the measurements above (this machine):
+1. **The transverse rule of multimode runs** (up to 4.2× at matched accuracy, with
+   threads; 1.9–2.3× single-threaded), in the regime where the transverse integral is
+   hard. Not a thread setting, but the largest single factor measured.
+2. **BLAS threads against Julia threads**: with `J > 1`, BLAS = 1 for multimode (up to
+   2.8× in the whole-run matrix, 2.6× above); BLAS = `J` for radial (radial 256 at `-t 4`:
+   0.95 s against 1.28 s with 8 and 1.68 s with 1); at `J = 1` OpenBLAS's default (8) is right
+   (radial 1024: 7.1 s against 20.2 s).
+3. **FFTW threads**: only for large plans without GEMMs (≥ 2¹⁷ elements); otherwise 1.
+   The current default (`4J` for every plan) costs up to 2× on small grids and up to 3.5×
+   on radial runs together with BLAS 8, and its `:patient` planning time is 10–60× that of
+   one thread.
+4. **Julia threads**: large gains for fixed-rule multimode (3.3×), radial and large
+   free-space grids (2–3×); none for small mode-averaged, GNLSE or small free-space runs,
+   which the thresholds leave single-threaded. `-t 8` (the performance cores) is the
+   useful maximum here; `-t 10` was never faster.
+5. **What does not matter**: FFTW threads above `J`; any thread setting for small grids
+   beyond not oversubscribing; host thread settings on a Metal run (≤ 30 %, through
+   setup).
+
 ## Proposed rule ("auto", `fftw_threads = 0` and a new `blas_threads = 0`)
 
 Per transform, at `Luna.setup`, with `J = Threads.nthreads()` and `N` the elements of each
