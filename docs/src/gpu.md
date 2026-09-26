@@ -4,24 +4,25 @@ Luna can run the heavy part of a propagation on a GPU. Neither Metal nor CUDA is
 dependency of Luna: they are weak dependencies, loaded through package extensions, so
 `Pkg.add("Luna")` on a machine without either installs and runs the CPU version.
 
-!!! warning "Work in progress"
-    This page describes what the device model does as of `gpu/int-E`.
-    `prop_capillary` and `prop_gnlse` take `device` and `precision` keywords (below), and
-    for mode-averaged propagation (`modes` a single mode) with the Kerr, plasma and
-    Raman responses -- which is everything `prop_capillary` builds by default, in any gas
-    -- it runs end to end on a device, including the absorbing boundaries
-    (`boundary=:rate`, the default) and the default per-step statistics. All three
-    free-space geometries -- radially symmetric, 2-D Cartesian and full 3-D, with the
-    Kerr, plasma, Raman and χ⁽²⁾ responses -- do too, through the low-level interface,
-    which is the only way to build one, and so does multimode propagation with
-    `modal_integral=:fixed` (below).
-    What is left on the host is `prop_gnlse`, the *adaptive* multimode transverse
-    integral (`modal_integral=:adaptive`, the default, whose cubature driver is host
-    scalar code), the per-step evaluation of the crystal-optics normalisation, and the
-    `fwhm_r` statistic. `Luna.setup`/`Luna.run` refuse a device or a reduced precision
-    for a *transform* which cannot do it rather than running it wrongly, and fall back
-    to the host for a *response* (or, for the simple interface, error with a message
-    naming the actual limitation). The page is completed in `gpu/32-docs`.
+In short: `prop_capillary` takes `device` and `precision` keywords (below), and
+mode-averaged propagation with the Kerr, plasma and Raman responses -- everything
+`prop_capillary` builds by default, in any gas -- runs end to end on a device, including
+the absorbing boundaries (`boundary=:rate`, the default), tapers and pressure gradients,
+and the default per-step statistics. All three free-space geometries (radially
+symmetric, 2-D Cartesian and full 3-D, with the Kerr, plasma, Raman and χ⁽²⁾ responses)
+do too, through the low-level interface, and so does multimode propagation with
+`modal_integral=:fixed`. What stays on the host is `prop_gnlse`, the *adaptive*
+multimode transverse integral (`modal_integral=:adaptive`, the default), the per-step
+evaluation of the crystal-optics normalisation, and a few statistics (`fwhm_r` among
+them). `Luna.setup`/`Luna.run` refuse a device or a reduced precision for a *transform*
+which cannot do it rather than running it wrongly, and fall back to the host for a
+*response*.
+
+!!! note "CUDA"
+    The CUDA extension is written and registered the same way as the Metal one, and the
+    device-contract tests run the same code on `JLArrays`, but the CUDA hardware tests
+    (`LUNA_TEST_CUDA=1`, `test/test_cuda.jl`) have not yet been run on a CUDA machine.
+    Every measurement on this page is from an Apple M1 Pro with Metal.
 
 ## Enabling it
 
@@ -136,7 +137,7 @@ round 1".)
 
 ## What runs where
 
-Anything Luna has not yet made device-capable runs on the host. At the moment that means
+Anything Luna has not made device-capable runs on the host. That means
 the *adaptive* multimode transform (`TransModal`, `modal_integral=:adaptive`, the default
 -- see "Multimode propagation" below) and `prop_gnlse`. The mode-averaged transform, all
 three free-space ones -- `TransRadial`, `TransFree2D` and `TransFree` -- and the
@@ -625,6 +626,46 @@ rule does roughly four times the work, which the Kerr rows hide (the transform c
 not grow with `nr`) and the plasma rows do not. And the GPU's advantage grows with the
 work per node: 1.0× for Kerr at the small grid, 9.6× for Kerr and plasma at the large
 one against the same arithmetic on the CPU, 7.4× against the `Float64` adaptive default.
+
+### On the CPU: threads
+
+A CPU run uses three kinds of threads, and the defaults are not the best choice for the
+grid sizes Luna typically runs:
+
+- **Julia threads** (`julia -t N`). Luna's per-step elementwise work -- the linear
+  propagator, the ionisation rate, the plasma response, the fused pointwise nonlinear
+  responses, the Runge-Kutta stage combines and the free-space normalisation -- is shared
+  out over them when an array is long enough to pay for it (≈2¹⁵ elements for the
+  transcendental ones, ≈2¹⁷ for plain arithmetic; see
+  [`Luna.set_threaded_broadcasts`](@ref)). The results do not depend on the thread count: each
+  element is computed by the same code either way. `Luna.set_threaded_broadcasts(false)`
+  turns this off. The plasma response also shares its columns (multimode points, radial
+  or Cartesian grid points) out over the threads.
+- **FFTW threads** (`Luna.set_fftw_threads(n)`). The default, `0`, means four times the
+  number of Julia threads, which is far too many for a mode-averaged or small multimode
+  grid: planning and synchronisation then cost more than the transforms.
+- **BLAS threads** (`LinearAlgebra.BLAS.set_num_threads(n)`), used by the multimode
+  and radial matrix products.
+
+Measured on an M1 Pro (8 performance cores), Kerr and PPT plasma in argon, wall time of
+the whole propagation (`benchmark/threaded/speed.jl`):
+
+| case | `-t 1` | `-t 8`, FFTW/BLAS 1 thread | `-t 8`, FFTW/BLAS 8 threads |
+| --- | ---: | ---: | ---: |
+| mode-averaged, 1 ps window, 0.5 m | 2.2 s | 2.2 s | 3.3 s |
+| mode-averaged, 8 ps window (nt ≈ 2¹⁶), 0.2 m | 8.0 s | 6.7 s | 6.0 s |
+| four modes, `modal_integral=:fixed` | 6.2 s | 1.8 s | 5.5 s |
+| radial, 256 points | 2.2 s | 1.7 s | 2.6 s |
+| radial, 1024 points | 20.3 s | 17.6 s | 9.4 s |
+
+So: start Julia with several threads, keep FFTW (and BLAS) at one thread for
+mode-averaged and small multimode runs, and give them several threads only for large
+transverse grids, where the transforms and matrix products dominate:
+
+```julia
+Luna.set_fftw_threads(1)
+using LinearAlgebra; BLAS.set_num_threads(1)
+```
 
 ## Running the hardware tests
 

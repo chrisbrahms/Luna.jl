@@ -21,6 +21,7 @@ Luna.settings
 Luna.set_fftw_mode
 Luna.set_fftw_threads
 Luna.set_fftw_wisdom
+Luna.set_threaded_broadcasts
 ```
 
 ## Devices and precision

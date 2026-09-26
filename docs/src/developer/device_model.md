@@ -3,10 +3,11 @@
 How Luna runs the same propagation code on a host array, on a reduced-precision host array
 and on a GPU. The user-facing page is [Running on a GPU](../gpu.md).
 
-!!! note "Work in progress"
-    Written for `gpu/10-device-model`, the first branch of the GPU work, and extended by
-    each later branch. It is consolidated, with every branch's measurements, in
-    `gpu/32-docs`.
+The page follows a propagation step from the outside in: where a run happens and the
+rules every per-step kernel obeys, the host threading of those kernels, the linear
+operator, the unit scaling, the nonlinear responses, the transforms (radial, Cartesian,
+modal), the output and statistics boundary, and finally the extension mechanism and the
+tests. Measurements are from an Apple M1 Pro (Metal); CUDA has not been run on hardware.
 
 ## Where a run happens
 
@@ -40,8 +41,9 @@ field-sized arrays. The rules, in the order they bite:
 
 1. **One implementation per operation.** There is no CPU copy of any kernel. The backend
    trait `Utils.backend` exists, but only for FFT planning (FFTW flags and wisdom against
-   the generic `AbstractFFTs` planners), for the host-copy fallbacks, and for residency
-   checks. It never selects a kernel.
+   the generic `AbstractFFTs` planners), for the host-copy fallbacks, for residency
+   checks, and to let the host executor share a broadcast out over threads (below). It
+   never selects a kernel.
 2. **Fused broadcasts are left-associated in the original order** wherever that costs
    nothing, so that the rounding-level differences from replacing a sequence of passes
    with one stay as small as they can be. In practice this has been free: the RK45 stage
@@ -70,6 +72,51 @@ field-sized arrays. The rules, in the order they bite:
    the only reliable detector of a stray `Float64`: `JLArray` and a `Float32` `Array` both
    promote silently.
 
+## Host threading
+
+A broadcast is one kernel on a device and one serial loop on the host. The host loop is
+shared out over Julia's threads by marking the destination:
+
+```julia
+@. $(Utils.threaded(y; minlen=Utils.THREAD_MINLEN_HEAVY)) = y * exp(linop*dt)
+```
+
+`Utils.threaded(dest; minlen)` returns a wrapper whose `Broadcast.materialize!` does what
+Base's does before its loop (fix the axes to `dest`'s, drop the style, unalias and
+extrude the arguments with `Broadcast.preprocess`) and then runs the same `Broadcasted`
+over slabs of `dest` along its last non-singleton dimension, one `Threads.@spawn` task per
+slab, each iterated as a `CartesianIndices` block. It is exactly the plain broadcast on a
+device array, below `minlen`, with one Julia thread, with
+[`Luna.set_threaded_broadcasts`](@ref)`(false)`, and inside `Utils.serial_region`, which
+the plasma response's column loop uses because its columns are already the threads'
+work (a process-wide atomic depth counter, since spawned tasks do not inherit task-local
+storage). Each element is computed by the same scalar code whichever task runs it, so
+the result is **bit-identical** for any thread count: the regression gate is exactly zero
+at 1 and at 4 threads.
+
+It is used where the profile put the time: the linear propagators
+(`RK45.make_prop!`, the integrated operators), the ionisation rate, the plasma
+response's broadcasts and the trapezoid-scan correction, the stage combines and error
+estimate, the fused pointwise responses (`NonlinearRHS._materialise!`) and the
+free-space normalisation. The thresholds are `THREAD_MINLEN = 2¹⁷` for arithmetic and
+`THREAD_MINLEN_HEAVY = 2¹⁵` for broadcasts dominated by a complex `exp` or a spline
+evaluation, with at least `minlen ÷ 4` elements per task. Task spawning costs ≈15–25 µs,
+more at 8 threads where equal slabs also wait for the efficiency cores; lower thresholds
+(2¹⁶/2¹²) slowed a mode-averaged run to ×0.67 at 8 threads.
+
+Sampling profile at one thread (Kerr + PPT plasma in argon, `benchmark/threaded/profile.jl`):
+broadcasts take 52 % of a mode-averaged step, 69 % of a four-mode `:fixed` step and 35 %
+of a 256-point radial step (where GEMM takes 46 %). The speed-ups from threading them are
+modest (`benchmark/threaded/speed.jl`, off/on at `-t 8`): 1.00 for a 1 ps mode-averaged
+window (below the thresholds), 1.18–1.30 for an 8 ps one, 1.11–1.40 for a 256-point
+radial grid, 1.05–1.23 for a 1024-point one, unchanged for the four-mode case (its plasma
+columns were already threaded). KernelAbstractions' CPU backend was measured for the same
+job and is no faster than `Threads.@spawn` over chunks
+(`benchmark/threaded/executors.jl`), so it is not a dependency.
+
+The prefix scan (`accumulate!`) of a single column stays serial: a parallel scan would
+change the summation order and with it the results.
+
 ## Grid mirrors
 
 `Grid.RealGrid`/`Grid.EnvGrid` stay host `Float64` — they are metadata, and they are
@@ -97,7 +144,7 @@ Luna.LinearOps.AbstractIntegratedLinop) is that interface and
 is an array and keeps its own exact method; a bare `linop!(out, z)` callable is refused,
 and `Luna.run` converts one according to `linop_integral`.
 
-`exp(linop(t2)·(t2 − t1))`, the one-point rule Luna used for a callable before gpu/27, is
+`exp(linop(t2)·(t2 − t1))`, the one-point rule Luna used for a callable before the integrated operators, is
 removed. Its error is first order in the step and is common to both of the embedded
 Runge–Kutta solutions, so it cancels out of the error estimate and the step controller
 never responds to it; measured, it is 7.5e-2 relative on `Eω` at 20 steps over a 0.1 m
@@ -153,7 +200,7 @@ pushed through the integral, and raises.
 [`LinearOps.constant_linop`](@ref Luna.LinearOps.constant_linop) first: a closure which
 ignores `z` — `make_linop` with a z-independent index, a `Capillary.gradient` with equal
 end pressures, a constant taper function — is materialised and propagated exactly by the
-array method, which is what such a run did before gpu/27, bit for bit. The test is the five
+array method, which is what such a run did before the integrated operators, bit for bit. The test is the five
 z values the tabulation's own first refinement evaluates, compared for equality, so it
 cannot be wrong in a way the two-node table it replaces is not already wrong.
 
@@ -169,6 +216,20 @@ state; the host term dominates a `Float32` device run, and it is what the pre-bu
 warning states. Nothing in Luna's tests or examples reaches the fallback: every z-dependent
 operator in them is mode-averaged or four-mode, and every free-space example uses
 `make_const_linop`.
+
+### The cost of evaluating the closure
+
+With `:auto` a z-dependent closure is evaluated only at the table nodes at setup (tens to
+a few hundred calls), so its per-call cost barely matters, and `Capillary` no longer
+overloads `LinearOps.neff_β_grid`/`neff_grid` to cache the waveguide part of a
+fixed-radius Marcatili mode's index. Measured before the removal
+(`benchmark/neff_overloads.jl`, a 0 → 1 bar helium gradient, 2049 frequency samples): the
+generic `Modes.neff` path costs 3.1e-4 s per mode-averaged call against 6.4e-5 s, which
+adds ≈0.08 s to a default run's setup and nothing per step; the multimode overload gave no
+speed-up at all. The one path where it shows is `:quadrature`, which evaluates the closure
+at every stage (3.4× slower for that case) -- taken when requested, or by `:auto` when the
+table would exceed the node budget, which for a mode-averaged operator means `Nω ≳ 32k`
+or a refinement needing more than the node cap. The results are bitwise identical.
 
 ## Tabulated z-dependent quantities
 
@@ -421,9 +482,8 @@ host array, and Metal refuses to compile the kernel. That failure is loud and im
 not a silently wrong answer, but `Chi2Env` does need `rescale` — which is what
 `resident_arrays` and the transform's residency assertion are for.
 
-The χ⁽²⁾ transforms themselves — the Cartesian free-space ones — are host-only until
-`gpu/21`, so the responses are exercised on a device block directly (`test_device.jl`,
-`test_metal.jl`) rather than through a propagation.
+The responses are also exercised on a device block directly (`test_device.jl`,
+`test_metal.jl`), independently of the Cartesian free-space transforms that use them.
 
 ## The host fallback
 
@@ -827,8 +887,7 @@ complex on an `EnvGrid` -- rather than the grid's `Float64` ones.
 For one polarisation component the reshaped operand is the same matrix, with the same
 leading dimension, as the view was, so the CPU result is bit-identical; for two the
 summation order may differ, and it is measured at 1e-14 relative in `test_device.jl`. The
-regression gate's two radial cases are unchanged to the last bit
-(`gpu/20-radial-device`).
+regression gate's two radial cases are unchanged to the last bit.
 
 `Grid.radial_matmul!` allows `out === A` and makes one copy when it is, which is how the
 noise setup and the transverse collar use it; nothing per step does.
@@ -866,8 +925,7 @@ Nothing else the kernel broadcasts against changes after construction.
 
 The **crystal-optics** variant, whose per-`(ω, kx)` root-finding for the internal angle is
 host scalar code with no kernel, stays on the host and copies its result up through a
-staging buffer. It is reached only from the Cartesian transforms, which are host-only until
-`gpu/21`.
+staging buffer. It is reached only from the Cartesian transforms.
 
 Because the normalisation is a positional argument of `Luna.setup` -- every low-level
 radial script builds one before it knows what device the run will use --
@@ -1029,8 +1087,109 @@ The `fft`, `rhs` and `step` columns reproduce to a few per cent between runs. Th
 sweeps and an independent single-size run the same rows came out within 10 % of each other
 (Metal at 64 x 64: 108.8, 108.8 and 121.8 ms), so read it to two figures. `proptime`
 discards a warm-up run and takes the minimum of five, which is what makes even that much
-reproducible -- with two samples and no warm-up, review 1 of `gpu/21-free-device` measured
+reproducible -- with two samples and no warm-up, an earlier measurement found
 a factor of 2.2 on the same row.
+
+## The modal transforms
+
+A multimode propagation evaluates the nonlinear polarisation at transverse points and
+integrates it against each mode's transverse field. That integral used to be evaluated
+one point at a time: for every point, a matrix product to synthesise the field there, an
+inverse transform of that one column, the responses on it, a forward transform and a
+matrix product back. Both modal transforms now share one **batched column evaluator**,
+[`NonlinearRHS.synthesise_responses!`](@ref Luna.NonlinearRHS.synthesise_responses!):
+
+1. the modal spectrum goes to the oversampled time domain **once per right-hand side**,
+   over the `nmodes` columns at once. Synthesis is linear and diagonal in time, so it
+   commutes with the transform: synthesising and then transforming gives the same field
+   as transforming and then synthesising, and the second order needs `nmodes` transform
+   columns instead of one per point;
+2. one matrix product (`Et = Emt S`) synthesises the field at every point of the current
+   set, with `S` the mode matrix
+   ([`Modes.mode_matrix`](@ref Luna.Modes.mode_matrix)) reshaped so that its column order
+   is the `(nto, npol, npts)` block's — polarisation fastest;
+3. the responses see the whole block through
+   [`NonlinearRHS.Et_to_Pt!`](@ref Luna.NonlinearRHS.Et_to_Pt!), exactly as a radial or
+   free-space transform's columns do.
+
+What happens next is the only thing the two transforms do differently, and it is what
+decides which one can run on a device.
+
+### `TransModal`: the adaptive rule
+
+[`NonlinearRHS.TransModal`](@ref) is the default (`modal_integral=:adaptive`). Its driver
+is `Cubature.pcubature_v`/`hcubature_v`, which chooses the transverse points itself and
+needs the integrand **at each point separately**, so the polarisation has to be
+transformed back per point and projected per point. The driver is host scalar code and
+returns the integral and its error estimate as `Vector{Float64}`, which is why this
+transform is host- and `Float64`-only and says so, naming the fixed rule, rather than
+being made parametric for a path it could not take.
+
+The driver hands over a *round* of points at a time — 3, 2, 4, 8, … for `pcubature_v`,
+17, 34, … for `hcubature_v`, independent of the integrand's dimension — and a round is
+evaluated as one block, or as a few blocks where the round is wider than `maxbatch`
+([`NonlinearRHS.MODAL_MAXBATCH`](@ref Luna.NonlinearRHS.MODAL_MAXBATCH)). Each distinct
+width has its own buffers, its own forward plan *and its own copy of any response which
+owns buffers*, because a [`Batched`](@ref Luna.Nonlinear.Batched) response sizes its
+buffers to the block it is given; that is what the cap is for. The set of widths is fixed
+by the rule, so the dictionary holding them stops growing after the first right-hand
+side.
+
+The projection is a broadcast rather than a matrix product: `out[ω, m, i] = pre[i] Σₚ
+Pω[ω, p, i] W[m, p, i]` writes straight into the driver's buffer, reinterpreted as the
+complex modal array. There are one or two polarisation components, so the sum over `p` is
+unrolled.
+
+### `TransModalFixed`: the fixed rule
+
+[`NonlinearRHS.TransModalFixed`](@ref) (`modal_integral=:fixed`) evaluates the same
+integral on a fixed quadrature rule
+([`Modes.TransverseQuadrature`](@ref Luna.Modes.TransverseQuadrature); Gauss–Legendre or
+Gauss–Kronrod in r or x, a periodic trapezoid in θ or Gauss–Legendre in y). Because the
+rule's weights are known in advance, the points are summed **before** the transform back:
+one matrix product `Pmt = Pt Wp` with the weights folded into `Wp`, then the time window,
+one batched transform over the `nmodes` columns, the spectral window and the
+normalisation. The time and spectral windows are diagonal in time and in frequency, and
+the projection is a sum over points at fixed time, so applying them after the projection
+is the same operation in a different order — and it means the number of transform columns
+does not grow with the number of nodes. Everything per step is a matrix product, a
+batched transform or a broadcast, which is the kernel discipline, so this is the
+multimode transform which runs on a device.
+
+The mode matrices are rebuilt when `z` moves, unless
+[`Modes.zconstant`](@ref Luna.Modes.zconstant) says the transverse profiles do not depend
+on it. That trait is `false` by default and `true` for a `Capillary.MarcatiliMode` with a
+numeric core radius (and for the `Antiresonant` modes wrapping one), which is the fixed-
+radius case; a taper re-evaluates the mode fields on the host and uploads them, which is
+what the adaptive rule does at every point anyway.
+
+The rule carries an embedded coarse rule — the Gauss subset of a Kronrod rule in r
+(`kronrod=true`), or every other node of the *polar* θ trapezoid (a Cartesian domain's
+second coordinate is Gauss–Legendre, which has none) — and
+[`NonlinearRHS.integral_error!`](@ref Luna.NonlinearRHS.integral_error!) turns it into
+`P_coarse - P_fine` with one further matrix product against the precomputed difference of
+the two weight sets. Nothing evaluates it per step; it becomes a statistic once `Stats`
+has been refactored.
+
+`Stats.mode_reconstruction_error` is the adaptive transform's: it re-evaluates the
+transform at one transverse point (which is what
+[`NonlinearRHS.Erω_to_Prω!`](@ref Luna.NonlinearRHS.Erω_to_Prω!) is for) and records the
+cubature's own error estimate. `prop_capillary` turns it off for a `:fixed` run and
+errors if it is asked for explicitly.
+
+### What moved
+
+Replacing a per-point loop with a matrix product and a batched transform changes the
+order of the arithmetic, which is what the regression gate allows and measures. Against
+`gpu/int-D`, the two cases which go through a modal transform moved by 1.5e-15
+(`modeavg_field_vector`, two modes and two polarisation components) and 6.9e-14
+(`multimode_field_plasma`, four modes) in `Eω` in the fixed-step mode; every other case
+is exactly zero, and the adaptive step counts did not change.
+
+The fixed rule is a different *discretisation*, so it agrees with the adaptive rule to
+the accuracy of the quadrature and not to rounding: 3.0e-16 (Kerr), 2.1e-14 (Kerr and
+plasma) and 4.2e-16 (envelope Kerr) on one right-hand side of a four-HE₁ₘ-mode capillary
+with `nr=64`, which is the adaptive rule's error rather than the fixed rule's.
 
 ## The output and statistics boundary
 
@@ -1289,104 +1448,8 @@ loaded, so it always precompiles the CPU path.
   same for the 3-D Cartesian transform, sweeping the transverse grid.
 - **`benchmark/modal.jl`** times a four-mode propagation on each transverse integral,
   device and precision.
-
-## The modal transforms
-
-A multimode propagation evaluates the nonlinear polarisation at transverse points and
-integrates it against each mode's transverse field. That integral used to be evaluated
-one point at a time: for every point, a matrix product to synthesise the field there, an
-inverse transform of that one column, the responses on it, a forward transform and a
-matrix product back. Both modal transforms now share one **batched column evaluator**,
-[`NonlinearRHS.synthesise_responses!`](@ref Luna.NonlinearRHS.synthesise_responses!):
-
-1. the modal spectrum goes to the oversampled time domain **once per right-hand side**,
-   over the `nmodes` columns at once. Synthesis is linear and diagonal in time, so it
-   commutes with the transform: synthesising and then transforming gives the same field
-   as transforming and then synthesising, and the second order needs `nmodes` transform
-   columns instead of one per point;
-2. one matrix product (`Et = Emt S`) synthesises the field at every point of the current
-   set, with `S` the mode matrix
-   ([`Modes.mode_matrix`](@ref Luna.Modes.mode_matrix)) reshaped so that its column order
-   is the `(nto, npol, npts)` block's — polarisation fastest;
-3. the responses see the whole block through
-   [`NonlinearRHS.Et_to_Pt!`](@ref Luna.NonlinearRHS.Et_to_Pt!), exactly as a radial or
-   free-space transform's columns do.
-
-What happens next is the only thing the two transforms do differently, and it is what
-decides which one can run on a device.
-
-### `TransModal`: the adaptive rule
-
-[`NonlinearRHS.TransModal`](@ref) is the default (`modal_integral=:adaptive`). Its driver
-is `Cubature.pcubature_v`/`hcubature_v`, which chooses the transverse points itself and
-needs the integrand **at each point separately**, so the polarisation has to be
-transformed back per point and projected per point. The driver is host scalar code and
-returns the integral and its error estimate as `Vector{Float64}`, which is why this
-transform is host- and `Float64`-only and says so, naming the fixed rule, rather than
-being made parametric for a path it could not take.
-
-The driver hands over a *round* of points at a time — 3, 2, 4, 8, … for `pcubature_v`,
-17, 34, … for `hcubature_v`, independent of the integrand's dimension — and a round is
-evaluated as one block, or as a few blocks where the round is wider than `maxbatch`
-([`NonlinearRHS.MODAL_MAXBATCH`](@ref Luna.NonlinearRHS.MODAL_MAXBATCH)). Each distinct
-width has its own buffers, its own forward plan *and its own copy of any response which
-owns buffers*, because a [`Batched`](@ref Luna.Nonlinear.Batched) response sizes its
-buffers to the block it is given; that is what the cap is for. The set of widths is fixed
-by the rule, so the dictionary holding them stops growing after the first right-hand
-side.
-
-The projection is a broadcast rather than a matrix product: `out[ω, m, i] = pre[i] Σₚ
-Pω[ω, p, i] W[m, p, i]` writes straight into the driver's buffer, reinterpreted as the
-complex modal array. There are one or two polarisation components, so the sum over `p` is
-unrolled.
-
-### `TransModalFixed`: the fixed rule
-
-[`NonlinearRHS.TransModalFixed`](@ref) (`modal_integral=:fixed`) evaluates the same
-integral on a fixed quadrature rule
-([`Modes.TransverseQuadrature`](@ref Luna.Modes.TransverseQuadrature); Gauss–Legendre or
-Gauss–Kronrod in r or x, a periodic trapezoid in θ or Gauss–Legendre in y). Because the
-rule's weights are known in advance, the points are summed **before** the transform back:
-one matrix product `Pmt = Pt Wp` with the weights folded into `Wp`, then the time window,
-one batched transform over the `nmodes` columns, the spectral window and the
-normalisation. The time and spectral windows are diagonal in time and in frequency, and
-the projection is a sum over points at fixed time, so applying them after the projection
-is the same operation in a different order — and it means the number of transform columns
-does not grow with the number of nodes. Everything per step is a matrix product, a
-batched transform or a broadcast, which is the kernel discipline, so this is the
-multimode transform which runs on a device.
-
-The mode matrices are rebuilt when `z` moves, unless
-[`Modes.zconstant`](@ref Luna.Modes.zconstant) says the transverse profiles do not depend
-on it. That trait is `false` by default and `true` for a `Capillary.MarcatiliMode` with a
-numeric core radius (and for the `Antiresonant` modes wrapping one), which is the fixed-
-radius case; a taper re-evaluates the mode fields on the host and uploads them, which is
-what the adaptive rule does at every point anyway.
-
-The rule carries an embedded coarse rule — the Gauss subset of a Kronrod rule in r
-(`kronrod=true`), or every other node of the *polar* θ trapezoid (a Cartesian domain's
-second coordinate is Gauss–Legendre, which has none) — and
-[`NonlinearRHS.integral_error!`](@ref Luna.NonlinearRHS.integral_error!) turns it into
-`P_coarse - P_fine` with one further matrix product against the precomputed difference of
-the two weight sets. Nothing evaluates it per step; it becomes a statistic once `Stats`
-has been refactored.
-
-`Stats.mode_reconstruction_error` is the adaptive transform's: it re-evaluates the
-transform at one transverse point (which is what
-[`NonlinearRHS.Erω_to_Prω!`](@ref Luna.NonlinearRHS.Erω_to_Prω!) is for) and records the
-cubature's own error estimate. `prop_capillary` turns it off for a `:fixed` run and
-errors if it is asked for explicitly.
-
-### What moved
-
-Replacing a per-point loop with a matrix product and a batched transform changes the
-order of the arithmetic, which is what the regression gate allows and measures. Against
-`gpu/int-D`, the two cases which go through a modal transform moved by 1.5e-15
-(`modeavg_field_vector`, two modes and two polarisation components) and 6.9e-14
-(`multimode_field_plasma`, four modes) in `Eω` in the fixed-step mode; every other case
-is exactly zero, and the adaptive step counts did not change.
-
-The fixed rule is a different *discretisation*, so it agrees with the adaptive rule to
-the accuracy of the quadrature and not to rounding: 3.0e-16 (Kerr), 2.1e-14 (Kerr and
-plasma) and 4.2e-16 (envelope Kerr) on one right-hand side of a four-HE₁ₘ-mode capillary
-with `nr=64`, which is the adaptive rule's error rather than the fixed rule's.
+- **`test/threaded_checks.jl`** (included by `test/test_utils.jl`) checks
+  `Utils.threaded` against the plain broadcast; under `Pkg.test()`, which runs with one
+  thread, it runs in a child process started with `-t 2`.
+- **`benchmark/threaded/`** holds the host profile (`profile.jl`), the executor comparison
+  (`executors.jl`) and the threading speed-up measurement (`speed.jl`, `cases.jl`).

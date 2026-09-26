@@ -43,8 +43,7 @@ Share Luna's per-step elementwise work (the propagator, ionisation rates, the pl
 response, pointwise nonlinear responses, the Runge-Kutta stage combines) out over Julia's
 threads on the CPU (`on=true`, the default) or run it on one thread. It has an effect only
 when Julia is started with several threads (`julia -t N`), and it does not change any
-result: each element is computed by the same code either way. See
-[`Utils.threaded`](@ref).
+result: each element is computed by the same code either way (`Luna.Utils.threaded`).
 """
 function set_threaded_broadcasts(on::Bool=true)
     settings["threaded_broadcasts"] = on
