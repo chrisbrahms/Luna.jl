@@ -9,7 +9,6 @@ import Luna: Maths, Grid
 import Luna.PhysData: c, ε_0, μ_0, ref_index_fun, roomtemp, densityspline, sellmeier_gas
 import Luna.Modes: AbstractMode, dimlimits, neff, field, Aeff, N, modeinfo,
                    zconstant, azimuthal_order
-import Luna.LinearOps: make_linop, conj_clamp, neff_grid, neff_β_grid
 import Luna.PhysData: wlfreq, roomtemp
 import Luna.Utils: subscript
 import Base: show
@@ -186,54 +185,6 @@ function neff(m::MarcatiliMode{Ta, Tco, Tcl, Val{false}}, ω, εco, vn, a) where
     end
 end
 
-function neff_wg(m::MarcatiliMode{Ta, Tco, Tcl, Val{true}}, ω; z=0) where {Ta, Tcl, Tco}
-    εcl = m.cladn(ω, z=z)^2
-    vn = get_vn(εcl, m.kind)
-    a = radius(m, z)
-    if m.model == :full
-        k = ω/c
-        return (m.unm/(k*a))^2*(1 - im*vn/(k*a))^2
-    elseif m.model == :reduced
-        return c^2*m.unm^2/(2*ω^2*a^2) + im*(c^3*m.unm^2)/(a^3*ω^3)*vn
-    else
-        error("model must be :full or :reduced")
-    end
-end
-
-function neff_wg(m::MarcatiliMode{Ta, Tco, Tcl, Val{false}}, ω; z=0) where {Ta, Tcl, Tco}
-    εcl = m.cladn(ω, z=z)^2
-    vn = get_vn(εcl, m.kind)
-    a = radius(m, z)
-    if m.model == :full
-        k = ω/c
-        return (m.unm/(k*a))^2*(1 - im*vn/(k*a))^2
-    elseif m.model == :reduced
-        return c^2*m.unm^2/(2*ω^2*a^2)
-    else
-        error("model must be :full or :reduced")
-    end
-end
-
-function neff(m::MarcatiliMode{Ta, Tco, Tcl, Val{true}}, εco, nwg) where {Ta, Tcl, Tco}
-    if m.model == :full
-        return sqrt(complex(εco - nwg))
-    elseif m.model == :reduced
-        return complex((1 + (εco - 1)/2 - nwg))
-    else
-        error("model must be :full or :reduced")
-    end
-end
-
-function neff(m::MarcatiliMode{Ta, Tco, Tcl, Val{false}}, εco, nwg) where {Ta, Tcl, Tco}
-    if m.model == :full
-        return real(sqrt(complex(εco - nwg)))
-    elseif m.model == :reduced
-        return real((1 + (εco - 1)/2 - nwg))
-    else
-        error("model must be :full or :reduced")
-    end
-end
-
 function get_vn(εcl, kind)
     if kind == :HE
         (εcl + 1)/(2*sqrt(complex(εcl - 1)))
@@ -269,9 +220,8 @@ dimlimits(m::MarcatiliMode; z=0) = (:polar, (0.0, 0.0), (radius(m, z), 2π))
 
 #= Everything transverse about a Marcatili mode -- `field`, `N` and `dimlimits` -- depends
    on `z` only through `radius(m, z)`, so a fixed core radius makes the mode profile
-   z-independent. That is the `MarcatiliMode{<:Number}` type parameter, the same one
-   `FixedCoreCollection` selects on; a tapered mode carries a callable and keeps the
-   conservative default of `Modes.zconstant`. =#
+   z-independent. That is the `MarcatiliMode{<:Number}` type parameter; a tapered mode
+   carries a callable and keeps the conservative default of `Modes.zconstant`. =#
 zconstant(m::MarcatiliMode{<:Number, Tco, Tcl, LT}) where {Tco, Tcl, LT} = true
 
 #= The Cartesian components of an HE_nm mode are `besselj(n-1, u r/a)` times
@@ -350,46 +300,6 @@ function gradient(gas, Z, P; T=roomtemp)
     dens(z) = dspl(p(z))
     coren(ω; z) = sqrt(1 + γ(wlfreq(ω)*1e6)*dens(z))
     return coren, dens
-end
-
-#= Avoid repeated calculation of the waveguide part of the effective index for modes with
-    constant core radius.
-    This is used by LinearOps.make_linop =#
-function neff_β_grid(grid,
-                   mode::MarcatiliMode{<:Number, Tco, Tcl, LT} where {Tco, Tcl, LT},
-                   λ0)
-    nwg = complex(zero(grid.ω))
-    sidcs = (1:length(grid.ω))[grid.sidx]
-    for iω in sidcs
-        nwg[iω] = neff_wg(mode, grid.ω[iω]; z=0)
-    end
-    _neff = let nwg=nwg, ω=grid.ω, mode=mode
-        _neff(iω; z) = neff(mode, mode.coren(ω[iω], z=z)^2, nwg[iω])
-    end
-    _β = let nwg=nwg, ω=grid.ω, _neff=_neff
-        _β(iω; z) = ω[iω]/c*real(_neff(iω; z=z))
-    end
-    _neff, _β
-end
-
-# Collection of modes with fixed core radius
-FixedCoreCollection = Union{
-    Tuple{Vararg{MarcatiliMode{<:Number, Tco, Tcl, LT}} where {Tco, Tcl, LT}},
-    AbstractArray{MarcatiliMode{<:Number, Tco, Tcl, LT} where {Tco, Tcl, LT}}
-    }
-
-function neff_grid(grid, modes::FixedCoreCollection, λ0; ref_mode=1)
-    nwg = Array{ComplexF64, 2}(undef, (length(grid.ω), length(modes)))
-    sidcs = (1:length(grid.ω))[grid.sidx]
-    for (i, mi) in enumerate(modes)
-        for iω in sidcs
-            nwg[iω, i] = neff_wg(mi, grid.ω[iω]; z=0)
-        end
-    end
-    _neff = let nwg=nwg, ω=grid.ω, modes=modes
-        _neff(iω, iim; z) = neff(modes[iim], modes[iim].coren(ω[iω], z=z)^2, nwg[iω, iim])
-    end
-    _neff
 end
 
 """
