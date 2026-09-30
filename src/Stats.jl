@@ -48,7 +48,10 @@ on every step whose statistics fire.
 
 The trait is structural: it does not depend on the array type a statistic was prepared
 for, only on whether its algorithm has a device form. `fwhm_r` and
-`mode_reconstruction_error` are the two statistics in the default sets which do not.
+`mode_reconstruction_error` are the two statistics in the default sets which do not, and
+`transverse_integral_error` has none when its transform carries an embedded error
+estimate (`kronrod=true`); without one it records only the node count and is
+device-capable.
 
 Which path a statistic actually *takes* is a separate, fixed decision -- see
 [`collect_stats`](@ref) and `Stats._onstate`. For a whole set,
@@ -1070,7 +1073,10 @@ function transverse_integral_error(t::TransModalFixed)
                             float(t.ncalls))
 end
 
-device_capable(::TransverseIntegralError) = false
+#= Without an embedded error estimate the statistic records only the rule's node count and
+   NaN, and never reads the state, so it runs on any array type. With one it stages the
+   state on the host into the transform's units, which is host work. =#
+device_capable(f::TransverseIntegralError) = !f.haserr
 needs_time(::TransverseIntegralError) = false
 
 function (f::TransverseIntegralError)(d, Eω, Et, z, dz)
