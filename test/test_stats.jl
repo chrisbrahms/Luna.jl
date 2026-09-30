@@ -94,7 +94,9 @@ end
         dd = sfd(Eω, 0.0, 1e-4)
         @test haskey(dd, "transverse_integral_error_rel")
         @test !haskey(dd, "mode_reconstruction_error")
-        @test Stats.host_statistics(sfd) ⊇ ["TransverseIntegralError"]
+        # host-only only when it has an estimate to compute, which needs the host
+        @test Stats.device_capable(stat) == !kronrod
+        @test ("TransverseIntegralError" in Stats.host_statistics(sfd)) == kronrod
     end
 
     #= The adaptive transform keeps the statistic it always had, which records the
