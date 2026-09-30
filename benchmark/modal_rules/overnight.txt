@@ -14,9 +14,9 @@ R1 550 vortex/F128x5/1e-6
 R1 1400 vortex/F64x16/1e-6
 R1 920 vortex/F64x5/1e-8
 R1 1500 vortex/A1e-4m100000/1e-7
-R1 3750 vortex/F512x5/1e-7
 R1 2010 mixed/F64x16/1e-8
 R1 2060 mixed/A1e-4m100000/1e-7
+R1 3750 vortex/F512x5/1e-7
 R2 4160 mixed/F128x32/1e-7
 R2 1085 mixed/F64x16/1e-7
 R2 2110 mixed/F64x32/1e-7
