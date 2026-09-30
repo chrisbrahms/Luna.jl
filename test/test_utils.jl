@@ -1,6 +1,6 @@
 import Test: @test, @testset, @test_throws
 import Luna
-import Luna: Utils
+import Luna: Utils, Grid, PhysData, NonlinearRHS, Nonlinear, Fields
 import LinearAlgebra
 import HDF5
 import Dates
@@ -156,8 +156,17 @@ end
         Luna.set_blas_threads(3)
         @test Luna.blas_threads(nothing, E) == 3
         Luna.set_blas_threads(0)
-        J == 1 && @test isnothing(Luna.blas_threads(nothing, E))
         @test isnothing(Luna.blas_threads(nothing, E)) # no matrix products
+        # the dispatch on a real radial transform
+        grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 0.2e-12)
+        rg = Grid.RadialGrid(1e-3, 8)
+        nfun = PhysData.ref_index_fun(:Ar, 1.0)
+        _, transform, _ = Luna.setup(grid, rg, z -> PhysData.density(:Ar, 1.0),
+                                     NonlinearRHS.const_norm_radial(grid, rg, nfun),
+                                     (Nonlinear.Kerr_field(PhysData.γ3_gas(:Ar)),),
+                                     Fields.GaussGaussField(λ0=800e-9, τfwhm=30e-15,
+                                                            energy=1e-9, w0=200e-6))
+        @test Luna._gemmkind(transform) === :radial
     finally
         Luna.set_fftw_threads(fftw0)
         Luna.set_blas_threads(blas0)

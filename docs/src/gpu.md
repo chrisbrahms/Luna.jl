@@ -652,7 +652,9 @@ start Julia (`julia -t N`).
   afterwards (also if the run fails): half of BLAS's own default for radial propagation,
   and what the Julia threads leave of it for multimode propagation, whose small products
   run next to the threaded plasma response. With one Julia thread BLAS keeps its own
-  default. [`Luna.set_blas_threads`](@ref)`(n)` fixes the count instead.
+  default. [`Luna.set_blas_threads`](@ref)`(n)` fixes the count instead; a count set with
+  `LinearAlgebra.BLAS.set_num_threads` is overridden inside `Luna.run` for radial and
+  multimode runs.
 
 FFTW plans are made with `:measure` by default ([`Luna.set_fftw_mode`](@ref)); on the
 machine these defaults were measured on, `:patient` gave plans up to 1.45× slower for

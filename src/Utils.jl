@@ -87,7 +87,7 @@ end
 """
     FFTW_THREAD_MINLEN
 
-Number of elements from which the automatic FFTW thread count ([`FFTWthreads`](@ref))
+Number of elements from which the automatic FFTW thread count (`Utils.FFTWthreads`)
 gives a plan `Threads.nthreads()` threads rather than one (2¹⁷, measured with `:measure`
 planning).
 """
@@ -102,9 +102,14 @@ const _FFTW_SERIAL = Ref(false)
 FFTW thread count for a plan of `n` elements. An explicit `Luna.set_fftw_threads(nt)`
 with `nt > 0` is used as given, also with one Julia thread (where FFTW then uses its own
 threads). Otherwise (`0`, the default) the count is chosen automatically:
-`Threads.nthreads()` for a plan of at least [`FFTW_THREAD_MINLEN`](@ref) elements, and 1
+`Threads.nthreads()` for a plan of at least `Utils.FFTW_THREAD_MINLEN` elements, and 1
 for smaller plans, with one Julia thread, and for plans made inside
-[`serial_fftw`](@ref).
+`Utils.serial_fftw`.
+
+The FFTW thread count, the `serial_fftw` flag and the BLAS count
+(`Utils.with_BLAS_threads`) are process-global: several `setup`s or `run`s on concurrent
+tasks in one process can get each other's counts. That affects speed, never results;
+`Scans` runs its workers as separate processes.
 """
 function FFTWthreads(n::Integer=0)
     nt = settings["fftw_threads"]
@@ -116,7 +121,7 @@ end
 """
     serial_fftw(f)
 
-Call `f()` with the automatic FFTW thread count ([`FFTWthreads`](@ref)) fixed at one.
+Call `f()` with the automatic FFTW thread count (`Utils.FFTWthreads`) fixed at one.
 `Luna.setup` plans the radial and multimode transforms inside it: their steps are
 dominated by matrix products, whose BLAS threads compete with FFTW's for the cores.
 """
@@ -162,7 +167,7 @@ _wisdomfile() = joinpath(cachedir(), settings["fftw_threads"] > 0 ?
                          "FFTWcache_$(settings["fftw_threads"])threads" : "FFTWcache_auto")
 
 """
-    loadFFTwisdom()
+    loadFFTwisdom(n=0)
 
 Import accumulated FFTW wisdom from the cache file in `cachedir()`, unless the wisdom
 cache is disabled (see [`Luna.set_fftw_wisdom`](@ref)), in which case only the FFTW thread
@@ -171,11 +176,12 @@ count is re-asserted and nothing is read.
 `Luna.setup` calls this immediately before planning, so the `FFTW.set_num_threads` here is
 what makes the thread count of plans made directly with FFTW independent of anything else
 in the process that may have called `FFTW.set_num_threads`. It therefore happens whether
-or not the wisdom cache is enabled. Plans made with [`plan_ft`](@ref) and
-[`plan_ift`](@ref) set their own count ([`FFTWthreads`](@ref)).
+or not the wisdom cache is enabled. `n` is the element count of the plan about to be
+made directly with FFTW, from which the automatic count is chosen (`Utils.FFTWthreads(n)`).
+Plans made with [`plan_ft`](@ref) and [`plan_ift`](@ref) set their own count.
 """
-function loadFFTwisdom()
-    FFTW.set_num_threads(FFTWthreads())
+function loadFFTwisdom(n=0)
+    FFTW.set_num_threads(FFTWthreads(n))
     settings["fftw_wisdom"] || return
     fpath = _wisdomfile()
     lockpath = joinpath(cachedir(), "FFTWlock")
@@ -498,7 +504,7 @@ real-to-complex transform if `x` is real (field-resolved grids) and a complex-to
 one if it is complex (envelope grids).
 
 On the host this is FFTW with Luna's configured planning flags and the thread count
-[`FFTWthreads`](@ref)`(length(x))`, so the wisdom logic of
+`Utils.FFTWthreads(length(x))`, so the wisdom logic of
 `Utils.loadFFTwisdom`/`Utils.saveFFTwisdom` applies. On a device it is the generic
 `AbstractFFTs` planner, which device FFT libraries implement and which takes no flags.
 

@@ -54,6 +54,20 @@ small grids, and up to 1.8× on 3-D grids from `:patient` plans.
 - Smoke, `-t 4`: radial and 4-mode runs log "BLAS threads for the propagation: 4
   (restored to 8 afterwards)" and leave BLAS at 8.
 
+## Review (fresh-context, approve with nits; all addressed)
+
+- Plans made directly with FFTW (the per-step transverse inverse of the free-space
+  `BeamProfile` statistic, `Stats._plan_ifft`, `Maths.plan_hilbert!`, `Maths.wigner`) now
+  get the automatic count for their size: `Utils.loadFFTwisdom(n)` takes the element count.
+- Docs and `set_blas_threads`'s docstring say that `BLAS.set_num_threads` is overridden
+  inside `Luna.run` for radial and multimode runs; `FFTWthreads`'s docstring notes that
+  the counts are process-global (speed, never results).
+- The BLAS log line only appears when the count changes; test fixes (a duplicate check
+  removed, the transform dispatch tested on a real radial setup, `finally` in
+  `threaded_checks.jl`); four unresolved docs references made plain code.
+- After the fixes: `test_utils.jl` 55/55 (with the `-t 2` child), `test_stats.jl` 167/167
+  at `-t 4`, docs build exit 0, no errors.
+
 ## Measurements
 
 Previous against new defaults, measured side by side in one session

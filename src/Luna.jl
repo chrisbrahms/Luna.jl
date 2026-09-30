@@ -81,7 +81,9 @@ than one thread (with one, BLAS keeps its own default): half of BLAS's own defau
 for radial propagation, and whatever the Julia threads leave of it (`max(1, B₀ − J)`)
 for multimode propagation, whose small products run next to the threaded nonlinear
 response. A positive `nthr` is used for every run. Either way the BLAS thread count is
-restored when `Luna.run` returns or throws; see [`blas_threads`](@ref).
+restored when `Luna.run` returns or throws; see [`blas_threads`](@ref). Inside `Luna.run`
+the automatic count takes precedence over a count set with `BLAS.set_num_threads`, so
+use this function to fix it.
 """
 function set_blas_threads(nthr=0)
     settings["blas_threads"] = nthr
@@ -1035,8 +1037,9 @@ function run(Eω, grid,
 
     flush(stderr) # flush std error once before starting to show setup steps
     nblas = blas_threads(transform, Eω)
-    isnothing(nblas) || Logging.@info("BLAS threads for the propagation: $nblas "*
-        "(restored to $(LinearAlgebra.BLAS.get_num_threads()) afterwards)")
+    (isnothing(nblas) || nblas == LinearAlgebra.BLAS.get_num_threads()) ||
+        Logging.@info("BLAS threads for the propagation: $nblas "*
+                      "(restored to $(LinearAlgebra.BLAS.get_num_threads()) afterwards)")
     result = Utils.with_BLAS_threads(nblas) do
         RK45.solve_precon(
             transform, linop, Eω, z0, init_dz, zmax, stepfun=stepfun,

@@ -1439,7 +1439,7 @@ _transverse_inverse(sg::Grid.Free2DGrid, Er) = _planned_ifft(Er, (3,))
 _transverse_inverse(sg::Grid.FreeGrid, Er) = _planned_ifft(Er, (3, 4))
 
 function _planned_ifft(buf, dims)
-    Utils.loadFFTwisdom()
+    Utils.loadFFTwisdom(length(buf))
     iFT = FFTW.plan_ifft(buf, dims, flags=settings["fftw_flag"])
     Utils.saveFFTwisdom()
     (out, Eω) -> mul!(out, iFT, Eω)
@@ -1670,7 +1670,7 @@ end
    same `ScaledPlan` that `plan_ifft` returns, so the host arithmetic is unchanged. =#
 function _plan_ifft(Eω, buf)
     Utils.isdevice(Eω) && return Utils.plan_ift(Utils.plan_ft(buf, 1))
-    Utils.loadFFTwisdom()
+    Utils.loadFFTwisdom(length(buf))
     iFT = FFTW.plan_ifft(buf, 1, flags=settings["fftw_flag"])
     Utils.saveFFTwisdom()
     iFT

@@ -40,9 +40,12 @@ import Test: @test, @testset
     @test Utils._THREADED_DEPTH[] == 0
     # the automatic FFTW count gives large plans the Julia threads, small ones one
     fftw0 = Luna.settings["fftw_threads"]
-    Luna.set_fftw_threads(0)
-    @test Utils.FFTWthreads(Utils.FFTW_THREAD_MINLEN) == Threads.nthreads()
-    @test Utils.FFTWthreads(Utils.FFTW_THREAD_MINLEN - 1) == 1
-    @test Utils.serial_fftw(() -> Utils.FFTWthreads(Utils.FFTW_THREAD_MINLEN)) == 1
-    Luna.set_fftw_threads(fftw0)
+    try
+        Luna.set_fftw_threads(0)
+        @test Utils.FFTWthreads(Utils.FFTW_THREAD_MINLEN) == Threads.nthreads()
+        @test Utils.FFTWthreads(Utils.FFTW_THREAD_MINLEN - 1) == 1
+        @test Utils.serial_fftw(() -> Utils.FFTWthreads(Utils.FFTW_THREAD_MINLEN)) == 1
+    finally
+        Luna.set_fftw_threads(fftw0)
+    end
 end

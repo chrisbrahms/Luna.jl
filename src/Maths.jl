@@ -579,6 +579,7 @@ function wigner(t, A::Vector{<:Complex}; downsample=1, crop=1)
     ωos = FFTW.fftshift(ωo)
 
     # plan FFT
+    FFTW.set_num_threads(Luna.Utils.FFTWthreads(length(Ao)))
     FT = FFTW.plan_fft(copy(Ao), 1; flags=settings["fftw_flag"])
 
     Af = FT * Ao
@@ -638,7 +639,7 @@ Pre-plan a Hilbert transform.
 Returns a closure `hilbert!(out, x)` which places the Hilbert transform of `x` in `out`.
 """
 function plan_hilbert!(x; dim=1)
-    loadFFTwisdom()
+    loadFFTwisdom(length(x))
     FT = FFTW.plan_fft(copy(x), dim, flags=Luna.settings["fftw_flag"])
     saveFFTwisdom()
     xf = Array{ComplexF64}(undef, size(FT))
