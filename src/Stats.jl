@@ -1074,14 +1074,17 @@ device_capable(::TransverseIntegralError) = false
 needs_time(::TransverseIntegralError) = false
 
 function (f::TransverseIntegralError)(d, Eω, Et, z, dz)
-    #= The state arrives on the host in physical units (the set is host-only, so
-       `Luna.ScaledOutput` has unscaled it); the transform works in its own units and on
-       its own array type. `invEref` is exactly 1 for every Float64 run. =#
-    @. f.Eh = Eω * f.invEref
-    f.Ein === f.Eh || copyto!(f.Ein, f.Eh)
-    f.t(f.nl, f.Ein, z)
     d["transverse_points"] = f.points
+    #= Without an embedded error estimate (`kronrod=false`, the default) there is nothing
+       to evaluate: the statistic records the rule's node count and NaN, and must not pay
+       for a right-hand side evaluation per accepted step to do so. =#
     if f.haserr
+        #= The state arrives on the host in physical units (the set is host-only, so
+           `Luna.ScaledOutput` has unscaled it); the transform works in its own units and
+           on its own array type. `invEref` is exactly 1 for every Float64 run. =#
+        @. f.Eh = Eω * f.invEref
+        f.Ein === f.Eh || copyto!(f.Ein, f.Eh)
+        f.t(f.nl, f.Ein, z)
         err = integral_error!(f.t)
         rms = sqrt(_meanabs2(err))
         d["transverse_integral_error_abs"] = f.Eref*rms

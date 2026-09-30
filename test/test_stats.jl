@@ -79,6 +79,14 @@ end
             @test isnan(d["transverse_integral_error_abs"])
             @test isnan(d["transverse_integral_error_rel"])
         end
+        #= The right-hand side is evaluated only when there is an estimate to record:
+           without one the statistic must not cost an evaluation per step. =#
+        stat = Stats.transverse_integral_error(transform)
+        fill!(stat.nl, NaN)
+        dstat = Dict{String, Any}()
+        stat(dstat, Eω, nothing, 0.0, 1e-4)
+        @test all(isnan, stat.nl) == !kronrod
+        @test dstat["transverse_points"] == nr
         # no mode reconstruction error: that is the adaptive rule's diagnostic
         @test !haskey(d, "mode_reconstruction_error")
         # ... and it is what `Stats.default` puts in the set for this transform
