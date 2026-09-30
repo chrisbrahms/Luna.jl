@@ -1,11 +1,11 @@
 #= Tables from the CPU-versus-GPU runs (`run.jl`): for each machine in `results/`, per case,
    the propagation time of every setting, its speed-up over the baseline -- the
-   single-threaded CPU Float64 run, `cpu64_t1` -- and how far its final field is from the
+   serial CPU Float64 run, `cpu64_t1_b1` (one Julia thread, one BLAS thread) -- and how far its final field is from the
    baseline's.
 
        julia --project=benchmark benchmark/cpu_gpu/summarise.jl [MACHINE ...]
 
-   `× base` and `× <threaded>` are the baseline's and the most-threaded CPU Float64 run's
+   `× base` and `× cpu64_t8` are the baseline's and the threaded CPU Float64 run's
    propagation time divided by this row's (above 1 is faster).
 
    Accuracy columns, against the baseline run of the same case on the same machine, at
@@ -15,7 +15,7 @@
      is above −40 dB of its peak
    - `ΔU_m` (multimode only): max over modes of the relative difference of the mode
      energy Σ_ω |E_m|², however weak the mode
-   A case the baseline did not run is compared with the most-threaded CPU Float64 run.
+   A case the baseline did not run is compared with the threaded CPU Float64 run.
    For the multimode rows the reference is the baseline run with the same transverse
    rule; how the rules compare with each other is in `benchmark/threads/modal_accuracy.jl`.
    The last row of each machine's table is the sum over the cases every setting ran. =#
@@ -40,17 +40,14 @@ function metrics(a, r; modal)
     l2, db, du
 end
 
-"The baseline setting: single-threaded CPU Float64, or the CPU Float64 run with the fewest threads."
-function baseline(settings)
-    cpu = filter(s -> startswith(s, "cpu64_t") && !occursin("_s", s), settings)
-    isempty(cpu) ? nothing : argmin(s -> parse(Int, s[8:end]), cpu)
-end
+"First of `names` that is among `settings`, or `nothing`."
+pick(settings, names) = (i = findfirst(in(settings), names); isnothing(i) ? nothing : names[i])
 
-"The multi-threaded CPU Float64 setting with the most threads, the other reference for the speed-up."
-function threaded(settings)
-    cpu = filter(s -> startswith(s, "cpu64_t") && !occursin("_s", s) && s != "cpu64_t1", settings)
-    isempty(cpu) ? nothing : argmax(s -> parse(Int, s[8:end]), cpu)
-end
+"The baseline: fully serial CPU Float64 (`cpu64_t1_b1`), else one Julia thread."
+baseline(settings) = pick(settings, ["cpu64_t1_b1", "cpu64_t1"])
+
+"The threaded CPU reference: Luna's defaults at 8 Julia threads (one per performance core)."
+threaded(settings) = pick(settings, ["cpu64_t8", "cpu64_t10", "cpu64_t4"])
 
 function summarise(machine)
     rows = readcsv(joinpath(DIR, "results", machine * ".csv"))
