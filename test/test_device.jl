@@ -3496,4 +3496,21 @@ end
     @test 0 < dh["transverse_integral_error_rel"] < 1e-3
 end
 
+#= Without an embedded error estimate the statistic records only the node count and never
+   reads the state, so it is device-capable and runs on the device state itself. =#
+@testset "the transverse integral statistic without an estimate on a device state" begin
+    dEω, _, dtr = modalrhs(Grid.RealGrid, JLSpec; nr=16, kronrod=false)
+    @test !NonlinearRHS.has_error_estimate(dtr)
+    f = Stats.transverse_integral_error(dtr)
+    @test Stats.device_capable(f)
+    ds = Stats.collect_stats(Grid.RealGrid(800e-9, (200e-9, 3000e-9), 400e-15), dEω, f;
+                             stats_device=:device)
+    @test Stats.device_capable(ds)
+    @test isempty(Stats.host_statistics(ds))
+    d = ds(dEω, 0.1, 1e-4) # the device state itself
+    @test d["transverse_points"] == 16
+    @test isnan(d["transverse_integral_error_abs"])
+    @test isnan(d["transverse_integral_error_rel"])
+end
+
 end # have_jlarrays
