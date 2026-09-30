@@ -1,6 +1,7 @@
 import Test: @test, @testset, @test_throws
 import Luna
 import Luna: Utils
+import LinearAlgebra
 import HDF5
 import Dates
 
@@ -116,6 +117,51 @@ end
         Luna.set_fftw_wisdom(was)
     end
     @test Luna.settings["fftw_wisdom"] == was
+end
+
+#= Thread counts: the automatic FFTW and BLAS rules and the explicit overrides. The rules
+   are those measured in benchmark/threads (THREADS_REPORT.md). =#
+@testset "thread counts" begin
+    fftw0, blas0 = Luna.settings["fftw_threads"], Luna.settings["blas_threads"]
+    try
+        Luna.set_fftw_threads(0)
+        J = Threads.nthreads()
+        big, small = Utils.FFTW_THREAD_MINLEN, Utils.FFTW_THREAD_MINLEN - 1
+        @test Utils.FFTWthreads(small) == 1
+        @test Utils.FFTWthreads(big) == (J > 1 ? J : 1)
+        @test Utils.serial_fftw(() -> Utils.FFTWthreads(big)) == 1
+        @test_throws ErrorException Utils.serial_fftw(() -> error("boom"))
+        @test Utils._FFTW_SERIAL[] == false # restored after the throw
+        Luna.set_fftw_threads(3) # explicit: every plan, also with one Julia thread
+        @test Utils.FFTWthreads(small) == 3
+        @test Utils.serial_fftw(() -> Utils.FFTWthreads(big)) == 3
+        Luna.set_fftw_threads(0)
+
+        nb = LinearAlgebra.BLAS.get_num_threads()
+        other = nb == 1 ? 2 : 1
+        @test Utils.with_BLAS_threads(() -> LinearAlgebra.BLAS.get_num_threads(), other) == other
+        @test LinearAlgebra.BLAS.get_num_threads() == nb
+        @test_throws ErrorException Utils.with_BLAS_threads(() -> error("boom"), other)
+        @test LinearAlgebra.BLAS.get_num_threads() == nb # restored after the throw
+        @test Utils.with_BLAS_threads(() -> LinearAlgebra.BLAS.get_num_threads(), nothing) == nb
+
+        # the automatic BLAS rule, for J Julia threads and B₀ BLAS's own default
+        @test Luna._auto_blas(:radial, 4, 8) == 4
+        @test Luna._auto_blas(:radial, 8, 8) == 4
+        @test Luna._auto_blas(:modal, 4, 8) == 4
+        @test Luna._auto_blas(:modal, 8, 8) == 1
+        @test Luna._auto_blas(:modal, 10, 8) == 1
+        @test isnothing(Luna._auto_blas(:none, 4, 8))
+        E = zeros(ComplexF64, 4)
+        Luna.set_blas_threads(3)
+        @test Luna.blas_threads(nothing, E) == 3
+        Luna.set_blas_threads(0)
+        J == 1 && @test isnothing(Luna.blas_threads(nothing, E))
+        @test isnothing(Luna.blas_threads(nothing, E)) # no matrix products
+    finally
+        Luna.set_fftw_threads(fftw0)
+        Luna.set_blas_threads(blas0)
+    end
 end
 
 #= The threaded path needs several Julia threads; with one, the same checks run in a child

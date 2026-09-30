@@ -629,43 +629,60 @@ one against the same arithmetic on the CPU, 7.4× against the `Float64` adaptive
 
 ### On the CPU: threads
 
-A CPU run uses three kinds of threads, and the defaults are not the best choice for the
-grid sizes Luna typically runs:
+A CPU run uses three kinds of threads. Luna chooses the FFTW and BLAS counts itself, from
+the size and kind of the propagation; you choose the number of Julia threads when you
+start Julia (`julia -t N`).
 
-- **Julia threads** (`julia -t N`). Luna's per-step elementwise work -- the linear
-  propagator, the ionisation rate, the plasma response, the fused pointwise nonlinear
-  responses, the Runge-Kutta stage combines and the free-space normalisation -- is shared
-  out over them when an array is long enough to pay for it (≈2¹⁵ elements for the
-  transcendental ones, ≈2¹⁷ for plain arithmetic; see
-  [`Luna.set_threaded_broadcasts`](@ref)). The results do not depend on the thread count: each
-  element is computed by the same code either way. `Luna.set_threaded_broadcasts(false)`
-  turns this off. The plasma response also shares its columns (multimode points, radial
-  or Cartesian grid points) out over the threads.
-- **FFTW threads** (`Luna.set_fftw_threads(n)`). The default, `0`, means four times the
-  number of Julia threads, which is far too many for a mode-averaged or small multimode
-  grid: planning and synchronisation then cost more than the transforms.
-- **BLAS threads** (`LinearAlgebra.BLAS.set_num_threads(n)`), used by the multimode
-  and radial matrix products.
+- **Julia threads.** Luna's per-step elementwise work -- the linear propagator, the
+  ionisation rate, the plasma response, the fused pointwise nonlinear responses, the
+  Runge-Kutta stage combines and the free-space normalisation -- is shared out over them
+  when an array is long enough to pay for it (≈2¹⁵ elements for the transcendental ones,
+  ≈2¹⁷ for plain arithmetic). The plasma response also shares its columns (multimode
+  points, radial or Cartesian grid points) out over the threads.
+  [`Luna.set_threaded_broadcasts`](@ref)`(false)` turns the elementwise part off.
+- **FFTW threads.** By default each FFT plan gets the Julia thread count if it has at
+  least 2¹⁷ elements and belongs to a transform without matrix products (mode-averaged,
+  GNLSE and Cartesian free-space propagation), and one thread otherwise -- including
+  always with one Julia thread. Small transforms lose more to synchronisation than they
+  gain, and in radial and multimode propagation FFTW's threads compete with BLAS's.
+  [`Luna.set_fftw_threads`](@ref)`(n)` fixes the count for every plan instead (with one
+  Julia thread FFTW then runs its own threads).
+- **BLAS threads**, for the matrix products of radial and multimode propagation. By
+  default `Luna.run` sets them for the duration of the propagation and restores them
+  afterwards (also if the run fails): half of BLAS's own default for radial propagation,
+  and what the Julia threads leave of it for multimode propagation, whose small products
+  run next to the threaded plasma response. With one Julia thread BLAS keeps its own
+  default. [`Luna.set_blas_threads`](@ref)`(n)` fixes the count instead.
 
-Measured on an M1 Pro (8 performance cores), Kerr and PPT plasma in argon, wall time of
-the whole propagation (`benchmark/threaded/speed.jl`):
+FFTW plans are made with `:measure` by default ([`Luna.set_fftw_mode`](@ref)); on the
+machine these defaults were measured on, `:patient` gave plans up to 1.45× slower for
+multi-dimensional transforms, and took much longer to plan.
 
-| case | `-t 1` | `-t 8`, FFTW/BLAS 1 thread | `-t 8`, FFTW/BLAS 8 threads |
+None of this changes a result: each element is computed by the same code whatever the
+thread counts.
+
+These rules come from measurements on one machine (Apple M1 Pro, 8 performance and 2
+efficiency cores); the report is `THREADS_REPORT.md` in the `benchmark/threads` directory
+of the repository. How many threads pay, and from which problem size, depends on the
+number and kind of cores and on memory bandwidth, so **for speed-sensitive work, run the
+benchmarks in `benchmark/threads` on your own machine** and set the counts explicitly if
+they disagree with the defaults. Measured on that machine, wall time of whole propagations
+(Kerr and PPT plasma in argon), previous defaults (FFTW `4J` threads for every plan, BLAS
+8) against the current ones:
+
+| case | `-t 1` | `-t 4` | `-t 8` |
 | --- | ---: | ---: | ---: |
-| mode-averaged, 1 ps window, 0.5 m | 2.2 s | 2.2 s | 3.3 s |
-| mode-averaged, 8 ps window (nt ≈ 2¹⁶), 0.2 m | 8.0 s | 6.7 s | 6.0 s |
-| four modes, `modal_integral=:fixed` | 6.3 s | 1.8 s | 5.5 s |
-| radial, 256 points | 2.2 s | 1.7 s | 2.6 s |
-| radial, 1024 points | 20.4 s | 17.6 s | 9.4 s |
+| mode-averaged, 1 ps window | 2.18 → 2.16 s | 2.93 → 2.16 s | 4.12 → 2.15 s |
+| mode-averaged, 8 ps window (nt ≈ 2¹⁷) | 7.74 → 7.66 s | 5.05 → 5.15 s | 6.11 → 5.92 s |
+| GNLSE | 0.05 → 0.05 s | 0.07 → 0.05 s | 0.11 → 0.05 s |
+| four modes, `modal_integral=:fixed` | 6.43 → 6.73 s | 4.17 → 2.24 s | 4.40 → 1.85 s |
+| four modes, `modal_integral=:adaptive` | 18.6 → 17.6 s | 15.3 → 15.5 s | 17.5 → 17.2 s |
+| radial, 256 points | 1.46 → 1.47 s | 1.72 → 1.07 s | 1.56 → 1.09 s |
+| radial, 1024 points | 7.77 → 7.44 s | 8.68 → 6.45 s | 7.36 → 6.53 s |
+| 3-D Cartesian, 64 × 64 | 5.88 → 5.41 s | 2.95 → 2.10 s | 6.34 → 1.67 s |
 
-So: start Julia with several threads, keep FFTW (and BLAS) at one thread for
-mode-averaged and small multimode runs, and give them several threads only for large
-transverse grids, where the transforms and matrix products dominate:
-
-```julia
-Luna.set_fftw_threads(1)
-using LinearAlgebra; BLAS.set_num_threads(1)
-```
+(`benchmark/threads/runs.jl`, previous defaults: `:patient`, FFTW `4J`, BLAS 8; current:
+all automatic. Best of 3; repeatability about ±5 %.)
 
 ## Running the hardware tests
 

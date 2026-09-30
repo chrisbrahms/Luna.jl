@@ -69,11 +69,13 @@ const METALCASES = ("modeavg", "modeavg_long", "modal_fixed", "radial", "radial_
 field(out) = out isa Output.MemoryOutput ? out.data["Eω"] : out["Eω"]
 
 # FFTW_LIST / BLAS_LIST (comma-separated, `J` allowed) override the default grids
-parselist(v) = sort(unique([x == "J" ? J : parse(Int, x) for x in split(v, ",")]))
+parselist(v) = sort(unique([x == "J" ? J : parse(Int, x) for x in split(v, ",")]))  # 0 = auto
 fftw_settings() = haskey(ENV, "FFTW_LIST") ? parselist(ENV["FFTW_LIST"]) :
                   J == 1 ? (J1_FFTW ? [1, 2, 4, 8] : [1]) : sort(unique([1, J, 2J, 4J]))
-blas_settings(gemm) = !gemm ? [1] : haskey(ENV, "BLAS_LIST") ? parselist(ENV["BLAS_LIST"]) :
-                      sort(unique([1, J, 8]))
+# BLAS_LIST applies to every case, so that a count set for one case cannot leak into the
+# next one in the same process
+blas_settings(gemm) = haskey(ENV, "BLAS_LIST") ? parselist(ENV["BLAS_LIST"]) :
+                      gemm ? sort(unique([1, J, 8])) : [1]
 
 function main()
     sel = haskey(ENV, "CASES") ? split(ENV["CASES"], ",") :
@@ -84,7 +86,14 @@ function main()
         name in sel || continue
         ref = nothing
         for nf in fftw_settings(), nb in blas_settings(gemm)
-            Luna.set_fftw_threads(nf); BLAS.set_num_threads(nb)
+            # 0 means Luna's automatic choice (for BLAS: Luna.run sets it during the run)
+            Luna.set_fftw_threads(nf)
+            if isdefined(Luna, :set_blas_threads)
+                Luna.set_blas_threads(nb)
+                nb > 0 && BLAS.set_num_threads(nb)
+            else
+                BLAS.set_num_threads(max(nb, 1))
+            end
             ref === nothing && f() # compile once per case
             # best of REPS, and of as many more (up to 20) as fit in one second for fast cases
             t = Inf; E = nothing; total = 0.0; k = 0

@@ -31,6 +31,8 @@ import Test: @test, @testset
 Luna.set_fftw_mode(:estimate)
 Luna.set_fftw_threads(1)
 LinearAlgebra.BLAS.set_num_threads(1)
+# Luna.run sets its own BLAS count unless told otherwise (older commits have no switch)
+isdefined(Luna, :set_blas_threads) && Luna.set_blas_threads(1)
 Luna.set_fftw_wisdom(false)
 
 include(joinpath(@__DIR__, "regression", "cases.jl"))

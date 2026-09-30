@@ -1,6 +1,7 @@
 module Utils
 import Dates
 import FFTW
+import LinearAlgebra
 import AbstractFFTs
 import GPUArraysCore
 import Logging
@@ -75,13 +76,90 @@ function sourcecode()
     return out
 end
 
-function FFTWthreads()
-    if Threads.nthreads() == 1
-        1
-    else
-        settings["fftw_threads"] == 0 ? 4*Threads.nthreads() : settings["fftw_threads"]
+#=================================================#
+#=================  THREAD COUNTS  ===============#
+#=================================================#
+
+#= The defaults below come from benchmark/threads (THREADS_REPORT.md): on the CPU, FFTW
+   threads only pay for large transforms, and they compete with BLAS threads in the
+   transforms whose step is dominated by matrix products (radial and multimode). =#
+
+"""
+    FFTW_THREAD_MINLEN
+
+Number of elements from which the automatic FFTW thread count ([`FFTWthreads`](@ref))
+gives a plan `Threads.nthreads()` threads rather than one (2¹⁷, measured with `:measure`
+planning).
+"""
+const FFTW_THREAD_MINLEN = 1 << 17
+
+# set while planning transforms whose step is dominated by matrix products; see serial_fftw
+const _FFTW_SERIAL = Ref(false)
+
+"""
+    FFTWthreads(n=0)
+
+FFTW thread count for a plan of `n` elements. An explicit `Luna.set_fftw_threads(nt)`
+with `nt > 0` is used as given, also with one Julia thread (where FFTW then uses its own
+threads). Otherwise (`0`, the default) the count is chosen automatically:
+`Threads.nthreads()` for a plan of at least [`FFTW_THREAD_MINLEN`](@ref) elements, and 1
+for smaller plans, with one Julia thread, and for plans made inside
+[`serial_fftw`](@ref).
+"""
+function FFTWthreads(n::Integer=0)
+    nt = settings["fftw_threads"]
+    nt > 0 && return nt
+    (Threads.nthreads() > 1 && !_FFTW_SERIAL[] && n >= FFTW_THREAD_MINLEN) ?
+        Threads.nthreads() : 1
+end
+
+"""
+    serial_fftw(f)
+
+Call `f()` with the automatic FFTW thread count ([`FFTWthreads`](@ref)) fixed at one.
+`Luna.setup` plans the radial and multimode transforms inside it: their steps are
+dominated by matrix products, whose BLAS threads compete with FFTW's for the cores.
+"""
+function serial_fftw(f)
+    old = _FFTW_SERIAL[]
+    _FFTW_SERIAL[] = true
+    try
+        return f()
+    finally
+        _FFTW_SERIAL[] = old
     end
 end
+
+"""
+    BLAS_DEFAULT
+
+OpenBLAS's own thread count as found when Luna was loaded; the automatic BLAS thread
+count ([`Luna.blas_threads`](@ref)) is derived from it.
+"""
+const BLAS_DEFAULT = Ref(0)
+
+"""
+    with_BLAS_threads(f, nthreads)
+
+Call `f()` with the BLAS thread count set to `nthreads`, and restore the previous count
+afterwards, also if `f` throws. `nthreads === nothing` calls `f()` unchanged.
+"""
+function with_BLAS_threads(f, nthreads)
+    isnothing(nthreads) && return f()
+    old = LinearAlgebra.BLAS.get_num_threads()
+    nthreads == old && return f()
+    LinearAlgebra.BLAS.set_num_threads(nthreads)
+    try
+        return f()
+    finally
+        LinearAlgebra.BLAS.set_num_threads(old)
+    end
+end
+
+# wisdom file: one for the automatic counts (FFTW's wisdom is keyed by thread count), or
+# one per explicit count
+_wisdomfile() = joinpath(cachedir(), settings["fftw_threads"] > 0 ?
+                         "FFTWcache_$(settings["fftw_threads"])threads" : "FFTWcache_auto")
 
 """
     loadFFTwisdom()
@@ -91,14 +169,15 @@ cache is disabled (see [`Luna.set_fftw_wisdom`](@ref)), in which case only the F
 count is re-asserted and nothing is read.
 
 `Luna.setup` calls this immediately before planning, so the `FFTW.set_num_threads` here is
-what makes the thread count Luna plans with independent of anything else in the process
-that may have called `FFTW.set_num_threads`. It therefore happens whether or not the
-wisdom cache is enabled.
+what makes the thread count of plans made directly with FFTW independent of anything else
+in the process that may have called `FFTW.set_num_threads`. It therefore happens whether
+or not the wisdom cache is enabled. Plans made with [`plan_ft`](@ref) and
+[`plan_ift`](@ref) set their own count ([`FFTWthreads`](@ref)).
 """
 function loadFFTwisdom()
     FFTW.set_num_threads(FFTWthreads())
     settings["fftw_wisdom"] || return
-    fpath = joinpath(cachedir(), "FFTWcache_$(FFTWthreads())threads")
+    fpath = _wisdomfile()
     lockpath = joinpath(cachedir(), "FFTWlock")
     isdir(cachedir()) || mkpath(cachedir())
     if isfile(fpath)
@@ -125,7 +204,7 @@ this does nothing.
 """
 function saveFFTwisdom()
     settings["fftw_wisdom"] || return
-    fpath = joinpath(cachedir(), "FFTWcache_$(FFTWthreads())threads")
+    fpath = _wisdomfile()
     lockpath = joinpath(cachedir(), "FFTWlock")
     mkpidlock(lockpath; stale_age=600) do
         isfile(fpath) && rm(fpath)
@@ -418,7 +497,8 @@ Plan the forward time-to-frequency transform of an array like `x` along `dims`: 
 real-to-complex transform if `x` is real (field-resolved grids) and a complex-to-complex
 one if it is complex (envelope grids).
 
-On the host this is FFTW with Luna's configured planning flags, so the wisdom logic of
+On the host this is FFTW with Luna's configured planning flags and the thread count
+[`FFTWthreads`](@ref)`(length(x))`, so the wisdom logic of
 `Utils.loadFFTwisdom`/`Utils.saveFFTwisdom` applies. On a device it is the generic
 `AbstractFFTs` planner, which device FFT libraries implement and which takes no flags.
 
@@ -427,10 +507,14 @@ reject views -- so `x` must be the buffer the transform will actually be applied
 one just like it).
 """
 plan_ft(x, dims) = _plan_ft(backend(x), x, dims)
-_plan_ft(::CPUBackend, x::AbstractArray{<:Real}, dims) =
+function _plan_ft(::CPUBackend, x::AbstractArray{<:Real}, dims)
+    FFTW.set_num_threads(FFTWthreads(length(x)))
     FFTW.plan_rfft(x, dims, flags=settings["fftw_flag"])
-_plan_ft(::CPUBackend, x::AbstractArray{<:Complex}, dims) =
+end
+function _plan_ft(::CPUBackend, x::AbstractArray{<:Complex}, dims)
+    FFTW.set_num_threads(FFTWthreads(length(x)))
     FFTW.plan_fft(x, dims, flags=settings["fftw_flag"])
+end
 _plan_ft(::DeviceBackend, x::AbstractArray{<:Real}, dims) = AbstractFFTs.plan_rfft(x, dims)
 _plan_ft(::DeviceBackend, x::AbstractArray{<:Complex}, dims) = AbstractFFTs.plan_fft(x, dims)
 
@@ -449,6 +533,11 @@ instead be folded into the scale factor the oversampling copy already applies
 For a real-to-complex `FT` the inverse is a `brfft`, which **overwrites its input**.
 """
 plan_ift(FT) = inv(FT)
+# an FFTW inverse plan takes the thread count current when it is made
+function plan_ift(FT::FFTW.FFTWPlan)
+    FFTW.set_num_threads(FFTWthreads(prod(size(FT))))
+    inv(FT)
+end
 
 """
     iplan(IFT)

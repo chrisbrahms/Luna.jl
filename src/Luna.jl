@@ -3,6 +3,7 @@ import FFTW
 import Hankel
 import Logging
 import Printf: @sprintf
+import LinearAlgebra
 import LinearAlgebra: mul!, ldiv!
 Logging.disable_logging(Logging.BelowMinLevel)
 
@@ -11,8 +12,9 @@ Logging.disable_logging(Logging.BelowMinLevel)
 
 Dictionary of global settings for `Luna`.
 """
-settings = Dict{String, Any}("fftw_flag" => FFTW.PATIENT,
+settings = Dict{String, Any}("fftw_flag" => FFTW.MEASURE,
                              "fftw_threads" => 0,
+                             "blas_threads" => 0,
                              "fftw_wisdom" => true,
                              "threaded_broadcasts" => true)
 
@@ -22,7 +24,10 @@ settings = Dict{String, Any}("fftw_flag" => FFTW.PATIENT,
 Set FFTW planning mode for all FFTW transform planning in `Luna`.
 
 Possible values for `mode` are `:estimate`, `:measure`, `:patient`, and `:exhaustive`.
-The initial value upon loading `Luna` is `:patient`
+The initial value upon loading `Luna` is `:measure`: on the machine the defaults were
+measured on (benchmark/threads), `:patient` plans were up to 1.45× slower for batched and
+multi-dimensional transforms and took far longer to make, and `:measure` was within 5 %
+of the best mode in every whole propagation.
 
 # Examples
 ```jldoctest
@@ -50,14 +55,36 @@ function set_threaded_broadcasts(on::Bool=true)
 end
 
 """
-    set_fftw_threads(nthr)
+    set_fftw_threads(nthr=0)
 
-Set number of threads to be used by FFTW. If set to `0`, the number of threads used by
-FFTW is determined automatically (see `Utils.FFTWthreads`).
+Set the number of threads FFTW uses for the plans Luna makes. `0` (the default) chooses
+it per plan: `Threads.nthreads()` for plans of at least `Utils.FFTW_THREAD_MINLEN`
+(2¹⁷) elements in transforms without matrix products (mode-averaged, GNLSE and Cartesian
+free-space propagation), and one otherwise, including always with one Julia thread. A
+positive `nthr` is used for every plan, also with one Julia thread, where FFTW then runs
+its own threads. See `Utils.FFTWthreads`.
+
+The best setting depends on the machine and the problem; for speed-sensitive work, run
+`benchmark/threads` on your own machine (see the "Running on a GPU" page).
 """
 function set_fftw_threads(nthr=0)
     settings["fftw_threads"] = nthr
     FFTW.set_num_threads(Utils.FFTWthreads())
+end
+
+"""
+    set_blas_threads(nthr=0)
+
+Set the number of BLAS threads Luna uses while it propagates. `0` (the default) chooses
+it per run, for the transforms which do matrix products, and only when Julia has more
+than one thread (with one, BLAS keeps its own default): half of BLAS's own default count
+for radial propagation, and whatever the Julia threads leave of it (`max(1, B₀ − J)`)
+for multimode propagation, whose small products run next to the threaded nonlinear
+response. A positive `nthr` is used for every run. Either way the BLAS thread count is
+restored when `Luna.run` returns or throws; see [`blas_threads`](@ref).
+"""
+function set_blas_threads(nthr=0)
+    settings["blas_threads"] = nthr
 end
 
 """
@@ -94,6 +121,7 @@ function set_fftw_wisdom(enabled::Bool)
 end
 
 function __init__()
+    Utils.BLAS_DEFAULT[] = LinearAlgebra.BLAS.get_num_threads()
     set_fftw_threads()
 end
 
@@ -329,13 +357,19 @@ collection of [`Modes.AbstractMode`](@ref Luna.Modes.AbstractMode)s and `compone
 """
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components; kwargs...)
-    setup_modal(grid, densityfun, responses, inputs, modes, components; kwargs...)
+    # FFT plans single-threaded under the automatic rule: see Utils.serial_fftw
+    Utils.serial_fftw() do
+        setup_modal(grid, densityfun, responses, inputs, modes, components; kwargs...)
+    end
 end
 
 @doc (@doc setup)
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components; kwargs...)
-    setup_modal(grid, densityfun, responses, inputs, modes, components; kwargs...)
+    # FFT plans single-threaded under the automatic rule: see Utils.serial_fftw
+    Utils.serial_fftw() do
+        setup_modal(grid, densityfun, responses, inputs, modes, components; kwargs...)
+    end
 end
 
 function setup_modal(grid, densityfun, responses, inputs, modes, components;
@@ -462,13 +496,17 @@ plan on the *state's* array type, which is what the absorbing boundaries apply.
 """
 function setup(grid::Grid.RealGrid, rg::Grid.RadialGrid,
                densityfun, normfun, responses, inputs; kwargs...)
-    setup_radial(Float64, grid, rg, densityfun, normfun, responses, inputs; kwargs...)
+    Utils.serial_fftw() do # see Utils.serial_fftw
+        setup_radial(Float64, grid, rg, densityfun, normfun, responses, inputs; kwargs...)
+    end
 end
 
 @doc (@doc setup)
 function setup(grid::Grid.EnvGrid, rg::Grid.RadialGrid,
                densityfun, normfun, responses, inputs; kwargs...)
-    setup_radial(ComplexF64, grid, rg, densityfun, normfun, responses, inputs; kwargs...)
+    Utils.serial_fftw() do # see Utils.serial_fftw
+        setup_radial(ComplexF64, grid, rg, densityfun, normfun, responses, inputs; kwargs...)
+    end
 end
 
 function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
@@ -677,6 +715,35 @@ sym2string(sym::Symbol) = string(sym)
 sym2string(other) = other
 
 save_modeinfo_maybe(output, t) = nothing
+
+"""
+    blas_threads(transform, Eω)
+
+The BLAS thread count `Luna.run` propagates with, or `nothing` to leave it as it is. An
+explicit [`set_blas_threads`](@ref)`(n)` gives `n`. Otherwise it is `nothing` for a state
+on a device, with one Julia thread, and for transforms without matrix products;
+`B₀ ÷ 2` for [`NonlinearRHS.TransRadial`](@ref Luna.NonlinearRHS.TransRadial) and
+`max(1, B₀ − J)` for the multimode transforms, with `J = Threads.nthreads()` and `B₀`
+BLAS's own default count (`Utils.BLAS_DEFAULT`). Measured in benchmark/threads: radial
+runs are fastest with 4 of 8 BLAS threads at 4 and 8 Julia threads, multimode runs with
+the cores the Julia threads leave (8 BLAS threads next to 8 Julia threads cost 2.8×).
+"""
+function blas_threads(transform, Eω)
+    nt = settings["blas_threads"]
+    nt > 0 && return nt
+    (Utils.isdevice(Eω) || Threads.nthreads() == 1) && return nothing
+    _auto_blas(_gemmkind(transform), Threads.nthreads(), _blasdefault())
+end
+
+_blasdefault() = Utils.BLAS_DEFAULT[] > 0 ? Utils.BLAS_DEFAULT[] :
+                 LinearAlgebra.BLAS.get_num_threads()
+
+_gemmkind(::NonlinearRHS.TransRadial) = :radial
+_gemmkind(::Union{NonlinearRHS.TransModal, NonlinearRHS.TransModalFixed}) = :modal
+_gemmkind(t) = :none
+
+_auto_blas(kind, J, B0) = kind === :radial ? max(1, B0 ÷ 2) :
+                          kind === :modal ? max(1, B0 - J) : nothing
 
 """
     run(Eω, grid, linop, transform, FT, output; zmax, kwargs...)
@@ -967,11 +1034,16 @@ function run(Eω, grid,
     save_modeinfo_maybe(output, transform)
 
     flush(stderr) # flush std error once before starting to show setup steps
-    result = RK45.solve_precon(
-        transform, linop, Eω, z0, init_dz, zmax, stepfun=stepfun,
-        max_dt=max_dz, min_dt=min_dz,
-        rtol=rtol, atol=atol, safety=safety, norm=norm,
-        status_period=status_period)
+    nblas = blas_threads(transform, Eω)
+    isnothing(nblas) || Logging.@info("BLAS threads for the propagation: $nblas "*
+        "(restored to $(LinearAlgebra.BLAS.get_num_threads()) afterwards)")
+    result = Utils.with_BLAS_threads(nblas) do
+        RK45.solve_precon(
+            transform, linop, Eω, z0, init_dz, zmax, stepfun=stepfun,
+            max_dt=max_dz, min_dt=min_dz,
+            rtol=rtol, atol=atol, safety=safety, norm=norm,
+            status_period=status_period)
+    end
     # Anything the operator has to say about the propagation as a whole (see `report_integral`)
     LinearOps.report_integral(linop)
     result

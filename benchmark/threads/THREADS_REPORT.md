@@ -338,3 +338,14 @@ to honour an explicit `n` there).
    implement now, or leave for later.
 5. The docs could recommend `-t 4` to `-t 8` (not `-t auto`, which includes efficiency cores)
    for laptops; Luna cannot choose `J` itself.
+
+## Implemented (decisions of 2026-09-29)
+
+Rule accepted; `:measure` is the default planning mode, so the FFTW threshold is 2¹⁷;
+BLAS set by `Luna.run` through `Utils.with_BLAS_threads` and restored afterwards; no
+`tune_threads` yet; the docs tell users to run `benchmark/threads` on their own machine
+rather than recommending a `-t`; the multimode default is unchanged. See `PR_33-threads.md`
+for the code and the old-against-new measurement (`results/runs_olddefaults.csv`,
+`results/runs_defaults.csv`): the new defaults are never slower beyond noise and up to
+3.8× faster (3-D 64 × 64 at `-t 8`).
+

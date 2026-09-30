@@ -23,6 +23,8 @@ const ONLY = ARGS[2:end]
 Luna.set_fftw_mode(:estimate)
 Luna.set_fftw_threads(1)
 LinearAlgebra.BLAS.set_num_threads(1)
+# Luna.run sets its own BLAS count unless told otherwise (older commits have no switch)
+isdefined(Luna, :set_blas_threads) && Luna.set_blas_threads(1)
 if isdefined(Luna, :set_fftw_wisdom)
     Luna.set_fftw_wisdom(false)
 else

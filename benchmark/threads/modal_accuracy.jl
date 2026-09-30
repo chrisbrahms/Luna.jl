@@ -14,9 +14,13 @@
      where S_ref is above -40 dB of its peak
    plus the accepted step count (length of stats["z"]) and the wall time (BLAS 1). =#
 import LinearAlgebra
-LinearAlgebra.BLAS.set_num_threads(1)
+import LinearAlgebra: BLAS
 using Luna, Printf, Logging, Statistics
 Luna.set_fftw_mode(:estimate); Luna.set_fftw_wisdom(false); Luna.set_fftw_threads(1)
+# BLAS counts are set explicitly below; stop Luna.run from choosing its own
+setblas(n) = (isdefined(Luna, :set_blas_threads) && Luna.set_blas_threads(n); BLAS.set_num_threads(n))
+
+setblas(1)
 
 const OUT = get(ENV, "OUT", joinpath(@__DIR__, "results", "modal_accuracy.csv"))
 const λ0, τ, NM, L, FRAC = 800e-9, 30e-15, 8, 0.3, 0.95

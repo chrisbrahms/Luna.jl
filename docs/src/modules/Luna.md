@@ -20,6 +20,8 @@ one gets.
 Luna.settings
 Luna.set_fftw_mode
 Luna.set_fftw_threads
+Luna.set_blas_threads
+Luna.blas_threads
 Luna.set_fftw_wisdom
 Luna.set_threaded_broadcasts
 ```

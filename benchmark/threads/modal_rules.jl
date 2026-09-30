@@ -15,6 +15,8 @@ import LinearAlgebra
 import LinearAlgebra: BLAS
 using Luna, Printf, Logging, Statistics
 Luna.set_fftw_mode(:estimate); Luna.set_fftw_wisdom(false); Luna.set_fftw_threads(1)
+# BLAS counts are set explicitly below; stop Luna.run from choosing its own
+setblas(n) = (isdefined(Luna, :set_blas_threads) && Luna.set_blas_threads(n); BLAS.set_num_threads(n))
 
 const J = Threads.nthreads()
 const OUT = get(ENV, "OUT", joinpath(@__DIR__, "results", "modal_rules.csv"))
@@ -43,11 +45,11 @@ isfile(OUT) || open(io -> println(io,
 Pcr = pcrit()
 for frac in FRACS
     E = frac*Pcr*τ/0.94 # peak power of a Gaussian: 0.94 E/τ
-    BLAS.set_num_threads(1)
+    setblas(1)
     ref = run(E, :fixed; modal_nr=256)["Eω"]
     first = true
     for (rule, nr, rtol) in RULES, nb in (1, 8)
-        BLAS.set_num_threads(nb)
+        setblas(nb)
         kw = rule === :fixed ? (modal_nr=nr,) : (radial_integral_rtol=rtol,)
         first && (run(E, rule; kw...); first = false) # compile
         t = @elapsed out = run(E, rule; kw...)
