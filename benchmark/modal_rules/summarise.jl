@@ -54,24 +54,34 @@ function timed()
     Dict((r[1], "$(r[2])_p$(r[3])_s$(parse(Float64, r[4]))") => parse(Float64, r[6]) for r in rows)
 end
 
+"The timed lane's runs (`fields_timed/`), listed with a `T:` prefix next to the accuracy runs."
+const TDIR = joinpath(@__DIR__, "fields_timed")
+
+runpath(case, n) = startswith(n, "T:") ? joinpath(TDIR, case, n[3:end] * ".jls") :
+                                         joinpath(DIR, case, n * ".jls")
+
 function summarise(case)
     files = filter(f -> endswith(f, ".jls"), readdir(joinpath(DIR, case)))
     names = first.(splitext.(files))
+    if isdir(joinpath(TDIR, case))
+        tn = first.(splitext.(filter(f -> endswith(f, ".jls"), readdir(joinpath(TDIR, case)))))
+        append!(names, "T:" .* tn)
+    end
     isempty(names) && return
     ref = get(ENV, "REF_" * case, "")
     if isempty(ref)
         # most nodes first, then the tightest propagation tolerance among those
-        fixed = filter(n -> startswith(n, "F"), names)
+        fixed = filter(n -> startswith(n, "F"), names)  # accuracy runs only
         ref = argmax(n -> (nodes(n), -prtol(n)), fixed)
     end
-    R = deserialize(joinpath(DIR, case, ref * ".jls"))
+    R = deserialize(runpath(case, ref))
     grid = GRIDS[case]()
     println("## ", case, " (reference ", ref, ")\n")
     T = timed()
     println("| run | steps | points med/max | run s | serial s | global | permode | energy | permode>1e-3 | energy>1e-3 | dB | Ppk | τ | permode end |")
     println("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
-    for n in sort(names; by=n -> (n[1], nodes(n), n))
-        r = deserialize(joinpath(DIR, case, n * ".jls"))
+    for n in sort(names; by=n -> (startswith(n, "T:"), n[1], nodes(replace(n, "T:" => "")), n))
+        r = deserialize(runpath(case, n))
         size(r.E) == size(R.E) || (println("| $n | shape differs |"); continue)
         ms = [metrics(grid, r.E[:, :, iz], R.E[:, :, iz]) for iz in 2:size(R.E, 3)]
         ms3 = [metrics(grid, r.E[:, :, iz], R.E[:, :, iz]; minshare=1e-3) for iz in 2:size(R.E, 3)]
@@ -79,7 +89,8 @@ function summarise(case)
         mx3(f) = maximum(getfield.(ms3, f))
         tp = filter(!isnan, r.transverse_points)
         pts = isempty(tp) ? "" : @sprintf("%d/%d", sort(tp)[cld(length(tp), 2)], maximum(tp))
-        ser = haskey(T, (case, n)) ? @sprintf("%.1f", T[(case, n)]) : ""
+        key = replace(n, "T:" => "")
+        ser = haskey(T, (case, key)) ? @sprintf("%.1f", T[(case, key)]) : ""
         @printf("| %s | %d | %s | %.1f | %s | %.1e | %.1e | %.1e | %.1e | %.1e | %.1e | %.1e | %.1e | %.1e |\n",
                 n, r.steps, pts, r.run_s, ser, mx(:global_), mx(:permode), mx(:energy),
                 mx3(:permode), mx3(:energy), mx(:dB), mx(:Ppk), mx(:τ), ms[end].permode)
@@ -87,6 +98,7 @@ function summarise(case)
     println()
     # the propagation floor: each rule run at more than one tolerance, against its own
     # tightest run (the difference is the step control's, not the transverse rule's)
+    names = filter(n -> !startswith(n, "T:"), names)
     rules = unique(first.(split.(names, "_p")))
     println("Propagation floor (same rule, against its tightest tolerance):\n")
     println("| run | against | global | permode>1e-3 | dB |")
