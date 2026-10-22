@@ -1130,6 +1130,43 @@ end
     end
 end
 
+#= The modified shot noise (LupoLab/Luna.jl#440) on Metal: the draw is made on the host from
+   `rng`, so the Metal and the CPU runs share it; the transform's device copy, advanced on
+   Metal, follows the host one in `E_ref` units (to the Float32 phase error, ~6e-8·|Φ|), and
+   the propagated fields agree as the noise-free ones do. At constant pressure and with a
+   gradient (the tabulated phase, read back on the device). =#
+@testset "modified shot noise on Metal" begin
+    Random = Base.require(Base.PkgId(Base.UUID("9a3f8284-a2c9-5f02-9a11-845980a1fd5c"),
+                                     "Random"))
+    capkw = (; λ0=800e-9, energy=100e-9, τfwhm=10e-15, λlims=(300e-9, 2000e-9),
+             trange=400e-15, saveN=5, plasma=false, raman=false, shotnoise=:modified)
+    @testset "pressure $pres" for pres in (1.0, (1.0, 0.0))
+        args = Luna.Interface.prop_capillary_args(125e-6, 0.1, :He, pres; capkw...,
+                                                  rng=Random.MersenneTwister(5),
+                                                  device=MetalSpec)
+        t = args[4]
+        @test t.dnoise.Eω0 isa MtlArray
+        Eref = t.scaling.Eref
+        for z in (0.0, 0.05, 0.1)
+            d = Array(NonlinearRHS.noise_at!(t.dnoise, z))
+            h = NonlinearRHS.noise_at!(t.noise, z) ./ Eref
+            err = maximum(abs, d .- h)/maximum(abs, h)
+            @info "Metal noise_at!" pres z err
+            @test err < 1e-5 # measured 5.6e-8 at z = 0, up to 8.4e-7 at the end
+        end
+        h32 = Luna.prop_capillary(125e-6, 0.1, :He, pres; capkw...,
+                                  rng=Random.MersenneTwister(5),
+                                  device=DeviceSpec(Array, Float32))
+        dm = Luna.prop_capillary(125e-6, 0.1, :He, pres; capkw...,
+                                 rng=Random.MersenneTwister(5), device=MetalSpec)
+        @test dm["noise_field"] == h32["noise_field"]
+        for idx in axes(h32["Eω"], 2)
+            @test maximum(abs, dm["Eω"][:, idx] .- h32["Eω"][:, idx]) /
+                  maximum(abs, h32["Eω"][:, idx]) < 1e-4
+        end
+    end
+end
+
 #= gpu/24's exit criterion on real hardware: every default statistic computed on the
    device, and no per-step copy of the state to the host to do it.
 
