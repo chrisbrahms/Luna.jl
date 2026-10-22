@@ -467,6 +467,36 @@ end
     @test out2["noise_field"] == saved
 end
 
+@testset "Modified noise through the interface in Float32" begin
+    #= `prop_capillary` takes `precision`: the saved draw and phase are the host,
+       physical-unit objects and `Luna.run` unscales the output, so the restored field
+       agrees with the Float64 run's to single precision. A cached resume adopts the
+       recorded draw and refreshes the kernels' Float32, state-unit copy of it. `plasma`
+       is off because the plasma response cannot be rescaled on this branch. =#
+    kw = (noise_kwargs..., plasma=false, shotnoise=:modified, save_noise=true)
+    out64 = prop_capillary(noise_args...; kw..., rng=Random.MersenneTwister(42))
+    out32 = prop_capillary(noise_args...; kw..., rng=Random.MersenneTwister(42),
+                           device=:cpu, precision=Float32)
+    @test eltype(out32["Eω"]) == ComplexF32
+    @test out32["noise_field"] == out64["noise_field"]
+    @test out32["noise_phase"] ≈ out64["noise_phase"]
+    E64 = Processing.withnoise(out64)
+    E32 = Processing.withnoise(out32)
+    @test maximum(abs, E32 .- E64)/maximum(abs, E64) < 1e-4
+
+    fpath = joinpath(mktempdir(), "noise_resume32.h5")
+    out = prop_capillary(noise_args...; kw..., rng=Random.MersenneTwister(42),
+                         filepath=fpath, device=:cpu, precision=Float32)
+    saved = out["noise_field"]
+    _, _, _, transform, _, _ = Interface.prop_capillary_args(
+        noise_args...; kw..., rng=Random.MersenneTwister(7), filepath=fpath,
+        device=:cpu, precision=Float32)
+    @test transform.noise.Eω0 == saved
+    @test transform.dnoise !== transform.noise
+    @test transform.dnoise.Eω0 ≈ ComplexF32.(saved ./ transform.scaling.Eref)
+    @test isnan(transform.dnoise.lastz[])
+end
+
 @testset "rtol/atol are threaded to the integrator" begin
     # prop_capillary and prop_gnlse previously offered no way to set integrator tolerances
     kwargs = (noise_kwargs..., shotnoise=false)
