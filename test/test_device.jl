@@ -2403,14 +2403,31 @@ end
     end
 end
 
+#= One right-hand side of the host transform with noise (`htr`), without (`ctr`) and of the
+   device one with noise (`dtr`), on the first saved field scaled by `s`, at `z`: how much the
+   noise changes the nonlinear term, and how far the device is from the host. The noise enters
+   the Kerr term relative to the field, so a small `s` makes its effect measurable in these
+   weak cases without amplifying the draw any further. =#
+function freerhs(href, htr, ctr, dtr, z; s=1)
+    E = s .* collect(selectdim(href["Eω"], ndims(href["Eω"]), 1))
+    nlh = similar(E); htr(nlh, E, z)
+    nlc = similar(E); ctr(nlc, E, z)
+    dnl = Luna.todevice(JLSpec, similar(E))
+    dtr(dnl, Luna.todevice(JLSpec, E), z)
+    m = maximum(abs, nlh)
+    maximum(abs, nlh .- nlc)/m, maximum(abs, Array(dnl) .- nlh)/m
+end
+
 #= The modified shot-noise path of the Cartesian transforms: the noise is advanced to the
    current z on the device (`dnoise`), taken to the oversampled real-space time domain by
    the transform's own inverse plan (which does ω -> t and k -> x in one), and a second
    block-sized buffer holds field+noise. The same host draw goes into both runs. =#
-@testset "the 2-D free-space noise field on JLArray" begin
+@testset "the 2-D free-space noise field on JLArray and in Float32" begin
     grid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
     Nx = 2^5
-    nfω = Fields.generate_noise_field(grid)
+    #= amplified 100 times, so that the noise changes the result far beyond the
+       comparison tolerances below (see `radialcase`) =#
+    nfω = 1e2 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(3))
     nf = zeros(ComplexF64, (length(grid.ω), 2, Nx))
     nf[grid.sidx, :, :] .= nfω[grid.sidx] .* ones(1, 2, Nx)
 
@@ -2427,6 +2444,18 @@ end
     @test maximum(abs, Array(dtr.Et_noise) .- htr.Et_noise)/
           maximum(abs, htr.Et_noise) < 1e-14
     @test radialdiff(href, dref) < 1e-10
+    #= The noise reaches the nonlinear term on the device. This weak case's propagated
+       field barely feels the noise (1e-12), so the check is on one right-hand side at
+       z > 0, where it enters the polarisation directly, of a field 1e4 times weaker
+       (4e-11 at full field). =#
+    _, ctr = free2dcase(Grid.RealGrid, HostSpec(); Nx)
+    effect, err = freerhs(href, htr, ctr, dtr, 10e-6; s=1e-4)
+    @info "2-D free-space noise, one right-hand side" effect err
+    @test effect > 1e-8
+    @test err < 1e-3*effect
+    _, t32 = free2dcase(Grid.RealGrid, DeviceSpec(Array, Float32); Nx, noise_field=nf)
+    @test t32.dnoise.Eω0 isa Array{ComplexF32, 3}
+    @test t32.dnoise.Eω0 ≈ ComplexF32.(t32.noise.Eω0 ./ t32.scaling.Eref)
     # a noise field of the wrong shape is refused, not silently broadcast
     @test_throws ErrorException free2dcase(Grid.RealGrid, HostSpec();
                                            Nx, noise_field=nf[:, 1:1, :])
@@ -2436,10 +2465,10 @@ end
    built without the polarisation axis before this branch, so that `ldiv!` against the
    region-(1,3,4) plan could not run at all; a 2-D test does not cover it, `freenoise`
    getting its shapes from the transform. =#
-@testset "the 3-D free-space noise field on JLArray" begin
+@testset "the 3-D free-space noise field on JLArray and in Float32" begin
     grid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 100e-15)
     Nx, Ny = 8, 6
-    nfω = Fields.generate_noise_field(grid)
+    nfω = 1e2 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(4))
     nf = zeros(ComplexF64, (length(grid.ω), 1, Nx, Ny))
     nf[grid.sidx, 1, :, :] .= nfω[grid.sidx] .* ones(1, Nx, Ny)
 
@@ -2461,6 +2490,16 @@ end
     dtr(dnl, dEω, 0.0)
     @test all(isfinite, Array(dnl))
     @test radialdiff(href, dref) < 1e-10
+    _, ctr = free3dcase(HostSpec(); Nx, Ny)
+    #= as in 2-D, of a field 1e7 times weaker (1.5e-14 at full field), where the noise
+       dominates the nonlinear term (effect ≈ 1) =#
+    effect, err = freerhs(href, htr, ctr, dtr, 1e-3; s=1e-7)
+    @info "3-D free-space noise, one right-hand side" effect err
+    @test effect > 1e-8
+    @test err < 1e-3*effect
+    _, t32 = free3dcase(DeviceSpec(Array, Float32); Nx, Ny, noise_field=nf)
+    @test t32.dnoise.Eω0 isa Array{ComplexF32, 4}
+    @test t32.dnoise.Eω0 ≈ ComplexF32.(t32.noise.Eω0 ./ t32.scaling.Eref)
     # a noise field without the polarisation axis is refused, not silently broadcast
     @test_throws ErrorException free3dcase(HostSpec();
                                            Nx, Ny, noise_field=nf[:, 1, :, :])
