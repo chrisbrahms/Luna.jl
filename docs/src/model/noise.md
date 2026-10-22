@@ -126,6 +126,9 @@ further on keeps its full noise amplitude. Either concerns a thin shell of trans
 wavenumbers, ``k_\perp`` between ``n(0)\omega/c`` and ``n(z)\omega/c``, which for a gas is
 small.
 
+The model runs unchanged on a GPU and in single precision, with two `Float32` limits on
+how well the noise is represented; see [Shot noise on a device](@ref).
+
 ## Usage
 
 The modified shot-noise model is used by default (`shotnoise=true`, equivalent to

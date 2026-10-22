@@ -450,6 +450,35 @@ In single precision the Raman coefficients need care: the response function is a
 coefficient so that no factor a kernel sees is subnormal. The developer guide has the
 audit; there is nothing to set.
 
+### Shot noise on a device
+
+The modified shot-noise model (`shotnoise=:modified`, which is what `prop_capillary`'s
+default `shotnoise=true` means; see [Noise model](@ref)) runs on a device
+with no keywords of its own. The draw is made on the host in `Float64` from `rng`, so a
+seed gives the same realisation on every device, and it is that host draw, in physical
+units, which is saved (`"noise_field"`), read by `Processing.withnoise` and adopted from
+the output when a cached run resumes. The transform keeps its own copy on the run's array
+type, in `E_ref` units like the state, together with the accumulated unitary phase (a
+constant, or the phase table built at setup and uploaded), and advances it to the current
+`z` once per right-hand side with one broadcast. In free space the draw is zero at the
+evanescent transverse wavenumbers, on the device as on the host.
+
+In single precision two limits apply, both documented rather than worked around:
+
+- The accumulated phase `Φ(z)` of the noise is formed from the absolute `z`, so it carries
+  an absolute error of about `6e-8·|Φ|` rad. In a waveguide's co-moving frame `|Φ|` is the
+  dispersion residual, tens to thousands of rad, so the error is ~1e-4 rad. In free space
+  near cutoff it approaches `k(ω)·z`: of order 0.3 rad on the highest transverse
+  wavenumbers over 0.5 m at 800 nm. The field does not have this problem (its propagator
+  works with a step's `Δz`, or a table with its secant removed).
+- One photon per mode is far below the field's own `Float32` resolution (`6e-8` of the
+  peak) wherever the pulse is: the noise survives in the spectral wings and outside the
+  pulse, which is where it seeds anything, but it is not resolved under the peak.
+
+For noise statistics themselves (seeding of Raman or modulational instability, shot-to-shot
+fluctuations), compare against a `Float64` run (CPU, or CUDA) before relying on a
+`Float32` result.
+
 ### Tapers and pressure gradients (`linop_integral`)
 
 ```julia
