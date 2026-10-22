@@ -386,22 +386,27 @@ end
     @test output2["spacegrid"]["kx"] == xgrid.kx
 end
 ##
-#= The modified shot-noise field is transformed from k-space to real space once at setup,
-   with the same matrix the field passes through on every step. =#
+#= The modified shot noise is propagated with the field (LupoLab/Luna.jl#440): on a
+   `Grid.RadialGrid` the transform acts on the field plus the noise at the current z, i.e.
+   it equals the noise-free transform evaluated on `Eω .+ noise_at(noise, z)` (as in
+   test_noise.jl, which covers the `Hankel.QDHT` shim). =#
 @testset "radial noise field" begin
     nfunλ = PhysData.ref_index_fun(gas, pressure)
     nfun = (λ; z=0.0) -> nfunλ(λ)
     normfun = NonlinearRHS.const_norm_radial(rgrid, q, nfun)
     responses = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
-    nfω = Fields.generate_noise_field(rgrid)
-    nf = zeros(ComplexF64, (length(rgrid.ω), 1, q.N))
-    nf[rgrid.sidx, 1, :] .= nfω[rgrid.sidx] .* ones(1, q.N)
     inputs = Fields.GaussGaussField(;λ0, τfwhm, energy, w0)
-    Eω, transform, FT = Luna.setup(rgrid, q, z -> PhysData.density(gas, pressure),
-                                   normfun, responses, inputs; noise_field=nf)
-    Eωo = zeros(ComplexF64, (length(rgrid.ωo), 1, q.N))
-    Etk = zeros(Float64, (length(rgrid.to), 1, q.N))
-    NonlinearRHS.to_time!(Etk, nf, Eωo, transform.IFT)
-    @test size(transform.Et_noise) == size(Etk)
-    @test transform.Et_noise ≈ Grid.to_rspace(q, Etk)
+    densityfun = z -> PhysData.density(gas, pressure)
+    Eω, tp, FT = Luna.setup(rgrid, q, densityfun, normfun, responses, inputs)
+    linop = LinearOps.make_const_linop(rgrid, q, nfun)
+    nf = 1e-2*maximum(abs, Eω) .* randn(ComplexF64, size(Eω))
+    noise = NonlinearRHS.ModifiedNoise(nf, LinearOps.unitary_phase(linop, rgrid, size(nf)),
+                                       rgrid)
+    _, tn, _ = Luna.setup(rgrid, q, densityfun, normfun, responses, inputs; noise)
+    for z in (0.0, 0.05)
+        nl1 = similar(Eω); nl2 = similar(Eω)
+        tn(nl1, Eω, z)
+        tp(nl2, Eω .+ NonlinearRHS.noise_at(noise, z), z)
+        @test isapprox(nl1, nl2; rtol=1e-10)
+    end
 end
