@@ -537,6 +537,30 @@ end
         _, tn, _ = Luna.setup(rgrid, q, densityfun, normfun, resp, inputs; noise)
         check(Eω, tn, tp, noise)
     end
+    #= The free-space draw is restricted to the propagating components (k⊥ ≤ k(ω)): fine
+       transverse grids put part of the band beyond cutoff, and the transforms zero the
+       draw there on construction, leaving the propagating components untouched. =#
+    @testset "evanescent components carry no noise: $(nameof(typeof(sg)))" for sg in
+            (Hankel.QDHT(5e-6, 32, dim=3), Grid.FreeGrid(4e-6, 16, 4e-6, 16))
+        nfun = (λ; z=0.0) -> nfunλ(λ)
+        linop = LinearOps.make_const_linop(rgrid, sg, nfun)
+        normfun = constnorm(rgrid, sg, nfun)
+        resp = (kerr(rgrid),)
+        inp = Fields.GaussGaussField(; λ0, τfwhm=20e-15, energy=1e-12, w0=1.5e-6)
+        Eω, tp, _ = Luna.setup(rgrid, sg, densityfun, normfun, resp, inp)
+        noise = drawnoise(Eω, linop, rgrid)
+        before = copy(noise.Eω0)
+        prop = NonlinearRHS.propagating_mask(normfun, 0.0)
+        @test size(prop) == size(Eω)
+        @test any(.!prop) # the grid really has evanescent components in the band
+        @test any(!iszero, before[.!prop])
+        # the mask agrees with the operator: real decay exactly where it is evanescent
+        @test all(<(0), real.(linop)[.!prop])
+        _, tn, _ = Luna.setup(rgrid, sg, densityfun, normfun, resp, inp; noise)
+        @test all(iszero, noise.Eω0[.!prop])
+        @test noise.Eω0[prop] == before[prop]
+        check(Eω, tn, tp, noise)
+    end
     capargs = (125e-6, 0.1, :Ar, 1.0)
     capkw = (λ0, τfwhm=10e-15, energy=1e-6, λlims=(200e-9, 3e-6), trange=200e-15,
              plasma=false)
