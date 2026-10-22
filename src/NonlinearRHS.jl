@@ -435,10 +435,13 @@ actually protects.
 The draw is multiplied by `grid.ωwin` on construction, matching the windowing the traditional
 input shot noise receives from the propagation loop.
 
-In free space the propagator is likewise only the phase: at evanescent transverse wavenumbers
-(`k⊥ > k`), where the linear operator is real decay rather than a phase, the noise is
-neither advanced nor damped, while the field there decays. Whether the draw should exclude
-those components is an open question; nothing in this model removes them.
+In free space the draw is restricted to the **propagating** components: the one-photon
+vacuum level is that of the radiating modes, and an evanescent transverse wavenumber
+(`k⊥ > k(ω)`, where the linear operator is a real decay rather than a phase) is not one.
+Left in, those components would keep their full amplitude for the whole propagation (the
+unitary phase does not damp them, while the field there decays) and feed the nonlinear
+polarisation with a noise floor that does not exist. The free-space transforms zero them on
+construction ([`mask_evanescent!`](@ref)), with `k(ω)` at `z = 0`.
 """
 struct ModifiedNoise{aT, pT, bT}
     Eω0::aT # z = 0 spectral draw (windowed)
@@ -1159,6 +1162,7 @@ Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisat
 function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun, normfun,
                      pol=false; noise=nothing, spec=HostSpec(),
                      scaling=UNIT_SCALING)
+    noise = mask_evanescent!(noise, normfun) # the vacuum noise of the propagating components
     np = pol ? 2 : 1
     N = rgrid.N
     IFT = Utils.plan_ift(FT)
@@ -1375,34 +1379,41 @@ function normfactor(nf::FreeSpaceNorm, βsq, ω, wk)
 end
 
 # isotropic: nfun(ω; z) -> n or (nx, ny), the same k⊥ for every polarisation
-function fillnorm!(nf::FreeSpaceNorm, z)
+fillnorm!(nf::FreeSpaceNorm, z) =
+    fillβsq!(nf.out, nf, z, (βsq, ω, wk) -> normfactor(nf, βsq, ω, wk), 1)
+
+#= Fill `out` (shaped like `nf.out`, `(nω, npol, k⊥...)`) with `f(βsq, ω, wk)` of the
+   longitudinal wavenumber squared `βsq = k(ω)² - k⊥²` at `z`, and with `outside` at ω = 0
+   and outside the simulation band. Shared by the normalisation and by the propagating
+   mask of the modified shot noise, so that the two agree on which components are
+   evanescent. =#
+function fillβsq!(out, nf::FreeSpaceNorm, z, f, outside)
     ω = nf.grid.ω
-    out = nf.out
     for ii in nf.kidcs
         for iω in eachindex(ω)
             if ω[iω] == 0 || !nf.grid.sidx[iω]
-                out[iω, :, ii] .= 1
+                out[iω, :, ii] .= outside
                 continue
             end
             for (ip, n) in enumerate(nf.nfun(ω[iω]; z))
                 βsq = (real(n)*ω[iω]/PhysData.c)^2 - nf.kperp2[ii]
-                out[iω, ip, ii] = normfactor(nf, βsq, ω[iω], nf.kwin[ii])
+                out[iω, ip, ii] = f(βsq, ω[iω], nf.kwin[ii])
             end
         end
     end
+    out
 end
 
 #= crystal optics: nfunx(λ, δθ; z) depends on the internal angle, which depends on kx only,
    so the angle is found once per (ω, kx) and reused along ky. For Free2DGrid the k axes are
    (Nkx,) and the trailing ky index below is the (allowed) singleton 1. =#
-function fillnorm!(nf::FreeSpaceNorm{<:Any, <:Any, <:Tuple}, z)
+function fillβsq!(out, nf::FreeSpaceNorm{<:Any, <:Any, <:Tuple}, z, f, outside)
     nfunx, nfuny = nf.nfun
     ω = nf.grid.ω
-    out = nf.out
     kx = nf.spacegrid.kx
     for iω in eachindex(ω)
         if ω[iω] == 0 || !nf.grid.sidx[iω]
-            out[iω, :, nf.kidcs] .= 1
+            out[iω, :, nf.kidcs] .= outside
             continue
         end
         ny = real(nfuny(wlfreq(ω[iω]); z))
@@ -1414,11 +1425,46 @@ function fillnorm!(nf::FreeSpaceNorm{<:Any, <:Any, <:Tuple}, z)
             for iy in axes(nf.kperp2, 2)
                 kperp2 = nf.kperp2[ix, iy]
                 wk = nf.kwin[ix, iy]
-                out[iω, 1, ix, iy] = normfactor(nf, ksq_xpol - kperp2, ω[iω], wk)
-                out[iω, 2, ix, iy] = normfactor(nf, ksq_ypol - kperp2, ω[iω], wk)
+                out[iω, 1, ix, iy] = f(ksq_xpol - kperp2, ω[iω], wk)
+                out[iω, 2, ix, iy] = f(ksq_ypol - kperp2, ω[iω], wk)
             end
         end
     end
+    out
+end
+
+"""
+    propagating_mask(nf::FreeSpaceNorm, z)
+
+`true` at the propagating components of a free-space field, `(nω, npol, k⊥...)`, i.e.
+where `β_z² = k(ω)² − k⊥² ≥ 0` at `z` (with the same `k(ω)` the normalisation uses, crystal
+optics included), `false` at the evanescent ones. `true` at `ω = 0` and outside the
+simulation band, where the windows remove everything anyway.
+"""
+propagating_mask(nf::FreeSpaceNorm, z) =
+    fillβsq!(Array{Bool}(undef, size(nf.out)), nf, z, (βsq, ω, wk) -> βsq >= 0, true)
+
+"""
+    mask_evanescent!(noise, normfun)
+
+Restrict the modified shot-noise draw of a free-space propagation to its propagating
+components: zero `noise.Eω0` wherever [`propagating_mask`](@ref)`(normfun, 0)` is `false`
+(see [`ModifiedNoise`](@ref) for why). Called by the free-space transforms on construction,
+so the caller's `ModifiedNoise` is changed in place and the draw recorded in the output
+(`"noise_field"`) is the masked one. A no-op without noise or for a normalisation which is
+not a [`FreeSpaceNorm`](@ref), where the transverse wavenumbers are not known. With a
+z-dependent index the mask is that of `z = 0`.
+"""
+mask_evanescent!(noise, normfun) = noise
+
+function mask_evanescent!(n::ModifiedNoise, nf::FreeSpaceNorm)
+    prop = propagating_mask(nf, 0.0)
+    size(prop) == size(n.Eω0) || error(
+        "the noise draw is $(size(n.Eω0)), but the free-space field is $(size(prop)). "*
+        "Build it with the state's shape, polarisation axis included.")
+    n.Eω0 .*= prop
+    n.lastz[] = NaN
+    n
 end
 
 """
@@ -1519,6 +1565,7 @@ free-space propagation.
 """
 function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false;
                    noise=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
+    noise = mask_evanescent!(noise, normfun) # the vacuum noise of the propagating components
     Ny = length(xygrid.y)
     Nx = length(xygrid.x)
     Eωo = zeros(ComplexF64, (length(grid.ωo), pol ? 2 : 1, Nx, Ny))
