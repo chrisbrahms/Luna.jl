@@ -23,9 +23,10 @@ import Logging
 using EllipsisNotation
 
 """
-    to_time!(Ato, Aω, Aωo, IFTplan)
+    to_time!(Ato, Aω, Aωo, FT)
 
-Transform ``A(ω)`` on normal grid to ``A(t)`` on oversampled time grid.
+Transform ``A(ω)`` on normal grid to ``A(t)`` on oversampled time grid. `FT` is the
+*forward* plan of the oversampled transform; the inverse is applied with `ldiv!`.
 """
 function to_time!(Ato::Array{<:Real, D}, Aω, Aωo, FT) where D
     N = size(Aω, 1)
@@ -192,6 +193,11 @@ actually protects.
 
 The draw is multiplied by `grid.ωwin` on construction, matching the windowing the traditional
 input shot noise receives from the propagation loop.
+
+In free space the propagator is likewise only the phase: at evanescent transverse wavenumbers
+(`k⊥ > k`), where the linear operator is real decay rather than a phase, the noise is
+neither advanced nor damped, while the field there decays. Whether the draw should exclude
+those components is an open question; nothing in this model removes them.
 """
 struct ModifiedNoise{aT, pT, bT}
     Eω0::aT # z = 0 spectral draw (windowed)
@@ -583,7 +589,7 @@ Transform E(ω) -> Pₙₗ(ω) for radially symmetric free-space propagation.
 # Fields
 - `noise`: [`ModifiedNoise`](@ref) for the modified shot-noise model, or `nothing`.
 - `Eωo_noise`/`Et_noise`: buffers holding the noise field at the current `z`, on the
-  oversampled frequency/k-space and time/real-space grids `(nto, nr)`.
+  oversampled frequency/k-space and time/real-space grids `(nωo, np, nr)`/`(nto, np, nr)`.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
 """
@@ -626,9 +632,12 @@ Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisat
 
 # Keyword arguments
 - `noise=nothing`: optional [`ModifiedNoise`](@ref) for the modified shot-noise model, whose
-  draw is an `(nω, nk)` frequency/k-space noise field. At each step it is advanced to the
-  current `z` and converted to the real-space time domain `(nto, nr)` via inverse FFT and
-  inverse Hankel transform.
+  draw is an `(nω, np, nk)` frequency/k-space noise field, the same size as the `Eω` returned
+  by [`Luna.setup`](@ref) (`np` polarisation components). At each step it is advanced to the
+  current `z` and converted to the real-space time domain `(nto, np, nr)` via inverse FFT and
+  the backward Hankel matrix, like the field. [`Fields.generate_noise_field`](@ref
+  Luna.Fields.generate_noise_field) makes only `(nω[, nmodes])` draws, so a free-space draw
+  is built by the caller.
 """
 function TransRadial(TT, grid, HT, FT, responses, densityfun, normfun, pol=false; noise=nothing)
     np = pol ? 2 : 1
@@ -920,7 +929,8 @@ Transform E(ω) -> Pₙₗ(ω) for 3D free-space propagation.
 # Fields
 - `noise`: [`ModifiedNoise`](@ref) for the modified shot-noise model, or `nothing`.
 - `Eωo_noise`/`Et_noise`: buffers holding the noise field at the current `z`, on the
-  oversampled frequency/k-space and time/real-space grids `(nto, ny, nx)`.
+  oversampled frequency/k-space and time/real-space grids `(nωo, np, nx, ny)`/
+  `(nto, np, nx, ny)`, the shapes of the field's buffers.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
 """
@@ -961,9 +971,11 @@ free-space propagation.
 
 # Keyword arguments
 - `noise=nothing`: optional [`ModifiedNoise`](@ref) for the modified shot-noise model, whose
-  draw is an `(nω, ny, nx)` frequency/k-space noise field. At each step it is advanced to the
-  current `z` and converted to the real-space oversampled time domain `(nto, ny, nx)` via
-  `copy_scale!` and a 3D inverse FFT.
+  draw is an `(nω, np, nx, ny)` frequency/k-space noise field, the same size as the `Eω`
+  returned by [`Luna.setup`](@ref). At each step it is advanced to the current `z` and
+  converted to the real-space oversampled time domain `(nto, np, nx, ny)` like the field.
+  [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field) makes only
+  `(nω[, nmodes])` draws, so a free-space draw is built by the caller.
 """
 function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false;
                    noise=nothing)
