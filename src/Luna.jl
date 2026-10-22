@@ -769,6 +769,11 @@ nor tabulated.
     embedded error estimate, so the step-size controller never responded to it. Gradient
     and taper results therefore change; see the user page.
 
+    The modified shot noise (`shotnoise=:modified`) keeps its own phase table, built at
+    setup from the callable whatever `linop_integral` is
+    ([`LinearOps.unitary_phase`](@ref Luna.LinearOps.unitary_phase)); it is bounded by the
+    same byte budget.
+
     The tables are built for the propagation: the `transform` object the caller passed in
     is not modified, so a statistics function built from `transform.aeff` before the run
     keeps calling the untabulated one (once per accepted step, on the host, where the
@@ -782,7 +787,7 @@ nor tabulated.
     ([`LinearOps.bytes_per_node`](@ref Luna.LinearOps.bytes_per_node), which is dominated by
     the host copies held while it is built). Ignored by `:tabulated` and `:quadrature`.
 - `tabulate_linop`: **deprecated**, and ignored apart from a warning. Both of its values
-    now mean `linop_integral=:tabulated`, because the propagator `false` selected no
+    now mean the default `linop_integral`, because the propagator `false` selected no
     longer exists.
 """
 function run(Eω, grid,

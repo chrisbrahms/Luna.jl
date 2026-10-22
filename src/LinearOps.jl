@@ -924,8 +924,8 @@ run).
 
 It is an [`AbstractIntegratedLinop`](@ref) of the [`AbsolutePhase`](@ref) kind, and
 [`RK45.make_prop!`](@ref Luna.RK45.make_prop!) builds the interaction-picture propagator
-`exp(Φ(t2) − Φ(t1))` from it. This is what `linop_integral=:tabulated` -- the default of
-[`Luna.run`](@ref) -- builds from a `linop!(out, z)` callable, and
+`exp(Φ(t2) − Φ(t1))` from it. This is what `linop_integral=:tabulated` -- and the default
+`:auto` of [`Luna.run`](@ref) within its budget -- builds from a `linop!(out, z)` callable, and
 [`QuadratureLinop`](@ref) is the alternative.
 
 # What is stored
@@ -1695,23 +1695,39 @@ stages are what the last saved plane is interpolated from. `linop!` has to be de
 past `zmax` for this, which it already does: `RK45.make_prop!` evaluates it there too.
 Anything beyond the margin still falls back to linear extrapolation.
 
+Since [`Luna.run`](@ref) tabulates the field's operator to `zmax + max(max_dz, init_dz)`
+rather than `1.05·zmax`, a final step longer than the margin has stages where the noise
+phase is extrapolated linearly; it enters only the noise term, so that is a small error,
+and a larger `margin` removes it.
+
+A `linop!` which does not depend on `z` (checked as [`Luna.run`](@ref) checks it, by
+[`constant_linop`](@ref)) gives a [`ConstUnitaryPhase`](@ref) exactly as the constant array
+would, not a two-node table.
+
 `maxdepth` and `maxnodes` bound the work if `linop!` is genuinely discontinuous in `z`; if
 either bound stops refinement before `atol` is met, a warning reports the error achieved.
+The default `maxnodes` is [`noise_node_budget`](@ref), which keeps the table inside the same
+byte budget as the field's own (`TABLE_BUDGET_BYTES`).
+
+The table is the noise's own: it is built at setup, from the callable, whatever
+`linop_integral` the run then uses, and does not share the field's table.
 """
 unitary_phase(linop::AbstractArray, grid, sz=size(linop); kwargs...) =
     ConstUnitaryPhase(imag.(linop))
 
 function unitary_phase(linop!, grid, sz; zmax, atol=1e-6, margin=0.05, maxdepth=24,
-                       maxnodes=4096)
+                       maxnodes=noise_node_budget(sz))
     N = length(sz)
     buf = Array{ComplexF64}(undef, sz)
+    zend = float(zmax)*(1 + margin)
+    c = constant_linop(linop!, buf, 0.0, zend)
+    isnothing(c) || return ConstUnitaryPhase(imag.(c))
     neval = Ref(0)
     dat = function (z)
         neval[] += 1
         linop!(buf, z)
         imag.(buf)
     end
-    zend = float(zmax)*(1 + margin)
     znodes = Float64[0.0]
     dnodes = Array{Float64, N}[dat(0.0)]
     deltas = Array{Float64, N}[] # accumulated phase across each accepted interval
@@ -1738,6 +1754,16 @@ function unitary_phase(linop!, grid, sz; zmax, atol=1e-6, margin=0.05, maxdepth=
     end
     TabulatedUnitaryPhase(znodes, Φ, dΦ, float(atol), worst[])
 end
+
+"""
+    noise_node_budget(sz, budget=TABLE_BUDGET_BYTES)
+
+The node cap of a noise phase table ([`unitary_phase`](@ref)) of an operator of size `sz`
+whose peak cost fits in `budget`: four `Float64` copies per node (the node derivatives and
+per-interval phases while it is built, then `Φ` and `dΦ`), clamped to `[2, 4096]`.
+"""
+noise_node_budget(sz, budget=TABLE_BUDGET_BYTES) =
+    clamp(budget ÷ (4*prod(sz)*sizeof(Float64)), 2, 4096)
 
 #= Bisect [a, b] until the cubic Hermite interpolant built from the endpoint values and
    derivatives is within atol of the true phase at the midpoint, which is where its error
