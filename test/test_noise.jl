@@ -553,12 +553,29 @@ end
         @test size(prop) == size(Eω)
         @test any(.!prop) # the grid really has evanescent components in the band
         @test any(!iszero, before[.!prop])
-        # the mask agrees with the operator: real decay exactly where it is evanescent
+        #= the mask agrees with the operator both ways: real decay where it is evanescent,
+           none where it propagates (in band; the operator is not used out of band) =#
+        inband = reshape(rgrid.sidx, :, ntuple(_ -> 1, ndims(prop) - 1)...) .& prop
         @test all(<(0), real.(linop)[.!prop])
+        @test all(iszero, real.(linop)[inband])
         _, tn, _ = Luna.setup(rgrid, sg, densityfun, normfun, resp, inp; noise)
         @test all(iszero, noise.Eω0[.!prop])
         @test noise.Eω0[prop] == before[prop]
         check(Eω, tn, tp, noise)
+    end
+    #= Crystal optics: the normalisation's own (nfunx, nfuny) β_z² loop decides which
+       components are evanescent, per polarisation; it must agree with the operator. =#
+    @testset "evanescent mask, crystal optics" begin
+        bbo = PhysData.ref_index_fun_xy(:BBO, deg2rad(29.2))
+        xy = Grid.FreeGrid(3e-6, 12, 3e-6, 12)
+        linop = LinearOps.make_const_linop(rgrid, xy, bbo)
+        normfun = NonlinearRHS.const_norm_free(rgrid, xy, bbo)
+        prop = NonlinearRHS.propagating_mask(normfun, 0.0)
+        @test size(prop) == size(linop)
+        @test any(.!prop)
+        inband = reshape(rgrid.sidx, :, 1, 1, 1) .& prop
+        @test all(<(0), real.(linop)[.!prop])
+        @test all(iszero, real.(linop)[inband])
     end
     capargs = (125e-6, 0.1, :Ar, 1.0)
     capkw = (λ0, τfwhm=10e-15, energy=1e-6, λlims=(200e-9, 3e-6), trange=200e-15,
