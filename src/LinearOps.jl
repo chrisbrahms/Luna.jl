@@ -958,7 +958,10 @@ z-independent operator, which then stores nothing at all.
 - `scale`: `maximum(abs, Φ̃)`, the size of the stored numbers
 
 `maxdepth` and `maxnodes` bound the work if `linop!` is discontinuous in z; if either stops
-the refinement before `tol` is met, a warning reports the error achieved. `quiet=true`
+the refinement before `tol` is met, a warning reports the error achieved. The node cap is
+checked as each interval is entered, so once it binds the intervals already waiting on the
+bisection stack are still accepted: the table can end up to `maxdepth` nodes over
+`maxnodes`. `quiet=true`
 suppresses the summary the constructor otherwise logs, but not the warnings.
 """
 struct TabulatedLinop{aT, sT} <: AbstractIntegratedLinop
@@ -1662,7 +1665,8 @@ function (p::TabulatedUnitaryPhase)(out, z)
 end
 
 """
-    unitary_phase(linop, grid, sz=size(linop); zmax, atol=1e-6, margin=0.05, maxdepth=24, maxnodes=4096)
+    unitary_phase(linop, grid, sz=size(linop); zmax, atol=1e-6, margin=0.05, maxdepth=24,
+                  maxnodes=noise_node_budget(sz))
 
 Create an [`AbstractUnitaryPhase`](@ref) for the linear operator `linop`, which may be either
 a constant array or a mutating function `linop!(out, z)`. `sz` is the size of the array
@@ -1707,7 +1711,9 @@ would, not a two-node table.
 `maxdepth` and `maxnodes` bound the work if `linop!` is genuinely discontinuous in `z`; if
 either bound stops refinement before `atol` is met, a warning reports the error achieved.
 The default `maxnodes` is [`noise_node_budget`](@ref), which keeps the table inside the same
-byte budget as the field's own (`TABLE_BUDGET_BYTES`).
+byte budget as the field's own (`TABLE_BUDGET_BYTES`). As for the field's table
+([`TabulatedLinop`](@ref)), the cap is checked as each interval is entered, so the table
+can end up to `maxdepth` nodes over it.
 
 The table is the noise's own: it is built at setup, from the callable, whatever
 `linop_integral` the run then uses, and does not share the field's table.

@@ -198,7 +198,7 @@ end
         LinearOps.unitary_phase(linop!, grid, (nω,); zmax,
                                 maxnodes=LinearOps.noise_node_budget((nω,), 3*4*8*nω))
     end
-    @test length(small.z) < length(phase.z) # the cap is checked per bisection, not per node
+    @test length(small.z) < length(phase.z) # the cap can overshoot by up to maxdepth
     # a closure which ignores z is a constant operator written the long way (`Luna.run`
     # treats it so too): exactly the constant array's phase, not a two-node table
     cl!, _ = LinearOps.make_linop(
