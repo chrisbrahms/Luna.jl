@@ -588,3 +588,14 @@ Tested both ways in "constβ is checked, not trusted".
 | `test_rk45.jl` | 48 pass |
 | `test_interface.jl` | 301 pass |
 | `test_gnlse.jl`, `test_gradient.jl`, `test_tapers.jl`, `test_linops.jl` | pass |
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+#440 enters from `gpu/base` (via int-A). On the device the transform keeps the caller's host
+`noise` (Float64, physical units: what is saved, read by `Processing.withnoise` and adopted on
+resume) and a kernels' copy `dnoise = retarget_noise(noise, spec, scaling)`: the draw divided
+by `E_ref` on the run's array type, the phase tables converted alike; on the default path it is
+`noise` itself. `sync_noise!` brings `dnoise` up to date after a resume and re-applies the
+evanescent mask; `noise_arrays` are part of `assert_resident`. In Float32 the noise phase is
+formed from the absolute z (error ~6e-8·|Φ|; documented, not fixed, by decision). Tests:
+test_noise (incl. a `sync_noise!` re-mask check), test_device (JLArray and Float32 copies).
