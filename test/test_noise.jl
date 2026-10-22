@@ -631,12 +631,15 @@ end
     capargs = (125e-6, 0.1, :Ar, 1.0)
     capkw = (λ0, τfwhm=10e-15, energy=1e-6, λlims=(200e-9, 3e-6), trange=200e-15,
              plasma=false)
-    for (name, kw) in (("mode-averaged", (;)), ("multimode", (; modes=2)),
-                       ("multimode, fixed quadrature", (; modes=2, modal_integral=:fixed)))
+    for (name, kw, T) in (("mode-averaged", (;), NonlinearRHS.TransModeAvg),
+                          ("multimode", (; modes=2), NonlinearRHS.TransModal),
+                          ("multimode, fixed quadrature", (; modes=2, modal_integral=:fixed),
+                           NonlinearRHS.TransModalFixed))
         @testset "$name" begin
             Eω, _, _, tn, _, _ = Interface.prop_capillary_args(
                 capargs...; capkw..., kw..., shotnoise=:modified,
                 rng=Random.MersenneTwister(3))
+            @test tn isa T # the case really builds the transform it is named for
             _, _, _, tp, _, _ = Interface.prop_capillary_args(
                 capargs...; capkw..., kw..., shotnoise=false)
             check(Eω, tn, tp, tn.noise)
