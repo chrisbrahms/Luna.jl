@@ -593,6 +593,11 @@ end
         @test all(iszero, noise.Eω0[.!prop])
         @test noise.Eω0[prop] == before[prop]
         check(Eω, tn, tp, noise)
+        # an unmasked draw adopted later (a resumed run) is masked again by `sync_noise!`
+        tn.noise.Eω0 .= before
+        NonlinearRHS.sync_noise!(tn)
+        @test all(iszero, tn.noise.Eω0[.!prop])
+        @test tn.noise.Eω0[prop] == before[prop]
     end
     #= Crystal optics: the normalisation's own (nfunx, nfuny) β_z² loop decides which
        components are evanescent, per polarisation; it must agree with the operator. =#
@@ -607,6 +612,18 @@ end
         inband = reshape(rgrid.sidx, :, 1, 1, 1) .& prop
         @test all(<(0), real.(linop)[.!prop])
         @test all(iszero, real.(linop)[inband])
+        # and the transform masks a two-polarisation draw with it
+        resp = (Nonlinear.Chi2Field(deg2rad(29.2), deg2rad(30), PhysData.χ2(:BBO)),)
+        inp = Fields.GaussGaussField(; λ0, τfwhm=20e-15, energy=1e-12, w0=1.5e-6)
+        Eω, tp, _ = Luna.setup(rgrid, xy, z -> 1, normfun, resp, inp)
+        @test size(Eω) == size(prop)
+        noise = drawnoise(Eω, linop, rgrid)
+        before = copy(noise.Eω0)
+        @test any(!iszero, before[.!prop])
+        _, tn, _ = Luna.setup(rgrid, xy, z -> 1, normfun, resp, inp; noise)
+        @test all(iszero, noise.Eω0[.!prop])
+        @test noise.Eω0[prop] == before[prop]
+        check(Eω, tn, tp, noise)
     end
     capargs = (125e-6, 0.1, :Ar, 1.0)
     capkw = (λ0, τfwhm=10e-15, energy=1e-6, λlims=(200e-9, 3e-6), trange=200e-15,
