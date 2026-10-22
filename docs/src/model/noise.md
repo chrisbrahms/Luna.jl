@@ -120,9 +120,11 @@ full amplitude for the whole propagation while the field decays. Those component
 radiating modes and have no one-photon vacuum level to restore, so the free-space transforms
 zero the draw there on construction (`NonlinearRHS.mask_evanescent!`), with ``k(\omega)`` taken
 at ``z = 0``. With a refractive index that changes along ``z`` (a pressure gradient) the mask
-is that of the entrance: a component which only becomes propagating further on, where the
-index is higher, carries no noise. For a gas this concerns a thin shell of transverse
-wavenumbers, ``k_\perp`` between ``\omega/c`` and ``n(z)\omega/c``.
+is that of the entrance, both ways: where the index rises, a component which only becomes
+propagating further on carries no noise; where it falls, a component which becomes evanescent
+further on keeps its full noise amplitude. Either concerns a thin shell of transverse
+wavenumbers, ``k_\perp`` between ``n(0)\omega/c`` and ``n(z)\omega/c``, which for a gas is
+small.
 
 ## Usage
 
