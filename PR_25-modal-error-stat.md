@@ -435,3 +435,9 @@ other), and two construction-time paths -- the probe guard, which only skips wor
 host path, and the Cartesian weight tuple, which the Metal cases exercise through the same
 `_weightedenergy` the JLArray ones do. The gate, `test_device.jl` and `test_stats.jl` were
 re-run in full.
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+Interface: this branch's removal of `_statskwargs`/`_mergekw` kept, #440's `savenoise` added.
+`TransverseIntegralError` evaluates the transform, noise included, at the saved z (consistent
+with the right-hand side the run uses; `noise_at!` is keyed on z, so it leaves no stale cache).
