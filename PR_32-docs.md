@@ -58,3 +58,9 @@ version was prepared separately.
 - Full `Pkg.test()` on this branch (started at 6ea1d342, so with the first version of the
   test_device change; the final version was re-run on its own, above): 7071 pass, 0 fail,
   12 broken (pre-existing, PhysData), 35 min.
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+docs/src/gpu.md "Shot noise on a device" (host Float64 draw, the `E_ref` device copy, the
+mask, and the two Float32 limits: the absolute-z phase error and one photon being below the
+field's Float32 resolution under the pulse), linked from model/noise.md.

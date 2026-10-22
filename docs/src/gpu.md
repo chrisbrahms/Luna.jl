@@ -460,7 +460,7 @@ units, which is saved (`"noise_field"`), read by `Processing.withnoise` and adop
 the output when a cached run resumes. The transform keeps its own copy on the run's array
 type, in `E_ref` units like the state, together with the accumulated unitary phase (a
 constant, or the phase table built at setup and uploaded), and advances it to the current
-`z` once per right-hand side with one broadcast. In free space the draw is zero at the
+`z` once per right-hand side (the phase readback, then `cis`). In free space the draw is zero at the
 evanescent transverse wavenumbers, on the device as on the host.
 
 In single precision two limits apply, both documented rather than worked around:
