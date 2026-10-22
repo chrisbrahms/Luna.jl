@@ -540,6 +540,10 @@ message, raising `linop_tol` so that the table fits is usually a better answer t
 fallback, because the fallback's ninety host evaluations of a state-sized operator per step
 cost more than the memory did.
 
+The modified shot noise (`shotnoise=:modified`) has its own table of the operator's
+unitary phase, built at setup from the callable whatever `linop_integral` is, to
+`linop_tol` and inside the same byte budget; `:quadrature` does not remove it.
+
 **Your own `Φ`.** If you know the integral in closed form, define a subtype of
 `LinearOps.AbstractIntegratedLinop` and pass it to `Luna.run` in place of the callable; it
 is used as it is, and neither `β` nor `Aeff` is tabulated for it. The interface is three

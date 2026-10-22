@@ -38,4 +38,25 @@ import Test: @test, @testset
     Luna.set_threaded_broadcasts(was)
     @test y3 == ref
     @test Utils._THREADED_DEPTH[] == 0
+    #= The modified shot noise's advance (LupoLab/Luna.jl#440): the phase readback and the
+       `cis` broadcast are threaded above their thresholds, and agree with the serial path
+       bit for bit, inside the table, in the extrapolation past it, and for a constant
+       operator. =#
+    n = Utils.THREAD_MINLEN
+    dφ = [1e3*sin(0.37i) for i in 1:n]
+    E0 = ComplexF64[cis(0.2i)*(1 + i/n) for i in 1:n]
+    Φ = hcat(zeros(n), 0.1 .* dφ, 0.3 .* dφ .+ 1e-3 .* cos.(1:n))
+    dΦ = hcat(dφ, dφ, 1.1 .* dφ)
+    for p in (Luna.LinearOps.ConstUnitaryPhase(dφ),
+              Luna.LinearOps.TabulatedUnitaryPhase([0.0, 0.1, 0.3], Φ, dΦ, 1e-6, 0.0))
+        mk() = Luna.NonlinearRHS.ModifiedNoise(copy(E0), p, zeros(n), similar(E0), Ref(NaN))
+        for z in (0.17, 0.45)
+            nt, ns = mk(), mk()
+            a = copy(Luna.NonlinearRHS.noise_at!(nt, z))
+            b = Utils.serial_region(() -> copy(Luna.NonlinearRHS.noise_at!(ns, z)))
+            @test a == b
+            @test a == E0 .* cis.(Utils.serial_region(() -> p(zeros(n), z)))
+        end
+    end
+    @test Utils._THREADED_DEPTH[] == 0
 end
