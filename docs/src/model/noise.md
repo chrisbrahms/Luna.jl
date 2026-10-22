@@ -113,6 +113,14 @@ of the Stokes wave relative to the pump, so denying the noise its phase evolutio
 phases that never mattered. Pure-Raman results are identical to five significant figures with
 or without this term.
 
+In free space (radial and Cartesian propagation) the draw is restricted to the **propagating**
+components. At an evanescent transverse wavenumber, ``k_\perp > k(\omega)``, the linear operator
+is a real decay rather than a phase, so the unitary propagator would carry the noise there at
+full amplitude for the whole propagation while the field decays. Those components are not
+radiating modes and have no one-photon vacuum level to restore, so the free-space transforms
+zero the draw there on construction (`NonlinearRHS.mask_evanescent!`), with ``k(\omega)`` taken
+at ``z = 0``.
+
 ## Usage
 
 The modified shot-noise model is used by default (`shotnoise=true`, equivalent to
