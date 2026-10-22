@@ -191,6 +191,23 @@ end
     coarse = LinearOps.unitary_phase(linop!, grid, (nω,); zmax, atol=1e-3)
     @test coarse.err <= 1e-3
     @test length(coarse.z) < length(phase.z) # ... with fewer nodes
+    # the table's memory is bounded: a budget too small for the tolerance stops the
+    # refinement, with a warning, rather than letting it grow
+    @test LinearOps.noise_node_budget((nω,), 3*4*8*nω) == 3
+    small = @test_logs (:warn, r"did not reach its tolerance") match_mode=:any begin
+        LinearOps.unitary_phase(linop!, grid, (nω,); zmax,
+                                maxnodes=LinearOps.noise_node_budget((nω,), 3*4*8*nω))
+    end
+    @test length(small.z) < length(phase.z) # the cap is checked per bisection, not per node
+    # a closure which ignores z is a constant operator written the long way (`Luna.run`
+    # treats it so too): exactly the constant array's phase, not a two-node table
+    cl!, _ = LinearOps.make_linop(
+        grid, Capillary.MarcatiliMode(100e-6, :He, 5.0; loss=true), grid.referenceλ)
+    cphase = LinearOps.unitary_phase(cl!, grid, (nω,); zmax)
+    @test cphase isa LinearOps.ConstUnitaryPhase
+    clin = zeros(ComplexF64, nω)
+    cl!(clin, 0.0)
+    @test cphase.dφ == imag.(clin)
 end
 
 @testset "Multimode modified noise integration" begin
@@ -560,7 +577,10 @@ end
     end
     # a z-dependent free-space operator: the tabulated phase on a (ω, pol, k⊥...) size
     @testset "tabulated phase, radial" begin
-        nfun = (λ; z=0.0) -> (nfunλ(λ), nfunλ(λ))
+        #= the index must really depend on z: a closure which ignores it gets the exact
+           constant phase instead (see "Tabulated unitary phase") =#
+        nzλ = (λ, z) -> nfunλ(λ) + 1e-5*z
+        nfun = (λ; z=0.0) -> (nzλ(λ, z), nzλ(λ, z))
         linop! = LinearOps.make_linop(rgrid, q, (ω; z) -> nfun(PhysData.wlfreq(ω); z))
         normfun = constnorm(rgrid, q, nfun)
         resp = (kerr(rgrid),)

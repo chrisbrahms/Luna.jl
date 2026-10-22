@@ -1682,7 +1682,7 @@ the linear operator is constant, i.e. for a waveguide of fixed radius at fixed p
 runs inside the right-hand side. With `constβ=false` (the default, and what a taper or a
 pressure gradient needs) `βfun!` is called on every evaluation and its result uploaded,
 unless [`tabulate`](@ref) has replaced the mirror with a table over `z`
-(`linop_integral=:tabulated` on [`Luna.run`](@ref), the default).
+(`linop_integral=:auto` on [`Luna.run`](@ref), the default).
 """
 function norm_mode_average(grid, βfun!, aeff; shock=true, spec=HostSpec(),
                            scaling=UNIT_SCALING, constβ=false)
