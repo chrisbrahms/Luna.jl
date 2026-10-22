@@ -1794,6 +1794,17 @@ end
     e32 = radialdiff(href, f32) # 1.2e-6 measured
     @test e32 < 1e-5
     @test effect > 10*e32
+    #= The evanescent mask reaches the kernels' copy: on a transverse grid fine enough to put
+       part of the band beyond cutoff, the device and the Float32 copies are zero there too. =#
+    for spec in (JLSpec, DeviceSpec(Array, Float32))
+        _, t = radialcase(Grid.RealGrid, spec; R=5e-6, N=32, w0=1.5e-6, energy=1e-12,
+                          noise=true)
+        prop = NonlinearRHS.propagating_mask(t.normfun, 0.0)
+        @test any(.!prop)
+        @test all(iszero, Array(t.noise.Eω0)[.!prop])
+        @test all(iszero, Array(t.dnoise.Eω0)[.!prop])
+        @test any(!iszero, Array(t.dnoise.Eω0)[prop])
+    end
 end
 
 @testset "radial envelope Raman on JLArray" begin
