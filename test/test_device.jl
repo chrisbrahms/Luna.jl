@@ -1089,16 +1089,53 @@ end # have_jlarrays
     @test tr32.dnoise.Eω0 isa Vector{ComplexF32}
     @test tr32.dnoise.Eω0 ≈ ComplexF32.(tr32.noise.Eω0 ./ tr32.scaling.Eref)
     Eref = tr32.scaling.Eref
+    hclean, _ = kerrcase(Grid.RealGrid, HostSpec(); pres=0.3)
+    err32 = 0.0
     for idx in axes(href["Eω"], 2)
         h = href["Eω"][:, idx]
         d = ComplexF64.(f32["Eω"][:, idx]) # Luna.run unscales the output
+        err32 = max(err32, maximum(abs, d .- h)/maximum(abs, h))
         @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
     end
-    # a resumed run adopts a recorded draw: the kernels' copy follows the caller's
+    # the noise changes the result by well over the Float32 comparison error
+    h = href["Eω"][:, end]
+    @test maximum(abs, h .- hclean["Eω"][:, end])/maximum(abs, h) > 10*err32
+    # a resumed run adopts a recorded draw: the kernels' copy follows the caller's, and
+    # the advance (forced by the reset `lastz`) starts from the new draw
     tr32.noise.Eω0 .*= 2
     NonlinearRHS.sync_noise!(tr32)
     @test tr32.dnoise.Eω0 ≈ ComplexF32.(tr32.noise.Eω0 ./ Eref)
     @test isnan(tr32.dnoise.lastz[])
+    @test NonlinearRHS.noise_at!(tr32.dnoise, 5e-3) ≈
+          ComplexF32.(NonlinearRHS.noise_at!(tr32.noise, 5e-3) ./ Eref)
+end
+
+@testset "tabulated noise phase on JLArray and in Float32" begin
+    #= A z-dependent operator gives a `TabulatedUnitaryPhase`; its retargeted copy (Hermite
+       evaluation on `selectdim` views of the device table, Float32 coefficients) must
+       follow the host one inside the table, in the overshoot margin past zmax and in the
+       linear extrapolation beyond the table's last node. =#
+    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
+    zmax = 0.2
+    coren, _ = Capillary.gradient(:He, zmax, 5.0, 0.5)
+    linop!, _ = LinearOps.make_linop(grid, Capillary.MarcatiliMode(100e-6, coren; loss=true),
+                                     grid.referenceλ)
+    phase = LinearOps.unitary_phase(linop!, grid, (length(grid.ω),); zmax)
+    @test phase isa LinearOps.TabulatedUnitaryPhase
+    nh = NonlinearRHS.ModifiedNoise(
+        Fields.generate_noise_field(grid; rng=Random.MersenneTwister(2)), phase, grid)
+    zs = (0.0, 0.05, 0.13, zmax, 1.02zmax, 1.5*phase.z[end])
+    for (spec, rtol) in ((JLSpec, 1e-12), (DeviceSpec(Array, Float32), 1e-4))
+        nd = NonlinearRHS.retarget_noise(nh, spec, UNIT_SCALING)
+        @test nd.phase isa LinearOps.TabulatedUnitaryPhase
+        @test nd.phase.Φ isa (spec === JLSpec ? JLArray{Float64} : Array{Float32})
+        Luna.assert_resident(spec, NonlinearRHS.noise_arrays(nd)...)
+        for z in zs
+            h = copy(NonlinearRHS.noise_at!(nh, z))
+            d = ComplexF64.(Array(NonlinearRHS.noise_at!(nd, z)))
+            @test maximum(abs, d .- h)/maximum(abs, h) < rtol
+        end
+    end
 end
 
 @testset "Float32 on the CPU" begin
