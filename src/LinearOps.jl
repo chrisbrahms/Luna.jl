@@ -614,7 +614,7 @@ function (p::TabulatedUnitaryPhase)(out, z)
 end
 
 """
-    unitary_phase(linop, grid, sz=size(linop); atol=1e-6, margin=0.05, maxdepth=24, maxnodes=4096)
+    unitary_phase(linop, grid, sz=size(linop); zmax, atol=1e-6, margin=0.05, maxdepth=24, maxnodes=4096)
 
 Create an [`AbstractUnitaryPhase`](@ref) for the linear operator `linop`, which may be either
 a constant array or a mutating function `linop!(out, z)`. `sz` is the size of the array
@@ -640,7 +640,8 @@ across such a feature, and give no way to tell how far off they are. Bisection p
 only where they are needed — a kink costs a handful of extra intervals rather than a finer
 grid everywhere — so the table is usually *smaller* than a uniform one of equal accuracy.
 
-The table covers `[0, (1 + margin)·zmax]` rather than `[0, zmax]`, because `RK45.solve` runs
+`zmax` is the propagation length (the grid does not carry it); a constant `linop` does not
+need it. The table covers `[0, (1 + margin)·zmax]` rather than `[0, zmax]`, because `RK45.solve` runs
 `while tn <= tmax` and so overshoots the end of the fibre on its final step -- and that step's
 stages are what the last saved plane is interpolated from. `linop!` has to be defined a little
 past `zmax` for this, which it already does: `RK45.make_prop!` evaluates it there too.
@@ -652,7 +653,8 @@ either bound stops refinement before `atol` is met, a warning reports the error 
 unitary_phase(linop::AbstractArray, grid, sz=size(linop); kwargs...) =
     ConstUnitaryPhase(imag.(linop))
 
-function unitary_phase(linop!, grid, sz; atol=1e-6, margin=0.05, maxdepth=24, maxnodes=4096)
+function unitary_phase(linop!, grid, sz; zmax, atol=1e-6, margin=0.05, maxdepth=24,
+                       maxnodes=4096)
     N = length(sz)
     buf = Array{ComplexF64}(undef, sz)
     neval = Ref(0)
@@ -661,12 +663,12 @@ function unitary_phase(linop!, grid, sz; atol=1e-6, margin=0.05, maxdepth=24, ma
         linop!(buf, z)
         imag.(buf)
     end
-    zmax = float(grid.zmax)*(1 + margin)
+    zend = float(zmax)*(1 + margin)
     znodes = Float64[0.0]
     dnodes = Array{Float64, N}[dat(0.0)]
     deltas = Array{Float64, N}[] # accumulated phase across each accepted interval
     worst = Ref(0.0)
-    _refine!(znodes, dnodes, deltas, worst, dat, 0.0, zmax, dnodes[1], dat(zmax), nothing,
+    _refine!(znodes, dnodes, deltas, worst, dat, 0.0, zend, dnodes[1], dat(zend), nothing,
              atol, 0, maxdepth, maxnodes)
 
     n = length(znodes)

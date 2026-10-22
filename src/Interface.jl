@@ -460,7 +460,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
     inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
-                                     noise_field, thg)
+                                     noise_field, zmax=flength, thg)
     stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
     output = makeoutput(flength, saveN, stats, filepath, scan, scanidx, filename)
     savenoise(output, transform, grid, saveN, save_noise; zmax=flength)
@@ -874,16 +874,17 @@ function makenoise(grid, mode_s, inputs, shotnoise::Symbol, rng)
 end
 
 """
-    makemodifiednoise(noise_field, linop, grid)
+    makemodifiednoise(noise_field, linop, grid; zmax)
 
 Bundle the `z = 0` noise draw with the propagator which advances it, i.e. the accumulated
 **unitary** phase of `linop` (dispersion, but neither loss nor gain). Returns `nothing` if
-`noise_field` is `nothing`. See [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise).
+`noise_field` is `nothing`. `zmax` is the propagation length, over which a `z`-dependent
+`linop`'s phase is tabulated. See [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise).
 """
-makemodifiednoise(noise_field::Nothing, linop, grid) = nothing
+makemodifiednoise(noise_field::Nothing, linop, grid; zmax) = nothing
 
-function makemodifiednoise(noise_field, linop, grid)
-    phase = LinearOps.unitary_phase(linop, grid, size(noise_field))
+function makemodifiednoise(noise_field, linop, grid; zmax)
+    phase = LinearOps.unitary_phase(linop, grid, size(noise_field); zmax)
     NonlinearRHS.ModifiedNoise(noise_field, phase, grid)
 end
 
@@ -905,24 +906,24 @@ linopkw(grid::Grid.RealGrid, thg) = NamedTuple()
 linopkw(grid::Grid.EnvGrid, thg) = (; thg)
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{true}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{true}; noise_field=nothing, zmax, thg=LinearOps.thg_default(grid))
     @info("Using mode-averaged propagation.")
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ;
                                                     linopkw(grid, thg)...)
 
-    noise = makemodifiednoise(noise_field, linop, grid)
+    noise = makemodifiednoise(noise_field, linop, grid; zmax)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
                                    βfun!, z -> Modes.Aeff(mode, z=z); noise)
     linop, Eω, transform, FT
 end
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{false}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{false}; noise_field=nothing, zmax, thg=LinearOps.thg_default(grid))
     @info("Using mode-averaged propagation.")
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ;
                                         linopkw(grid, thg)...)
 
-    noise = makemodifiednoise(noise_field, linop, grid)
+    noise = makemodifiednoise(noise_field, linop, grid; zmax)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
                                    βfun!, z -> Modes.Aeff(mode, z=z); noise)
     linop, Eω, transform, FT
@@ -933,22 +934,22 @@ needfull(modes) = !all(modes) do mode
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               noise_field=nothing, zmax, thg=LinearOps.thg_default(grid))
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_const_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
-    noise = makemodifiednoise(noise_field, linop, grid)
+    noise = makemodifiednoise(noise_field, linop, grid; zmax)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
                                    pol ? :xy : :y; full=nf, rtol, noise)
     linop, Eω, transform, FT
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               noise_field=nothing, zmax, thg=LinearOps.thg_default(grid))
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
-    noise = makemodifiednoise(noise_field, linop, grid)
+    noise = makemodifiednoise(noise_field, linop, grid; zmax)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
                                    pol ? :xy : :y; full=nf, rtol, noise)
     linop, Eω, transform, FT
@@ -1201,7 +1202,7 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
     inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
 
     norm! = NonlinearRHS.norm_mode_average_gnlse(grid, aeff; shock)
-    noise = makemodifiednoise(noise_field, linop, grid)
+    noise = makemodifiednoise(noise_field, linop, grid; zmax=flength)
     Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
                                    norm!, noise)
     stats = Stats.default(grid, Eω, mode_s, linop, transform)

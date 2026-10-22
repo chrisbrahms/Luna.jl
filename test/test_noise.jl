@@ -100,7 +100,7 @@ const noise_kwargs = (λ0=800e-9, τfwhm=10e-15, energy=1e-12,
 end
 
 @testset "Unitary phase and noise propagation" begin
-    grid = Grid.RealGrid(0.1, 800e-9, (200e-9, 4e-6), 400e-15)
+    grid = Grid.RealGrid(800e-9, (200e-9, 4e-6), 400e-15)
     mode = Capillary.MarcatiliMode(100e-6, :He, 1.0; loss=true)
     linop, _, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ)
     # the mode really is lossy, or the "loss is not applied" test below is vacuous
@@ -130,7 +130,8 @@ end
     # refinement was asked for. Luna's own profiles are the awkward cases -- a p0 = 0
     # gradient has a 1/√z cusp in dp/dz at the entrance and a multi-section fill has a
     # derivative discontinuity at every junction -- so all of them are exercised here.
-    grid = Grid.RealGrid(0.2, 800e-9, (400e-9, 2e-6), 200e-15)
+    zmax = 0.2 # the propagation length; the grid does not carry it
+    grid = Grid.RealGrid(800e-9, (400e-9, 2e-6), 200e-15)
     nω = length(grid.ω)
 
     function refphase(linop!, z; n=2001) # composite Simpson, n odd
@@ -157,7 +158,7 @@ end
     for (name, coren) in linops
         mode = Capillary.MarcatiliMode(100e-6, coren; loss=true)
         linop!, _ = LinearOps.make_linop(grid, mode, grid.referenceλ)
-        phase = LinearOps.unitary_phase(linop!, grid, (nω,))
+        phase = LinearOps.unitary_phase(linop!, grid, (nω,); zmax)
         @test phase isa LinearOps.TabulatedUnitaryPhase
         # the refinement met the tolerance it was asked for...
         @test phase.err <= phase.atol
@@ -176,9 +177,9 @@ end
     afun(z) = z < 0.1 ? 100e-6 : 100e-6 - 40e-6*(z - 0.1)/0.1
     linop!, _ = LinearOps.make_linop(
         grid, Capillary.MarcatiliMode(afun, :He, 5.0; loss=true), grid.referenceλ)
-    phase = LinearOps.unitary_phase(linop!, grid, (nω,))
+    phase = LinearOps.unitary_phase(linop!, grid, (nω,); zmax)
     @test phase.err <= phase.atol
-    @test phase.z[end] > grid.zmax # the overshoot margin is tabulated, not extrapolated
+    @test phase.z[end] > zmax # the overshoot margin is tabulated, not extrapolated
     for z in (0.13, 0.2, 0.205)
         phase(φ, z)
         @test maximum(abs, φ .- refphase(linop!, z)) < 10*phase.atol
@@ -187,7 +188,7 @@ end
     phase(φ, 0.5)
     @test all(isfinite, φ)
     # a tolerance the caller asks for is honoured
-    coarse = LinearOps.unitary_phase(linop!, grid, (nω,); atol=1e-3)
+    coarse = LinearOps.unitary_phase(linop!, grid, (nω,); zmax, atol=1e-3)
     @test coarse.err <= 1e-3
     @test length(coarse.z) < length(phase.z) # ... with fewer nodes
 end
@@ -406,7 +407,7 @@ end
         Eω, grid, linop, transform, FT, output = Interface.prop_gnlse_args(
             γ, L, [0.0, 0.0, β2]; kw..., shotnoise, rng=Random.MersenneTwister(42))
         Luna.run(Eω, grid, linop, transform, FT, output;
-                 rtol=1e-8, atol=1e-16, status_period=60)
+                 zmax=L, rtol=1e-8, atol=1e-16, status_period=60)
         output, transform
     end
     ref, _ = propagate(false)
@@ -440,7 +441,7 @@ end
     Eω, grid, linop, transform, FT, out2 = Interface.prop_capillary_args(
         noise_args...; noise_kwargs..., shotnoise=:modified,
         rng=Random.MersenneTwister(42))
-    Luna.run(Eω, grid, linop, transform, FT, out2; status_period=60)
+    Luna.run(Eω, grid, linop, transform, FT, out2; zmax=noise_args[2], status_period=60)
     @test haskey(out2, "noise_field")
     @test !haskey(out2, "noise_phase")
     @test_throws ErrorException Processing.withnoise(out2)
@@ -493,14 +494,14 @@ end
     end
     drawnoise(Eω, linop, grid) = NonlinearRHS.ModifiedNoise(
         1e-2*maximum(abs, Eω) .* randn(rng, ComplexF64, size(Eω)),
-        LinearOps.unitary_phase(linop, grid, size(Eω)), grid)
+        LinearOps.unitary_phase(linop, grid, size(Eω); zmax=0.1), grid)
     λ0 = 800e-9
     gas, pres = :Ar, 1.0
     dens0 = PhysData.density(gas, pres)
     densityfun = z -> dens0
     nfunλ = PhysData.ref_index_fun(gas, pres)
-    rgrid = Grid.RealGrid(0.1, λ0, (400e-9, 2000e-9), 100e-15)
-    egrid = Grid.EnvGrid(0.1, λ0, (400e-9, 2000e-9), 100e-15)
+    rgrid = Grid.RealGrid(λ0, (400e-9, 2000e-9), 100e-15)
+    egrid = Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
     γ3 = PhysData.γ3_gas(gas)
     kerr(::Grid.RealGrid) = Nonlinear.Kerr_field(γ3)
     kerr(::Grid.EnvGrid) = Nonlinear.Kerr_env(γ3)
