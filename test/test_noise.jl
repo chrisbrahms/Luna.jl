@@ -499,26 +499,41 @@ end
     dens0 = PhysData.density(gas, pres)
     densityfun = z -> dens0
     nfunλ = PhysData.ref_index_fun(gas, pres)
-    nfun = (λ; z=0.0) -> nfunλ(λ)
-    resp = (Nonlinear.Kerr_field(PhysData.γ3_gas(gas)),)
-    grid = Grid.RealGrid(0.1, λ0, (400e-9, 2000e-9), 100e-15)
+    rgrid = Grid.RealGrid(0.1, λ0, (400e-9, 2000e-9), 100e-15)
+    egrid = Grid.EnvGrid(0.1, λ0, (400e-9, 2000e-9), 100e-15)
+    γ3 = PhysData.γ3_gas(gas)
+    kerr(::Grid.RealGrid) = Nonlinear.Kerr_field(γ3)
+    kerr(::Grid.EnvGrid) = Nonlinear.Kerr_env(γ3)
+    q = Hankel.QDHT(1e-3, 16, dim=3)
+    xy = Grid.FreeGrid(1e-3, 8, 1e-3, 8)
+    constnorm(grid, sg::Hankel.QDHT, nfun) = NonlinearRHS.const_norm_radial(grid, sg, nfun)
+    constnorm(grid, sg::Grid.FreeGrid, nfun) = NonlinearRHS.const_norm_free(grid, sg, nfun)
     inputs = Fields.GaussGaussField(; λ0, τfwhm=20e-15, energy=1e-6, w0=200e-6)
-    @testset "radial" begin
-        q = Hankel.QDHT(1e-3, 16, dim=3)
-        linop = LinearOps.make_const_linop(grid, q, nfun)
-        normfun = NonlinearRHS.const_norm_radial(grid, q, nfun)
-        Eω, tp, _ = Luna.setup(grid, q, densityfun, normfun, resp, inputs)
+    # both free-space transforms, field and envelope, one and two polarisation components
+    # (the noise buffers have the field's (ω/t, pol, k⊥...) shape)
+    @testset "$(nameof(typeof(sg))), $(nameof(typeof(grid))), pol=$pol" for sg in (q, xy),
+                                                                           grid in (rgrid, egrid),
+                                                                           pol in (false, true)
+        nfun = pol ? (λ; z=0.0) -> (nfunλ(λ), nfunλ(λ)) : (λ; z=0.0) -> nfunλ(λ)
+        linop = LinearOps.make_const_linop(grid, sg, nfun)
+        normfun = constnorm(grid, sg, nfun)
+        resp = (kerr(grid),)
+        Eω, tp, _ = Luna.setup(grid, sg, densityfun, normfun, resp, inputs)
+        @test size(Eω, 2) == (pol ? 2 : 1)
         noise = drawnoise(Eω, linop, grid)
-        _, tn, _ = Luna.setup(grid, q, densityfun, normfun, resp, inputs; noise)
+        _, tn, _ = Luna.setup(grid, sg, densityfun, normfun, resp, inputs; noise)
         check(Eω, tn, tp, noise)
     end
-    @testset "3-D" begin
-        xy = Grid.FreeGrid(1e-3, 8, 1e-3, 8)
-        linop = LinearOps.make_const_linop(grid, xy, nfun)
-        normfun = NonlinearRHS.const_norm_free(grid, xy, nfun)
-        Eω, tp, _ = Luna.setup(grid, xy, densityfun, normfun, resp, inputs)
-        noise = drawnoise(Eω, linop, grid)
-        _, tn, _ = Luna.setup(grid, xy, densityfun, normfun, resp, inputs; noise)
+    # a z-dependent free-space operator: the tabulated phase on a (ω, pol, k⊥...) size
+    @testset "tabulated phase, radial" begin
+        nfun = (λ; z=0.0) -> (nfunλ(λ), nfunλ(λ))
+        linop! = LinearOps.make_linop(rgrid, q, (ω; z) -> nfun(PhysData.wlfreq(ω); z))
+        normfun = constnorm(rgrid, q, nfun)
+        resp = (kerr(rgrid),)
+        Eω, tp, _ = Luna.setup(rgrid, q, densityfun, normfun, resp, inputs)
+        noise = drawnoise(Eω, linop!, rgrid)
+        @test noise.phase isa LinearOps.TabulatedUnitaryPhase
+        _, tn, _ = Luna.setup(rgrid, q, densityfun, normfun, resp, inputs; noise)
         check(Eω, tn, tp, noise)
     end
     capargs = (125e-6, 0.1, :Ar, 1.0)

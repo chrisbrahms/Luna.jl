@@ -28,10 +28,17 @@ branch merges this, so the GPU PRs can be based on a master which contains #440.
 multimode transforms, the transform with noise equals the noise-free one applied to
 `Eω .+ noise_at(noise, z)`, at two z. #440's own tests cover only the capillary transforms;
 this is the check that carries the free-space resolutions (and, later, every device path).
+The free-space cases cover radial and 3-D, field and envelope grids, one and two
+polarisation components, and a z-dependent (tabulated) phase on a `(ω, pol, k⊥)` size.
+
+Docstrings: the free-space noise shapes (`(nω, np, k⊥...)`, the size of `Eω` from
+`Luna.setup`; `generate_noise_field` does not make free-space draws) and `to_time!`'s forward
+plan. Open question noted in `ModifiedNoise`: noise at evanescent `k⊥ > k` is neither advanced
+nor damped (the propagator is the phase only), while the field there decays.
 
 ## Verification
 
-test_noise 111/111 (incl. #440's Chen & Wise identity), test_freespace 68/68,
+test_noise 141/141 (incl. #440's Chen & Wise identity), test_freespace 68/68,
 test_interface 301/301. (No regression gate on this branch; it arrives with gpu/00-harness.)
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
