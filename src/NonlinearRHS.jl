@@ -471,8 +471,10 @@ output, read by [`Processing.withnoise`](@ref Luna.Processing.withnoise) and, on
 cached run, overwritten with the recorded draw (see [`sync_noise!`](@ref)).
 
 In `Float32` the accumulated phase `Φ(z)` is formed from the absolute `z`, so it carries an
-absolute error of about `6e-8·|Φ|` rad (the field does not: its propagator uses only a
-step's `Δz`). How large `|Φ|` gets depends on the operator. In a waveguide's co-moving frame
+absolute error of about `6e-8·|Φ|` rad. The field's propagator does not: a constant operator
+is applied over a step's `Δz` only, and a tabulated one stores `Φ` with its secant removed
+(`LinearOps.TabulatedLinop`), whereas the noise's phase table holds the absolute `Φ`; the
+same secant subtraction would remove this error, if it ever matters. How large `|Φ|` gets depends on the operator. In a waveguide's co-moving frame
 it is the dispersion residual, tens to thousands of rad, so ~1e-4 rad. In free space it is
 `(β_z − β₁(ω − ω₀) − β_ref)·z`, which near cutoff (`β_z → 0`) approaches `k(ω)·z`: ~4e6 rad
 over 0.5 m at 800 nm, i.e. an error of order 0.3 rad on the high-k⊥ components (on axis it is
