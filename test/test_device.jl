@@ -626,7 +626,7 @@ end # have_jlarrays
     Eref = tr32.scaling.Eref
     for idx in axes(href["Eω"], 2)
         h = href["Eω"][:, idx]
-        d = ComplexF64.(f32["Eω"][:, idx]) .* Eref
+        d = ComplexF64.(f32["Eω"][:, idx]) # Luna.run unscales the output
         @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
     end
     # a resumed run adopts a recorded draw: the kernels' copy follows the caller's
