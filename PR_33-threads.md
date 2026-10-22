@@ -101,3 +101,9 @@ leak into the next (fixed: a `BLAS_LIST` now applies to every case).
 - `Luna.tune_threads()` (per-machine thresholds): later.
 - The fixed rule's statistic evaluating the right-hand side once per step even without a
   Kronrod estimate (pinned, next).
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+test_metal: "modified shot noise on Metal" — the device-advanced noise against the host
+(5.6e-8 to 8.4e-7, constant pressure and gradient), the shared draw, the field against CPU
+Float32; 810/810 on an M1 Pro.
