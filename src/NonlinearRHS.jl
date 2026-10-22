@@ -20,6 +20,7 @@ import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING, GridVectors, HostM
 import Luna: alloc, todevice, gridvectors, assert_resident, all_resident, scalar,
              upload!, realtype, arraytype, isdevicespec, isunity
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
+import Luna.LinearOps
 import Luna.LinearOps: βz, transverse_k2
 import Logging
 using EllipsisNotation
@@ -566,7 +567,7 @@ inverse plans for the oversampled time grid
   grid, and injected into the nonlinear operator at every propagation step. The transform
   keeps the caller's object as `noise` (host, physical units: what is saved and what
   [`Processing.withnoise`](@ref Luna.Processing.withnoise) needs) and advances
-  `dnoise = retarget(noise, spec, scaling)`, which is the same object on the default host
+  `dnoise = retarget_noise(noise, spec, scaling)`, which is the same object on the default host
   `Float64` path and otherwise a copy on `spec` in `scaling`'s units.
 - `spec=HostSpec()`: the [`Luna.DeviceSpec`](@ref) the buffers, mirrors and responses live
   on.
@@ -585,7 +586,7 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
     Pto = similar(Eto)
     Pωo = similar(Eωo)
     gv = gridvectors(grid, spec)
-    dnoise = retarget(noise, spec, scaling)
+    dnoise = retarget_noise(noise, spec, scaling)
     if !isnothing(noise)
         Eωo_noise = alloc(spec, CT, (nωo,))
         Et_noise = alloc(spec, TT, (nto,))
