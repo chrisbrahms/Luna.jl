@@ -3159,15 +3159,11 @@ end
         @test length(unique(objectid, Any[t.Eto_r, t.Eto_k, t.Pto_r, t.Pto_k])) == 4
         @test size(t.Eωo, 1) == length(t.grid.ωo)
     end
-    # with the modified shot-noise model, two more: the noise and the field+noise buffer
-    grid = Grid.RealGrid(800e-9, (400e-9, 2000e-9), 100e-15)
-    rg = Grid.RadialGrid(1e-3, 24)
-    nfω = Fields.generate_noise_field(grid)
-    nf = zeros(ComplexF64, (length(grid.ω), 1, rg.N))
-    nf[grid.sidx, :, :] .= nfω[grid.sidx] .* ones(1, 1, rg.N)
-    _, tn = radialcase(Grid.RealGrid, HostSpec(); noise_field=nf)
-    @test length(fieldbuffers(tn)) == 7
-    @test !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
+    #= with the modified shot-noise model, three more: the oversampled spectral and the
+       time-domain noise at the current z, and the field+noise buffer =#
+    _, tn = radialcase(Grid.RealGrid, HostSpec(); noise=true)
+    @test length(fieldbuffers(tn)) == 8
+    @test !isnothing(tn.Eωo_noise) && !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
 end
 
 #= 2-D Cartesian free space end to end on a device, field-resolved and envelope, with the
