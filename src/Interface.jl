@@ -960,6 +960,9 @@ function makenoise(grid, mode_s, inputs, shotnoise::Symbol, rng)
     if shotnoise == :modified
         nm = mode_s isa AbstractArray ? length(mode_s) : 1
         noise_field = Fields.generate_noise_field(grid; rng, nmodes=nm)
+        #= a mode collection's transforms take one column per mode, so a single mode's
+           draw is the (nω, 1) matrix and not the vector `generate_noise_field` returns =#
+        mode_s isa AbstractArray && (noise_field = reshape(noise_field, :, nm))
         @info("Modified shot-noise model enabled. Traditional input shot noise is " *
               "disabled (noise enters through nonlinear operator instead).")
         return (inputs, noise_field)
