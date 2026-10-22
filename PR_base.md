@@ -33,13 +33,20 @@ polarisation components, and a z-dependent (tabulated) phase on a `(ω, pol, k�
 
 Docstrings: the free-space noise shapes (`(nω, np, k⊥...)`, the size of `Eω` from
 `Luna.setup`; `generate_noise_field` does not make free-space draws) and `to_time!`'s forward
-plan. Open question noted in `ModifiedNoise`: noise at evanescent `k⊥ > k` is neither advanced
-nor damped (the propagator is the phase only), while the field there decays.
+plan. (The open question first noted here, noise at evanescent `k⊥ > k`, is resolved below.)
 
 ## Verification
 
 test_noise 141/141 (incl. #440's Chen & Wise identity), test_freespace 68/68,
 test_interface 301/301. (No regression gate on this branch; it arrives with gpu/00-harness.)
+
+## Evanescent components
+
+At `k⊥ > k(ω)` the operator is a real decay, so the unitary propagator would carry the noise at
+full amplitude while the field decays. The free-space transforms zero the draw there on
+construction (`propagating_mask`, `mask_evanescent!`; crystal optics per polarisation), with
+`k(ω)` at z = 0; noise.md states the limit for an index which changes along z. Tests: the mask
+agrees with the operator both ways, isotropic and BBO, through `setup`. Reviewed, AGREE.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
