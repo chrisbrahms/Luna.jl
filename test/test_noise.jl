@@ -563,6 +563,11 @@ end
         @test all(iszero, noise.Eω0[.!prop])
         @test noise.Eω0[prop] == before[prop]
         check(Eω, tn, tp, noise)
+        # an unmasked draw adopted later (a resumed run) is masked again by `sync_noise!`
+        tn.noise.Eω0 .= before
+        NonlinearRHS.sync_noise!(tn)
+        @test all(iszero, tn.noise.Eω0[.!prop])
+        @test tn.noise.Eω0[prop] == before[prop]
     end
     #= Crystal optics: the normalisation's own (nfunx, nfuny) β_z² loop decides which
        components are evanescent, per polarisation; it must agree with the operator. =#
