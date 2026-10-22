@@ -3267,23 +3267,30 @@ end
 #= One right-hand side of the host transform with noise (`htr`), without (`ctr`) and of the
    device one with noise (`dtr`), on the first saved field scaled by `s`, at `z`: how much the
    noise changes the nonlinear term, and how far the device is from the host. The noise enters
-   the Kerr term relative to the field, so a small `s` makes its effect measurable in these
-   weak cases without amplifying the draw any further. =#
-function freerhs(href, htr, ctr, dtr, z; s=1)
+   the (χ² or Kerr) nonlinear term relative to the field, so a small `s` makes its effect
+   measurable in these weak cases without amplifying the draw any further. With `t32`, a
+   Float32 transform, also how far that is from the host: it takes the state in `Eref` and
+   returns the right-hand side of that state, so its result times `Eref` is physical. =#
+function freerhs(href, htr, ctr, dtr, z; s=1, t32=nothing)
     E = s .* collect(selectdim(href["Eω"], ndims(href["Eω"]), 1))
     nlh = similar(E); htr(nlh, E, z)
     nlc = similar(E); ctr(nlc, E, z)
     dnl = Luna.todevice(JLSpec, similar(E))
     dtr(dnl, Luna.todevice(JLSpec, E), z)
     m = maximum(abs, nlh)
-    maximum(abs, nlh .- nlc)/m, maximum(abs, Array(dnl) .- nlh)/m
+    effect, err = maximum(abs, nlh .- nlc)/m, maximum(abs, Array(dnl) .- nlh)/m
+    isnothing(t32) && return effect, err
+    Eref = t32.scaling.Eref
+    nl32 = similar(E, ComplexF32)
+    t32(nl32, ComplexF32.(E ./ Eref), z)
+    effect, err, maximum(abs, ComplexF64.(nl32) .* Eref .- nlh)/m
 end
 
 #= The modified shot-noise path of the Cartesian transforms: the noise is advanced to the
    current z on the device (`dnoise`), taken to the oversampled real-space time domain by
    the transform's own inverse plan (which does ω -> t and k -> x in one), and a second
    block-sized buffer holds field+noise. The same host draw goes into both runs. =#
-@testset "the 2-D free-space noise field on JLArray and in Float32" begin
+@testset "the 2-D free-space noise field on JLArray (Float32: the copy's units)" begin
     grid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
     Nx = 2^5
     #= amplified 100 times, so that the noise changes the result far beyond the
@@ -3352,15 +3359,37 @@ end
     @test all(isfinite, Array(dnl))
     @test radialdiff(href, dref) < 1e-10
     _, ctr = free3dcase(HostSpec(); Nx, Ny)
-    #= as in 2-D, of a field 1e7 times weaker (1.5e-14 at full field), where the noise
-       dominates the nonlinear term (effect ≈ 1) =#
-    effect, err = freerhs(href, htr, ctr, dtr, 1e-3; s=1e-7)
-    @info "3-D free-space noise, one right-hand side" effect err
-    @test effect > 1e-8
-    @test err < 1e-3*effect
     _, t32 = free3dcase(DeviceSpec(Array, Float32); Nx, Ny, noise_field=nf)
     @test t32.dnoise.Eω0 isa Array{ComplexF32, 4}
     @test t32.dnoise.Eω0 ≈ ComplexF32.(t32.noise.Eω0 ./ t32.scaling.Eref)
+    #= as in 2-D, of a field 1e7 times weaker (1.5e-14 at full field), where the noise
+       dominates the nonlinear term (effect ≈ 1), so that the Float32 transform's
+       right-hand side, noise included, is compared too =#
+    effect, err, err32 = freerhs(href, htr, ctr, dtr, 1e-3; s=1e-7, t32)
+    @info "3-D free-space noise, one right-hand side" effect err err32
+    @test effect > 1e-8
+    @test err < 1e-3*effect
+    @test err32 < 1e-3*effect
+    #= an unmasked draw adopted later (a resumed run): `sync_noise!` masks it again before
+       it reaches the kernels' copy. This needs evanescent components, which the grid
+       above (8 points over 2 mm) does not have, so on a 4 µm grid, not propagated. =#
+    xy = Grid.FreeGrid(4e-6, Nx, 4e-6, Ny)
+    nfunλ = PhysData.ref_index_fun(:Ar, 1.0)
+    nfun = (λ; z=0.0) -> nfunλ(λ)
+    normfun = NonlinearRHS.const_norm_free(grid, xy, nfun)
+    linop = LinearOps.make_const_linop(grid, xy, nfun)
+    prop = NonlinearRHS.propagating_mask(normfun, 0.0)
+    @test any(.!prop)
+    inp = Fields.GaussGaussField(; λ0=800e-9, τfwhm=20e-15, energy=1e-12, w0=1.5e-6)
+    _, mtr, _ = Luna.setup(grid, xy, z -> PhysData.density(:Ar, 1.0), normfun,
+                           (Nonlinear.Kerr_env(PhysData.γ3_gas(:Ar)),), inp;
+                           noise=casenoise(copy(nf), linop, grid), device=JLSpec)
+    @test all(iszero, mtr.noise.Eω0[.!prop])
+    mtr.noise.Eω0 .= 1
+    NonlinearRHS.sync_noise!(mtr)
+    @test all(iszero, mtr.noise.Eω0[.!prop])
+    @test all(iszero, Array(mtr.dnoise.Eω0)[.!prop])
+    @test all(==(1), Array(mtr.dnoise.Eω0)[prop])
     # a noise field without the polarisation axis is refused, not silently broadcast
     @test_throws ErrorException free3dcase(HostSpec();
                                            Nx, Ny, noise_field=nf[:, 1, :, :])
