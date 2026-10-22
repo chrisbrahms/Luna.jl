@@ -623,7 +623,7 @@ buffer, so copy it if it needs to outlive the next call.
 function noise_at!(n::ModifiedNoise, z)
     if z != n.lastz[]
         n.phase(n.φ, z)
-        @. n.Eω = n.Eω0 * cis(n.φ)
+        @. $(Utils.threaded(n.Eω; minlen=Utils.THREAD_MINLEN_HEAVY)) = n.Eω0 * cis(n.φ)
         n.lastz[] = z
     end
     n.Eω

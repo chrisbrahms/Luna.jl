@@ -1612,7 +1612,7 @@ end
    kernel argument is refused (Metal) or slow, and on the host Float64 this is a no-op. =#
 function (p::ConstUnitaryPhase)(out, z)
     zT = convert(eltype(out), z)
-    @. out = p.dφ * zT
+    @. $(threaded(out)) = p.dφ * zT
     out
 end
 
@@ -1643,7 +1643,7 @@ function (p::TabulatedUnitaryPhase)(out, z)
         Φk = selectdim(p.Φ, d, k)
         dk = selectdim(p.dΦ, d, k)
         δ = convert(eltype(out), z - zs[k])
-        @. out = Φk + dk*δ
+        @. $(threaded(out)) = Φk + dk*δ
         return out
     end
     k = searchsortedlast(zs, z)
@@ -1661,7 +1661,7 @@ function (p::TabulatedUnitaryPhase)(out, z)
     Φk1 = selectdim(p.Φ, d, k+1)
     dk = selectdim(p.dΦ, d, k)
     dk1 = selectdim(p.dΦ, d, k+1)
-    @. out = h00*Φk + h10*dk + h01*Φk1 + h11*dk1
+    @. $(threaded(out)) = h00*Φk + h10*dk + h01*Φk1 + h11*dk1
     out
 end
 
