@@ -2392,7 +2392,7 @@ end
     dEω, dnl, dtr = modalrhs(Grid.RealGrid, JLSpec; z, noise=true)
     @test htr.dnoise === htr.noise
     @test dtr.dnoise.Eω0 isa JLArray{ComplexF64, 2}
-    @test Luna.all_resident(JLSpec, dtr.Emωo_noise, NonlinearRHS.noise_arrays(dtr.dnoise)...)
+    @test Luna.all_resident(JLSpec, NonlinearRHS.noise_arrays(dtr.dnoise)...)
     @test dtr.Emt_noise isa JLArray
     @test dtr.Emt_nl isa JLArray
     @test htr.noise.Eω != htr.noise.Eω0 # advanced

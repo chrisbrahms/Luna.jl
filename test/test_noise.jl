@@ -614,7 +614,8 @@ end
     capargs = (125e-6, 0.1, :Ar, 1.0)
     capkw = (λ0, τfwhm=10e-15, energy=1e-6, λlims=(200e-9, 3e-6), trange=200e-15,
              plasma=false)
-    for (name, kw) in (("mode-averaged", (;)), ("multimode", (; modes=2)))
+    for (name, kw) in (("mode-averaged", (;)), ("multimode", (; modes=2)),
+                       ("multimode, fixed quadrature", (; modes=2, modal_integral=:fixed)))
         @testset "$name" begin
             Eω, _, _, tn, _, _ = Interface.prop_capillary_args(
                 capargs...; capkw..., kw..., shotnoise=:modified,
