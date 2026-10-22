@@ -475,3 +475,13 @@ and the `Boundaries.clampdecay`/`addloss`/`addloss_k` `Float64` promotion is sti
   the noise path uses `to_time!`), and `TransFree2D` gains a `noise_field` keyword it did
   not have. Both are changes to the low-level constructor signatures, which only
   `Luna.setup` uses.
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+`freenoise(spec, TT, noise, grid, ωshape, tshape, scaling)` builds `(dnoise, Eωo_noise,
+Et_noise, Et_nl)` for TransFree and TransFree2D; `freetransform!` advances `dnoise` per
+right-hand side; the evanescent mask is the constructors' first line. The propagated field of
+the test cases barely feels the noise (1e-12), so test_device checks one right-hand side of a
+scaled-down field (noise effect 4e-7 in 2-D, ~1 in 3-D; JLArray equals host exactly; the 3-D
+Float32 right-hand side 3.5e-7 from the host), and `sync_noise!` re-masking the JLArray copy on
+a 4 µm grid.

@@ -439,3 +439,10 @@ tables above are the new run).
   retargeting keeps every existing low-level script, example and gate case working unchanged
   while still allowing `spec` to be passed to `norm_radial` directly.
 - `Pωo === Eωo` aliasing is left to `gpu/21` (above).
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+TransRadial on the device advances `dnoise` per right-hand side and takes it ω → t, k → r with
+the device inverse FFT and `Grid.radial_matmul!`, like the field. test_device: the radial noise
+testset checks a masked `dnoise` on JLArray and in Float32 (1e2-amplified draw: the effect is
+3e-4, the Float32 comparison 1.2e-6 against 1e-5).
