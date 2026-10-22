@@ -844,6 +844,11 @@ takes the `transform` returned by e.g.
     If the quantity being compared already includes the seed — as it does when comparing
     against a `:input` run — subtracting again double-counts.
 
+!!! note
+    The noise added is in physical units (`transform.noise` and the saved draw are the
+    host, Float64 objects), as is the output: `Luna.run` unscales the output of a
+    reduced-precision run (see [`Luna.UnitScaling`](@ref)).
+
 # Examples
 ```julia
 out = prop_capillary(a, L, gas, P; ..., shotnoise=:modified, save_noise=true)
