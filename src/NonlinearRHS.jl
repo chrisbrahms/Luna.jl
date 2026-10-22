@@ -20,6 +20,7 @@ import Luna: DeviceSpec, HostSpec, UnitScaling, UNIT_SCALING, GridVectors, HostM
 import Luna: alloc, todevice, gridvectors, assert_resident, all_resident, scalar,
              upload!, realtype, arraytype, isdevicespec, isunity
 import Luna.PhysData: wlfreq, c, crystal_internal_angle
+import Luna.LinearOps
 import Luna.LinearOps: βz, transverse_k2
 import Logging
 using EllipsisNotation
@@ -381,19 +382,154 @@ function _refuse_columnwise(Pt, r, scaling)
 end
 
 """
+    ModifiedNoise(Eω_noise, phase, grid)
+
+The noise field of the modified shot-noise model (Chen & Wise, arXiv:2410.20567) together
+with the propagator which advances it in `z`.
+
+`Eω_noise` is the one-photon-per-mode spectral draw from
+[`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field), made once before
+propagation and never re-randomised. `phase` is an
+[`AbstractUnitaryPhase`](@ref Luna.LinearOps.AbstractUnitaryPhase), created with
+[`LinearOps.unitary_phase`](@ref Luna.LinearOps.unitary_phase), which supplies the
+accumulated phase `Φ(ω, z) = ∫₀ᶻ imag(linop) dz'`.
+
+The noise is advanced by the **unitary** part of the linear operator only:
+
+- **dispersion — yes.** It is unitary, and it is the phase evolution of the medium's own
+  vacuum modes. Without it the model is not related to the traditional (`:input`) model by
+  the identity `A_s = A_s' + A_noise` on which it rests, and Kerr/FWM magnitudes are wrong by
+  up to ~6× per frequency (much more in conservative propagation).
+- **loss — no.** Fluctuation–dissipation: loss replenishes vacuum rather than removing it, so
+  the local noise level stays at one photon per mode. This is also what allows the model to
+  seed spontaneous generation in absorptive media.
+- **gain — no.** The source term already injects fresh vacuum at every `z`, which the
+  homogeneous propagator amplifies over the remaining length — that integral *is* the ASE.
+  Amplifying the noise as well double-counts it.
+
+Because the field is drawn once and only ever propagated deterministically, results remain
+step-size independent, which is what the "constant noise field" requirement of the paper
+actually protects.
+
+The draw is multiplied by `grid.ωwin` on construction, matching the windowing the traditional
+input shot noise receives from the propagation loop.
+
+In free space the propagator is likewise only the phase: at evanescent transverse wavenumbers
+(`k⊥ > k`), where the linear operator is real decay rather than a phase, the noise is
+neither advanced nor damped, while the field there decays. Whether the draw should exclude
+those components is an open question; nothing in this model removes them.
+"""
+struct ModifiedNoise{aT, pT, bT}
+    Eω0::aT # z = 0 spectral draw (windowed)
+    phase::pT # accumulated unitary phase of the linear operator
+    φ::bT # buffer for Φ(ω, z)
+    Eω::aT # buffer holding the propagated spectral noise
+    lastz::Base.RefValue{Float64}
+end
+
+function ModifiedNoise(Eω_noise, phase, grid)
+    Eω0 = Eω_noise .* grid.ωwin
+    ModifiedNoise(Eω0, phase, zeros(Float64, size(Eω0)), similar(Eω0), Ref(NaN))
+end
+
+"""
+    noise_at!(noise::ModifiedNoise, z)
+
+Fill and return the propagated spectral noise field at `z`. The result aliases an internal
+buffer, so copy it if it needs to outlive the next call.
+"""
+function noise_at!(n::ModifiedNoise, z)
+    if z != n.lastz[]
+        n.phase(n.φ, z)
+        @. n.Eω = n.Eω0 * cis(n.φ)
+        n.lastz[] = z
+    end
+    n.Eω
+end
+
+"""
+    noise_at(noise::ModifiedNoise, z)
+
+As [`noise_at!`](@ref) but returns a fresh array.
+"""
+noise_at(n::ModifiedNoise, z) = copy(noise_at!(n, z))
+
+"""
+    retarget_noise(noise, spec, scaling)
+
+The [`ModifiedNoise`](@ref) a transform's kernels advance on `spec`, in `scaling`'s units:
+the draw divided by `scaling.Eref` (the noise is a state-unit quantity, like the field) and
+converted to `spec`'s complex type and array type, with the phase tables converted alike
+(see `retarget_phase`). On the default path -- host arrays, `Float64`, unit scaling -- it is
+`noise` itself, so that path is unchanged. `nothing` stays `nothing`.
+
+The transform keeps the caller's object too, in physical units: that is what is saved to the
+output, read by [`Processing.withnoise`](@ref Luna.Processing.withnoise) and, on a resumed
+cached run, overwritten with the recorded draw (see [`sync_noise!`](@ref)).
+
+In `Float32` the accumulated phase is held to `Float32` precision, about `6e-8·|Φ|` rad,
+which for the largest phases a run accumulates (thousands of rad) is ~1e-4 rad; and the
+one-photon noise is itself below the field's `Float32` resolution near the pulse peak.
+"""
+retarget_noise(::Nothing, spec, scaling) = nothing
+
+function retarget_noise(n::ModifiedNoise, spec, scaling)
+    (arraytype(spec) === Array && realtype(spec) === Float64 && isunity(scaling)) && return n
+    T = realtype(spec)
+    Eω0 = todevice(spec, Complex{T}.(n.Eω0 ./ scaling.Eref))
+    ModifiedNoise(Eω0, retarget_phase(n.phase, spec), alloc(spec, T, size(Eω0)),
+                  similar(Eω0), Ref(NaN))
+end
+
+"The phase of a `ModifiedNoise` on `spec`'s array type and real type."
+retarget_phase(p::LinearOps.ConstUnitaryPhase, spec) =
+    LinearOps.ConstUnitaryPhase(todevice(spec, realtype(spec).(p.dφ)))
+
+retarget_phase(p::LinearOps.TabulatedUnitaryPhase, spec) =
+    LinearOps.TabulatedUnitaryPhase(p.z, todevice(spec, realtype(spec).(p.Φ)),
+                                    todevice(spec, realtype(spec).(p.dΦ)), p.atol, p.err)
+
+"The arrays a `ModifiedNoise` holds, for `assert_resident`; none for `nothing`."
+noise_arrays(::Nothing) = ()
+noise_arrays(n::ModifiedNoise) = (n.Eω0, n.φ, n.Eω, phase_arrays(n.phase)...)
+phase_arrays(p::LinearOps.ConstUnitaryPhase) = (p.dφ,)
+phase_arrays(p::LinearOps.TabulatedUnitaryPhase) = (p.Φ, p.dΦ)
+
+"""
+    sync_noise!(transform)
+
+After the caller's `transform.noise` has been changed in place (a resumed cached run adopts
+the draw recorded in the output), bring the transform's kernel copy `dnoise` up to date.
+Nothing to do when the two are the same object, or for a transform without noise.
+"""
+function sync_noise!(t)
+    hasfield(typeof(t), :noise) || return t
+    n = t.noise
+    isnothing(n) && return t
+    n.lastz[] = NaN
+    hasfield(typeof(t), :dnoise) || return t
+    d = t.dnoise
+    d === n && return t
+    # host -> device copy of the draw in the transform's units (copyto! handles the transfer)
+    copyto!(d.Eω0, eltype(d.Eω0).(n.Eω0 ./ t.scaling.Eref))
+    d.lastz[] = NaN
+    t
+end
+
+"""
     TransModal
 
 Transform E(ω) -> Pₙₗ(ω) for multimode propagation via spatial integration.
 
 # Fields
-- `Emω_noise`: modal noise field `(nω, nmodes)` for the modified shot-noise model, or
-  `nothing`. When present, the noise is projected to real space at each integration point
-  and combined with the field in a separate buffer (`Er_nl`) for nonlinear evaluation.
-  The propagating field (`Er`) is never modified.
+- `noise`: [`ModifiedNoise`](@ref) for the modified shot-noise model, or `nothing`. It is
+  advanced to the current `z` once per call, in `reset!`, and then projected to real space at
+  each integration point and combined with the field in a separate buffer (`Er_nl`) for
+  nonlinear evaluation. The propagating field (`Er`) is never modified.
 - `Er_noise`: preallocated buffer for the real-space time-domain noise, same shape as `Er`.
 - `Er_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`.
 """
-mutable struct TransModal{tsT, lT, TT, FTT, IFTT, rT, gT, dT, ddT, nT, eT, enT, enlT}
+mutable struct TransModal{tsT, lT, TT, FTT, IFTT, rT, gT, dT, ddT, nT, nsT, enT, enlT}
     ts::tsT
     full::Bool
     dimlimits::lT
@@ -418,7 +554,7 @@ mutable struct TransModal{tsT, lT, TT, FTT, IFTT, rT, gT, dT, ddT, nT, eT, enT, 
     atol::Float64
     mfcn::Int
     err::Array{ComplexF64,2}
-    Emω_noise::eT # modal noise field for modified shot-noise model, or nothing
+    noise::nsT # ModifiedNoise for the modified shot-noise model, or nothing
     Er_noise::enT # buffer for real-space time-domain noise, or nothing
     Er_nl::enlT # buffer for field+noise passed to Et_to_Pt!, or nothing
 end
@@ -436,7 +572,7 @@ function show(io::IO, t::TransModal)
 end
 
 """
-    TransModal(grid, ts, FT, resp, densityfun, norm!; rtol=1e-3, atol=0.0, mfcn=300, full=false, noise_field=nothing)
+    TransModal(grid, ts, FT, resp, densityfun, norm!; rtol=1e-3, atol=0.0, mfcn=300, full=false, noise=nothing)
 
 Construct a `TransModal`, transform E(ω) -> Pₙₗ(ω) for modal fields.
 
@@ -451,12 +587,11 @@ Construct a `TransModal`, transform E(ω) -> Pₙₗ(ω) for modal fields.
 - `atol::Float=0.0` : absolute tolerance on the `HCubature` integration
 - `mfcn::Int=512` : maximum number of function evaluations for one modal integration
 - `full::Bool=false` : if `true`, use full 2-D mode integral, if `false`, only do radial integral
-- `noise_field=nothing` : optional `(nω, nmodes)` noise field for the modified shot-noise
-  model. Each mode column should contain independent noise with the one-photon-per-mode
-  spectral density. Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `noise=nothing` : optional [`ModifiedNoise`](@ref) for the modified shot-noise model, whose
+  `(nω, nmodes)` draw holds independent one-photon-per-mode noise in each mode column.
 """
 function TransModal(tT, grid, ts::Modes.ToSpace, FT, resp, densityfun, norm!;
-                    rtol=1e-3, atol=0.0, mfcn=512, full=false, noise_field=nothing)
+                    rtol=1e-3, atol=0.0, mfcn=512, full=false, noise=nothing)
     Emω = Array{ComplexF64,2}(undef, length(grid.ω), ts.nmodes)
     Erω = Array{ComplexF64,2}(undef, length(grid.ω), ts.npol)
     Erωo = Array{ComplexF64,2}(undef, length(grid.ωo), ts.npol)
@@ -466,21 +601,19 @@ function TransModal(tT, grid, ts::Modes.ToSpace, FT, resp, densityfun, norm!;
     Prωo = Array{ComplexF64,2}(undef, length(grid.ωo), ts.npol)
     Prmω = Array{ComplexF64,2}(undef, length(grid.ω), ts.nmodes)
     IFT = Utils.plan_ift(FT)
-    # For the modified shot-noise model, store the modal noise field and allocate a buffer
-    # for the real-space time-domain noise. The noise is projected to space at each
-    # integration point in Erω_to_Prω!, so we store it in the modal domain.
-    if !isnothing(noise_field)
-        Emω_noise = copy(noise_field)
+    # For the modified shot-noise model, allocate a buffer for the modal noise field at the
+    # current z and one for the real-space time-domain noise. The noise is projected to space
+    # at each integration point in Erω_to_Prω!, so we hold it in the modal domain.
+    if !isnothing(noise)
         Er_noise = Array{tT,2}(undef, length(grid.to), ts.npol)
         Er_nl = Array{tT,2}(undef, length(grid.to), ts.npol)
     else
-        Emω_noise = nothing
         Er_noise = nothing
         Er_nl = nothing
     end
     TransModal(ts, full, Modes.dimlimits(ts.ms[1]), Emω, Erω, Erωo, Er, Pr, Prω, Prωo, Prmω,
                FT, IFT, resp, grid, densityfun, densityfun(0.0), norm!, 0, 0.0, rtol, atol, mfcn,
-               similar(Prmω), Emω_noise, Er_noise, Er_nl)
+               similar(Prmω), noise, Er_noise, Er_nl)
 end
 
 function TransModal(grid::Grid.RealGrid, args...; kwargs...)
@@ -497,6 +630,9 @@ function reset!(t::TransModal, Emω::Array{ComplexF64,2}, z::Float64)
     t.z = z
     t.dimlimits = Modes.dimlimits(t.ts.ms[1], z=z)
     t.density = t.densityfun(z)
+    # Advance the modified shot-noise field to this z. Done once per RHS evaluation rather
+    # than at every cubature point, which is why this path costs essentially nothing.
+    isnothing(t.noise) || noise_at!(t.noise, z)
 end
 
 function pointcalc!(fval, xs, t::TransModal)
@@ -541,11 +677,12 @@ end
 function Erω_to_Prω!(t, x)
     Modes.to_space!(t.Erω, t.Emω, x, t.ts, z=t.z)
     to_time!(t.Er, t.Erω, t.Erωo, t.IFT)
-    # Modified shot-noise model: project noise modes to real space at this spatial point,
-    # convert to oversampled time domain, and combine with field in a separate buffer (Er_nl)
-    # so the propagating field (Er) is never contaminated.
-    if !isnothing(t.Emω_noise)
-        Modes.to_space!(t.Erω, t.Emω_noise, x, t.ts, z=t.z)
+    # Modified shot-noise model: project the noise modes (already advanced to t.z by reset!)
+    # to real space at this spatial point, convert to the oversampled time domain, and
+    # combine with the field in a separate buffer (Er_nl) so the propagating field (Er) is
+    # never contaminated.
+    if !isnothing(t.noise)
+        Modes.to_space!(t.Erω, t.noise.Eω, x, t.ts, z=t.z)
         to_time!(t.Er_noise, t.Erω, t.Erωo, t.IFT)
         @. t.Er_nl = t.Er + t.Er_noise
         Et_to_Pt!(t.Pr, t.Er_nl, t.resp, t.density)
@@ -598,13 +735,16 @@ end
 Transform E(ω) -> Pₙₗ(ω) for mode-averaged single-mode propagation.
 
 # Fields
-- `Et_noise`: precomputed time-domain noise on the oversampled grid for the modified
-  shot-noise model (Chen & Wise, arXiv:2410.20567), or `nothing` for the traditional model.
-- `Et_nl`: preallocated buffer for the combined field + noise. When `Et_noise` is present,
+- `noise`: [`ModifiedNoise`](@ref) for the modified shot-noise model (Chen & Wise,
+  arXiv:2410.20567), or `nothing` for the traditional model.
+- `Eωo_noise`/`Et_noise`: buffers holding the noise field at the current `z`, on the
+  oversampled frequency and time grids.
+- `Et_nl`: preallocated buffer for the combined field + noise. When `noise` is present,
   `Et_nl = Eto + Et_noise` is computed at each step and passed to `Et_to_Pt!`. The
-  propagating field (`Eto`) is never modified; dispersion acts only on the physical field.
+  propagating field (`Eto`) is never modified: the noise feels only the unitary part of the
+  linear operator, and never the loss.
 """
-struct TransModeAvg{TT, ωT, FTT, IFTT, rT, gT, gvT, dT, nT, aT, eT, nlT}
+struct TransModeAvg{TT, ωT, FTT, IFTT, rT, gT, gvT, dT, nT, aT, nsT, dnT, eoT, eT, nlT}
     Pto::TT
     Eto::TT
     Eωo::ωT
@@ -617,7 +757,10 @@ struct TransModeAvg{TT, ωT, FTT, IFTT, rT, gT, gvT, dT, nT, aT, eT, nlT}
     densityfun::dT
     norm!::nT
     aeff::aT # function which returns effective area
-    Et_noise::eT # time-domain noise for modified shot-noise model, or nothing
+    noise::nsT # ModifiedNoise for the modified shot-noise model (host, physical units), or nothing
+    dnoise::dnT # the copy the kernels advance: `noise` itself on the host in Float64, else on `spec`
+    Eωo_noise::eoT # buffer for the oversampled spectral noise at the current z, or nothing
+    Et_noise::eT # buffer for the time-domain noise at the current z, or nothing
     Et_nl::nlT # buffer for field+noise passed to Et_to_Pt!, or nothing
     scaling::UnitScaling # units the state and the polarisation are expressed in
 end
@@ -640,19 +783,22 @@ inverse plans for the oversampled time grid
 (see [`Utils.plan_ft`](@ref Luna.Utils.plan_ft)).
 
 # Keyword arguments
-- `noise_field=nothing`: optional frequency-domain noise field (on the normal grid) for the
-  modified shot-noise model. When provided, it is converted to the oversampled time grid and
-  stored as `Et_noise` for injection into the nonlinear operator at every propagation step.
-  Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `noise=nothing`: optional [`ModifiedNoise`](@ref) for the modified shot-noise model. When
+  provided, the noise field is advanced to the current `z`, converted to the oversampled time
+  grid, and injected into the nonlinear operator at every propagation step. The transform
+  keeps the caller's object as `noise` (host, physical units: what is saved and what
+  [`Processing.withnoise`](@ref Luna.Processing.withnoise) needs) and advances
+  `dnoise = retarget_noise(noise, spec, scaling)`, which is the same object on the default host
+  `Float64` path and otherwise a copy on `spec` in `scaling`'s units.
 - `spec=HostSpec()`: the [`Luna.DeviceSpec`](@ref) the buffers, mirrors and responses live
   on.
 - `scaling=UNIT_SCALING`: the [`Luna.UnitScaling`](@ref) the state and the nonlinear
   polarisation are expressed in. The responses are converted to it with
-  [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale) and the noise field is divided by
+  [`Nonlinear.rescale`](@ref Luna.Nonlinear.rescale) and the noise draw is divided by
   `Eref`.
 """
 function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
-                      noise_field=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
+                      noise=nothing, spec=HostSpec(), scaling=UNIT_SCALING)
     nωo = length(grid.ωo)
     nto = length(grid.to)
     CT = Complex{realtype(spec)}
@@ -661,17 +807,13 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
     Pto = similar(Eto)
     Pωo = similar(Eωo)
     gv = gridvectors(grid, spec)
-    # Precompute time-domain noise on the oversampled grid if noise_field is provided.
-    # Uses the same ω→t conversion path as to_time!: copy_scale! into oversampled spectral
-    # array, then inverse FFT. The result is constant throughout propagation.
-    if !isnothing(noise_field)
+    dnoise = retarget_noise(noise, spec, scaling)
+    if !isnothing(noise)
         Eωo_noise = alloc(spec, CT, (nωo,))
         Et_noise = alloc(spec, TT, (nto,))
-        #= The noise is a state-unit quantity, so it carries the same 1/Eref the state
-           does. Scaled here, once, rather than in the per-step kernel. =#
-        to_time!(Et_noise, todevice(spec, noise_field ./ scaling.Eref), Eωo_noise, IFT)
         Et_nl = alloc(spec, TT, (nto,))
     else
+        Eωo_noise = nothing
         Et_noise = nothing
         Et_nl = nothing
     end
@@ -684,9 +826,9 @@ function TransModeAvg(TT, grid, FT, IFT, resp, densityfun, norm!, aeff;
        mistake, so it has to cover everything. =#
     resparrays = reduce((a, r) -> (a..., Nonlinear.resident_arrays(r)...), resp; init=())
     assert_resident(spec, Eωo, Eto, Pto, Pωo, gv.ω, gv.ωwin, gv.twin, gv.towin, gv.sidx,
-                    Et_noise, Et_nl, resparrays...)
+                    Eωo_noise, Et_noise, Et_nl, noise_arrays(dnoise)..., resparrays...)
     TransModeAvg(Pto, Eto, Eωo, Pωo, FT, IFT, resp, grid, gv, densityfun, norm!, aeff,
-                 Et_noise, Et_nl, scaling)
+                 noise, dnoise, Eωo_noise, Et_noise, Et_nl, scaling)
 end
 
 function TransModeAvg(grid::Grid.RealGrid, FT, IFT, resp, densityfun, norm!, aeff;
@@ -707,10 +849,12 @@ function (t::TransModeAvg)(nl, Eω, z)
     to_time!(t.Eto, Eω, t.Eωo, t.IFT)
     sc = scalar(t.Eto, nlscale*sqrt(t.aeff(z)))
     @. t.Eto /= sc
-    # Modified shot-noise model: compute field+noise in a separate buffer (Et_nl) so that
-    # the propagating field (Eto) is never contaminated. The noise is scaled by the same
-    # normalisation factor (nlscale × √Aeff) so it enters in physical units.
-    if !isnothing(t.Et_noise)
+    # Modified shot-noise model: advance the noise to this z, then compute field+noise in a
+    # separate buffer (Et_nl) so that the propagating field (Eto) is never contaminated. The
+    # noise is scaled by the same normalisation factor (nlscale × √Aeff) so it enters in
+    # physical units.
+    if !isnothing(t.noise)
+        to_time!(t.Et_noise, noise_at!(t.dnoise, z), t.Eωo_noise, t.IFT)
         @. t.Et_nl = t.Eto + t.Et_noise / sc
         Et_to_Pt!(t.Pto, t.Et_nl, t.resp, t.densityfun(z); scaling=t.scaling)
     else
@@ -921,12 +1065,13 @@ end
 Transform E(ω) -> Pₙₗ(ω) for radially symmetric free-space propagation.
 
 # Fields
-- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, nr)`
-  for the modified shot-noise model, or `nothing`.
+- `noise`: [`ModifiedNoise`](@ref) for the modified shot-noise model, or `nothing`.
+- `Eωo_noise`/`Et_noise`: buffers holding the noise field at the current `z`, on the
+  oversampled frequency/k-space and time/real-space grids `(nωo, np, nr)`/`(nto, np, nr)`.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
 """
-struct TransRadial{TT, RGT, FTT, IFTT, nT, rT, gT, dT, iT, eT, nlT}
+struct TransRadial{TT, RGT, FTT, IFTT, nT, rT, gT, dT, iT, nsT, eoT, eT, nlT}
     rgrid::RGT # transverse grid (Grid.RadialGrid: space to k-space)
     FT::FTT # Fourier transform (time to frequency)
     IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
@@ -943,7 +1088,9 @@ struct TransRadial{TT, RGT, FTT, IFTT, nT, rT, gT, dT, iT, eT, nlT}
     idcs::iT # CartesianIndices for Et_to_Pt! to iterate over
     Tfwd::Matrix{TT} # forward Hankel transform matrix
     Tbwd::Matrix{TT} # backward Hankel transform matrix
-    Et_noise::eT # time-domain noise for modified shot-noise model, or nothing
+    noise::nsT # ModifiedNoise for the modified shot-noise model, or nothing
+    Eωo_noise::eoT # buffer for the oversampled spectral noise at the current z, or nothing
+    Et_noise::eT # buffer for the time-domain noise at the current z, or nothing
     Et_nl::nlT # buffer for field+noise passed to Et_to_Pt!, or nothing
 end
 
@@ -958,19 +1105,22 @@ function show(io::IO, t::TransRadial)
 end
 
 """
-    TransRadial(TT, grid, rgrid, FT, responses, densityfun, normfun; noise_field=nothing)
+    TransRadial(TT, grid, rgrid, FT, responses, densityfun, normfun; noise=nothing)
 
 Construct a `TransRadial` to calculate the reciprocal-domain nonlinear polarisation.
 `rgrid` is a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid).
 
 # Keyword arguments
-- `noise_field=nothing`: optional `(nω, nk)` frequency/k-space noise field for the modified
-  shot-noise model. When provided, it is converted to the real-space time domain `(nto, nr)`
-  via inverse FFT and inverse Hankel transform, and stored as `Et_noise`.
-  Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `noise=nothing`: optional [`ModifiedNoise`](@ref) for the modified shot-noise model, whose
+  draw is an `(nω, np, nk)` frequency/k-space noise field, the same size as the `Eω` returned
+  by [`Luna.setup`](@ref) (`np` polarisation components). At each step it is advanced to the
+  current `z` and converted to the real-space time domain `(nto, np, nr)` via inverse FFT and
+  the backward Hankel matrix, like the field. [`Fields.generate_noise_field`](@ref
+  Luna.Fields.generate_noise_field) makes only `(nω[, nmodes])` draws, so a free-space draw
+  is built by the caller.
 """
 function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun, normfun,
-                     pol=false; noise_field=nothing)
+                     pol=false; noise=nothing)
     np = pol ? 2 : 1
     N = rgrid.N
     IFT = Utils.plan_ift(FT)
@@ -985,21 +1135,19 @@ function TransRadial(TT, grid, rgrid::Grid.RadialGrid, FT, responses, densityfun
        needs both operands in the same element type (and on devices it is required). =#
     Tfwd = convert(Matrix{TT}, rgrid.Tfwd)
     Tbwd = convert(Matrix{TT}, rgrid.Tbwd)
-    #= Precompute time-domain noise in real space: ω→t via to_time!, then k→r. This is
-       Grid.to_rspace! done with our own Tbwd, so that the noise passes through exactly
-       the same matrix as the field does on every step. =#
-    if !isnothing(noise_field)
+    # buffers for the noise at the current z: (ω, k) -> (t, k) -> (t, r) each step, through
+    # the same Tbwd as the field
+    if !isnothing(noise)
         Eωo_noise = zeros(ComplexF64, (length(grid.ωo), np, N))
         Et_noise = zeros(TT, (length(grid.to), np, N))
-        to_time!(Et_noise, noise_field, Eωo_noise, IFT)
-        Grid.radial_matmul!(Et_noise, Et_noise, Tbwd)
         Et_nl = zeros(TT, (length(grid.to), np, N))
     else
+        Eωo_noise = nothing
         Et_noise = nothing
         Et_nl = nothing
     end
     TransRadial(rgrid, FT, IFT, normfun, responses, grid, densityfun, Pto_r, Pto_k, Eto_r, Eto_k, Eωo, Pωo, idcs,
-                Tfwd, Tbwd, Et_noise, Et_nl)
+                Tfwd, Tbwd, noise, Eωo_noise, Et_noise, Et_nl)
 end
 
 # accept a Hankel.QDHT as before, converting it (with a deprecation warning)
@@ -1028,11 +1176,14 @@ function (t::TransRadial)(nl, Eω, z)
     for ip in axes(t.Eto_k, 2)
         mul!(view(t.Eto_r, :, ip, :), view(t.Eto_k, :, ip, :), t.Tbwd)
     end
-    # Modified shot-noise: compute field+noise in separate buffer (Et_nl) so the
-    # propagating field is never contaminated.
-    # Note that if noise_field is nothing, we pass t.Eto_r straight without copying
-    # to the buffer t.Et_nl first
-    if !isnothing(t.Et_noise)
+    # Modified shot-noise: advance the noise to this z, take it ω -> t (into Et_nl, used
+    # as scratch for the k-space noise) and k -> r (into Et_noise), then compute
+    # field+noise in Et_nl so the propagating field (Eto_r) is never contaminated.
+    if !isnothing(t.noise)
+        to_time!(t.Et_nl, noise_at!(t.noise, z), t.Eωo_noise, t.IFT)
+        for ip in axes(t.Et_nl, 2)
+            mul!(view(t.Et_noise, :, ip, :), view(t.Et_nl, :, ip, :), t.Tbwd)
+        end
         @. t.Et_nl = t.Eto_r + t.Et_noise
         Et_to_Pt!(t.Pto_r, t.Et_nl, t.resp, t.densityfun(z), t.idcs)
     else
@@ -1269,12 +1420,14 @@ end
 Transform E(ω) -> Pₙₗ(ω) for 3D free-space propagation.
 
 # Fields
-- `Et_noise`: precomputed time-domain noise on the oversampled real-space grid `(nto, ny, nx)`
-  for the modified shot-noise model, or `nothing`.
+- `noise`: [`ModifiedNoise`](@ref) for the modified shot-noise model, or `nothing`.
+- `Eωo_noise`/`Et_noise`: buffers holding the noise field at the current `z`, on the
+  oversampled frequency/k-space and time/real-space grids `(nωo, np, nx, ny)`/
+  `(nto, np, nx, ny)`, the shapes of the field's buffers.
 - `Et_nl`: preallocated buffer for the combined field + noise, passed to `Et_to_Pt!`. The
   propagating field (`Eto`) is never modified.
 """
-mutable struct TransFree{TT, FTT, IFTT, nT, rT, gT, xygT, dT, iT, eT, nlT}
+mutable struct TransFree{TT, FTT, IFTT, nT, rT, gT, xygT, dT, iT, nsT, eoT, eT, nlT}
     FT::FTT # 3D Fourier transform (space to k-space and time to frequency)
     IFT::IFTT # explicit inverse of FT (see Utils.plan_ift)
     normfun::nT # Function which returns normalisation factor
@@ -1288,7 +1441,9 @@ mutable struct TransFree{TT, FTT, IFTT, nT, rT, gT, xygT, dT, iT, eT, nlT}
     Pωo::Array{ComplexF64, 4} # buffer for oversampled frequency-domain NL polarisation
     scale::Float64 # scale factor to be applied during oversampling
     idcs::iT # iterating over these slices Eto/Pto into Vectors, one at each position
-    Et_noise::eT # time-domain noise for modified shot-noise model, or nothing
+    noise::nsT # ModifiedNoise for the modified shot-noise model, or nothing
+    Eωo_noise::eoT # buffer for the oversampled spectral noise at the current z, or nothing
+    Et_noise::eT # buffer for the time-domain noise at the current z, or nothing
     Et_nl::nlT # buffer for field+noise passed to Et_to_Pt!, or nothing
 end
 
@@ -1303,19 +1458,21 @@ function show(io::IO, t::TransFree)
 end
 
 """
-    TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false; noise_field=nothing)
+    TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false; noise=nothing)
 
 Construct a `TransFree` to calculate the reciprocal-domain nonlinear polarisation for 3D
 free-space propagation.
 
 # Keyword arguments
-- `noise_field=nothing`: optional `(nω, ny, nx)` frequency/k-space noise field for the
-  modified shot-noise model. When provided, it is converted to the real-space oversampled
-  time domain `(nto, ny, nx)` via `copy_scale!` and 3D inverse FFT, and stored as `Et_noise`.
-  Generate with [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field).
+- `noise=nothing`: optional [`ModifiedNoise`](@ref) for the modified shot-noise model, whose
+  draw is an `(nω, np, nx, ny)` frequency/k-space noise field, the same size as the `Eω`
+  returned by [`Luna.setup`](@ref). At each step it is advanced to the current `z` and
+  converted to the real-space oversampled time domain `(nto, np, nx, ny)` like the field.
+  [`Fields.generate_noise_field`](@ref Luna.Fields.generate_noise_field) makes only
+  `(nω[, nmodes])` draws, so a free-space draw is built by the caller.
 """
 function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, pol=false;
-                   noise_field=nothing)
+                   noise=nothing)
     Ny = length(xygrid.y)
     Nx = length(xygrid.x)
     Eωo = zeros(ComplexF64, (length(grid.ωo), pol ? 2 : 1, Nx, Ny))
@@ -1323,21 +1480,18 @@ function TransFree(TT, scale, grid, xygrid, FT, responses, densityfun, normfun, 
     Pto = similar(Eto)
     Pωo = similar(Eωo)
     idcs = CartesianIndices((Nx, Ny))
-    # Precompute time-domain noise in real space:
-    # copy_scale! into oversampled spectral grid, then 3D IFFT: (ω,kx,ky) → (t,x,y)
-    if !isnothing(noise_field)
-        Eωo_noise = zeros(ComplexF64, (length(grid.ωo), Nx, Ny))
-        N = length(grid.ω)
-        copy_scale!(Eωo_noise, noise_field, N, scale)
-        Et_noise = zeros(TT, (length(grid.to), Nx, Ny))
-        ldiv!(Et_noise, FT, Eωo_noise)
-        Et_nl = zeros(TT, (length(grid.to), Nx, Ny))
+    # buffers for the noise at the current z, shaped like the field's (ω/t, pol, x, y)
+    if !isnothing(noise)
+        Eωo_noise = similar(Eωo)
+        Et_noise = similar(Eto)
+        Et_nl = similar(Eto)
     else
+        Eωo_noise = nothing
         Et_noise = nothing
         Et_nl = nothing
     end
     TransFree(FT, Utils.plan_ift(FT), normfun, responses, grid, xygrid, densityfun,
-              Pto, Eto, Eωo, Pωo, scale, idcs, Et_noise, Et_nl)
+              Pto, Eto, Eωo, Pωo, scale, idcs, noise, Eωo_noise, Et_noise, Et_nl)
 end
 
 function TransFree(grid::Grid.RealGrid, args...; kwargs...)
@@ -1362,9 +1516,11 @@ and place the result in `nl`.
 """
 function (t::TransFree)(nl, Eωk, z)
     to_time!(t.Eto, Eωk, t.Eωo, t.IFT) # transform (ω, kx, ky) -> (t, x, y)
-    # Modified shot-noise: compute field+noise in separate buffer (Et_nl) so the
-    # propagating field (Eto) is never contaminated.
-    if !isnothing(t.Et_noise)
+    # Modified shot-noise: advance the noise to this z ((ω,kx,ky) → (t,x,y)) and compute
+    # field+noise in a separate buffer (Et_nl) so the propagating field (Eto) is never
+    # contaminated.
+    if !isnothing(t.noise)
+        to_time!(t.Et_noise, noise_at!(t.noise, z), t.Eωo_noise, t.IFT)
         @. t.Et_nl = t.Eto + t.Et_noise
         Et_to_Pt!(t.Pto, t.Et_nl, t.resp, t.densityfun(z), t.idcs)
     else
