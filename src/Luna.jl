@@ -165,7 +165,9 @@ frequency-domain field from `inputs`, and return `(Eω, transform, FT)`.
     [`NonlinearRHS.norm_mode_average`](@ref Luna.NonlinearRHS.norm_mode_average) for the
     chosen device and precision if not given; a normalisation supplied here must have
     been built for the same ones.
-- `noise_field=nothing`: frequency-domain noise field for the modified shot-noise model.
+- `noise=nothing`: the [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise) of
+    the modified shot-noise model, built on the host in physical units; the transform makes
+    its own copy for the chosen device and precision.
 - `constβ=false`: declare that `βfun!` does not depend on `z`, which lets the
     normalisation fold it in once instead of calling it on every right-hand side. True
     whenever the linear operator is constant.
@@ -211,7 +213,7 @@ runscaling(transform::NonlinearRHS.TransFree2D) = transform.scaling
 runscaling(transform::NonlinearRHS.TransModalFixed) = transform.scaling
 
 function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
-                            norm! = nothing, noise_field=nothing, constβ=false,
+                            norm! = nothing, noise=nothing, constβ=false,
                             device=device_request(), precision=nothing)
     #= The *unresolved* request is the default and the resolution happens here, so that
        `log_device` can tell `:auto` which found no GPU from a plain `:cpu` -- which is
@@ -242,7 +244,7 @@ function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
         NonlinearRHS.check_norm(norm!, spec, scaling)
     end
     transform = NonlinearRHS.TransModeAvg(grid, FTo, IFTo, responses, densityfun, norm!,
-                                          aeff; noise_field, spec, scaling)
+                                          aeff; noise, spec, scaling)
     Eω = todevice(spec, isunity(scaling) ? Eωh : Eωh ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
@@ -299,7 +301,10 @@ collection of [`Modes.AbstractMode`](@ref Luna.Modes.AbstractMode)s and `compone
 - `nr=$(NonlinearRHS.FIXED_NR)`, `nθ=$(NonlinearRHS.FIXED_Nθ)`, `kronrod=false`,
     `zconstant=nothing`: the quadrature rule (`:fixed` only); see
     [`NonlinearRHS.TransModalFixed`](@ref Luna.NonlinearRHS.TransModalFixed).
-- `noise_field=nothing`: `(nω, nmodes)` noise field for the modified shot-noise model.
+- `noise=nothing`: [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise)
+  for the modified shot-noise model, with an `(nω, nmodes)` draw. It stays on the host in
+  physical units; the fixed-quadrature transform advances its own copy on the run's device
+  and in its units.
 - `device`, `precision`: where to run and in what precision, as for the mode-averaged
     `setup` above. A device or a `Float32` run needs `modal_integral=:fixed`.
 
@@ -327,7 +332,7 @@ function setup_modal(grid, densityfun, responses, inputs, modes, components;
                      rtol=1e-3, atol=0.0, mfcn=512,
                      maxbatch=NonlinearRHS.MODAL_MAXBATCH,
                      nr=NonlinearRHS.FIXED_NR, nθ=NonlinearRHS.FIXED_Nθ, kronrod=false,
-                     zconstant=nothing, noise_field=nothing,
+                     zconstant=nothing, noise=nothing,
                      device=device_request(), precision=nothing)
     modal_integral in (:adaptive, :fixed) || error(
         "modal_integral must be :adaptive or :fixed, got $(repr(modal_integral))")
@@ -369,10 +374,10 @@ function setup_modal(grid, densityfun, responses, inputs, modes, components;
     TT = timetype(grid, T)
     transform = if modal_integral === :adaptive
         NonlinearRHS.TransModal(TT, grid, ts, responses, densityfun, norm!;
-                                rtol, atol, mfcn, full, noise_field, maxbatch)
+                                rtol, atol, mfcn, full, noise, maxbatch)
     else
         NonlinearRHS.TransModalFixed(TT, grid, ts, responses, densityfun, norm!;
-                                     full, nr, nθ, kronrod, noise_field, zconstant,
+                                     full, nr, nθ, kronrod, noise, zconstant,
                                      spec, scaling)
     end
     # the transform of the state itself, which `Luna.run` gives to the absorbers
@@ -427,8 +432,10 @@ Set up a radially symmetric free-space propagation: plan the transforms, build t
 `(ω, polarisation, k⊥)` field from `inputs`, and return `(Eωk, transform, FT)`.
 
 # Keyword arguments
-- `noise_field=nothing`: `(nω, npol, nk)` frequency/k-space noise field for the modified
-  shot-noise model.
+- `noise=nothing`: [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise)
+  for the modified shot-noise model, with an `(nω, npol, nk)` frequency/k-space draw. It
+  stays on the host in physical units; the transform advances its own copy on the run's
+  device and in its units.
 - `device`, `precision`: where and in what precision to run; see the mode-averaged
   [`setup`](@ref) for the meaning. `normfun` is built by the caller, before the device is
   known, so it is retargeted here with
@@ -451,7 +458,7 @@ end
 
 function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
                       densityfun, normfun, responses, inputs;
-                      noise_field=nothing, device=device_request(),
+                      noise=nothing, device=device_request(),
                       precision=nothing) where {TH}
     spec = withprecision(resolve_device(device), precision)
     T = realtype(spec)
@@ -485,7 +492,7 @@ function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
     Utils.plan_ift(FTo)
     transform = NonlinearRHS.TransRadial(
         grid, rg, FTo, responses, densityfun, normfun, np > 1;
-        noise_field, spec, scaling)
+        noise, spec, scaling)
     Eωk = todevice(spec, isunity(scaling) ? Eωk : Eωk ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
@@ -504,8 +511,10 @@ The joint time-and-space transform is one multi-axis plan — region `(1, 3, 4)`
 `(1, 3)` in 2-D, the polarisation axis skipped — on every backend.
 
 # Keyword arguments
-- `noise_field=nothing`: `(nω, npol, nk...)` frequency/k-space noise field for the
-  modified shot-noise model.
+- `noise=nothing`: [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise)
+  for the modified shot-noise model, with an `(nω, npol, nk...)` frequency/k-space draw. It
+  stays on the host in physical units; the transform advances its own copy on the run's
+  device and in its units.
 - `device`, `precision`: where and in what precision to run; see the mode-averaged
   [`setup`](@ref) for the meaning. `normfun` is built by the caller, before the device is
   known, so it is retargeted here with
@@ -552,7 +561,7 @@ freetransform(grid, spacegrid::Grid.Free2DGrid, args...; kwargs...) =
     NonlinearRHS.TransFree2D(grid, spacegrid, args...; kwargs...)
 
 function setup_free(::Type{TH}, grid, spacegrid, densityfun, normfun, responses, inputs;
-                    noise_field=nothing, device=device_request(),
+                    noise=nothing, device=device_request(),
                     precision=nothing) where {TH}
     spec = withprecision(resolve_device(device), precision)
     T = realtype(spec)
@@ -589,7 +598,7 @@ function setup_free(::Type{TH}, grid, spacegrid, densityfun, normfun, responses,
        an oversampled block of exactly the shape and type the transform's own `Eto` has,
        and it has served its purpose once `FTo` is planned. =#
     transform = freetransform(grid, spacegrid, FTo, responses, densityfun, normfun, np > 1;
-                              noise_field, spec, scaling, Eto=xo)
+                              noise, spec, scaling, Eto=xo)
     Eωk = todevice(spec, isunity(scaling) ? Eωk : Eωk ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
