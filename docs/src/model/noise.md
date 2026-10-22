@@ -119,7 +119,10 @@ is a real decay rather than a phase, so the unitary propagator would carry the n
 full amplitude for the whole propagation while the field decays. Those components are not
 radiating modes and have no one-photon vacuum level to restore, so the free-space transforms
 zero the draw there on construction (`NonlinearRHS.mask_evanescent!`), with ``k(\omega)`` taken
-at ``z = 0``.
+at ``z = 0``. With a refractive index that changes along ``z`` (a pressure gradient) the mask
+is that of the entrance: a component which only becomes propagating further on, where the
+index is higher, carries no noise. For a gas this concerns a thin shell of transverse
+wavenumbers, ``k_\perp`` between ``\omega/c`` and ``n(z)\omega/c``.
 
 ## Usage
 
