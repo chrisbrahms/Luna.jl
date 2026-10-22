@@ -1239,12 +1239,14 @@ function radialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3, λ0=
     inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength,
                                      θ=npol == 2 ? π/6 : 0.0)
     #= `noise=true`: the modified shot-noise model (LupoLab/Luna.jl#440), the one-photon
-       draw amplified 1e6 times so that it changes the result far beyond rounding, the same
-       in every k column and polarisation component. Built on the host in Float64, as the
-       caller does; the transform advances its own copy on `spec`. =#
+       draw the same in every k column and polarisation component, amplified 100 times so
+       that it changes the result (by ~3e-4) far beyond the comparison tolerances. (The
+       draw is normalised per waveguide mode, not per k column: at 1e4 times this case
+       already blows up.) Built on the host in Float64, as the caller does; the transform
+       advances its own copy on `spec`. =#
     nz = nothing
     if noise
-        nfω = 1e6 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(1))
+        nfω = 1e2 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(1))
         nf = repeat(nfω, 1, npol, N)
         nz = NonlinearRHS.ModifiedNoise(nf, LinearOps.unitary_phase(linop, grid, size(nf)),
                                         grid)
@@ -1778,7 +1780,7 @@ end
                             NonlinearRHS.noise_arrays(dtr.dnoise)...)
     # the noise matters far beyond the level compared
     effect = radialdiff(href, hclean)
-    @test effect > 1e-6
+    @test effect > 1e-5
     @test radialdiff(href, dref) < 1e-10
     # two polarisation components: the noise buffers have the field's (t, pol, r) shape
     h2, _ = radialcase(Grid.RealGrid, HostSpec(); noise=true, npol=2)
@@ -1789,9 +1791,8 @@ end
     f32, t32 = radialcase(Grid.RealGrid, DeviceSpec(Array, Float32); noise=true)
     @test t32.dnoise.Eω0 isa Array{ComplexF32, 3}
     @test t32.dnoise.Eω0 ≈ ComplexF32.(t32.noise.Eω0 ./ t32.scaling.Eref)
-    e32 = radialdiff(href, f32)
-    @info "radial noise, Float32 vs Float64" e32 effect
-    @test e32 < 1e-4
+    e32 = radialdiff(href, f32) # 1.2e-6 measured
+    @test e32 < 1e-5
     @test effect > 10*e32
 end
 
