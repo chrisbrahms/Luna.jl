@@ -634,6 +634,10 @@ end
     for (name, kw, T) in (("mode-averaged", (;), NonlinearRHS.TransModeAvg),
                           ("multimode", (; modes=2), NonlinearRHS.TransModal),
                           ("multimode, fixed quadrature", (; modes=2, modal_integral=:fixed),
+                           NonlinearRHS.TransModalFixed),
+                          # one mode: still one column per mode (gpu/base's makenoise)
+                          ("one mode", (; modes=1), NonlinearRHS.TransModal),
+                          ("one mode, fixed quadrature", (; modes=1, modal_integral=:fixed),
                            NonlinearRHS.TransModalFixed))
         @testset "$name" begin
             Eω, _, _, tn, _, _ = Interface.prop_capillary_args(
