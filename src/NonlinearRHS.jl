@@ -841,6 +841,7 @@ function TransModal(tT, grid, ts::Modes.ToSpace, resp, densityfun, norm!;
     Emωo = Array{ComplexF64, 2}(undef, nωo, nmodes)
     Emt = Array{tT, 2}(undef, nto, nmodes)
     IFT = Utils.plan_ift(Utils.plan_ft(Emt, 1))
+    _check_modalnoise(noise, nω, nmodes)
     if !isnothing(noise)
         #= The noise enters the nonlinear term linearly and through the same synthesis as
            the field, so `reset!` takes it to the time domain once per right-hand side
@@ -884,6 +885,15 @@ function TransModal(tT, grid, ts::Modes.ToSpace, resp, densityfun, norm!;
                S, S3, W, pre, pts, inside, Tuple(resp), grid, densityfun, densityfun(0.0),
                norm!, 0, 0.0, rtol, atol, mfcn,
                Array{ComplexF64, 2}(undef, nω, nmodes))
+end
+
+# The modal draw is `(nω, nmodes)`, one independent column per mode.
+_check_modalnoise(::Nothing, nω, nmodes) = nothing
+function _check_modalnoise(noise, nω, nmodes)
+    size(noise.Eω0) == (nω, nmodes) || error(
+        "the modal noise draw is $(size(noise.Eω0)), but this transform needs "*
+        "($nω, $nmodes): one column per mode (Fields.generate_noise_field(grid; nmodes)).")
+    nothing
 end
 
 function ModalRound(tT, grid, npol, npts, resp, spec, scaling)
@@ -1192,7 +1202,7 @@ condition in θ, which is checked against
 - `err`: the embedded error estimate, filled on demand by [`integral_error!`](@ref)
 """
 mutable struct TransModalFixed{tsT, qT, bT, ST, WT, EωT, EtmT, FTT, IFTT, rsT, gT, gvT,
-                               dT, ddT, nT, nsT, dnT, eoT, enT, enlT} <: AbstractTransModal
+                               dT, ddT, nT, nsT, dnT, enT, enlT} <: AbstractTransModal
     ts::tsT
     full::Bool
     quad::qT
@@ -1207,7 +1217,6 @@ mutable struct TransModalFixed{tsT, qT, bT, ST, WT, EωT, EtmT, FTT, IFTT, rsT, 
     Emt::EtmT # (nto, nmodes) modal field in the oversampled time domain
     noise::nsT # caller's ModifiedNoise (host, physical units), or nothing
     dnoise::dnT # the kernels' copy of it (run's array type, state units), or nothing
-    Emωo_noise::eoT # (nωo, nmodes) scratch for the noise at the current z, or nothing
     Emt_noise::enT # (nto, nmodes) modal noise at the current z, or nothing
     Emt_nl::enlT # (nto, nmodes) field + noise, or nothing
     Pmt::EtmT # (nto, nmodes) modal polarisation in the oversampled time domain
@@ -1300,23 +1309,21 @@ function TransModalFixed(tT, grid, ts::Modes.ToSpace, resp, densityfun, norm!;
     #= The noise is a state-unit quantity, so the kernels' copy carries the same 1/Eref the
        state does. It enters linearly and through the same synthesis as the field, so it is
        advanced and transformed once per right-hand side, in the modal domain. =#
+    _check_modalnoise(noise, nω, nmodes)
     dnoise = retarget_noise(noise, spec, scaling)
     if !isnothing(noise)
-        Emωo_noise = alloc(spec, CT, (nωo, nmodes))
         Emt_noise = alloc(spec, tT, (nto, nmodes))
         Emt_nl = alloc(spec, tT, (nto, nmodes))
     else
-        Emωo_noise = nothing
         Emt_noise = nothing
         Emt_nl = nothing
     end
     block = ModalBlock(tT, grid, npol, npts, resp, spec, scaling)
     gv = gridvectors(grid, spec)
-    assert_resident(spec, S, Wp, Wd, Emωo, Pmωo, Emt, Pmt, err, Emωo_noise, Emt_noise,
-                    Emt_nl, noise_arrays(dnoise)..., gv.ω, gv.ωwin, gv.twin, gv.towin,
-                    gv.sidx)
+    assert_resident(spec, S, Wp, Wd, Emωo, Pmωo, Emt, Pmt, err, Emt_noise, Emt_nl,
+                    noise_arrays(dnoise)..., gv.ω, gv.ωwin, gv.twin, gv.towin, gv.sidx)
     TransModalFixed(ts, full, quad, zc, 0.0, block, S, Wp, Wd, Emωo, Pmωo, Emt,
-                    noise, dnoise, Emωo_noise, Emt_noise, Emt_nl, Pmt, err, FT, IFT,
+                    noise, dnoise, Emt_noise, Emt_nl, Pmt, err, FT, IFT,
                     Tuple(resp), grid, gv, densityfun, densityfun(0.0), norm!, 0.0, npts,
                     scaling)
 end
@@ -1385,9 +1392,11 @@ function (t::TransModalFixed)(nl, Eω, z)
     update_matrices!(t, z)
     to_time!(t.Emt, Eω, t.Emωo, t.IFT)
     Emt = t.Emt
-    # modified shot noise: advanced to this z once per right-hand side, then field + noise
+    #= modified shot noise: advanced to this z once per right-hand side and taken to the
+       time domain through the field's plan (`Emωo` is free again as the scratch buffer),
+       then field + noise =#
     if !isnothing(t.dnoise)
-        to_time!(t.Emt_noise, noise_at!(t.dnoise, z), t.Emωo_noise, t.IFT)
+        to_time!(t.Emt_noise, noise_at!(t.dnoise, z), t.Emωo, t.IFT)
         @. t.Emt_nl = t.Emt + t.Emt_noise
         Emt = t.Emt_nl
     end
