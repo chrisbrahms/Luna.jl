@@ -2818,7 +2818,7 @@ function tabulate(t::TransModeAvg, z0, z1, tol, proto)
     shared = t.aeff === _normaeff(t.norm!) ? atab : nothing
     TransModeAvg(t.Pto, t.Eto, t.Eωo, t.Pωo, t.FT, t.IFT, t.resp, t.grid, t.gv,
                  t.densityfun, tabulate(t.norm!, z0, z1, tol, proto; aeff=shared), atab,
-                 t.Et_noise, t.Et_nl, t.scaling)
+                 t.noise, t.dnoise, t.Eωo_noise, t.Et_noise, t.Et_nl, t.scaling)
 end
 
 #= The `Aeff` callable of a normalisation, or `nothing` for one Luna did not build: a
