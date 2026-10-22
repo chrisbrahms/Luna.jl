@@ -504,3 +504,18 @@ test/                +~330  see Tests
 docs/                +~150  docs/src/gpu.md user section, developer/device_model.md
 benchmark/            ~20   tabulated.jl compares :quadrature against :tabulated
 ```
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+The noise keeps its own table of the operator's unitary phase, built at setup from the
+callable whatever `linop_integral` is. It is tabulated to `prop_capillary`'s `linop_tol`
+(through `setup` → `makemodifiednoise` → `unitary_phase`), capped by `noise_node_budget`
+(the same `TABLE_BUDGET_BYTES`; the cap can overshoot by up to `maxdepth`, as the field's),
+and a closure which ignores z gives `ConstUnitaryPhase` (as `Luna.run` recognises it). The
+noise table's 1.05·zmax margin is shorter than the run's `zmax + max(max_dz, init_dz)`;
+documented (only the noise term of the final step's last stages is extrapolated).
+
+**Follow-up, not done:** reuse the run's integrated linop for the noise phase (one table,
+device-capable, and the secant subtraction would also remove the Float32 phase error). It
+needs plumbing in `Luna.run` and the device retargeting; it matters for 3-D z-dependent free
+space, where a state-sized noise table is large.
