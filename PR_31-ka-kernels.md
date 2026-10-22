@@ -135,3 +135,9 @@ page in `gpu/32-docs`.
   scan would change the summation order and so the results.
 - `TransModeAvg`'s own broadcasts, the boundaries and the statistics are not wrapped (each
   ≤ 2 % in the profile, and mode-averaged arrays are mostly below `THREAD_MINLEN`).
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+`noise_at!`'s `cis` broadcast (`THREAD_MINLEN_HEAVY`) and the unitary phase readbacks
+(constant, Hermite, extrapolation) go through `Utils.threaded`; threaded_checks.jl checks them
+bit-identical to the serial path. Mode-averaged sizes stay below both thresholds.

@@ -457,3 +457,10 @@ Two references *were* new on the first build of this branch and are fixed in `90
 `Boundaries.addloss` (the element-type commit had put two helper definitions between its
 docstring and its first method) and `Luna.prop_capillary` in `LinearOps.jl` (which does not
 resolve from inside `module LinearOps`).
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+Merging 21–24 with #440: TransRadial `Pωo === Eωo` aliasing kept with the noise buffers; the
+TransRadial buffer-count test is eight with the propagated noise. Two review rounds (test
+discrimination, Float32 free-space RHS, mask tests both ways, TransModalFixed shape check,
+docs), then AGREE. Gate 466/466, exactly 0.

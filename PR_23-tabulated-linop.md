@@ -407,3 +407,10 @@ Every test file named above and the gate were rerun after the fixes: `test_linop
   exponential, as the untabulated one does.
 - `RK45.make_prop!`'s new method is defined in `LinearOps`, not in `RK45.jl`, because
   `RK45.jl` is included before `LinearOps.jl` and cannot name the type.
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+`tabulate(::TransModeAvg)` passes `noise`, `dnoise` and the noise buffers through by reference,
+so a resume's `sync_noise!` on the setup transform reaches the tabulated one. #440's
+`unitary_phase` section of LinearOps.jl was re-applied on top of this branch's file (the
+automatic merge interleaved the two bisection routines).

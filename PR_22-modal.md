@@ -485,3 +485,11 @@ analysis of what it costs is in known gap 6 above.
 | `test_device.jl` | **738 pass, 0 fail, 41 testsets** (was 715/39) |
 | `test_metal.jl` | **452 pass, 0 fail, 18 testsets** (was 448; the four new assertions are the `:auto` sentinel ones in "Luna.set_device(:cpu) opts out") |
 | `test_modes.jl`, `test_multimode.jl`, `test_interface.jl` | 724 + 6 + 349 pass, 0 fail |
+
+## LupoLab/Luna.jl#440 (propagated modified shot noise)
+
+Batched TransModal keeps #440's once-per-right-hand-side advance in `reset!` (`Emωo` as the
+scratch). TransModalFixed: `noise`/`dnoise`, the noise taken to the time domain through the
+field's plan after the field (reusing `Emωo`), `Emt_nl = Emt + Emt_noise`. Both modal
+transforms refuse a draw that is not `(nω, nmodes)` (`_check_modalnoise`). test_noise runs its
+interface case with `modal_integral=:fixed` and asserts each case's transform type.
