@@ -37,6 +37,7 @@ import FFTW
 import Adapt
 import LinearAlgebra
 import LinearAlgebra: mul!
+import Random
 
 # A minimal device-array type: enough to test the `backend` trait, which never touches
 # the data.
@@ -255,7 +256,7 @@ Base.getindex(h::ToHost, k) = h.o[k]
 #= One small mode-averaged Kerr propagation, built once and run on whichever spec is
    asked for. `boundary=:none` because the absorbers are host code until gpu/11. =#
 function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
-                  precision=nothing)
+                  precision=nothing, noise=false)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15)
@@ -270,8 +271,14 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
         (Nonlinear.Kerr_env(PhysData.γ3_gas(gas)),)
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
+    #= `noise=true`: the modified shot-noise model, with the one-photon draw amplified 1e6
+       times so that it changes the result far beyond rounding (the device comparisons
+       below are at 1e-10). Always built on the host in Float64, as the interface does. =#
+    nz = noise ? NonlinearRHS.ModifiedNoise(
+            1e6 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(1)),
+            LinearOps.unitary_phase(linop, grid), grid) : nothing
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
-                                   constβ=true, device=spec, precision)
+                                   constβ=true, device=spec, precision, noise=nz)
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
     output = Utils.isdevice(Eω) ? ToHost(out) : out
     Luna.run(Eω, grid, linop, transform, FT, output;
@@ -527,6 +534,47 @@ end # have_jlarrays
 #= The reduced-precision path on the CPU. This is the scaling layer under a magnifying
    glass: Float32 on the host keeps subnormals, so an unscaled run would *work* here and
    fail only on Metal. The check is therefore on the numbers, not on whether it runs. =#
+@testset "modified shot noise on JLArray and in Float32" begin
+    #= LupoLab/Luna.jl#440: the noise is advanced by the unitary phase at every right-hand
+       side. On a device, or in Float32, the transform advances its own copy (`dnoise`) on
+       that array type and in state units; the caller's `noise` stays on the host in
+       physical units. =#
+    for GT in (Grid.RealGrid, Grid.EnvGrid)
+        href, htr = kerrcase(GT, HostSpec(); noise=true)
+        hclean, _ = kerrcase(GT, HostSpec())
+        dref, dtr = kerrcase(GT, JLSpec; noise=true)
+        @test htr.dnoise === htr.noise # the default path uses the caller's object
+        @test dtr.noise.Eω0 isa Vector{ComplexF64} # the caller's object is untouched...
+        @test dtr.dnoise.Eω0 isa JLArray{ComplexF64} # ...and the kernels' copy is resident
+        @test dtr.dnoise.φ isa JLArray{Float64}
+        @test dtr.dnoise.phase.dφ isa JLArray{Float64}
+        @test dtr.Et_noise isa JLArray
+        # the noise matters at the level compared, so the agreement below is not vacuous
+        @test maximum(abs, href["Eω"][:, end] .- hclean["Eω"][:, end]) >
+              1e-6*maximum(abs, href["Eω"][:, end])
+        for idx in axes(href["Eω"], 2)
+            h = href["Eω"][:, idx]
+            d = dref["Eω"][:, idx]
+            @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
+        end
+    end
+    href, _ = kerrcase(Grid.RealGrid, HostSpec(); pres=0.3, noise=true)
+    f32, tr32 = kerrcase(Grid.RealGrid, DeviceSpec(Array, Float32); pres=0.3, noise=true)
+    @test tr32.dnoise.Eω0 isa Vector{ComplexF32}
+    @test tr32.dnoise.Eω0 ≈ ComplexF32.(tr32.noise.Eω0 ./ tr32.scaling.Eref)
+    Eref = tr32.scaling.Eref
+    for idx in axes(href["Eω"], 2)
+        h = href["Eω"][:, idx]
+        d = ComplexF64.(f32["Eω"][:, idx]) .* Eref
+        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
+    end
+    # a resumed run adopts a recorded draw: the kernels' copy follows the caller's
+    tr32.noise.Eω0 .*= 2
+    NonlinearRHS.sync_noise!(tr32)
+    @test tr32.dnoise.Eω0 ≈ ComplexF32.(tr32.noise.Eω0 ./ Eref)
+    @test isnan(tr32.dnoise.lastz[])
+end
+
 @testset "Float32 on the CPU" begin
     #= Helium at 0.3 bar is the dynamic-range case: ρ ε₀ γ₃ is 3.3e-39 there, below the
        smallest Float32 subnormal (1.2e-38 normal, 1.4e-45 subnormal), and Metal flushes
