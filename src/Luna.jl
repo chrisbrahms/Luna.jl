@@ -66,6 +66,12 @@ its own threads. See `Utils.FFTWthreads`.
 
 The best setting depends on the machine and the problem; for speed-sensitive work, run
 `benchmark/threads` on your own machine (see the "Running on a GPU" page).
+
+With one Julia thread an explicit `nthr > 0` makes libfftw3 use its own native pthreads
+pool rather than Julia tasks. This is a way to run threaded FFTs on Julia ≥ 1.12, where
+the Julia-task FFTW callback can segfault: start Julia with one thread and call
+`set_fftw_threads(n)` (e.g. in a Slurm scan script, together with
+`SlurmExec(...; nthreads=1, cpus=n)`).
 """
 function set_fftw_threads(nthr=0)
     settings["fftw_threads"] = nthr
