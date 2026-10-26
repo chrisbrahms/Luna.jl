@@ -155,13 +155,14 @@ function sellmeier_gas(material::Symbol)
         C2 = 7.76e-3
         return γ_Börzsönyi(B1/dens, C1, B2/dens, C2)
     elseif material == :He || material == :HeJ
+        densHe = dens_1atm_0degC[material]
         B1 = 2.16463842e-05
         C1 = -6.80769781e-04
         B2 = 2.10561127e-07
         C2 = 5.13251289e-03
         B3 = 4.75092720e-05
         C3 = 3.18621354e-03
-        return γ_JCT(B1/dens, C1, B2/dens, C2, B3/dens, C3)
+        return γ_JCT(B1/densHe, C1, B2/densHe, C2, B3/densHe, C3)
     elseif material == :Ne
         B1 = 9154.48e-8
         C1 = 656.97e-6
