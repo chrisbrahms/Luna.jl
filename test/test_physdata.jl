@@ -9,6 +9,12 @@ end
 @testset "refractive indices" begin
     @test PhysData.ref_index(:HeB, 800e-9) ≈ 1.000031950041203
     @test PhysData.ref_index(:HeB, 800e-9, 10) ≈ 1.0003180633169397
+    # :He is the optmat "fit/He" oscillator model; reference n-1 at 1 bar, 293.15 K from solprop
+    # (optmat 0.9.1); the 4e-7 relative tolerance covers the two codes' equations of state
+    for (λ, nm1) in ((220e-9, 3.3430067667e-05), (515e-9, 3.2096687112e-05), (1030e-9, 3.1885658755e-05))
+        @test isapprox(real(PhysData.ref_index(:He, λ, 1.0, 293.15)) - 1, nm1, rtol=1e-6)
+    end
+    @test real(PhysData.ref_index(:He, 1030e-9, 16.5)) - 1 ≈ 16.5*(real(PhysData.ref_index(:He, 1030e-9, 1.0)) - 1) rtol=1e-2
     @test PhysData.ref_index(:SiO2, 800e-9, lookup=false) ≈ 1.4533172548587419
     @test PhysData.ref_index(:SiO2, 400e-9, lookup=false) ≈ 1.4701161185594052
     @test PhysData.ref_index(:SiO2, PhysData.eV_to_m(6)) ≈ 1.543

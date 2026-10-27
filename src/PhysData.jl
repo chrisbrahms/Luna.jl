@@ -109,6 +109,22 @@ function γ_JCT(B1, C1, B2, C2, B3, C3)
 end
 
 """
+    γ_oscillator(strengths, energies, offset, retardation)
+
+Per-particle linear susceptibility from an oscillator-sum model of the refractive polarisability
+in atomic units, α(ω) = Σᵢ fᵢ/(Eᵢ² - ω²) + offset + retardation·ω² with ω and Eᵢ in hartree,
+converted to γ = α/ε₀ in m³ so that χ₁ = γ·ρ. This is the form of the fitted gas models in
+optmat (https://github.com/LupoLab/optmat), which solprop uses; no reference density enters.
+"""
+function γ_oscillator(strengths, energies, offset, retardation)
+    return μm -> begin
+        ω_au = 2π*c/(μm*1e-6) * ħ / au_energy
+        α = sum(f/(E^2 - ω_au^2) for (f, E) in zip(strengths, energies)) + offset + retardation*ω_au^2
+        α * au_polarisability / ε_0
+    end
+end
+
+"""
     γ_Peck(B1, C1, B2, C2, dens)
 
 Sellmeier expansion for linear susceptibility from
@@ -152,7 +168,19 @@ function sellmeier_gas(material::Symbol)
         B2 = 1856.94e-8
         C2 = 7.76e-3
         return γ_Börzsönyi(B1/dens, C1, B2/dens, C2)
-    elseif material == :He || material == :HeJ
+    elseif material == :He
+        # optmat 0.9.1 "fit/He" (He.toml, config sha256 48788d835e64…): two resonance lines
+        # (1s² ¹S → 1s2p ¹P, 1s3p ¹P) plus four effective terms, fitted on an ab initio backbone
+        # (Puchalski et al. 2016) with the microwave static value; validated against
+        # Cuthbertson 1932, Mansfield & Peck 1969, Smith 1976, Huber & Tondello 1974, Swift 1988,
+        # Marchetti 2006, Schmidt 2007. Valid from 60 nm to the static limit. Replaces the
+        # Ermolov et al. (2015) Sellmeier (kept as :HeJ), which is 0.3–0.9 % low in the UV.
+        strengths = (0.2762528434183227, 0.07346000761474655, 0.20602761869668437,
+                     0.48370806210336675, 0.7240993448856782, 0.2364521254067089)
+        energies = (0.7797479521796601, 0.8484322813635901, 0.9070661302147991,
+                    1.1298647931797836, 1.9225329696953253, 10.53144492914687)
+        return γ_oscillator(strengths, energies, -2.1194e-05, -3.73405e-05)
+    elseif material == :HeJ
         B1 = 2.16463842e-05
         C1 = -6.80769781e-04
         B2 = 2.10561127e-07
