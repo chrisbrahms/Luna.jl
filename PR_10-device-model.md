@@ -318,7 +318,6 @@ All CPU, all pass:
 | `test_gnlse.jl` | 4 pass | 21.4 s |
 | `test_mixtures.jl` | 2049 pass | 5.0 s |
 | `test_stats.jl` | 1 pass | 3.2 s |
-| `test_noise.jl` | 49 pass | 15.6 s |
 | `test_utils.jl` | 33 pass | 3.8 s |
 | `test_interface.jl` | 301 pass | 4m02 |
 | `test_multimode.jl` | 6 pass | 3m38 |
@@ -410,7 +409,6 @@ and it is still slower. The win is in the multi-column transforms (radial, free-
 fixed-rule multimode), which are later branches; this branch's job is that the mode-averaged
 path *runs* correctly on a device, which it does. A GPU should not be used for a
 single-column run, and the user page says so.
-
 
 ## Known gaps
 
@@ -588,14 +586,3 @@ Tested both ways in "constβ is checked, not trusted".
 | `test_rk45.jl` | 48 pass |
 | `test_interface.jl` | 301 pass |
 | `test_gnlse.jl`, `test_gradient.jl`, `test_tapers.jl`, `test_linops.jl` | pass |
-
-## LupoLab/Luna.jl#440 (propagated modified shot noise)
-
-#440 enters from `gpu/base` (via int-A). On the device the transform keeps the caller's host
-`noise` (Float64, physical units: what is saved, read by `Processing.withnoise` and adopted on
-resume) and a kernels' copy `dnoise = retarget_noise(noise, spec, scaling)`: the draw divided
-by `E_ref` on the run's array type, the phase tables converted alike; on the default path it is
-`noise` itself. `sync_noise!` brings `dnoise` up to date after a resume and re-applies the
-evanescent mask; `noise_arrays` are part of `assert_resident`. In Float32 the noise phase is
-formed from the absolute z (error ~6e-8·|Φ|; documented, not fixed, by decision). Tests:
-test_noise (incl. a `sync_noise!` re-mask check), test_device (JLArray and Float32 copies).
