@@ -830,7 +830,7 @@ regression gate's two radial cases are unchanged to the last bit
 (`gpu/20-radial-device`).
 
 `Grid.radial_matmul!` allows `out === A` and makes one copy when it is, which is how the
-noise setup and the transverse collar use it; nothing per step does.
+transverse collar uses it; nothing per step does.
 
 **The frequency-domain normalisation** is one fused broadcast over a precombined vector
 `prefac = ωwin·(-iω)·Pref` and the normalisation array, written in the same association as
