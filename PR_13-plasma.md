@@ -359,7 +359,6 @@ to in code spans rather than with `@ref`.
 - **`preionfrac`** is carried through unchanged and is exercised only by
   `test_ionisation.jl`'s existing case.
 
-
 ## Changes after review round 1
 
 The review's verdict was "request changes", on one blocker and two majors. All eleven
