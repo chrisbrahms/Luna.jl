@@ -2,7 +2,7 @@ module Interface
 using Luna
 import Luna.PhysData: wlfreq, roomtemp
 import Luna: Grid, Modes, Output, Fields, Boundaries
-import Random: AbstractRNG, GLOBAL_RNG
+import Random: GLOBAL_RNG
 import Logging: @info, @debug
 
 module Pulses
@@ -288,21 +288,10 @@ In this case, all keyword arguments except for `λ0` are ignored.
     elliptical polarisation is always the y-axis.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
-- `shotnoise`: Whether and how to include quantum noise. Can be one of:
-    - `true` (default) -- same as `:modified`.
-    - `false` -- disable all noise.
-    - `:modified` -- use the modified shot-noise model of Chen & Wise
-      (arXiv:2410.20567), where a noise field enters the nonlinear operator at every step
-      but is never added to the propagating field. The noise field is drawn once and then
-      advanced under the *unitary* part of the linear operator only -- dispersion, but
-      neither loss nor gain. This gives a spectrum with no elevated noise floor, Raman
-      Stokes/anti-Stokes asymmetry, and spontaneous generation in absorbing media.
-    - `:input` -- use traditional one-photon-per-mode shot noise added to the input
-      field at `z = 0`.
-    See the [Noise model](@ref) documentation for details.
-- `rng`: Random number generator for noise field generation. Defaults to `GLOBAL_RNG`.
-    Pass a seeded RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations,
-    or different seeds for ensemble/shot-to-shot statistics.
+- `shotnoise`:  If `true` (default), one-photon-per-mode quantum noise is included.
+- `rng`: Random number generator for the shot noise. Defaults to `GLOBAL_RNG`. Pass a seeded
+    RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations, or different seeds
+    for ensemble/shot-to-shot statistics.
 
 # Modes options
 - `modes`: Defines which modes are included in the propagation. Can be any of:
@@ -345,11 +334,6 @@ If `raman` is `true`, then the following options apply:
 # Output options
 - `stats_kwargs::Dict{Symbol, Any}`: a dictionary of keyword arguments to `Stats.default`
 - `saveN::Integer`: Number of points along z at which to save the field.
-- `save_noise::Bool`: If `true`, additionally save the accumulated phase of the modified
-    shot-noise field at every output plane, so that the noise background can be restored
-    from the saved file with [`Processing.withnoise`](@ref Luna.Processing.withnoise). The
-    `z = 0` noise draw is always saved as `"noise_field"`. Defaults to `false`, since the
-    extra array is half the size of the saved field.
 - `filepath`: If `nothing` (default), create a `MemoryOutput` to store the simulation results
     only in the working memory. If not `nothing`, should be a file path as a `String`,
     and the results are saved in a file at this location. If `scan` is passed, `filepath`
@@ -372,16 +356,10 @@ If `raman` is `true`, then the following options apply:
 - `boundary_length`: Absorber reference length in metres, overriding `boundary_N`.
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
-
-# Integrator options
-- `rtol::Number`: Relative tolerance for the adaptive RK45 integrator. Defaults to `1e-6`.
-    Tighten this (e.g. `1e-10`) for work which is sensitive to accumulated integration
-    error, such as soliton recurrence or noise-seeded dynamics.
-- `atol::Number`: Absolute tolerance for the integrator. Defaults to `1e-10`.
 """
-function prop_capillary(args...; status_period=5, rtol=1e-6, atol=1e-10, kwargs...)
+function prop_capillary(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_capillary_args(args...; kwargs...)
-    Luna.run(Eω, grid, linop, transform, FT, output; status_period, rtol, atol,
+    Luna.run(Eω, grid, linop, transform, FT, output; status_period,
              boundary_kwargs(kwargs)...)
     output
 end
@@ -409,15 +387,14 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         power=nothing, energy=nothing,
                         pulseshape=:gauss, polarisation=:linear, propagator=nothing,
                         pulses=nothing,
-                        shotnoise=true,
-                        rng=GLOBAL_RNG,
+                        shotnoise=true, rng=GLOBAL_RNG,
                         modes=:HE11, model=:full, loss=true,
                         radial_integral_rtol=1e-3,
                         raman=nothing, kerr=true, plasma=nothing,
                         stats_kwargs=Dict{Symbol, Any}(),
                         PPT_options=Dict{Symbol, Any}(), preionfrac=0.0,
                         rotation=true, vibration=true, temperature=roomtemp,
-                        saveN=201, save_noise=false, filepath=nothing,
+                        saveN=201, filepath=nothing,
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
                         boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR)
@@ -445,18 +422,17 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         PPT_options, preionfrac, temperature)
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
-    inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
+    inputs = shotnoise_maybe(inputs, mode_s, shotnoise, rng)
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
-                                     noise_field, thg)
+                                     thg)
     stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
     output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
-    savenoise(output, transform, grid, saveN, save_noise)
 
     saveargs(output; radius, flength, gas, pressure, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
         shotnoise, modes, model, loss, raman, kerr, plasma, PPT_options,
-        temperature, saveN, save_noise, filepath, filename,
+        temperature, saveN, filepath, filename,
         boundary, boundary_N, boundary_length, tcollar)
 
     return Eω, grid, linop, transform, FT, output
@@ -842,47 +818,13 @@ function ellfields(pulse::Pulses.DataPulse, pf)
     f1, f2
 end
 
-function makenoise(grid, mode_s, inputs, shotnoise::Bool, rng)
-    shotnoise ? makenoise(grid, mode_s, inputs, :modified, rng) : (inputs, nothing)
-end
-
-function makenoise(grid, mode_s, inputs, shotnoise::Symbol, rng)
-    if shotnoise == :modified
-        nm = mode_s isa AbstractArray ? length(mode_s) : 1
-        noise_field = Fields.generate_noise_field(grid; rng, nmodes=nm)
-        #= a mode collection's transforms take one column per mode, so a single mode's
-           draw is the (nω, 1) matrix and not the vector `generate_noise_field` returns =#
-        mode_s isa AbstractArray && (noise_field = reshape(noise_field, :, nm))
-        @info("Modified shot-noise model enabled. Traditional input shot noise is " *
-              "disabled (noise enters through nonlinear operator instead).")
-        return (inputs, noise_field)
-    elseif shotnoise == :input
-        inputs = _add_input_shotnoise(inputs, mode_s, rng)
-        return (inputs, nothing)
-    else
-        throw(DomainError(shotnoise, "Unknown shotnoise=$shotnoise. Use true, false, :modified, or :input."))
-    end
-end
-
-"""
-    makemodifiednoise(noise_field, linop, grid)
-
-Bundle the `z = 0` noise draw with the propagator which advances it, i.e. the accumulated
-**unitary** phase of `linop` (dispersion, but neither loss nor gain). Returns `nothing` if
-`noise_field` is `nothing`. See [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise).
-"""
-makemodifiednoise(noise_field::Nothing, linop, grid) = nothing
-
-function makemodifiednoise(noise_field, linop, grid)
-    phase = LinearOps.unitary_phase(linop, grid, size(noise_field))
-    NonlinearRHS.ModifiedNoise(noise_field, phase, grid)
-end
-
-function _add_input_shotnoise(inputs, mode::Modes.AbstractMode, rng)
+function shotnoise_maybe(inputs, mode::Modes.AbstractMode, shotnoise::Bool, rng=GLOBAL_RNG)
+    shotnoise || return inputs
     (inputs..., (mode=1, fields=(Fields.ShotNoise(rng),)))
 end
 
-function _add_input_shotnoise(inputs, modes, rng)
+function shotnoise_maybe(inputs, modes, shotnoise::Bool, rng=GLOBAL_RNG)
+    shotnoise || return inputs
     (inputs..., [(mode=ii, fields=(Fields.ShotNoise(rng),)) for ii in eachindex(modes)]...)
 end
 
@@ -896,26 +838,24 @@ linopkw(grid::Grid.RealGrid, thg) = NamedTuple()
 linopkw(grid::Grid.EnvGrid, thg) = (; thg)
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{true}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{true}; thg=LinearOps.thg_default(grid))
     @info("Using mode-averaged propagation.")
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ;
                                                     linopkw(grid, thg)...)
 
-    noise = makemodifiednoise(noise_field, linop, grid)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z); noise)
+    βfun!, z -> Modes.Aeff(mode, z=z))
     linop, Eω, transform, FT
 end
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{false}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{false}; thg=LinearOps.thg_default(grid))
     @info("Using mode-averaged propagation.")
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ;
                                         linopkw(grid, thg)...)
 
-    noise = makemodifiednoise(noise_field, linop, grid)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z); noise)
+                                   βfun!, z -> Modes.Aeff(mode, z=z))
     linop, Eω, transform, FT
 end
 
@@ -924,72 +864,23 @@ needfull(modes) = !all(modes) do mode
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               thg=LinearOps.thg_default(grid))
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_const_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
-    noise = makemodifiednoise(noise_field, linop, grid)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf, rtol, noise)
+                                   pol ? :xy : :y; full=nf, rtol)
     linop, Eω, transform, FT
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               thg=LinearOps.thg_default(grid))
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
-    noise = makemodifiednoise(noise_field, linop, grid)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf, rtol, noise)
+                                   pol ? :xy : :y; full=nf, rtol)
     linop, Eω, transform, FT
-end
-
-"""
-    savenoise(output, transform, grid, saveN, save_noise)
-
-Record the modified shot-noise realisation in `output`. The `z = 0` draw is always written as
-`"noise_field"`; it is small and identifies the realisation. When `save_noise` is `true` the
-accumulated unitary phase at each of the `saveN` output planes is written as `"noise_phase"`,
-which is what [`Processing.withnoise`](@ref Luna.Processing.withnoise) needs to restore the
-noise background from a saved file. That array is half the size of `Eω`, so it is off by
-default.
-
-If `output` already contains a noise field, this is a cached `HDF5Output` being resumed, and
-the recorded realisation is adopted for the rest of the propagation instead (the `rng`
-argument is ignored, with a message saying so). That matters more here than it would for
-`shotnoise=:input`, where the noise enters only the initial condition and is therefore
-carried by the cached field: the modified model uses the noise at *every* step, so continuing
-with a fresh draw would splice two different realisations together and leave the already-saved
-planes inconsistent with the recorded one.
-
-Does nothing unless the modified shot-noise model is in use.
-"""
-function savenoise(output, transform, grid, saveN, save_noise)
-    noise = hasfield(typeof(transform), :noise) ? transform.noise : nothing
-    isnothing(noise) && return
-    if haskey(output, "noise_field")
-        saved = output["noise_field"]
-        size(saved) == size(noise.Eω0) || error(
-            "the noise field saved in this output has size $(size(saved)) but this "*
-            "simulation needs $(size(noise.Eω0)) -- the output belongs to a different "*
-            "simulation")
-        noise.Eω0 .= saved
-        noise.lastz[] = NaN
-        @info("Adopting the noise realisation already recorded in the output; the `rng` "*
-              "argument is ignored when resuming a cached run.")
-    else
-        output("noise_field", noise.Eω0)
-    end
-    save_noise || return
-    haskey(output, "noise_phase") && return # already recorded, and a function of the draw
-    Φ = zeros(Float64, (size(noise.Eω0)..., saveN))
-    d = ndims(Φ)
-    for (i, z) in enumerate(range(0, stop=grid.zmax, length=saveN))
-        noise.phase(selectdim(Φ, d, i), z)
-    end
-    output("noise_phase", Φ)
-    return
 end
 
 function makeoutput(grid, saveN, stats, filepath::Nothing, scan::Nothing, scanidx, filename)
@@ -1047,21 +938,10 @@ Note that the current GNLSE model is single mode only.
     elliptical polarisation is always the y-axis.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
-- `shotnoise`: Whether and how to include quantum noise. Can be one of:
-    - `true` (default) -- same as `:modified`.
-    - `false` -- disable all noise.
-    - `:modified` -- use the modified shot-noise model of Chen & Wise
-      (arXiv:2410.20567), where a noise field enters the nonlinear operator at every step
-      but is never added to the propagating field. The noise field is drawn once and then
-      advanced under the *unitary* part of the linear operator only -- dispersion, but
-      neither loss nor gain. This gives a spectrum with no elevated noise floor, Raman
-      Stokes/anti-Stokes asymmetry, and spontaneous generation in absorbing media.
-    - `:input` -- use traditional one-photon-per-mode shot noise added to the input
-      field at `z = 0`.
-    See the [Noise model](@ref) documentation for details.
-- `rng`: Random number generator for noise field generation. Defaults to `GLOBAL_RNG`.
-    Pass a seeded RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations,
-    or different seeds for ensemble/shot-to-shot statistics.
+- `shotnoise`:  If `true` (default), one-photon-per-mode quantum noise is included.
+- `rng`: Random number generator for the shot noise. Defaults to `GLOBAL_RNG`. Pass a seeded
+    RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations, or different seeds
+    for ensemble/shot-to-shot statistics.
 
 # GNLSE options
 - `shock::Bool`: Whether to include the shock derivative term. Default is `true`.
@@ -1077,11 +957,6 @@ Note that the current GNLSE model is single mode only.
 
 # Output options
 - `saveN::Integer`: Number of points along z at which to save the field.
-- `save_noise::Bool`: If `true`, additionally save the accumulated phase of the modified
-    shot-noise field at every output plane, so that the noise background can be restored
-    from the saved file with [`Processing.withnoise`](@ref Luna.Processing.withnoise). The
-    `z = 0` noise draw is always saved as `"noise_field"`. Defaults to `false`, since the
-    extra array is half the size of the saved field.
 - `filepath`: If `nothing` (default), create a `MemoryOutput` to store the simulation results
     only in the working memory. If not `nothing`, should be a file path as a `String`,
     and the results are saved in a file at this location. If `scan` is passed, `filepath`
@@ -1104,16 +979,10 @@ Note that the current GNLSE model is single mode only.
 - `boundary_length`: Absorber reference length in metres, overriding `boundary_N`.
 - `tcollar::Real`: Minimum width of the temporal absorber collar, as a fraction of the time
     window.
-
-# Integrator options
-- `rtol::Number`: Relative tolerance for the adaptive RK45 integrator. Defaults to `1e-6`.
-    Tighten this (e.g. `1e-10`) for work which is sensitive to accumulated integration
-    error, such as soliton recurrence or noise-seeded dynamics.
-- `atol::Number`: Absolute tolerance for the integrator. Defaults to `1e-10`.
 """
-function prop_gnlse(args...; status_period=5, rtol=1e-6, atol=1e-10, kwargs...)
+function prop_gnlse(args...; status_period=5, kwargs...)
     Eω, grid, linop, transform, FT, output = prop_gnlse_args(args...; kwargs...)
-    Luna.run(Eω, grid, linop, transform, FT, output; status_period, rtol, atol,
+    Luna.run(Eω, grid, linop, transform, FT, output; status_period,
              boundary_kwargs(kwargs)...)
     output
 end
@@ -1132,11 +1001,10 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
                         power=nothing, energy=nothing,
                         pulseshape=:gauss, propagator=nothing,
                         pulses=nothing,
-                        shotnoise=true, shock=true,
-                        rng=GLOBAL_RNG,
+                        shotnoise=true, shock=true, rng=GLOBAL_RNG,
                         loss=0.0, raman=true, fr=0.18,
                         ramanmodel=:sdo, τ1=12.2e-15, τ2=32e-15,
-                        saveN=201, save_noise=false, filepath=nothing,
+                        saveN=201, filepath=nothing,
                         scan=nothing, scanidx=nothing, filename=nothing,
                         boundary=:rate, boundary_N=Boundaries.DEFAULT_N,
                         boundary_length=nothing, tcollar=Boundaries.DEFAULT_TCOLLAR)
@@ -1176,20 +1044,17 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
 
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
-    inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
+    inputs = shotnoise_maybe(inputs, mode_s, shotnoise, rng)
 
     norm! = NonlinearRHS.norm_mode_average_gnlse(grid, aeff; shock)
-    noise = makemodifiednoise(noise_field, linop, grid)
-    Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
-                                   norm!, noise)
+    Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff, norm! = norm!)
     stats = Stats.default(grid, Eω, mode_s, linop, transform)
     output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
-    savenoise(output, transform, grid, saveN, save_noise)
 
     saveargs(output; γ, flength, βs, λlims, trange, envelope, thg, δt,
         λ0, τfwhm, τw, ϕ, power, energy, pulseshape, polarisation, propagator, pulses,
         shotnoise, shock, loss, raman, ramanmodel, fr, τ1, τ2,
-        saveN, save_noise, filepath, filename,
+        saveN, filepath, filename,
         boundary, boundary_N, boundary_length, tcollar)
 
     return Eω, grid, linop, transform, FT, output
