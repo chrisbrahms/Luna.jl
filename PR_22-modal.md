@@ -204,7 +204,7 @@ recorded, unchanged by this one.
 | `test/test_regression.jl` | 460 pass, 0 fail (both bases) | `LUNA_REGRESSION_BASE=fa556e6f julia --project=. -t 1 test/test_regression.jl` |
 | `test/test_device.jl` | 715 pass, 0 fail, 39 testsets | `julia --project=<jlenv> -t 1 -e 'using Luna; include("test/test_device.jl")'` |
 | `test/test_metal.jl` | 448 pass, 0 fail, 18 testsets | `julia --project=<metalenv> -t 1 -e 'using Luna, Metal; include("test/test_metal.jl")'` |
-| `test_multimode`, `test_modes`, `test_polarisation_field`, `test_vectorplasma`, `test_stats`, `test_noise`, `test_interface`, `test_capillary`, `test_antiresonant` | 1336 pass, 0 fail, 47 testsets | `using Luna; Luna.set_fftw_mode(:estimate); Luna.set_fftw_threads(1); Luna.set_fftw_wisdom(false); include(...)` |
+| `test_multimode`, `test_modes`, `test_polarisation_field`, `test_vectorplasma`, `test_stats`, `test_interface`, `test_capillary`, `test_antiresonant` | 1336 pass, 0 fail, 47 testsets | `using Luna; Luna.set_fftw_mode(:estimate); Luna.set_fftw_threads(1); Luna.set_fftw_wisdom(false); include(...)` |
 | `test_rect_modes`, `test_polarisation`, `test_polarisation_env`, `test_tapers`, `test_gradient`, `test_mixtures`, `test_processing`, `test_output`, `test_linops` | 2563 pass, 0 fail, 28 testsets | as above |
 
 The eight modal examples in `examples/low_level_interface` run (the propagation part of
@@ -466,10 +466,9 @@ modal transform", which this branch's own 8-thread numbers depend on being false
 **Findings 6, 7, 8 — nits.** `Interface._statskwargs` accepts a `NamedTuple` as well as a
 `Dict`. There is a comment on why the mode matrices are held in the field's element type
 (complex with a zero imaginary part on an envelope grid: `mul!` needs matching element
-types to reach a BLAS `gemm` on the host and the accelerated path on a device). Two of the
-three coverage gaps are closed: the modified shot-noise model through `TransModalFixed` on
-JLArray against the host (the noise buffer, `Emt_nl` and the `1/Eref` division), and the
-multimode `:auto` sentinel on Metal hardware (`modes=4, modal_integral=:fixed` with no
+types to reach a BLAS `gemm` on the host and the accelerated path on a device). Of the
+three coverage gaps, the one about the modified shot-noise model went with that model
+(removed after this branch was written), and one is closed: the multimode `:auto` sentinel on Metal hardware (`modes=4, modal_integral=:fixed` with no
 `device` keyword resolves to the GPU, while the `:adaptive` default stays on the host and
 `device=:cpu` opts out). The third — a multimode *envelope* propagation on a device — is
 still one right-hand side on JLArray only.
