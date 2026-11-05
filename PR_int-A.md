@@ -205,8 +205,7 @@ themselves — neither changes any arithmetic — and it holds through the merge
 
 The two radial cases move, which is what `gpu/02-radialgrid` predicted and measured: it
 replaces Hankel's `permutedims` + left GEMM by a right GEMM on a reshape in
-`Boundaries.RadialCollar`, in `Fields.transform` (the input field) and in the `TransRadial`
-noise setup, and folds the scalar `scaleRK` into the transform matrix. Both change the order
+`Boundaries.RadialCollar` and in `Fields.transform` (the input field), and folds the scalar `scaleRK` into the transform matrix. Both change the order
 of the floating-point operations.
 
 - `:fixed` (20 imposed steps, so the difference is attributable to the arithmetic alone):
