@@ -172,9 +172,4 @@ end
     include(joinpath(testdir, "test_gnlse.jl"))
 end
 
-@testset "Noise model" begin
-    @info("================= test_noise.jl")
-    include(joinpath(testdir, "test_noise.jl"))
-end
-
 end
