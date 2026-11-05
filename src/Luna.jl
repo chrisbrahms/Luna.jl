@@ -165,9 +165,6 @@ frequency-domain field from `inputs`, and return `(Eω, transform, FT)`.
     [`NonlinearRHS.norm_mode_average`](@ref Luna.NonlinearRHS.norm_mode_average) for the
     chosen device and precision if not given; a normalisation supplied here must have
     been built for the same ones.
-- `noise=nothing`: the [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise) of
-    the modified shot-noise model, built on the host in physical units; the transform makes
-    its own copy for the chosen device and precision.
 - `constβ=false`: declare that `βfun!` does not depend on `z`, which lets the
     normalisation fold it in once instead of calling it on every right-hand side. True
     whenever the linear operator is constant.
@@ -208,7 +205,7 @@ runscaling(transform::NonlinearRHS.TransModeAvg) = transform.scaling
 runscaling(transform::NonlinearRHS.TransRadial) = transform.scaling
 
 function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
-                            norm! = nothing, noise=nothing, constβ=false,
+                            norm! = nothing, constβ=false,
                             device=device_request(), precision=nothing)
     #= The *unresolved* request is the default and the resolution happens here, so that
        `log_device` can tell `:auto` which found no GPU from a plain `:cpu` -- which is
@@ -239,7 +236,7 @@ function setup_mode_average(grid, densityfun, responses, inputs, βfun!, aeff;
         NonlinearRHS.check_norm(norm!, spec, scaling)
     end
     transform = NonlinearRHS.TransModeAvg(grid, FTo, IFTo, responses, densityfun, norm!,
-                                          aeff; noise, spec, scaling)
+                                          aeff; spec, scaling)
     Eω = todevice(spec, isunity(scaling) ? Eωh : Eωh ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
@@ -270,7 +267,7 @@ end
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
                full=false, norm! = NonlinearRHS.norm_modal(grid),
-               rtol=1e-3, atol=0.0, mfcn=512, noise=nothing)
+               rtol=1e-3, atol=0.0, mfcn=512)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
@@ -285,7 +282,7 @@ function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransModal(grid, ts, FTo,
                                  responses, densityfun, norm!;
-                                 rtol, atol, mfcn, full, noise)
+                                 rtol, atol, mfcn, full)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -297,7 +294,7 @@ end
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
                full=false, norm! = NonlinearRHS.norm_modal(grid),
-               rtol=1e-3, atol=0.0, mfcn=512, noise=nothing)
+               rtol=1e-3, atol=0.0, mfcn=512)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
@@ -312,7 +309,7 @@ function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransModal(grid, ts, FTo,
                                  responses, densityfun, norm!;
-                                 rtol, atol, mfcn, full, noise)
+                                 rtol, atol, mfcn, full)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -363,10 +360,6 @@ Set up a radially symmetric free-space propagation: plan the transforms, build t
 `(ω, polarisation, k⊥)` field from `inputs`, and return `(Eωk, transform, FT)`.
 
 # Keyword arguments
-- `noise=nothing`: [`NonlinearRHS.ModifiedNoise`](@ref Luna.NonlinearRHS.ModifiedNoise)
-  for the modified shot-noise model, with an `(nω, npol, nk)` frequency/k-space draw. It
-  stays on the host in physical units; the transform advances its own copy on the run's
-  device and in its units.
 - `device`, `precision`: where and in what precision to run; see the mode-averaged
   [`setup`](@ref) for the meaning. `normfun` is built by the caller, before the device is
   known, so it is retargeted here with
@@ -389,7 +382,7 @@ end
 
 function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
                       densityfun, normfun, responses, inputs;
-                      noise=nothing, device=device_request(),
+                      device=device_request(),
                       precision=nothing) where {TH}
     spec = withprecision(resolve_device(device), precision)
     T = realtype(spec)
@@ -423,7 +416,7 @@ function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
     Utils.plan_ift(FTo)
     transform = NonlinearRHS.TransRadial(
         grid, rg, FTo, responses, densityfun, normfun, np > 1;
-        noise, spec, scaling)
+        spec, scaling)
     Eωk = todevice(spec, isunity(scaling) ? Eωk : Eωk ./ scaling.Eref)
     Utils.saveFFTwisdom()
     Logging.@info("Setup finished.")
@@ -432,7 +425,7 @@ function setup_radial(::Type{TH}, grid, rg::Grid.RadialGrid,
 end
 
 function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs; noise=nothing)
+               densityfun, normfun, responses, inputs)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
@@ -448,8 +441,7 @@ function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
     xo = Array{Float64}(undef, length(grid.to), np, length(x), length(y))
     FTo = FFTW.plan_rfft(xo, (1, 3, 4), flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun, np > 1;
-                                       noise)
+                                       responses, densityfun, normfun, np > 1)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -459,7 +451,7 @@ function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
 end
 
 function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs; noise=nothing)
+               densityfun, normfun, responses, inputs)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
@@ -475,8 +467,7 @@ function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
     xo = Array{ComplexF64}(undef, length(grid.to), np, length(x), length(y))
     FTo = FFTW.plan_fft(xo, (1, 3, 4), flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun, np > 1;
-                                       noise)
+                                       responses, densityfun, normfun, np > 1)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
