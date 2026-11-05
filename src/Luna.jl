@@ -148,15 +148,13 @@ function doinput_sm(grid, inputs::Tuple{Vararg{T} where T <: NamedTuple{<:Any, <
 end
 
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff;
-               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff),
-               noise=nothing)
+               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
     xo = Array{Float64}(undef, length(grid.to))
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff;
-                                          noise)
+    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff)
     x = Array{Float64}(undef, length(grid.t))
     FT = FFTW.plan_rfft(x, 1, flags=settings["fftw_flag"])
     Eω = doinput_sm(grid, inputs, FT)
@@ -169,8 +167,7 @@ function setup(grid::Grid.RealGrid, densityfun, responses, inputs, βfun!, aeff;
 end
 
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs, βfun!, aeff;
-               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff),
-               noise=nothing)
+               norm! = NonlinearRHS.norm_mode_average(grid, βfun!, aeff))
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
@@ -178,8 +175,7 @@ function setup(grid::Grid.EnvGrid, densityfun, responses, inputs, βfun!, aeff;
     FT = FFTW.plan_fft(x, 1, flags=settings["fftw_flag"])
     xo = Array{ComplexF64}(undef, length(grid.to))
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
-    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff;
-                                          noise)
+    transform = NonlinearRHS.TransModeAvg(grid, FTo, responses, densityfun, norm!, aeff)
     Eω = doinput_sm(grid, inputs, FT)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
@@ -212,7 +208,7 @@ end
 function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
                full=false, norm! = NonlinearRHS.norm_modal(grid),
-               rtol=1e-3, atol=0.0, mfcn=512, noise=nothing)
+               rtol=1e-3, atol=0.0, mfcn=512)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
@@ -227,7 +223,7 @@ function setup(grid::Grid.RealGrid, densityfun, responses, inputs,
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransModal(grid, ts, FTo,
                                  responses, densityfun, norm!;
-                                 rtol, atol, mfcn, full, noise)
+                                 rtol, atol, mfcn, full)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -239,7 +235,7 @@ end
 function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
                modes::Modes.ModeCollection, components;
                full=false, norm! = NonlinearRHS.norm_modal(grid),
-               rtol=1e-3, atol=0.0, mfcn=512, noise=nothing)
+               rtol=1e-3, atol=0.0, mfcn=512)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     ts = Modes.ToSpace(modes, components=components)
@@ -254,7 +250,7 @@ function setup(grid::Grid.EnvGrid, densityfun, responses, inputs,
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransModal(grid, ts, FTo,
                                  responses, densityfun, norm!;
-                                 rtol, atol, mfcn, full, noise)
+                                 rtol, atol, mfcn, full)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -282,7 +278,7 @@ function doinputs_fs!(Eωk, grid, spacegrid::Union{Hankel.QDHT, Grid.FreeGrid, G
 end
 
 function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
-               densityfun, normfun, responses, inputs; noise=nothing)
+               densityfun, normfun, responses, inputs)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
@@ -302,8 +298,7 @@ function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
     xo = Array{Float64}(undef, length(grid.to), oshape...)
     FTo = FFTW.plan_rfft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransRadial(
-        grid, q, FTo, responses, densityfun, normfun, np > 1;
-        noise)
+        grid, q, FTo, responses, densityfun, normfun, np > 1)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -313,7 +308,7 @@ function setup(grid::Grid.RealGrid, q::Hankel.QDHT,
 end
 
 function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
-               densityfun, normfun, responses, inputs; noise=nothing)
+               densityfun, normfun, responses, inputs)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
@@ -333,8 +328,7 @@ function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
     xo = Array{ComplexF64}(undef, length(grid.to), oshape...)
     FTo = FFTW.plan_fft(xo, 1, flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransRadial(
-        grid, q, FTo, responses, densityfun, normfun, np > 1;
-        noise)
+        grid, q, FTo, responses, densityfun, normfun, np > 1)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -344,7 +338,7 @@ function setup(grid::Grid.EnvGrid, q::Hankel.QDHT,
 end
 
 function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs; noise=nothing)
+               densityfun, normfun, responses, inputs)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
@@ -360,8 +354,7 @@ function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
     xo = Array{Float64}(undef, length(grid.to), np, length(x), length(y))
     FTo = FFTW.plan_rfft(xo, (1, 3, 4), flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun, np > 1;
-                                       noise)
+                                       responses, densityfun, normfun, np > 1)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
@@ -371,7 +364,7 @@ function setup(grid::Grid.RealGrid, xygrid::Grid.FreeGrid,
 end
 
 function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
-               densityfun, normfun, responses, inputs; noise=nothing)
+               densityfun, normfun, responses, inputs)
     Logging.@info("Setting up and planning FFTs...")
     flush(stderr)
     Utils.loadFFTwisdom()
@@ -387,8 +380,7 @@ function setup(grid::Grid.EnvGrid, xygrid::Grid.FreeGrid,
     xo = Array{ComplexF64}(undef, length(grid.to), np, length(x), length(y))
     FTo = FFTW.plan_fft(xo, (1, 3, 4), flags=settings["fftw_flag"])
     transform = NonlinearRHS.TransFree(grid, xygrid, FTo,
-                                       responses, densityfun, normfun, np > 1;
-                                       noise)
+                                       responses, densityfun, normfun, np > 1)
     inv(FT) # create inverse FT plans now, so wisdom is saved
     inv(FTo)
     Utils.saveFFTwisdom()
