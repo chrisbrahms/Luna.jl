@@ -1,53 +1,24 @@
-# gpu/base: the GPU project's base with LupoLab/Luna.jl#440
+# gpu/base: the GPU project's base
 
-`evanescent` (fdf8dbe3) + #440 ("Propagate the modified shot-noise field under the unitary
-linear operator", head 6537a0f4 on jtravs/claude/luna-modified-noise-fix-40e7bb). Every GPU
-branch merges this, so the GPU PRs can be based on a master which contains #440.
+`evanescent` without the modified shot-noise model. Every GPU branch merges this.
 
-## Conflicts resolved
+## History
 
-`evanescent` carries the free-space rework of #416 (polarisation dimension in the radial and
-3-D transforms, the radial Hankel transform as two GEMMs, `to_time!`/`to_freq!` taking the
-*forward* plan); #440 was written against master. Resolutions:
+This branch used to be `evanescent` + LupoLab/Luna.jl#440 ("Propagate the modified shot-noise
+field under the unitary linear operator"), so that the GPU PRs could be based on a master
+containing #440. The modified shot-noise model of #414 has since been dropped because its
+physics is not correct: `revert-modified-noise` reverts #414's noise model on master (keeping
+its Scans.jl queue fix, the .gitignore entries, the PPT test tolerance and the `rng` keyword,
+which now seeds the input `Fields.ShotNoise`), and #440 will not be merged.
 
-- `to_time!` calls keep `t.FT` (evanescent's convention); #440's `inv(t.FT)` would be wrong
-  here, including in the auto-merged TransModeAvg noise path.
-- **TransRadial**: evanescent's layout `(t, pol, r)` and GEMMs, with #440's noise: the noise
-  is advanced every right-hand side, taken ω → t and k → r with the same `Tbwd` as the field
-  (`Et_nl` doubles as the k-space scratch), and added in `Et_nl`.
-- **TransFree**: evanescent's `(t, pol, x, y)` layout and `to_time!`; the noise buffers now
-  have the field's shape (evanescent's precomputed noise buffers had no polarisation
-  dimension, so `Et_nl = Eto + Et_noise` could not have broadcast).
-- `Luna.setup` radial/3-D methods: `np > 1` polarisation argument kept, keyword `noise`.
-- Interface: #440's `rtol`/`atol` and `save_noise` alongside evanescent's absorbing-boundary
-  keywords (`boundary_kwargs`) and `linopkw` for the envelope THG option.
+`evanescent` merged `revert-modified-noise`, and this branch then merged `evanescent` taking
+its tree, so it now differs from `evanescent` only by this file. The #440 code, its fixes on
+this branch (the one-mode `(nω, 1)` draw, the evanescent-component mask of the free-space draw)
+and `test_noise.jl` are gone. `shotnoise=true` adds one-photon-per-mode noise to the input
+field, as before #414.
 
-## Test added
-
-`test_noise.jl` "Every transform sees E + noise(z)": for the radial, 3-D, mode-averaged and
-multimode transforms, the transform with noise equals the noise-free one applied to
-`Eω .+ noise_at(noise, z)`, at two z. #440's own tests cover only the capillary transforms;
-this is the check that carries the free-space resolutions (and, later, every device path).
-The free-space cases cover radial and 3-D, field and envelope grids, one and two
-polarisation components, and a z-dependent (tabulated) phase on a `(ω, pol, k⊥)` size.
-
-Docstrings: the free-space noise shapes (`(nω, np, k⊥...)`, the size of `Eω` from
-`Luna.setup`; `generate_noise_field` does not make free-space draws) and `to_time!`'s forward
-plan. (The open question first noted here, noise at evanescent `k⊥ > k`, is resolved below.)
-
-## Verification
-
-test_noise 141/141 (incl. #440's Chen & Wise identity), test_freespace 68/68,
-test_interface 301/301. (No regression gate on this branch; it arrives with gpu/00-harness.)
-
-## Evanescent components
-
-At `k⊥ > k(ω)` the operator is a real decay, so the unitary propagator would carry the noise at
-full amplitude while the field decays. The free-space transforms zero the draw there on
-construction (`propagating_mask`, `mask_evanescent!`; crystal optics per polarisation), with
-`k(ω)` at z = 0; noise.md states the limit for an index which changes along z. Tests: the mask
-agrees with the operator both ways, isotropic and BBO, through `setup`. Reviewed, AGREE.
+Every branch downstream removes its own noise code when it merges this one.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
-https://claude.ai/code/session_01PizrXcSBunUFRHcXRjCd6C
+https://claude.ai/code/session_01WM2AxPkj1PCFvBcaaaanzV
