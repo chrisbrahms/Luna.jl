@@ -332,7 +332,6 @@ used, unchanged — so these runs read and wrote the shared FFTW wisdom cache. I
 touch the regression record: the gate, the baseline generation and the sensitivity run all
 disable wisdom themselves.
 
-
 ## State of the project
 
 Group E2 is the last implementation group. What the branch leaves behind:
@@ -402,9 +401,3 @@ Unchanged from `PR_int-E.md` except where a Group E2 branch closed one:
   error statistics have no device form; the crystal-optics normalisation stages through the
   host; a tapered mode collection with `modal_integral=:fixed` re-evaluates the mode fields
   on the host whenever `z` moves; a free-space energy functional has no device form.
-
-## LupoLab/Luna.jl#440 (propagated modified shot noise)
-
-25, 26, 27 with #440: Interface's `setup` and `saveargs` argument lists (`zmax`, `save_noise`,
-`linop_integral`); the noise-table changes are on gpu/27. Reviewed, AGREE after one round.
-Gate 506/506, exactly 0; device 1527, noise 211, linops 354, interface 369, multimode 15.
