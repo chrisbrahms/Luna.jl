@@ -2,7 +2,7 @@ module Interface
 using Luna
 import Luna.PhysData: wlfreq, roomtemp
 import Luna: Grid, Modes, Output, Fields, Boundaries
-import Random: AbstractRNG, GLOBAL_RNG
+import Random: GLOBAL_RNG
 import Logging: @info, @debug
 
 module Pulses
@@ -288,19 +288,10 @@ In this case, all keyword arguments except for `λ0` are ignored.
     elliptical polarisation is always the y-axis.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
-- `shotnoise`: Whether and how to include quantum noise. Can be one of:
-    - `true` (default) -- same as `:modified`.
-    - `false` -- disable all noise.
-    - `:modified` -- use the modified shot-noise model of Chen & Wise
-      (arXiv:2410.20567), where a constant noise field enters the nonlinear operator
-      at every step but is excluded from dispersion. This prevents artificial FWM
-      phase-matching and elevated noise floor artefacts.
-    - `:input` -- use traditional one-photon-per-mode shot noise added to the input
-      field at `z = 0`.
-    See the [Noise model](@ref) documentation for details.
-- `rng`: Random number generator for noise field generation. Defaults to `GLOBAL_RNG`.
-    Pass a seeded RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations,
-    or different seeds for ensemble/shot-to-shot statistics.
+- `shotnoise`:  If `true` (default), one-photon-per-mode quantum noise is included.
+- `rng`: Random number generator for the shot noise. Defaults to `GLOBAL_RNG`. Pass a seeded
+    RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations, or different seeds
+    for ensemble/shot-to-shot statistics.
 
 # Modes options
 - `modes`: Defines which modes are included in the propagation. Can be any of:
@@ -396,8 +387,7 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         power=nothing, energy=nothing,
                         pulseshape=:gauss, polarisation=:linear, propagator=nothing,
                         pulses=nothing,
-                        shotnoise=true,
-                        rng=GLOBAL_RNG,
+                        shotnoise=true, rng=GLOBAL_RNG,
                         modes=:HE11, model=:full, loss=true,
                         radial_integral_rtol=1e-3,
                         raman=nothing, kerr=true, plasma=nothing,
@@ -432,10 +422,10 @@ function prop_capillary_args(radius, flength, gas, pressure;
                         PPT_options, preionfrac, temperature)
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
-    inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
+    inputs = shotnoise_maybe(inputs, mode_s, shotnoise, rng)
     linop, Eω, transform, FT = setup(grid, mode_s, density, resp, inputs, pol,
                                      radial_integral_rtol, const_linop(radius, pressure);
-                                     noise_field, thg)
+                                     thg)
     stats = Stats.default(grid, Eω, mode_s, linop, transform; gas=gas, stats_kwargs...)
     output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
 
@@ -828,30 +818,13 @@ function ellfields(pulse::Pulses.DataPulse, pf)
     f1, f2
 end
 
-function makenoise(grid, mode_s, inputs, shotnoise::Bool, rng)
-    shotnoise ? makenoise(grid, mode_s, inputs, :modified, rng) : (inputs, nothing)
-end
-
-function makenoise(grid, mode_s, inputs, shotnoise::Symbol, rng)
-    if shotnoise == :modified
-        nm = mode_s isa AbstractArray ? length(mode_s) : 1
-        noise_field = Fields.generate_noise_field(grid; rng, nmodes=nm)
-        @info("Modified shot-noise model enabled. Traditional input shot noise is " *
-              "disabled (noise enters through nonlinear operator instead).")
-        return (inputs, noise_field)
-    elseif shotnoise == :input
-        inputs = _add_input_shotnoise(inputs, mode_s, rng)
-        return (inputs, nothing)
-    else
-        throw(DomainError(shotnoise, "Unknown shotnoise=$shotnoise. Use true, false, :modified, or :input."))
-    end
-end
-
-function _add_input_shotnoise(inputs, mode::Modes.AbstractMode, rng)
+function shotnoise_maybe(inputs, mode::Modes.AbstractMode, shotnoise::Bool, rng=GLOBAL_RNG)
+    shotnoise || return inputs
     (inputs..., (mode=1, fields=(Fields.ShotNoise(rng),)))
 end
 
-function _add_input_shotnoise(inputs, modes, rng)
+function shotnoise_maybe(inputs, modes, shotnoise::Bool, rng=GLOBAL_RNG)
+    shotnoise || return inputs
     (inputs..., [(mode=ii, fields=(Fields.ShotNoise(rng),)) for ii in eachindex(modes)]...)
 end
 
@@ -865,24 +838,24 @@ linopkw(grid::Grid.RealGrid, thg) = NamedTuple()
 linopkw(grid::Grid.EnvGrid, thg) = (; thg)
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{true}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{true}; thg=LinearOps.thg_default(grid))
     @info("Using mode-averaged propagation.")
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, mode, grid.referenceλ;
                                                     linopkw(grid, thg)...)
 
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z); noise_field)
+    βfun!, z -> Modes.Aeff(mode, z=z))
     linop, Eω, transform, FT
 end
 
 function setup(grid, mode::Modes.AbstractMode, density, responses, inputs, pol, rtol,
-               c::Val{false}; noise_field=nothing, thg=LinearOps.thg_default(grid))
+               c::Val{false}; thg=LinearOps.thg_default(grid))
     @info("Using mode-averaged propagation.")
     linop, βfun! = LinearOps.make_linop(grid, mode, grid.referenceλ;
                                         linopkw(grid, thg)...)
 
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs,
-                                   βfun!, z -> Modes.Aeff(mode, z=z); noise_field)
+                                   βfun!, z -> Modes.Aeff(mode, z=z))
     linop, Eω, transform, FT
 end
 
@@ -891,22 +864,22 @@ needfull(modes) = !all(modes) do mode
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{true};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               thg=LinearOps.thg_default(grid))
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_const_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf, rtol, noise_field)
+                                   pol ? :xy : :y; full=nf, rtol)
     linop, Eω, transform, FT
 end
 
 function setup(grid, modes, density, responses, inputs, pol, rtol, c::Val{false};
-               noise_field=nothing, thg=LinearOps.thg_default(grid))
+               thg=LinearOps.thg_default(grid))
     nf = needfull(modes)
     @info(nf ? "Using full 2-D modal integral." : "Using radial modal integral.")
     linop = LinearOps.make_linop(grid, modes, grid.referenceλ; linopkw(grid, thg)...)
     Eω, transform, FT = Luna.setup(grid, density, responses, inputs, modes,
-                                   pol ? :xy : :y; full=nf, rtol, noise_field)
+                                   pol ? :xy : :y; full=nf, rtol)
     linop, Eω, transform, FT
 end
 
@@ -965,19 +938,10 @@ Note that the current GNLSE model is single mode only.
     elliptical polarisation is always the y-axis.
 - `propagator`: A function `propagator!(Eω, grid)` which **mutates** its first argument to
                 apply an arbitrary propagation to the pulse before the simulation starts.
-- `shotnoise`: Whether and how to include quantum noise. Can be one of:
-    - `true` (default) -- same as `:modified`.
-    - `false` -- disable all noise.
-    - `:modified` -- use the modified shot-noise model of Chen & Wise
-      (arXiv:2410.20567), where a constant noise field enters the nonlinear operator
-      at every step but is excluded from dispersion. This prevents artificial FWM
-      phase-matching and elevated noise floor artefacts.
-    - `:input` -- use traditional one-photon-per-mode shot noise added to the input
-      field at `z = 0`.
-    See the [Noise model](@ref) documentation for details.
-- `rng`: Random number generator for noise field generation. Defaults to `GLOBAL_RNG`.
-    Pass a seeded RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations,
-    or different seeds for ensemble/shot-to-shot statistics.
+- `shotnoise`:  If `true` (default), one-photon-per-mode quantum noise is included.
+- `rng`: Random number generator for the shot noise. Defaults to `GLOBAL_RNG`. Pass a seeded
+    RNG (e.g. `MersenneTwister(seed)`) for reproducible noise realisations, or different seeds
+    for ensemble/shot-to-shot statistics.
 
 # GNLSE options
 - `shock::Bool`: Whether to include the shock derivative term. Default is `true`.
@@ -1037,8 +1001,7 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
                         power=nothing, energy=nothing,
                         pulseshape=:gauss, propagator=nothing,
                         pulses=nothing,
-                        shotnoise=true, shock=true,
-                        rng=GLOBAL_RNG,
+                        shotnoise=true, shock=true, rng=GLOBAL_RNG,
                         loss=0.0, raman=true, fr=0.18,
                         ramanmodel=:sdo, τ1=12.2e-15, τ2=32e-15,
                         saveN=201, filepath=nothing,
@@ -1081,11 +1044,10 @@ function prop_gnlse_args(γ, flength, βs; λ0, λlims, trange,
 
     inputs = makeinputs(mode_s, λ0, pulses, τfwhm, τw, ϕ,
                         power, energy, pulseshape, polarisation, propagator)
-    inputs, noise_field = makenoise(grid, mode_s, inputs, shotnoise, rng)
+    inputs = shotnoise_maybe(inputs, mode_s, shotnoise, rng)
 
     norm! = NonlinearRHS.norm_mode_average_gnlse(grid, aeff; shock)
-    Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff;
-                                   norm!, noise_field)
+    Eω, transform, FT = Luna.setup(grid, density, resp, inputs, βfun!, aeff, norm! = norm!)
     stats = Stats.default(grid, Eω, mode_s, linop, transform)
     output = makeoutput(grid, saveN, stats, filepath, scan, scanidx, filename)
 
