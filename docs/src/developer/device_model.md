@@ -253,8 +253,7 @@ The nodes are placed by bisection: an interval is accepted when the interpolant 
 be read back agrees, at the interval's midpoint, with a directly computed value to the
 tolerance. That measures the error of the thing actually used, and it puts nodes at the
 features Luna's operators have — the `1/√z` cusp of a gradient filled from vacuum, a
-junction in a multi-section fill — without refining anywhere else. The design is PR 440's
-`TabulatedUnitaryPhase` generalised to the full complex operator.
+junction in a multi-section fill — without refining anywhere else.
 
 `TabulatedLinop` stores not `Φ` but its deviation from the secant through the ends of the
 table, and the propagator adds `L̄·(t2 − t1)` back in the same broadcast. In exact

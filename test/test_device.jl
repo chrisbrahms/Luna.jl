@@ -1077,7 +1077,7 @@ end
    `:rate` case, which exercises `Boundaries.RateAbsorber`, has its own testset below. =#
 function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=800e-9,
                   precision=nothing, boundary=:none, stats=false, extraresp=(),
-                  stats_device=:auto, noise=false)
+                  stats_device=:auto)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (300e-9, 2000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (300e-9, 2000e-9), 400e-15)
@@ -1093,14 +1093,8 @@ function kerrcase(GT, spec; gas=:He, pres=1.0, energy=1e-6, flength=1e-2, λ0=80
     resp = (resp..., extraresp...)
     linop, βfun!, _, _ = LinearOps.make_const_linop(grid, m, λ0)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
-    #= `noise=true`: the modified shot-noise model, with the one-photon draw amplified 1e6
-       times so that it changes the result far beyond rounding (the device comparisons
-       below are at 1e-10). Always built on the host in Float64, as the interface does. =#
-    nz = noise ? NonlinearRHS.ModifiedNoise(
-            1e6 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(1)),
-            LinearOps.unitary_phase(linop, grid), grid) : nothing
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, βfun!, aeff;
-                                   constβ=true, device=spec, precision, noise=nz)
+                                   constβ=true, device=spec, precision)
     #= The state itself: `Stats.default` builds its buffers and plans its transform for
        the array type and precision `Eω` has, so the default statistics run where the
        state does (gpu/24). =#
@@ -1289,7 +1283,7 @@ end
    length does not cap `max_dz` and undo that. =#
 function radialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3, λ0=800e-9,
                     R=1e-3, N=24, w0=200e-6, plasma=false, raman=false, npol=1,
-                    noise=false, precision=nothing, boundary=:rate)
+                    precision=nothing, boundary=:rate)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (400e-9, 2000e-9), 100e-15) :
         Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
@@ -1319,21 +1313,8 @@ function radialcase(GT, spec; gas=:Ar, pres=1.0, energy=1e-6, flength=2e-3, λ0=
        first component. =#
     inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength,
                                      θ=npol == 2 ? π/6 : 0.0)
-    #= `noise=true`: the modified shot-noise model (LupoLab/Luna.jl#440), the one-photon
-       draw the same in every k column and polarisation component, amplified 100 times so
-       that it changes the result (by ~3e-4) far beyond the comparison tolerances. (The
-       draw is normalised per waveguide mode, not per k column: at 1e4 times this case
-       already blows up.) Built on the host in Float64, as the caller does; the transform
-       advances its own copy on `spec`. =#
-    nz = nothing
-    if noise
-        nfω = 1e2 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(1))
-        nf = repeat(nfω, 1, npol, N)
-        nz = NonlinearRHS.ModifiedNoise(nf, LinearOps.unitary_phase(linop, grid, size(nf)),
-                                        grid)
-    end
     Eω, transform, FT = Luna.setup(grid, rg, dens, normfun, Tuple(resp), inputs;
-                                   noise=nz, device=spec, precision)
+                                   device=spec, precision)
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
     h = flength/8
     Luna.run(Eω, grid, linop, transform, FT, out;
@@ -1377,7 +1358,7 @@ end
 function modalcase(GT, spec; nmodes=4, components=:y, gas=:Ar, pres=0.1, energy=50e-6,
                    flength=2e-3, λ0=800e-9, plasma=false, modal_integral=:fixed,
                    nr=32, nθ=16, full=false, kronrod=false, precision=nothing, run=true,
-                   taper=false, noise=false, modes=nothing)
+                   taper=false, modes=nothing)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (200e-9, 3000e-9), 400e-15) :
         Grid.EnvGrid(λ0, (200e-9, 3000e-9), 400e-15)
@@ -1399,18 +1380,8 @@ function modalcase(GT, spec; nmodes=4, components=:y, gas=:Ar, pres=0.1, energy=
     linop = taper ? LinearOps.make_linop(grid, modes, λ0) :
                     LinearOps.make_const_linop(grid, modes, λ0)
     inputs = Fields.GaussField(λ0=λ0, τfwhm=20e-15, energy=energy)
-    #= The modified shot-noise model (LupoLab/Luna.jl#440): the noise enters through the
-       nonlinear operator, advanced to the current z by the unitary part of the case's own
-       operator, so the transform carries it in the modal time domain. Seeded, so that a
-       host and a device run of the same case get the same draw. =#
-    nz = nothing
-    if noise
-        nf = Fields.generate_noise_field(grid; nmodes, rng=MersenneTwister(1234))
-        nz = NonlinearRHS.ModifiedNoise(
-            nf, LinearOps.unitary_phase(linop, grid, size(nf); zmax=flength), grid)
-    end
     Eω, transform, FT = Luna.setup(grid, dens, resp, inputs, modes, components;
-                                   modal_integral, full, nr, nθ, kronrod, noise=nz,
+                                   modal_integral, full, nr, nθ, kronrod,
                                    device=spec, precision)
     run || return Eω, transform, FT, linop, grid
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
@@ -2341,52 +2312,6 @@ end
     @test radialdiff(href, dref) < 1e-10
 end
 
-#= The modified shot-noise path (LupoLab/Luna.jl#440): the noise is advanced to the
-   current z on the run's array type, taken to the time domain with the device inverse plan
-   and then k -> r with the device `Tbwd`, and a second block-sized buffer holds
-   field+noise. The same host draw goes into every run, so they are comparable. =#
-@testset "the radial modified shot noise on JLArray and in Float32" begin
-    href, htr = radialcase(Grid.RealGrid, HostSpec(); noise=true)
-    hclean, _ = radialcase(Grid.RealGrid, HostSpec())
-    dref, dtr = radialcase(Grid.RealGrid, JLSpec; noise=true)
-    @test htr.dnoise === htr.noise # the default path uses the caller's object
-    @test dtr.noise.Eω0 isa Array{ComplexF64, 3}
-    @test dtr.dnoise.Eω0 isa JLArray{ComplexF64, 3}
-    @test dtr.Eωo_noise isa JLArray{ComplexF64, 3}
-    @test dtr.Et_noise isa JLArray{Float64, 3}
-    @test dtr.Et_nl isa JLArray{Float64, 3}
-    @test size(dtr.Et_noise) == size(dtr.Eto_r)
-    @test Luna.all_resident(JLSpec, dtr.Eωo_noise, dtr.Et_noise, dtr.Et_nl,
-                            NonlinearRHS.noise_arrays(dtr.dnoise)...)
-    # the noise matters far beyond the level compared
-    effect = radialdiff(href, hclean)
-    @test effect > 1e-5
-    @test radialdiff(href, dref) < 1e-10
-    # two polarisation components: the noise buffers have the field's (t, pol, r) shape
-    h2, _ = radialcase(Grid.RealGrid, HostSpec(); noise=true, npol=2)
-    d2, dtr2 = radialcase(Grid.RealGrid, JLSpec; noise=true, npol=2)
-    @test size(dtr2.Et_noise) == size(dtr2.Eto_r)
-    @test radialdiff(h2, d2) < 1e-10
-    # Float32: the kernels' copy is in state units, the output unscaled by Luna.run
-    f32, t32 = radialcase(Grid.RealGrid, DeviceSpec(Array, Float32); noise=true)
-    @test t32.dnoise.Eω0 isa Array{ComplexF32, 3}
-    @test t32.dnoise.Eω0 ≈ ComplexF32.(t32.noise.Eω0 ./ t32.scaling.Eref)
-    e32 = radialdiff(href, f32) # 1.2e-6 measured
-    @test e32 < 1e-5
-    @test effect > 10*e32
-    #= The evanescent mask reaches the kernels' copy: on a transverse grid fine enough to put
-       part of the band beyond cutoff, the device and the Float32 copies are zero there too. =#
-    for spec in (JLSpec, DeviceSpec(Array, Float32))
-        _, t = radialcase(Grid.RealGrid, spec; R=5e-6, N=32, w0=1.5e-6, energy=1e-12,
-                          noise=true)
-        prop = NonlinearRHS.propagating_mask(t.normfun, 0.0)
-        @test any(.!prop)
-        @test all(iszero, Array(t.noise.Eω0)[.!prop])
-        @test all(iszero, Array(t.dnoise.Eω0)[.!prop])
-        @test any(!iszero, Array(t.dnoise.Eω0)[prop])
-    end
-end
-
 @testset "radial envelope Raman on JLArray" begin
     hr, _ = radialcase(Grid.EnvGrid, HostSpec(); gas=:N2, energy=50e-6, raman=true)
     dr, dtr = radialcase(Grid.EnvGrid, JLSpec; gas=:N2, energy=50e-6, raman=true)
@@ -2558,38 +2483,6 @@ end
             @test maximum(abs, d .- h)/nrm < 1e-10
         end
     end
-end
-
-#= The modified shot-noise model on a device: the kernels' copy of the modal noise
-   (`dnoise`, divided by `Eref`) is advanced to the current z and transformed once per
-   right-hand side, and added to the modal field before the synthesis. Review round 1,
-   finding 8: that path had no test. Evaluated away from z = 0, so that the noise has
-   moved. =#
-@testset "the modified shot-noise model on JLArray" begin
-    z = 1e-3
-    hEω, hnl, htr = modalrhs(Grid.RealGrid, HostSpec(); z, noise=true)
-    dEω, dnl, dtr = modalrhs(Grid.RealGrid, JLSpec; z, noise=true)
-    @test htr.dnoise === htr.noise
-    @test dtr.dnoise.Eω0 isa JLArray{ComplexF64, 2}
-    @test Luna.all_resident(JLSpec, NonlinearRHS.noise_arrays(dtr.dnoise)...)
-    @test dtr.Emt_noise isa JLArray
-    @test dtr.Emt_nl isa JLArray
-    @test htr.noise.Eω != htr.noise.Eω0 # advanced
-    @test maximum(abs, Array(dtr.Emt_noise) .- htr.Emt_noise) /
-          maximum(abs, htr.Emt_noise) < 1e-14
-    @test maximum(abs, Array(dnl) .- hnl)/maximum(abs, hnl) < 1e-10
-    #= The adaptive transform advances the same noise once per right-hand side in
-       `reset!`: the two discretisations of the integral agree with the noise in it to
-       the accuracy they agree without it. =#
-    _, anl, atr = modalrhs(Grid.RealGrid, HostSpec(); z, noise=true, modal_integral=:adaptive)
-    _, fnl, _ = modalrhs(Grid.RealGrid, HostSpec(); z, noise=true, nr=64)
-    @test atr isa NonlinearRHS.TransModal
-    @test maximum(abs, anl .- fnl)/maximum(abs, anl) < 1e-12
-    #= The noise really contributes: the same case without it differs by far more than
-       the tolerance above. =#
-    _, nonl, notr = modalrhs(Grid.RealGrid, HostSpec(); z)
-    @test isnothing(notr.Emt_noise)
-    @test maximum(abs, nonl .- hnl)/maximum(abs, hnl) > 1e-10
 end
 
 #= The embedded error estimate is two matrix products and a transform like everything
@@ -3077,84 +2970,6 @@ end # have_jlarrays
 #= The reduced-precision path on the CPU. This is the scaling layer under a magnifying
    glass: Float32 on the host keeps subnormals, so an unscaled run would *work* here and
    fail only on Metal. The check is therefore on the numbers, not on whether it runs. =#
-@testset "modified shot noise on JLArray and in Float32" begin
-    #= LupoLab/Luna.jl#440: the noise is advanced by the unitary phase at every right-hand
-       side. On a device, or in Float32, the transform advances its own copy (`dnoise`) on
-       that array type and in state units; the caller's `noise` stays on the host in
-       physical units. =#
-    for GT in (Grid.RealGrid, Grid.EnvGrid)
-        href, htr = kerrcase(GT, HostSpec(); noise=true)
-        hclean, _ = kerrcase(GT, HostSpec())
-        dref, dtr = kerrcase(GT, JLSpec; noise=true)
-        @test htr.dnoise === htr.noise # the default path uses the caller's object
-        @test dtr.noise.Eω0 isa Vector{ComplexF64} # the caller's object is untouched...
-        @test dtr.dnoise.Eω0 isa JLArray{ComplexF64} # ...and the kernels' copy is resident
-        @test dtr.dnoise.φ isa JLArray{Float64}
-        @test dtr.dnoise.phase.dφ isa JLArray{Float64}
-        @test dtr.Et_noise isa JLArray
-        # the noise matters at the level compared, so the agreement below is not vacuous
-        @test maximum(abs, href["Eω"][:, end] .- hclean["Eω"][:, end]) >
-              1e-6*maximum(abs, href["Eω"][:, end])
-        for idx in axes(href["Eω"], 2)
-            h = href["Eω"][:, idx]
-            d = dref["Eω"][:, idx]
-            @test maximum(abs, d .- h)/maximum(abs, h) < 1e-10
-        end
-    end
-    href, _ = kerrcase(Grid.RealGrid, HostSpec(); pres=0.3, noise=true)
-    f32, tr32 = kerrcase(Grid.RealGrid, DeviceSpec(Array, Float32); pres=0.3, noise=true)
-    @test tr32.dnoise.Eω0 isa Vector{ComplexF32}
-    @test tr32.dnoise.Eω0 ≈ ComplexF32.(tr32.noise.Eω0 ./ tr32.scaling.Eref)
-    Eref = tr32.scaling.Eref
-    hclean, _ = kerrcase(Grid.RealGrid, HostSpec(); pres=0.3)
-    err32 = 0.0
-    for idx in axes(href["Eω"], 2)
-        h = href["Eω"][:, idx]
-        d = ComplexF64.(f32["Eω"][:, idx]) # Luna.run unscales the output
-        err32 = max(err32, maximum(abs, d .- h)/maximum(abs, h))
-        @test maximum(abs, d .- h)/maximum(abs, h) < 1e-5
-    end
-    # the noise changes the result by well over the Float32 comparison error
-    h = href["Eω"][:, end]
-    @test maximum(abs, h .- hclean["Eω"][:, end])/maximum(abs, h) > 10*err32
-    # a resumed run adopts a recorded draw: the kernels' copy follows the caller's, and
-    # the advance (forced by the reset `lastz`) starts from the new draw
-    tr32.noise.Eω0 .*= 2
-    NonlinearRHS.sync_noise!(tr32)
-    @test tr32.dnoise.Eω0 ≈ ComplexF32.(tr32.noise.Eω0 ./ Eref)
-    @test isnan(tr32.dnoise.lastz[])
-    @test NonlinearRHS.noise_at!(tr32.dnoise, 5e-3) ≈
-          ComplexF32.(NonlinearRHS.noise_at!(tr32.noise, 5e-3) ./ Eref)
-end
-
-@testset "tabulated noise phase on JLArray and in Float32" begin
-    #= A z-dependent operator gives a `TabulatedUnitaryPhase`; its retargeted copy (Hermite
-       evaluation on `selectdim` views of the device table, Float32 coefficients) must
-       follow the host one inside the table, in the overshoot margin past zmax and in the
-       linear extrapolation beyond the table's last node. =#
-    grid = Grid.RealGrid(800e-9, (300e-9, 2000e-9), 400e-15)
-    zmax = 0.2
-    coren, _ = Capillary.gradient(:He, zmax, 5.0, 0.5)
-    linop!, _ = LinearOps.make_linop(grid, Capillary.MarcatiliMode(100e-6, coren; loss=true),
-                                     grid.referenceλ)
-    phase = LinearOps.unitary_phase(linop!, grid, (length(grid.ω),); zmax)
-    @test phase isa LinearOps.TabulatedUnitaryPhase
-    nh = NonlinearRHS.ModifiedNoise(
-        Fields.generate_noise_field(grid; rng=Random.MersenneTwister(2)), phase, grid)
-    zs = (0.0, 0.05, 0.13, zmax, 1.02zmax, 1.5*phase.z[end])
-    for (spec, rtol) in ((JLSpec, 1e-12), (DeviceSpec(Array, Float32), 1e-4))
-        nd = NonlinearRHS.retarget_noise(nh, spec, UNIT_SCALING)
-        @test nd.phase isa LinearOps.TabulatedUnitaryPhase
-        @test nd.phase.Φ isa (spec === JLSpec ? JLArray{Float64} : Array{Float32})
-        Luna.assert_resident(spec, NonlinearRHS.noise_arrays(nd)...)
-        for z in zs
-            h = copy(NonlinearRHS.noise_at!(nh, z))
-            d = ComplexF64.(Array(NonlinearRHS.noise_at!(nd, z)))
-            @test maximum(abs, d .- h)/maximum(abs, h) < rtol
-        end
-    end
-end
-
 @testset "Float32 on the CPU" begin
     #= Helium at 0.3 bar is the dynamic-range case: ρ ε₀ γ₃ is 3.3e-39 there, below the
        smallest Float32 subnormal (1.2e-38 normal, 1.4e-45 subnormal), and Metal flushes
@@ -3239,15 +3054,8 @@ end
 const BBO_θ = deg2rad(29.2) # type I phase-matching angle
 const BBO_ϕ = deg2rad(30)
 
-#= The modified shot noise (LupoLab/Luna.jl#440) of the free-space cases: `noise_field` is
-   the raw `(nω, npol, nk...)` draw, built on the host by the caller, wrapped with the
-   unitary phase of the case's own operator. =#
-casenoise(::Nothing, linop, grid) = nothing
-casenoise(nf, linop, grid) =
-    NonlinearRHS.ModifiedNoise(nf, LinearOps.unitary_phase(linop, grid, size(nf)), grid)
-
 function free2dcase(GT, spec; λ0=800e-9, τfwhm=30e-15, w0=20e-6, energy=10e-9,
-                    thickness=30e-6, Nx=2^5, noise_field=nothing, precision=nothing,
+                    thickness=30e-6, Nx=2^5, precision=nothing,
                     boundary=:rate)
     grid = GT === Grid.RealGrid ?
         Grid.RealGrid(λ0, (250e-9, 2e-6), 120e-15) :
@@ -3260,7 +3068,6 @@ function free2dcase(GT, spec; λ0=800e-9, τfwhm=30e-15, w0=20e-6, energy=10e-9,
     resp = (freechi2(grid),)
     inputs = Fields.GaussGaussField(;λ0, τfwhm, energy=energy/(sqrt(π/2)*w0), w0)
     Eω, transform, FT = Luna.setup(grid, xgrid, densityfun, normfun, resp, inputs;
-                                   noise=casenoise(noise_field, linop, grid),
                                    device=spec, precision)
     out = Output.MemoryOutput(0, thickness, 3, Output.nostats)
     h = thickness/8
@@ -3280,7 +3087,7 @@ freechi2(grid::Grid.EnvGrid) = Nonlinear.Chi2Env(BBO_θ, BBO_ϕ, PhysData.χ2(:B
    fixed steps. The block is `(nto, npol, Nx, Ny)` and the transform is one region-(1,3,4)
    FFT each way. =#
 function free3dcase(spec; gas=:Ar, pres=1.0, λ0=800e-9, energy=1e-9, flength=2e-3,
-                    R=1e-3, Nx=8, Ny=6, w0=200e-6, noise_field=nothing,
+                    R=1e-3, Nx=8, Ny=6, w0=200e-6,
                     precision=nothing, boundary=:rate)
     grid = Grid.EnvGrid(λ0, (400e-9, 2000e-9), 100e-15)
     xygrid = Grid.FreeGrid(R, Nx, R, Ny)
@@ -3293,7 +3100,6 @@ function free3dcase(spec; gas=:Ar, pres=1.0, λ0=800e-9, energy=1e-9, flength=2e
     normfun = NonlinearRHS.const_norm_free(grid, xygrid, nfun)
     inputs = Fields.GaussGaussField(;λ0, τfwhm=20e-15, energy, w0, propz=-flength)
     Eω, transform, FT = Luna.setup(grid, xygrid, dens, normfun, resp, inputs;
-                                   noise=casenoise(noise_field, linop, grid),
                                    device=spec, precision)
     out = Output.MemoryOutput(0, flength, 3, Output.nostats)
     h = flength/8
@@ -3328,16 +3134,6 @@ end
         # ... and the aliased buffer really is the one both passes use
         @test size(t.Eωo, 1) == length(t.grid.ωo)
     end
-    #= with the modified shot-noise model, three more: the oversampled spectral and the
-       time-domain noise at the current z, and the field+noise buffer =#
-    grid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
-    Nx = 2^5
-    nfω = Fields.generate_noise_field(grid)
-    nf = zeros(ComplexF64, (length(grid.ω), 2, Nx))
-    nf[grid.sidx, :, :] .= nfω[grid.sidx] .* ones(1, 2, Nx)
-    _, tn = free2dcase(Grid.RealGrid, HostSpec(); noise_field=nf)
-    @test length(fieldbuffers(tn)) == 6
-    @test !isnothing(tn.Eωo_noise) && !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
 end
 
 #= `TransRadial` aliases the same buffer (gpu/int-E; `gpu/21` did it for the two
@@ -3354,11 +3150,6 @@ end
         @test length(unique(objectid, Any[t.Eto_r, t.Eto_k, t.Pto_r, t.Pto_k])) == 4
         @test size(t.Eωo, 1) == length(t.grid.ωo)
     end
-    #= with the modified shot-noise model, three more: the oversampled spectral and the
-       time-domain noise at the current z, and the field+noise buffer =#
-    _, tn = radialcase(Grid.RealGrid, HostSpec(); noise=true)
-    @test length(fieldbuffers(tn)) == 8
-    @test !isnothing(tn.Eωo_noise) && !isnothing(tn.Et_noise) && !isnothing(tn.Et_nl)
 end
 #= The remaining device tests, like the block above, need JLArrays. They were added after
    `end # have_jlarrays` closed that block, so they get their own guard rather than
@@ -3450,137 +3241,6 @@ end
         @test dc.removed[] ≈ hc.removed[] rtol=1e-12
         @test hc.removed[] > 0 # the collar really absorbed something
     end
-end
-
-#= One right-hand side of the host transform with noise (`htr`), without (`ctr`) and of the
-   device one with noise (`dtr`), on the first saved field scaled by `s`, at `z`: how much the
-   noise changes the nonlinear term, and how far the device is from the host. The noise enters
-   the (χ² or Kerr) nonlinear term relative to the field, so a small `s` makes its effect
-   measurable in these weak cases without amplifying the draw any further. With `t32`, a
-   Float32 transform, also how far that is from the host: it takes the state in `Eref` and
-   returns the right-hand side of that state, so its result times `Eref` is physical. =#
-function freerhs(href, htr, ctr, dtr, z; s=1, t32=nothing)
-    E = s .* collect(selectdim(href["Eω"], ndims(href["Eω"]), 1))
-    nlh = similar(E); htr(nlh, E, z)
-    nlc = similar(E); ctr(nlc, E, z)
-    dnl = Luna.todevice(JLSpec, similar(E))
-    dtr(dnl, Luna.todevice(JLSpec, E), z)
-    m = maximum(abs, nlh)
-    effect, err = maximum(abs, nlh .- nlc)/m, maximum(abs, Array(dnl) .- nlh)/m
-    isnothing(t32) && return effect, err
-    Eref = t32.scaling.Eref
-    nl32 = similar(E, ComplexF32)
-    t32(nl32, ComplexF32.(E ./ Eref), z)
-    effect, err, maximum(abs, ComplexF64.(nl32) .* Eref .- nlh)/m
-end
-
-#= The modified shot-noise path of the Cartesian transforms: the noise is advanced to the
-   current z on the device (`dnoise`), taken to the oversampled real-space time domain by
-   the transform's own inverse plan (which does ω -> t and k -> x in one), and a second
-   block-sized buffer holds field+noise. The same host draw goes into both runs. =#
-@testset "the 2-D free-space noise field on JLArray (Float32: the copy's units)" begin
-    grid = Grid.RealGrid(800e-9, (250e-9, 2e-6), 120e-15)
-    Nx = 2^5
-    #= amplified 100 times, so that the noise changes the result far beyond the
-       comparison tolerances below (see `radialcase`) =#
-    nfω = 1e2 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(3))
-    nf = zeros(ComplexF64, (length(grid.ω), 2, Nx))
-    nf[grid.sidx, :, :] .= nfω[grid.sidx] .* ones(1, 2, Nx)
-
-    href, htr = free2dcase(Grid.RealGrid, HostSpec(); Nx, noise_field=nf)
-    dref, dtr = free2dcase(Grid.RealGrid, JLSpec; Nx, noise_field=nf)
-
-    @test htr.dnoise === htr.noise
-    @test dtr.dnoise.Eω0 isa JLArray{ComplexF64, 3}
-    @test Luna.all_resident(JLSpec, dtr.Eωo_noise, NonlinearRHS.noise_arrays(dtr.dnoise)...)
-    @test dtr.Et_noise isa JLArray{Float64, 3}
-    @test dtr.Et_nl isa JLArray{Float64, 3}
-    @test size(dtr.Et_noise) == size(dtr.Eto)
-    @test maximum(abs, Array(dtr.Et_noise)) > 0
-    @test maximum(abs, Array(dtr.Et_noise) .- htr.Et_noise)/
-          maximum(abs, htr.Et_noise) < 1e-14
-    @test radialdiff(href, dref) < 1e-10
-    #= The noise reaches the nonlinear term on the device. This weak case's propagated
-       field barely feels the noise (1e-12), so the check is on one right-hand side at
-       z > 0, where it enters the polarisation directly, of a field 1e4 times weaker
-       (4e-11 at full field). =#
-    _, ctr = free2dcase(Grid.RealGrid, HostSpec(); Nx)
-    effect, err = freerhs(href, htr, ctr, dtr, 10e-6; s=1e-4)
-    @info "2-D free-space noise, one right-hand side" effect err
-    @test effect > 1e-8
-    @test err < 1e-3*effect
-    _, t32 = free2dcase(Grid.RealGrid, DeviceSpec(Array, Float32); Nx, noise_field=nf)
-    @test t32.dnoise.Eω0 isa Array{ComplexF32, 3}
-    @test t32.dnoise.Eω0 ≈ ComplexF32.(t32.noise.Eω0 ./ t32.scaling.Eref)
-    # a noise field of the wrong shape is refused, not silently broadcast
-    @test_throws ErrorException free2dcase(Grid.RealGrid, HostSpec();
-                                           Nx, noise_field=nf[:, 1:1, :])
-end
-
-#= The 3-D shot-noise path in its own right. This is the dimensionality whose buffers were
-   built without the polarisation axis before this branch, so that `ldiv!` against the
-   region-(1,3,4) plan could not run at all; a 2-D test does not cover it, `freenoise`
-   getting its shapes from the transform. =#
-@testset "the 3-D free-space noise field on JLArray and in Float32" begin
-    grid = Grid.EnvGrid(800e-9, (400e-9, 2000e-9), 100e-15)
-    Nx, Ny = 8, 6
-    nfω = 1e2 .* Fields.generate_noise_field(grid; rng=Random.MersenneTwister(4))
-    nf = zeros(ComplexF64, (length(grid.ω), 1, Nx, Ny))
-    nf[grid.sidx, 1, :, :] .= nfω[grid.sidx] .* ones(1, Nx, Ny)
-
-    href, htr = free3dcase(HostSpec(); Nx, Ny, noise_field=nf)
-    dref, dtr = free3dcase(JLSpec; Nx, Ny, noise_field=nf)
-
-    @test dtr.dnoise.Eω0 isa JLArray{ComplexF64, 4}
-    @test Luna.all_resident(JLSpec, dtr.Eωo_noise, NonlinearRHS.noise_arrays(dtr.dnoise)...)
-    @test dtr.Et_noise isa JLArray{ComplexF64, 4}
-    @test dtr.Et_nl isa JLArray{ComplexF64, 4}
-    @test size(dtr.Et_noise) == size(dtr.Eto) == (length(grid.to), 1, Nx, Ny)
-    @test maximum(abs, Array(dtr.Et_noise)) > 0
-    @test maximum(abs, Array(dtr.Et_noise) .- htr.Et_noise)/
-          maximum(abs, htr.Et_noise) < 1e-14
-    # one right-hand side on the device, with the noise in it, is finite
-    nl = similar(dref["Eω"][:, :, :, :, 1])
-    dnl = Luna.todevice(JLSpec, nl)
-    dEω = Luna.todevice(JLSpec, href["Eω"][:, :, :, :, 1])
-    dtr(dnl, dEω, 0.0)
-    @test all(isfinite, Array(dnl))
-    @test radialdiff(href, dref) < 1e-10
-    _, ctr = free3dcase(HostSpec(); Nx, Ny)
-    _, t32 = free3dcase(DeviceSpec(Array, Float32); Nx, Ny, noise_field=nf)
-    @test t32.dnoise.Eω0 isa Array{ComplexF32, 4}
-    @test t32.dnoise.Eω0 ≈ ComplexF32.(t32.noise.Eω0 ./ t32.scaling.Eref)
-    #= as in 2-D, of a field 1e7 times weaker (1.5e-14 at full field), where the noise
-       dominates the nonlinear term (effect ≈ 1), so that the Float32 transform's
-       right-hand side, noise included, is compared too =#
-    effect, err, err32 = freerhs(href, htr, ctr, dtr, 1e-3; s=1e-7, t32)
-    @info "3-D free-space noise, one right-hand side" effect err err32
-    @test effect > 1e-8
-    @test err < 1e-3*effect
-    @test err32 < 1e-3*effect
-    #= an unmasked draw adopted later (a resumed run): `sync_noise!` masks it again before
-       it reaches the kernels' copy. This needs evanescent components, which the grid
-       above (8 points over 2 mm) does not have, so on a 4 µm grid, not propagated. =#
-    xy = Grid.FreeGrid(4e-6, Nx, 4e-6, Ny)
-    nfunλ = PhysData.ref_index_fun(:Ar, 1.0)
-    nfun = (λ; z=0.0) -> nfunλ(λ)
-    normfun = NonlinearRHS.const_norm_free(grid, xy, nfun)
-    linop = LinearOps.make_const_linop(grid, xy, nfun)
-    prop = NonlinearRHS.propagating_mask(normfun, 0.0)
-    @test any(.!prop)
-    inp = Fields.GaussGaussField(; λ0=800e-9, τfwhm=20e-15, energy=1e-12, w0=1.5e-6)
-    _, mtr, _ = Luna.setup(grid, xy, z -> PhysData.density(:Ar, 1.0), normfun,
-                           (Nonlinear.Kerr_env(PhysData.γ3_gas(:Ar)),), inp;
-                           noise=casenoise(copy(nf), linop, grid), device=JLSpec)
-    @test all(iszero, mtr.noise.Eω0[.!prop])
-    mtr.noise.Eω0 .= 1
-    NonlinearRHS.sync_noise!(mtr)
-    @test all(iszero, mtr.noise.Eω0[.!prop])
-    @test all(iszero, Array(mtr.dnoise.Eω0)[.!prop])
-    @test all(==(1), Array(mtr.dnoise.Eω0)[prop])
-    # a noise field without the polarisation axis is refused, not silently broadcast
-    @test_throws ErrorException free3dcase(HostSpec();
-                                           Nx, Ny, noise_field=nf[:, 1, :, :])
 end
 
 #= The radial and free-space default statistics on JLArray. `Stats.beam_profile` is the
