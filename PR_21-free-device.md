@@ -48,7 +48,7 @@ needed**, and none is in the branch.
 Both become parametric in their buffer array type, like `TransModeAvg` and `TransRadial`:
 every buffer allocated with `Luna.alloc`, the grid vectors mirrored (`Luna.gridvectors`),
 the inverse plan held explicitly, the responses given the run's `spec` and `scaling`
-through `Nonlinear.rescale_responses`, the noise field uploaded and divided by `Eref`, and
+through `Nonlinear.rescale_responses`, and
 a constructor which asserts residency of every buffer, mirror and response array. Both
 carry a `UnitScaling`, and `Luna.runscaling` knows about them, so a `Float32` free-space
 run gets a `ScaledOutput` like a mode-averaged one.
@@ -59,8 +59,7 @@ nothing reads it again; `to_freq!` then writes the nonlinear polarisation into t
 array. The two never appear as the input and the output of the same FFT call, which a
 device plan would reject. Each Cartesian transform holds **three** field-sized arrays
 (`Eto`, `Pto`, and the shared frequency-domain buffer) where it held four.
-`test_device.jl` asserts the count by identity, and five when the modified shot-noise
-model adds `Et_noise` and `Et_nl`.
+`test_device.jl` asserts the count by identity.
 
 **The frequency-domain normalisation** was
 `nl .*= ωwin .* (-im.*ω) ./ (2 .* normfun(z))`, which rebuilt two host vectors on every
@@ -74,8 +73,8 @@ case for TransFree` the 2-D call operator carried. They stay separate types beca
 `Boundaries.spacegrid` and `Luna.setup` dispatch on them and because the FFT region
 differs.
 
-**The `scale` field and constructor argument are gone.** Nothing read them except the 3-D
-noise setup, which now goes through `to_time!` and computes the same factor itself.
+**The `scale` field and constructor argument are gone.** Nothing reads them: the
+oversampling goes through `to_time!`, which computes the same factor itself.
 
 ### `Luna.setup` (`src/Luna.jl`)
 
@@ -106,27 +105,6 @@ does no transform: the Cartesian grids transform time and space together, so whe
 Comment only: `prop_capillary`/`prop_gnlse` never build a free-space run, so all three
 free-space device paths are reached through the low-level interface. `_cpu_only!` is now
 about multimode propagation alone.
-
-## A bug found and fixed
-
-**`TransFree`'s modified shot-noise path could not have worked.** Its buffers were built
-without the polarisation axis —
-
-```julia
-Eωo_noise = zeros(ComplexF64, (length(grid.ωo), Nx, Ny))   # 3-D
-Et_noise  = zeros(TT, (length(grid.to), Nx, Ny))           # 3-D
-ldiv!(Et_noise, FT, Eωo_noise)                             # FT is the 4-D (1,3,4) plan
-```
-
-— so `ldiv!` against the 4-D plan and the later `@. t.Et_nl = t.Eto + t.Et_noise`
-broadcast were both shape mismatches. Nothing in the test suite, the gate or the examples
-passes `noise_field` to a Cartesian free-space setup, so it had never been run.
-
-Since the constructor was being rewritten anyway, the path is now the `TransRadial`
-arrangement: an `(nω, npol, nk...)` noise field taken to the oversampled real-space time
-domain by the transform's own inverse plan, with an explicit shape check and a message
-naming the expected shape. `TransFree2D`, which had no noise support at all, has the same.
-Both are tested on `JLArray`.
 
 ## Rounding
 
@@ -219,8 +197,7 @@ ones run.
 `test/test_device.jl` (all against the host on `JLArray`, `allowscalar(false)`):
 
 - `the free-space transforms hold three field-sized buffers` — the buffer-count
-  assertion, by `objectid`, for all three transform/grid combinations, plus five with a
-  noise field.
+  assertion, by `objectid`, for all three transform/grid combinations.
 - `2-D free-space χ⁽²⁾ on JLArray` — type I SHG in BBO on a `Grid.Free2DGrid`,
   field-resolved and envelope, `boundary=:rate`, fixed steps. The same case as
   `test_freespace.jl`'s "BBO SHG" testset and the `free2d_*_chi2` gate cases, on a smaller
@@ -233,8 +210,6 @@ ones run.
   host staging buffer, unlike the crystal-optics one).
 - `the Cartesian collar on JLArray` — both transverse shapes against the host, including
   the absorbed-energy bookkeeping.
-- `the 2-D free-space noise field on JLArray` — the upload, the device inverse plan, the
-  field+noise buffer, and that a noise field of the wrong shape is refused.
 
 Measured, per save, normalised by the largest `|Eω|` in that save (the gate's metric):
 
@@ -243,8 +218,6 @@ Measured, per save, normalised by the largest `|Eω|` in that save (the gate's m
 | 2-D free-space field χ⁽²⁾ (BBO) | **0.000e+00** |
 | 2-D free-space envelope χ⁽²⁾ (BBO) | **0.000e+00** |
 | 3-D free-space envelope Kerr | **0.000e+00** |
-| 2-D free-space field χ⁽²⁾ with a shot-noise field | **0.000e+00** |
-| 3-D free-space envelope Kerr with a shot-noise field | **0.000e+00** |
 
 Exactly zero, where the radial cases are at 1e-16. There is no GEMM in a Cartesian
 right-hand side, and the JLArray FFT shims wrap host plans, so every operation is the same
@@ -307,8 +280,7 @@ polarisation, in `Float32`:
 | **total** | **0.63 GB** | **0.88 GB** | **1.00 GB** |
 
 **Field-sized buffers per transform: four before, three after** (`Eto`, `Pto`, `Eωo`,
-`Pωo` → `Eto`, `Pto`, `Eωo === Pωo`); five with the modified shot-noise model, which
-was six. The aliasing is worth 64 MB of 0.88 GB, about 7 %, on the run above, and a larger
+`Pωo` → `Eto`, `Pto`, `Eωo === Pωo`). The aliasing is worth 64 MB of 0.88 GB, about 7 %, on the run above, and a larger
 fraction of a transform-dominated one.
 
 **A 3-D plasma run at the examples' sizes fits a 16 GB Metal device eighteen times over**,
@@ -422,9 +394,6 @@ the `fft`, `rhs` and `step` columns agree between all runs to a few per cent.
 - **No `npol = 2` Cartesian gate case.** The two χ⁽²⁾ gate cases are two-component 2-D
   runs, so the shape is covered there; there is no two-component *3-D* case anywhere
   except `test_freespace.jl`'s host-only `pol = true` sweep.
-- **The new `noise_field` keywords are tested on `JLArray` but not on Metal.** Both
-  dimensionalities are covered there (2-D and, since review round 1, 3-D, which is the one
-  the branch repaired); the gate runs with `shotnoise=false` by construction.
 
 ## Review round 1
 
@@ -438,7 +407,7 @@ runs. The eight findings are addressed in one follow-up commit:
 
 | # | finding | fix |
 | --- | --- | --- |
-| 1 | the 3-D shot-noise path, the one this branch repaired, had no test (the noise testsets and the wrong-shape check were all 2-D) | `free3dcase` gains `noise_field`; new testset `the 3-D free-space noise field on JLArray` — `Et_noise` resident, `(nto, 1, 8, 6)`, bit-identical to the host's, one device right-hand side finite, the propagation at 0.000e+00, and a noise field without the polarisation axis refused |
+| 1 | the 3-D shot-noise path had no test | moot: the free-space noise path went with the modified shot-noise model, removed after this branch was written |
 | 2 | `Luna.run`'s comment still named two of the four transforms that carry a scaling (stale twice over: review 20's finding 4 was the other half of the same sentence) | names all four, and `TransModal` as the exception |
 | 3 | the `prop` column does not reproduce, and three speed-up figures in the PR and both docs pages rest on it | `proptime` discards a warm-up run and takes the minimum of five (`LUNA_BENCH_PROPSAMPLES`); re-measured over two sweeps and a single-size run, now within 10 %; the quoted ratios come from `step`, which reproduces to 3 %, with the end-to-end ones given alongside and a paragraph on the scatter in the PR, in `benchmark/free.jl`'s docstring and in `device_model.md` |
 | 4 | `setup_free` allocated two field-sized blocks only to plan against them | the oversampled one is handed to the transform as its `Eto` (`freebuffers` takes it over, checks its shape and zero-fills it); the state-shaped one is documented |
@@ -471,7 +440,5 @@ and the `Boundaries.clampdecay`/`addloss`/`addloss_k` `Float64` promotion is sti
 - The brief asked for chunking of the response block "if a 3-D plasma run at the examples'
   sizes does not fit a 16 GB Metal device, or say why not". It fits with 18× headroom, so
   there is no chunking; the numbers and the argument are under "Memory".
-- `TransFree`/`TransFree2D` lose their `scale` constructor argument and field (dead once
-  the noise path uses `to_time!`), and `TransFree2D` gains a `noise_field` keyword it did
-  not have. Both are changes to the low-level constructor signatures, which only
-  `Luna.setup` uses.
+- `TransFree`/`TransFree2D` lose their `scale` constructor argument and field, a change to
+  the low-level constructor signature, which only `Luna.setup` uses.
