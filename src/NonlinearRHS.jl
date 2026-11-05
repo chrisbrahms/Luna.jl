@@ -921,7 +921,7 @@ function Erω_to_Prω!(t::TransModal, x)
     b = r.block
     t.pts[1] = (x[1], x[2])
     Modes.mode_matrix!(view(t.S3, :, :, 1:1), t.ts.ms, t.ts.indices, t.pts; z=t.z)
-    synthesise_responses!(b, _nlfield(t), view(t.S, :, 1:t.ts.npol), t.density)
+    synthesise_responses!(b, t.Emt, view(t.S, :, 1:t.ts.npol), t.density)
     @. b.Pt *= t.grid.towin
     to_freq!(r.Pω, r.Pωo, b.Pt, r.FT)
     @. r.Pω *= t.grid.ωwin
