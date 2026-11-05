@@ -112,7 +112,6 @@ split across several processes, so the counts are per group.
 | `test_raman.jl` | passed |
 | `test_fields.jl` | passed |
 | `test_maths.jl` | passed |
-| `test_noise.jl` | passed |
 | `test_scans.jl` | passed (18+18+1+1+1+2+5+93) |
 
 ### A pre-existing `Scans.jl` bug found while running these
