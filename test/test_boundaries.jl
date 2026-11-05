@@ -455,6 +455,10 @@ for (sg, nfs) in ((q, NonlinearRHS.const_norm_radial(grid, q, nfunλ)),
     b = Boundaries.setup(:rate, grid, transform, lin, Et, FT, dummy, 0.0, zmax, zmax/2, 1e-4)
     @test b.max_dz == ℓ
     @test nfs.ℓ == ℓ && nfs.κmax == ratemax
+    # the evanescent, spectral and k-space decays add; their sum is capped once more, so a
+    # full step of ℓ never back-propagates by more than exp(MAX_αℓ/2), even in Float32
+    @test minimum(real(b.linop)) ≈ -ratemax
+    @test all(isfinite, exp.(.-Float32.(real.(b.linop)) .* Float32(ℓ)))
     @test minimum(nfs.kwin) >= exp(-Boundaries.MAX_αℓ/2) # never zero: the norm divides by it
     @test minimum(real(b.linop)) >= -ratemax - 1.5Boundaries.MAX_αℓ/ℓ - 1e-9
     @test b.stepfun.spatial isa (sg isa Grid.RadialGrid ? Boundaries.RadialCollar : Boundaries.CartesianCollar)

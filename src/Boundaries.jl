@@ -69,7 +69,11 @@ transverse wavevector `k⊥`.
   `kcollar` fraction of `|k⊥|` ([`kprofile`](@ref)) becomes a rate ([`rate`](@ref)), rides
   the propagator through [`addloss_k`](@ref) and tapers the source through the same
   `FreeSpaceNorm`. Where the evanescent region reaches the grid edge this is redundant
-  with `κ`, and harmless.
+  with `κ`. The clamped `κ`, the spectral absorber and the k-space absorber are each capped
+  at a field rate of `MAX_αℓ/(2ℓ)` but they *add*, so [`setup`](@ref) clamps their sum at
+  `MAX_αℓ/(2ℓ)` once more ([`clampdecay`](@ref)). Without that the corner of the grid
+  (band edge, largest `k⊥`) decays at three times the cap and the interaction picture
+  amplifies by `exp(3MAX_αℓ/2) = exp(90)`, which overflows `Float32`.
 - **Transverse collar** (`:rate` only). The analogue of the temporal collar: a beam
   reaching the transverse edge wraps around (FFT grids) or reflects off the `E(R) = 0`
   wall of a [`Grid.RadialGrid`](@ref Luna.Grid.RadialGrid). A rate over the outer part of
@@ -686,6 +690,10 @@ function setup(boundary, grid, transform, linop, Et, FT, output, z0, zmax, max_d
             linop = evanescent(linop, transform, ℓabs; kwin=max.(Wk, exp(-MAX_αℓ/2)))
             linop = addloss(linop, spectral_rate(grid, zmax; N, ℓ))
             linop = addloss_k(linop, rate(Wk, ℓabs))
+            #= Each of the three decays above is capped at MAX_αℓ/(2ℓ), but they add: at the
+               band edge and the largest k⊥ the sum is three times the cap, and exp(90) over a
+               step of ℓ overflows Float32. Cap the total. See "Free space" above. =#
+            linop = clampdecay(linop, MAX_αℓ/(2ℓabs))
             spatial = spatialcollar(sg, rate(rprofile(sg, rcollar), ℓabs), grid, Et)
         end
         log_setup(grid, zmax, ℓabs, collar, sg, kcollar, rcollar)
