@@ -14,7 +14,7 @@ that which the GPU work needs to change:
   constructor, so it cannot describe a device grid.
 - Hankel transforms along `QDHT.dim` with a `permutedims` temporary per call for
   `dim ≠ 1`. `NonlinearRHS.TransRadial` already worked around this with its own transposed
-  matrices; `Boundaries.RadialCollar`, `Luna.setup` and the noise setup did not.
+  matrices; `Boundaries.RadialCollar` and `Luna.setup` did not.
 - Metal's accelerated GEMM needs both operands in the same element type, so the transform
   matrix has to be held per consumer in the type it multiplies, not once in the grid.
 
@@ -96,7 +96,7 @@ rank:
   converting methods for a `Grid.HankelTransform` at the same concrete arities.
 - `NonlinearRHS`: `TransRadial.QDHT` becomes `TransRadial.rgrid`; the constructor takes the
   grid's matrices as `convert(Matrix{TT}, rgrid.Tfwd/Tbwd)` copies in the element type it
-  multiplies. The noise-field `ldiv!` becomes a `radial_matmul!` with that same `Tbwd`.
+  multiplies.
   `norm_radial`/`const_norm_radial` take a `RadialGrid` and have converting methods.
   The per-step transform body is unchanged.
 - `Boundaries`: `spacegrid(::TransRadial)` returns the `rgrid`; `kprofile`, `rprofile`,
@@ -117,9 +117,8 @@ rank:
   `onaxis`/`symmetric`/`rsymmetric` against Hankel, and `to_dict`/`from_dict`. This is the
   only file in `test/` which constructs a `QDHT`.
 - `test_freespace.jl`, `test_boundaries.jl`, `test_linops.jl`, `test_fields.jl` and
-  `test_modes.jl` use `Grid.RadialGrid`. Two testsets are added to `test_freespace.jl`: the
-  transverse grid written to the output round-trips through `Grid.RadialGrid`, and the
-  radial noise field is transformed to real space with the transform's own matrix.
+  `test_modes.jl` use `Grid.RadialGrid`. A testset is added to `test_freespace.jl`: the
+  transverse grid written to the output round-trips through `Grid.RadialGrid`.
 - `examples/low_level_interface/freespace/radial*.jl` use `Grid.RadialGrid` and the
   `Grid.` post-processing functions. `radial_hcf.jl` also had its post-processing indices
   corrected: it indexed `Eω` as `(ω, r, z)`, but `Luna.setup` has added a polarisation axis
@@ -137,10 +136,9 @@ grid, and the module pages are `@autodocs`, so the new names are picked up autom
 
 ## Numerical change and its measurement
 
-Hankel's `permutedims` + left GEMM is replaced by a right GEMM on a reshape in three places
-that were not already doing it: `Boundaries.RadialCollar`, the input-field transform
-(`Fields.transform`, which `Luna.setup` reaches through `doinputs_fs!`), and the
-`TransRadial` noise setup. (GPU_PLAN.md §4.14 attributes the input-field change to
+Hankel's `permutedims` + left GEMM is replaced by a right GEMM on a reshape in the two places
+that were not already doing it: `Boundaries.RadialCollar` and the input-field transform
+(`Fields.transform`, which `Luna.setup` reaches through `doinputs_fs!`). (GPU_PLAN.md §4.14 attributes the input-field change to
 `Luna.setup`'s `q * Eω`; that call transforms an all-zero array and contributes nothing.
 The change is in `Fields.transform`.) Folding the scalar `scaleRK` into the matrix instead of
 applying it after the product also changes the order of operations. Both change rounding.
@@ -254,12 +252,6 @@ not run (too slow); the files above are the ones this branch touches, plus
 
 ## Known gaps and deviations from GPU_PLAN.md
 
-- The plan's §4.14 says the noise-field transform uses `to_rspace!`. It uses
-  `Grid.radial_matmul!` with `TransRadial`'s own `Tbwd` instead, which is the same
-  operation with the matrix in the transform's element type. Calling `to_rspace!` would
-  multiply a `ComplexF64` array by the grid's `Float64` matrix for an `EnvGrid`, which is
-  the mixed-type GEMM §4.14 says each consumer should avoid, and it would round differently
-  from the per-step transform.
 - `FreeGrid` and `Free2DGrid` get a `to_dict` but no `from_dict`: their constructors take a
   `window_factor` which is not recoverable from the fields, and the plan only asks for a
   minimal description in the output.

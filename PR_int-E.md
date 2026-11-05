@@ -129,8 +129,7 @@ same buffer. The two never appear as the input and the output of one FFT call, w
 device plan would reject.
 
 One `(nωo, npol, nr)` complex array per radial run. `TransRadial` now holds **five**
-field-sized buffers, not six, and seven with the modified shot-noise model instead of
-eight. `test/test_device.jl` asserts the count by `objectid`, as it does for the two
+field-sized buffers, not six. `test/test_device.jl` asserts the count by `objectid`, as it does for the two
 Cartesian transforms, for a field and an envelope grid.
 
 ## `Boundaries.clampdecay`, `addloss`, `addloss_k`
@@ -407,8 +406,7 @@ of running it twice: nothing in the device paths depends on the thread count.
 
 - `test/test_device.jl`, **"TransRadial holds five field-sized buffers"** (12): `Pωo ===
   Eωo` by identity, the field-sized buffer count for a field and an envelope grid, that
-  the four time-domain buffers are four distinct arrays, and seven buffers with the
-  modified shot-noise model.
+  the four time-domain buffers are four distinct arrays.
 - `test/test_boundaries.jl`, **"the operator absorbers on an uploaded operator"** (19):
   described under "`Boundaries.clampdecay`, `addloss`, `addloss_k`" above.
 
@@ -457,10 +455,3 @@ Two references *were* new on the first build of this branch and are fixed in `90
 `Boundaries.addloss` (the element-type commit had put two helper definitions between its
 docstring and its first method) and `Luna.prop_capillary` in `LinearOps.jl` (which does not
 resolve from inside `module LinearOps`).
-
-## LupoLab/Luna.jl#440 (propagated modified shot noise)
-
-Merging 21–24 with #440: TransRadial `Pωo === Eωo` aliasing kept with the noise buffers; the
-TransRadial buffer-count test is eight with the propagated noise. Two review rounds (test
-discrimination, Float32 free-space RHS, mask tests both ways, TransModalFixed shape check,
-docs), then AGREE. Gate 466/466, exactly 0.

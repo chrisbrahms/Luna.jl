@@ -232,7 +232,6 @@ The tabulated device path agrees with the tabulated host path exactly as well as
 untabulated one does, and the `Float32` tables cost nothing measurable next to the
 `Float32` state itself — which is what the secant subtraction is for.
 
-
 ## Regression gate
 
 21 cases in two run modes, the environment `test/regression/README.md` prescribes
@@ -315,7 +314,6 @@ accepted steps:
 | `tabulate_linop=true` | 133 → 133 | 35 → 35 | 3 → 3 | 121 → 229 |
 
 Without tabulation the counts scale with the stages; with it they do not move at all.
-
 
 ## Known gaps
 
@@ -407,10 +405,3 @@ Every test file named above and the gate were rerun after the fixes: `test_linop
   exponential, as the untabulated one does.
 - `RK45.make_prop!`'s new method is defined in `LinearOps`, not in `RK45.jl`, because
   `RK45.jl` is included before `LinearOps.jl` and cannot name the type.
-
-## LupoLab/Luna.jl#440 (propagated modified shot noise)
-
-`tabulate(::TransModeAvg)` passes `noise`, `dnoise` and the noise buffers through by reference,
-so a resume's `sync_noise!` on the setup transform reaches the tabulated one. #440's
-`unitary_phase` section of LinearOps.jl was re-applied on top of this branch's file (the
-automatic merge interleaved the two bisection routines).

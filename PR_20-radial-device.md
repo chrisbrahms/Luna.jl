@@ -31,7 +31,7 @@ from it, are `NonlinearRHS.FreeSpaceNorm` (shared by all three free-space transf
 Parametric in its buffer array type, like `TransModeAvg`: every buffer is allocated with
 `Luna.alloc`, the grid vectors are mirrored (`Luna.gridvectors`), the inverse plan is held
 explicitly, the responses are given the run's `spec` and `scaling` through
-`Nonlinear.rescale_responses`, the noise field is uploaded and divided by `Eref`, and the
+`Nonlinear.rescale_responses`, and the
 constructor asserts residency of every buffer, mirror, transform matrix and response array.
 The transform carries its `UnitScaling`, and `Luna.runscaling` knows about it, so a
 `Float32` radial run gets a `ScaledOutput` like a mode-averaged one.
@@ -246,9 +246,6 @@ off, through the timing wrapper.
   `npol = 2`, which is the only shape in which the reshaped GEMM can differ from the
   per-view loop at all. The input is rotated by `θ = π/6` so that both components carry
   field, and the test asserts that.
-- `the radial noise field on JLArray` (review round 1): a transform built with a
-  `noise_field`, so that the upload, the device `IFT` and `Tbwd` at setup, the `Et_nl`
-  buffer and their residency are covered. The same host noise field goes into both runs.
 
 Measured differences (per save, normalised by the largest `|Eω|` in that save — the gate's
 metric; an elementwise relative difference is meaningless in the k-channels the evanescent
@@ -262,7 +259,6 @@ taper has emptied):
 | radial field Kerr+Raman | 6.223e-16 |
 | radial envelope Kerr+Raman | 8.383e-16 |
 | radial field Kerr, two polarisation components | 8.481e-16 |
-| radial field Kerr with a shot-noise field | 1.095e-15 |
 
 The plasma case runs on a tighter grid at a smaller waist than the Kerr ones so that argon
 actually ionises, and the test asserts the ionised fraction is non-zero — otherwise it would
@@ -387,10 +383,6 @@ printed.
   baselined, and no case in the matrix is a two-component free-space run.
 - **The `Float32` radial path is not exercised on the regression gate**, only in the tests:
   the gate is a `Float64` contract by construction.
-- **The modified shot-noise path is tested on `JLArray` but not on Metal** (review round 1,
-  finding 5). `the radial noise field on JLArray` covers the upload, the device `IFT` and
-  `Tbwd` at setup, `Et_nl`, residency and the propagation; the gate runs with
-  `shotnoise=false` by construction.
 - **Plasma and Raman are not in the Metal radial testset**, only in the `JLArray` one. Their
   kernels are already covered on Metal by `gpu/13`/`gpu/14`'s own testsets (on device blocks
   and through mode-averaged propagations), and what this branch adds is the transform around
@@ -412,9 +404,9 @@ follow-up commit:
 | 2 | "twelve non-zero rows" above a sixteen-row table | now "sixteen (eight cases in two modes)" |
 | 3 | the gate header listed the 21 cases which *ran*, not the one skipped | `selected()` returns a description built from the `ONLY`/`SKIP` lists as given; the header prints `21 of 22  (skipped: radial_field_raman)` and the docstring matches |
 | 4 | stale comment in `Luna.run` naming only `TransModeAvg` as carrying a scaling | names `TransRadial` too |
-| 5 | two device paths added but untested: `npol = 2` end to end, and the radial noise field | `radialcase` gains `npol` (with `θ = π/6` so both components carry field) and `noise_field`; two new testsets, `two polarisation components on JLArray` (8.481e-16 vs host) and `the radial noise field on JLArray` (`Et_noise` resident and bit-identical to the host's, propagation 1.095e-15) |
+| 5 | two device paths added but untested: `npol = 2` end to end, and the radial noise field | `radialcase` gains `npol` (with `θ = π/6` so both components carry field); new testset `two polarisation components on JLArray` (8.481e-16 vs host) (the noise part of this finding went with the modified shot-noise model, removed after this branch was written) |
 | 6 | `retarget` silently replaces the caller's normalisation object | `docs/src/gpu.md` now says the transform holds a different object on a device run, that the caller's copy is dead, and how to avoid it (`transform.normfun`, or the `spec` keyword) |
-| 7 | `noise_field ./ Eref` allocated on the default path | guarded with `isunity(scaling)`, as everywhere else |
+| 7 | `noise_field ./ Eref` allocated on the default path | moot: the noise field went with the modified shot-noise model |
 | 8 | `spatialcollar` allocated a field-sized prototype used only for `similar` | `RadialCollar` takes the buffer over instead of copying it; one field-sized array per radial run, not two |
 | 9 | `benchmark/radial.jl`'s `step` column timed arithmetic on overflowed evanescent channels | `prepare` uploads the operator `Boundaries.evanescent` has clamped, which is what `boundary=:none` does inside `Luna.run` |
 | 10 | `radialdiff` defined twice with the same signature | the `test_metal.jl` one is `metalradialdiff` |
@@ -439,10 +431,3 @@ tables above are the new run).
   retargeting keeps every existing low-level script, example and gate case working unchanged
   while still allowing `spec` to be passed to `norm_radial` directly.
 - `Pωo === Eωo` aliasing is left to `gpu/21` (above).
-
-## LupoLab/Luna.jl#440 (propagated modified shot noise)
-
-TransRadial on the device advances `dnoise` per right-hand side and takes it ω → t, k → r with
-the device inverse FFT and `Grid.radial_matmul!`, like the field. test_device: the radial noise
-testset checks a masked `dnoise` on JLArray and in Float32 (1e2-amplified draw: the effect is
-3e-4, the Float32 comparison 1.2e-6 against 1e-5).
