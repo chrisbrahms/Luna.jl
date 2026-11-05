@@ -129,8 +129,7 @@ same buffer. The two never appear as the input and the output of one FFT call, w
 device plan would reject.
 
 One `(nωo, npol, nr)` complex array per radial run. `TransRadial` now holds **five**
-field-sized buffers, not six, and seven with the modified shot-noise model instead of
-eight. `test/test_device.jl` asserts the count by `objectid`, as it does for the two
+field-sized buffers, not six. `test/test_device.jl` asserts the count by `objectid`, as it does for the two
 Cartesian transforms, for a field and an envelope grid.
 
 ## `Boundaries.clampdecay`, `addloss`, `addloss_k`
@@ -407,8 +406,7 @@ of running it twice: nothing in the device paths depends on the thread count.
 
 - `test/test_device.jl`, **"TransRadial holds five field-sized buffers"** (12): `Pωo ===
   Eωo` by identity, the field-sized buffer count for a field and an envelope grid, that
-  the four time-domain buffers are four distinct arrays, and seven buffers with the
-  modified shot-noise model.
+  the four time-domain buffers are four distinct arrays.
 - `test/test_boundaries.jl`, **"the operator absorbers on an uploaded operator"** (19):
   described under "`Boundaries.clampdecay`, `addloss`, `addloss_k`" above.
 
