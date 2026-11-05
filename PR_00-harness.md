@@ -420,7 +420,7 @@ Total 2830 s ≈ 47 min, of which `test_scans.jl`, `test_polarisation_field.jl`,
 | `test_scans.jl` | 714.9 | `test_boundaries.jl` | 33.0 | `test_maths.jl` | 15.5 |
 | `test_polarisation_field.jl` | 695.1 | `test_gnlse.jl` | 29.0 | `test_polarisation_env.jl` | 13.5 |
 | `test_freespace.jl` | 313.9 | `test_tapers.jl` | 24.1 | `test_mixtures.jl` | 13.1 |
-| `test_interface.jl` | 268.6 | `test_noise.jl` | 22.7 | `test_physdata.jl` | 12.3 |
+| `test_interface.jl` | 268.6 | — | — | `test_physdata.jl` | 12.3 |
 | `test_multimode.jl` | 246.1 | `test_output.jl` | 22.4 | `test_rk45.jl` | 11.9 |
 | `test_fields.jl` | 66.5 | `test_linops.jl` | 18.2 | `test_capillary.jl` | 11.8 |
 | `test_vectorplasma.jl` | 43.9 | `test_gradient.jl` | 17.5 | `test_stats.jl` | 11.4 |
