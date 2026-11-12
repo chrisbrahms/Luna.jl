@@ -102,7 +102,11 @@ end
 Construct a second-order nonlinear polarisation response for real, two-component
 electric fields in the lab frame.
 
-`θ` and `ϕ` (radians) define the crystal orientation relative to the lab frame.
+`θ` and `ϕ` (radians) define the crystal orientation relative to the lab frame: the
+crystal's `z` (optic) axis is at `θ` from the lab `z` axis, tilted towards `+x`, i.e.
+`(sin θ, 0, cos θ)`, and `ϕ` rotates the crystal about its own `z` axis.
+[`PhysData.ref_index_fun_xy`](@ref)`(material, θ)` uses the same orientation, so the two
+agree on which side of the beam the optic axis lies.
 `χ2` must be a 3×6 second-order susceptibility tensor in contracted notation,
 with column order `[xx, yy, zz, yz, xz, xy]` (where mixed terms are multiplied by 2
 in [`field_products!`](@ref)).

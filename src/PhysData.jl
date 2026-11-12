@@ -455,22 +455,37 @@ function ref_index_fun_uniax(material; axes=(:o, :e))
     return n
 end
 
+"""
+    ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
+
+Refractive-index functions `(nfunx, nfuny)` of a uniaxial crystal for free-space
+propagation along `z`, with the optic axis in the `x`-`z` plane at angle `θ` from `z`,
+tilted towards `+x`: the axis is `(sin θ, 0, cos θ)`, the same orientation as
+[`Nonlinear.Chi2Field`](@ref)`(θ, 0, χ2)` gives the crystal's `z` axis.
+
+`nfuny(λ)` is the ordinary index (`y` polarisation). `nfunx(λ, δθ)` is the
+extraordinary index (`x` polarisation) of a plane wave whose wavevector is tilted by
+`δθ` from `z` towards `+x`; that wave is at `θ - δθ` to the optic axis. `δθ` is found
+from the transverse wavevector by [`crystal_internal_angle`](@ref).
+"""
 function ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
     # y polarisation: ordinary polarisation
     no = ref_index_fun(material; axis=ordinary)
     # x polarisation: extraordinary polarisation, need extra δθ argument
     ne = ref_index_fun_uniax(material; axes=(ordinary, extraordinary))
-    nfunx(λ, δθ=0) = real(ne(λ, θ+δθ))
+    # A wave tilted towards +x is closer to an axis tilted towards +x: θ - δθ.
+    nfunx(λ, δθ=0) = real(ne(λ, θ-δθ))
     nfuny(λ) = real(no(λ))
     nfunx, nfuny
 end
 
 function crystal_internal_angle(nfun, ω, kx)
     # External wavevector is kx = ω/c*sin(θ_i) with θ_i the AOI of the plane wave
-    # Internal wavevector is kx2 = ω/c * n(θ+δθ) * sin(δθ)
+    # Internal wavevector is kx2 = ω/c * n(δθ) * sin(δθ), with n(δθ) the index of a wave
+    # tilted by δθ (towards +x for δθ > 0; see ref_index_fun_xy)
     # Momentum conservation requires kx = kx2
     # kx is given by the grid, so
-    # kx = ω/c * n(θ+δθ)*sin(δθ)
+    # kx = ω/c * n(δθ)*sin(δθ)
     # Solve this numerically
     try
         global δθ = fzero(0.0) do δθi
@@ -502,10 +517,13 @@ Currently implemented materials:
 """
 function χ2(material)
     if material == :BBO
-        # Shoji, I. et al. J. Opt. Soc. Am. B, JOSAB 16, 620–624 (1999)
+        # Shoji, I. et al. J. Opt. Soc. Am. B, JOSAB 16, 620–624 (1999), at 1064 nm, as
+        # quoted by Bache et al., Opt. Mater. Express 3, 357 (2013), p. 26:
+        # |d22| = 2.2, |d31| = 0.04, d15 = 0.03 and d33 = 0.04 pm/V. Point group 3m
+        # requires d24 = d15 and d32 = d31, d21 = -d22, d16 = -d22.
         χ2 = 2e-12.*[ # note factor of 2 to convert d to χ2
             0 0 0 0 0.03 2.2;
-            2.2 -2.2 0 -0.08 0 0;
+            2.2 -2.2 0 0.03 0 0;
             0.04 0.04 0.04 0 0 0
         ]
     else

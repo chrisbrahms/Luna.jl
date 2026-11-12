@@ -263,3 +263,29 @@ end
 	@test rectification > 1e8 * max(fundamental, eps())
 	@test maximum(abs.(out[:, 1])) < 1e-15
 end
+
+@testset "BBO χ2 tensor has the 3m structure" begin
+	d = PhysData.χ2(:BBO) ./ 2e-12 # d in pm/V; columns [xx, yy, zz, yz, xz, xy]
+	@test d[2, 4] == d[1, 5]       # d24 = d15
+	@test d[3, 2] == d[3, 1]       # d32 = d31
+	@test d[2, 1] == -d[2, 2]      # d21 = -d22
+	@test d[1, 6] == -d[2, 2]      # d16 = -d22
+	@test all(iszero, (d[1, 1:4]..., d[2, 3], d[2, 5], d[2, 6], d[3, 4:6]...))
+end
+
+@testset "Chi2Field and ref_index_fun_xy agree on the optic axis" begin
+	θ = deg2rad(29.2)
+	axis = Nonlinear.Chi2Field(θ, deg2rad(30), PhysData.χ2(:BBO)).toLab * [0.0, 0.0, 1.0]
+	@test axis ≈ [sin(θ), 0.0, cos(θ)]
+	nfunx, _ = PhysData.ref_index_fun_xy(:BBO, θ)
+	ne = PhysData.ref_index_fun_uniax(:BBO)
+	ω = PhysData.wlfreq(400e-9)
+	for kx in (0.05, -0.05) .* ω ./ PhysData.c
+		δθ = PhysData.crystal_internal_angle(nfunx, ω, kx)
+		@test sign(δθ) == sign(kx)
+		k = [sin(δθ), 0.0, cos(δθ)]
+		# the operator's index is the extraordinary index at the wave's true angle to
+		# the optic axis Chi2Field uses
+		@test nfunx(400e-9, δθ) ≈ real(ne(400e-9, acos(k' * axis))) rtol=1e-12
+	end
+end
