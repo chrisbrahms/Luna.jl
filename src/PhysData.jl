@@ -464,17 +464,21 @@ tilted towards `+x`: the axis is `(sin θ, 0, cos θ)`, the same orientation as
 [`Nonlinear.Chi2Field`](@ref)`(θ, 0, χ2)` gives the crystal's `z` axis.
 
 `nfuny(λ)` is the ordinary index (`y` polarisation). `nfunx(λ, δθ)` is the
-extraordinary index (`x` polarisation) of a plane wave whose wavevector is tilted by
-`δθ` from `z` towards `+x`; that wave is at `θ - δθ` to the optic axis. `δθ` is found
-from the transverse wavevector by [`crystal_internal_angle`](@ref).
+extraordinary index (`x` polarisation) of the plane-wave component at transverse
+wavevector `kx` on Luna's grid, with `δθ` (of the sign of `kx`) found from `kx` by
+[`crystal_internal_angle`](@ref). Luna's fields vary as `exp(i(ωt + kx*x - βz*z))`
+(forward FFTs in `t` and `x`, propagation `exp(-iβz*z)`), so a component with `kx > 0`
+travels towards `-x`, away from the axis: it is at `θ + δθ` to the optic axis. An
+extraordinary beam therefore walks off towards `-x`, away from the axis, as it must in a
+negative uniaxial crystal.
 """
 function ref_index_fun_xy(material, θ; ordinary=:o, extraordinary=:e)
     # y polarisation: ordinary polarisation
     no = ref_index_fun(material; axis=ordinary)
     # x polarisation: extraordinary polarisation, need extra δθ argument
     ne = ref_index_fun_uniax(material; axes=(ordinary, extraordinary))
-    # A wave tilted towards +x is closer to an axis tilted towards +x: θ - δθ.
-    nfunx(λ, δθ=0) = real(ne(λ, θ-δθ))
+    # kx > 0 travels towards -x (see the docstring), away from the axis: θ + δθ.
+    nfunx(λ, δθ=0) = real(ne(λ, θ+δθ))
     nfuny(λ) = real(no(λ))
     nfunx, nfuny
 end
@@ -482,7 +486,8 @@ end
 function crystal_internal_angle(nfun, ω, kx)
     # External wavevector is kx = ω/c*sin(θ_i) with θ_i the AOI of the plane wave
     # Internal wavevector is kx2 = ω/c * n(δθ) * sin(δθ), with n(δθ) the index of a wave
-    # tilted by δθ (towards +x for δθ > 0; see ref_index_fun_xy)
+    # tilted by δθ (δθ has the sign of kx; a component with kx > 0 travels towards -x,
+    # see ref_index_fun_xy)
     # Momentum conservation requires kx = kx2
     # kx is given by the grid, so
     # kx = ω/c * n(δθ)*sin(δθ)

@@ -1,5 +1,6 @@
 import Test: @test, @testset
-import Luna: Fields, Grid, Maths, Nonlinear, PhysData
+import Luna
+import Luna: Fields, Grid, LinearOps, Maths, Nonlinear, NonlinearRHS, Output, PhysData
 import Luna.PhysData: ε_0
 import FFTW
 
@@ -273,6 +274,20 @@ end
 	@test all(iszero, (d[1, 1:4]..., d[2, 3], d[2, 5], d[2, 6], d[3, 4:6]...))
 end
 
+@testset "Luna's grid: a component with kx > 0 travels towards -x" begin
+	# Luna's fields vary as exp(i(ωt + kx*x - βz*z)): a real wave cos(ωt - k*x), which
+	# travels towards +x, sits at kx = -k on the grid.
+	grid = Grid.RealGrid(1e-6, 800e-9, (650e-9, 1000e-9), 200e-15)
+	xgrid = Grid.Free2DGrid(100e-6, 64)
+	k = xgrid.kx[5]
+	ω = grid.ω[argmin(abs.(grid.ω .- PhysData.wlfreq(800e-9)))]
+	E = cos.(ω .* grid.t .- k .* xgrid.x')
+	Eωk = FFTW.rfft(E, (1, 2))
+	iω, ik = Tuple(argmax(abs.(Eωk)))
+	@test grid.ω[iω] ≈ ω
+	@test xgrid.kx[ik] ≈ -k
+end
+
 @testset "Chi2Field and ref_index_fun_xy agree on the optic axis" begin
 	θ = deg2rad(29.2)
 	axis = Nonlinear.Chi2Field(θ, deg2rad(30), PhysData.χ2(:BBO)).toLab * [0.0, 0.0, 1.0]
@@ -283,9 +298,41 @@ end
 	for kx in (0.05, -0.05) .* ω ./ PhysData.c
 		δθ = PhysData.crystal_internal_angle(nfunx, ω, kx)
 		@test sign(δθ) == sign(kx)
-		k = [sin(δθ), 0.0, cos(δθ)]
-		# the operator's index is the extraordinary index at the wave's true angle to
-		# the optic axis Chi2Field uses
+		# the component travels along (-sin δθ, 0, cos δθ) (see the testset above); the
+		# operator's index is the extraordinary index at its true angle to the optic axis
+		# Chi2Field uses
+		k = [-sin(δθ), 0.0, cos(δθ)]
 		@test nfunx(400e-9, δθ) ≈ real(ne(400e-9, acos(k' * axis))) rtol=1e-12
 	end
+end
+
+@testset "An extraordinary beam walks off away from Chi2Field's optic axis" begin
+	# BBO is negative uniaxial, so the Poynting vector of an extraordinary wave is
+	# further from the optic axis than its wavevector, by ρ = -(dn_e/dθ)/n_e. With the
+	# axis tilted towards +x (Chi2Field), a beam at normal incidence moves towards -x.
+	θ = deg2rad(29.2)
+	λ0 = 800e-9
+	L = 200e-6
+	grid = Grid.RealGrid(L, λ0, (650e-9, 1000e-9), 150e-15)
+	xgrid = Grid.Free2DGrid(100e-6, 128)
+	nfuns = PhysData.ref_index_fun_xy(:BBO, θ)
+	linop = LinearOps.make_const_linop(grid, xgrid, nfuns)
+	normfun = NonlinearRHS.const_norm_free2D(grid, xgrid, nfuns)
+	responses = (Nonlinear.Chi2Field(θ, 0.0, zeros(3, 6)),) # linear propagation only
+	inputs = Fields.GaussGaussField(; λ0, τfwhm=40e-15, energy=1e-12, w0=15e-6, θ=π/2)
+	Eω, transform, FT = Luna.setup(grid, xgrid, z -> 1, normfun, responses, inputs)
+	output = Output.MemoryOutput(0, L, 2)
+	Luna.run(Eω, grid, linop, transform, FT, output; init_dz=1e-6)
+	centroid = map(1:2) do iz
+		Etx = FT \ copy(output["Eω"][:, :, :, iz])
+		Ix = vec(sum(abs2, Etx[:, 1, :]; dims=1))
+		sum(Ix .* xgrid.x)/sum(Ix)
+	end
+	ne = PhysData.ref_index_fun_uniax(:BBO)
+	n(θi) = real(ne(λ0, θi))
+	h = 1e-6
+	ρ = -(n(θ + h) - n(θ - h))/(2h)/n(θ)
+	@test ρ > 0
+	# 1 %: the beam's spectrum spans 700-930 nm, over which ρ varies by about that much
+	@test centroid[2] - centroid[1] ≈ -ρ*L rtol=0.01
 end
